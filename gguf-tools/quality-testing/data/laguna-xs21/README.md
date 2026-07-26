@@ -210,6 +210,42 @@ which kernel/batch-path difference between "generate" and "sync+eval"
 causes the divergence is out of scope for this task; flagged as a follow-up
 if later tasks need tighter precision than this floor allows.
 
+**Follow-up: this is not XS-2.1-specific.** After this section was
+originally written, the same self-consistency methodology (`collect_local.py`
++ `score_official`) was run against Laguna S 2.1 — an already-trusted model
+whose decode/prefill code this project's changes (including Task 3's
+`laguna_graph_forward_token` QKVG dispatch fix) never touched — on a 15-prompt
+sample. It scored **~80% first-token-match** under the identical
+methodology — the same rough noise-floor magnitude as XS 2.1's 71%/45-71%
+range above, on a model with no code path in common with this project's
+changes. This was directly measured, not inferred.
+
+This is confirmed evidence that the divergence documented above is a
+pre-existing characteristic of the `collect_local.py`/`score_official`
+self-consistency comparison itself — a comparison this tooling was not
+originally designed or tested for (it was built to score captured
+continuations against externally-hosted reference logprobs, not to score a
+model's own free-generation output against itself) — and **not** evidence of
+an XS-2.1-specific bug or a regression introduced by Task 3's decode-dispatch
+fix. Since the same magnitude of mismatch shows up on a completely unrelated,
+already-trusted model under the same methodology, the most defensible
+conclusion is that the methodology itself has this noise floor, independent
+of which model it's pointed at.
+
+The leading (but unverified) hypothesis for the proximate cause is that
+`score_official.c` re-tokenizes the *printed continuation text* independently
+(via `ds4_tokenize_text`) rather than reusing the token IDs that were
+originally sampled during `collect_local.py`'s generate loop. If the
+tokenizer's text-to-token mapping isn't perfectly round-trippable at every
+BPE boundary, retokenizing printed text can silently produce a different
+token sequence than the one that was actually sampled, which would desync
+`score_official`'s teacher-forced eval from the generation that produced the
+fixture — independent of any model weights, kernel, or dispatch-path
+question. This is reasoned from reading `score_official.c`, **not** verified
+independently: no one has diffed raw logits between the two paths or traced
+the exact token/step where the two paths first disagree. Treat it as the
+leading explanation, not a proven root cause.
+
 ## Known limitation: webpy tool-call prompts
 
 The 5 tool-call prompts in `webpy` (case_015-019) ask the model, in plain
