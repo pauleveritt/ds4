@@ -321,12 +321,12 @@ git commit -m "Add Laguna XS 2.1 quality fixtures and P0 baseline"
 - Test: `tests/ds4_test.c` + manual refusal checks
 
 **Interfaces:**
-- Produces: `--ssd-streaming` proceeds for XS2, still refuses for S21 with the existing message. Non-Metal + Laguna still refuses.
+- Produces: `--ssd-streaming` proceeds for XS 2.1, still refuses for S21 with the existing message. Non-Metal + Laguna still refuses.
 
 - [ ] **Step 1: Change the guard.** Inside the `DS4_MODEL_FAMILY_LAGUNA` block replace the unconditional streaming rejection with:
 
 ```c
-if (e->ssd_streaming && DS4_MODEL_VARIANT != DS4_VARIANT_LAGUNA_XS2) {
+if (e->ssd_streaming && DS4_MODEL_VARIANT != DS4_VARIANT_LAGUNA_XS21) {
     fprintf(stderr,
             "ds4: --ssd-streaming for Laguna is only supported "
             "for Laguna XS 2.1\n");
@@ -664,7 +664,7 @@ git commit -m "Profile and record Python/web-biased XS 2.1 expert hotlist"
 
 **Interfaces:**
 - Consumes: Task 12 hotlist text.
-- Produces: `ds4_default_streaming_hotlist_laguna_xs2[][2]` + `_count`, selected automatically for XS2 when no env override.
+- Produces: `ds4_default_streaming_hotlist_laguna_xs2[][2]` + `_count`, selected automatically for XS 2.1 when no env override.
 
 - [ ] **Step 1: Write the converter**
 
@@ -700,7 +700,7 @@ python3 gguf-tools/imatrix/hotlist_to_inc.py gguf-tools/imatrix/laguna-xs21-bias
 In `ds4.c`: add `#include "ds4_streaming_hotlist_laguna_xs21.inc"` at ~1361 and a variant case at ~20841:
 
 ```c
-} else if (g_ds4_shape.variant == DS4_VARIANT_LAGUNA_XS2) {
+} else if (g_ds4_shape.variant == DS4_VARIANT_LAGUNA_XS21) {
     hotlist = ds4_default_streaming_hotlist_laguna_xs2;
     hotlist_count = ds4_default_streaming_hotlist_laguna_xs2_count;
 ```
