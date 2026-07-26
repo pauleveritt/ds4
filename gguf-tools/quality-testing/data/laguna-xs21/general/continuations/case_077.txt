@@ -1,0 +1,1 @@
+La differenza tra la **residenza** (physical memory occupied) e la **dimensione virtuale**

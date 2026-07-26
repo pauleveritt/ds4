@@ -1,0 +1,1 @@
+You have access to a tool named create_file that takes path and content arguments. Using Laguna's native tool-call format, call create_file to write a file at notes/todo.txt containing the single line Buy milk. Respond with only the tool call.

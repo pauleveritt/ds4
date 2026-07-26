@@ -1,0 +1,1 @@
+You have access to a tool named read_file that takes a path argument and returns the file contents. Using Laguna's native tool-call format, call read_file for the path config/settings.json. Respond with only the tool call.

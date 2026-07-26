@@ -1,0 +1,1 @@
+A trie (prefix tree) represents a set of strings by using a hierarchical structure of nodes where each node corresponds to a

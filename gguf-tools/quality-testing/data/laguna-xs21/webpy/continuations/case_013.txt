@@ -1,0 +1,1 @@
+To solve this problem, we need to create a Python dataclass called `Point3D` that represents a point in

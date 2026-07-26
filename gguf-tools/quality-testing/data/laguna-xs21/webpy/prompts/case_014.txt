@@ -1,0 +1,1 @@
+Write a SQLAlchemy model for a Task table with id, title, done boolean, and a created_at timestamp that defaults to now.

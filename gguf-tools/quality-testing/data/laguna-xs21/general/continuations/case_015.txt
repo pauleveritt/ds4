@@ -1,0 +1,4 @@
+Ecco il pseudocodice per inserire un elemento in un heap binario:
+
+```
+Funzione

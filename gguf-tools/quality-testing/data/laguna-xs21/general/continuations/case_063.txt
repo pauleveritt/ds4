@@ -1,0 +1,5 @@
+Here's a concise example demonstrating a race condition in C:
+
+```c
+#include <stdio.h>
+#include <

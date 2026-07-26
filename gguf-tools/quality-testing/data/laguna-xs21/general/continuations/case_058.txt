@@ -1,0 +1,1 @@
+Ecco una checklist dettagliata per verificare che un modello quantizzato rispetti le

@@ -1,0 +1,1 @@
+Specetulative decoding preserves the exact greedy output through a mechanism that combines sampling from a fast but approximate model with rejection sampling

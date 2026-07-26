@@ -1,0 +1,20 @@
+{"id": "case_000", "prompt": "Write a Python function that reads a CSV file and returns the average of a given numeric column."}
+{"id": "case_001", "prompt": "Debug this CSS flexbox issue: two sibling divs in a flex row won't stay the same height even though I set align-items: stretch on the parent. What else could be wrong?"}
+{"id": "case_002", "prompt": "Add a POST /users route to this Express app that validates a JSON body with name and email fields and returns 201 on success."}
+{"id": "case_003", "prompt": "Write a TypeScript interface for a paginated API response containing a list of Product objects."}
+{"id": "case_004", "prompt": "Write a Python decorator that retries a function up to three times with exponential backoff on exception."}
+{"id": "case_005", "prompt": "Explain why a JavaScript async function that forgets to await a promise inside a for loop can cause subtle bugs."}
+{"id": "case_006", "prompt": "Write an HTML form with client-side validation that requires an email field and a password field of at least eight characters."}
+{"id": "case_007", "prompt": "Convert this Python list comprehension to an equivalent generator expression: [x * x for x in range(100) if x % 2 == 0]."}
+{"id": "case_008", "prompt": "Write a CSS grid layout for a responsive three-column card gallery that collapses to one column on narrow screens."}
+{"id": "case_009", "prompt": "Write a Python context manager that times a block of code and prints the elapsed milliseconds on exit."}
+{"id": "case_010", "prompt": "Explain the difference between Python's asyncio.gather and asyncio.wait, with a short example of when to prefer each."}
+{"id": "case_011", "prompt": "Write a small Flask route that streams a large file to the client in chunks instead of loading it into memory."}
+{"id": "case_012", "prompt": "Fix this bug: a JavaScript debounce function is not clearing the previous timeout, so it fires on every keystroke instead of after the pause."}
+{"id": "case_013", "prompt": "Write a Python dataclass for a Point3D with x, y, z floats and a method that returns the Euclidean distance to another Point3D."}
+{"id": "case_014", "prompt": "Write a SQLAlchemy model for a Task table with id, title, done boolean, and a created_at timestamp that defaults to now."}
+{"id": "case_015", "prompt": "You have access to a tool named get_weather that takes a city argument and returns the current weather. Using Laguna's native tool-call format, call get_weather for Tokyo. Respond with only the tool call."}
+{"id": "case_016", "prompt": "You have access to a tool named read_file that takes a path argument and returns the file contents. Using Laguna's native tool-call format, call read_file for the path config/settings.json. Respond with only the tool call."}
+{"id": "case_017", "prompt": "You have access to a tool named run_query that takes a sql argument and returns query results as rows. Using Laguna's native tool-call format, call run_query with sql set to SELECT count(*) FROM users. Respond with only the tool call."}
+{"id": "case_018", "prompt": "You have access to a tool named send_email that takes to, subject, and body arguments. Using Laguna's native tool-call format, call send_email to notify alice@example.com with subject Build Failed and a short body saying the nightly build failed. Respond with only the tool call."}
+{"id": "case_019", "prompt": "You have access to a tool named create_file that takes path and content arguments. Using Laguna's native tool-call format, call create_file to write a file at notes/todo.txt containing the single line Buy milk. Respond with only the tool call."}

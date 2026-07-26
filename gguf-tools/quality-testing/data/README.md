@@ -12,6 +12,13 @@ safe to commit and use in release QA.
   slices.
 - `pro`: 100 DeepSeek V4 PRO official continuations with API top-logprob
   slices.
+- `laguna-xs21/general`: 100 Laguna XS 2.1 continuations captured locally
+  from `Laguna-XS-2.1-Q4_K_M.gguf` (same shared `prompts.jsonl` as the other
+  fixtures). No hosted reference was collected (no `OPENROUTER_API_KEY` in
+  this environment); see `laguna-xs21/README.md`.
+- `laguna-xs21/webpy`: 20 XS-2.1-specific continuations (15 web/Python coding
+  prompts, 5 tool-call-format prompts) captured the same way, from
+  `prompts_laguna_xs21_webpy.jsonl`. See `laguna-xs21/README.md`.
 
 Each fixture directory contains:
 

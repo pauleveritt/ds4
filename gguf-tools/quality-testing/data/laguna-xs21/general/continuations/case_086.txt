@@ -1,0 +1,1 @@
+Checksums detect accidental corruption by generating a unique value derived from a data block's contents using a mathematical algorithm. When data is

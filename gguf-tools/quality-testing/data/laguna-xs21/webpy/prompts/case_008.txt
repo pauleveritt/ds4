@@ -1,0 +1,1 @@
+Write a CSS grid layout for a responsive three-column card gallery that collapses to one column on narrow screens.

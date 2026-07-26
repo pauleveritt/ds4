@@ -1,0 +1,4 @@
+Here are three examples of useful server metrics:
+
+1. **CPU Utilization**:  
+   Measures the percentage of CPU

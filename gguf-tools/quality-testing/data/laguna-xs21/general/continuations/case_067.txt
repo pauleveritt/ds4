@@ -1,0 +1,1 @@
+The discrepancy between memory mapped file residency and virtual address space (VAS) size arises from fundamental differences in how virtual memory management

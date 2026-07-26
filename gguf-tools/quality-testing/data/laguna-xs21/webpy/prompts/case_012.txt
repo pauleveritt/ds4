@@ -1,0 +1,1 @@
+Fix this bug: a JavaScript debounce function is not clearing the previous timeout, so it fires on every keystroke instead of after the pause.

@@ -1,0 +1,1 @@
+Tokenizers must treat special tags carefully to ensure accuracy, interoperability, and robustness across models and applications. Key reasons include:

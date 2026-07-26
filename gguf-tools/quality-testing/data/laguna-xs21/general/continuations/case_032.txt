@@ -1,0 +1,1 @@
+I **mutex** e i **contatori atomici** sono strumenti utilizzati per la gestione

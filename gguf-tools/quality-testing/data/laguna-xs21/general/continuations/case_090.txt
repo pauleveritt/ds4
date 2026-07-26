@@ -1,0 +1,1 @@
+Quantization is a technique to convert a neural network from floating-point arithmetic (e.g., FP32) to lower-precision

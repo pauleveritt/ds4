@@ -1,0 +1,1 @@
+Hash tables resolve collisions using two primary strategies: **collision resolution** and **collision reduction**. Here's a detailed explanation of

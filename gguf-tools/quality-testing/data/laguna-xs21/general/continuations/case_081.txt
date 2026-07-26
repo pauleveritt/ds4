@@ -1,0 +1,3 @@
+/* This lock protects the shared resource accessed by multiple threads, ensuring mutual exclusion and preventing race conditions */
+
+**Step-by

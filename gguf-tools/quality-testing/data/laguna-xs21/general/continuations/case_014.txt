@@ -1,0 +1,1 @@
+La cache **Key-Value (KV) su disco** aiuta significativamente nelle **sessioni agentiche**

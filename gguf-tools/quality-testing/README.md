@@ -22,6 +22,15 @@ calling hosted APIs:
   DeepSeek API with `top_logprobs=20`.
 - `data/pro`: 100 DeepSeek V4 PRO continuations collected from the official
   DeepSeek API with `top_logprobs=20`.
+- `data/laguna-xs21/general`: 100 Laguna XS 2.1 continuations (shared
+  `prompts.jsonl`) captured locally from `Laguna-XS-2.1-Q4_K_M.gguf` with
+  `collect_local.py`, since no `OPENROUTER_API_KEY` was available to collect
+  the hosted `poolside/laguna-xs-2.1` reference. See
+  `data/laguna-xs21/README.md`.
+- `data/laguna-xs21/webpy`: 20 XS-2.1-specific continuations (web/Python
+  coding + tool-call-format prompts from
+  `prompts_laguna_xs21_webpy.jsonl`), also captured locally. See
+  `data/laguna-xs21/README.md`.
 
 DeepSeek V4 Flash also has tracked official smoke vectors in
 `tests/test-vectors/`.  Those vectors drive `./ds4_test --logprob-vectors` and
@@ -112,6 +121,31 @@ The prompt list is tracked in `prompts.jsonl`.  Curated fixture directories are
 also tracked after review; ad-hoc API collection directories should stay
 untracked until they are intentionally promoted into the release QA set.
 
+## 2b. Collect Local Continuations (No Hosted Reference)
+
+When a model family has no hosted API/key available, `collect_local.py`
+drives `ds4` itself instead of an HTTP endpoint, writing the same
+`prompts/case_*.txt` + `continuations/case_*.txt` + `manifest.tsv` shape
+(minus `responses/`, since there is no hosted response to retain):
+
+```sh
+python3 gguf-tools/quality-testing/collect_local.py \
+  --ds4 ./ds4 \
+  --model gguf/Laguna-XS-2.1-Q4_K_M.gguf \
+  --prompts gguf-tools/quality-testing/prompts.jsonl \
+  --out gguf-tools/quality-testing/data/laguna-xs21/general \
+  --max-tokens 24 \
+  --think-mode nothink \
+  --lock-file /tmp/ds4-collect.lock
+```
+
+This is a legitimate baseline when later tasks only need to compare local
+GGUF variants against each other (e.g. a biased low-bit quant vs. a known-good
+Q4_K_M), not against an external gold reference. See
+`data/laguna-xs21/README.md` for a worked example, including how to score a
+GGUF against its own captured continuations as a self-consistency P0
+baseline / noise floor.
+
 ## 3. Build The Local Scorer
 
 ```sh
@@ -137,11 +171,13 @@ gguf-tools/quality-testing/score_official \
 ```
 
 Use `data/flash/manifest.tsv` for Flash GGUFs,
-`data/glm52-openrouter-100/manifest.tsv` for GLM 5.2 GGUFs, and
-`data/laguna-openrouter-100/manifest.tsv` for Laguna S 2.1 GGUFs, and
-`data/pro/manifest.tsv` for PRO GGUFs. The scorer and comparator do not care
-which model produced the manifest; the manifest path selects the continuation
-set.
+`data/glm52-openrouter-100/manifest.tsv` for GLM 5.2 GGUFs,
+`data/laguna-openrouter-100/manifest.tsv` for Laguna S 2.1 GGUFs,
+`data/pro/manifest.tsv` for PRO GGUFs, and
+`data/laguna-xs21/general/manifest.tsv` or
+`data/laguna-xs21/webpy/manifest.tsv` for Laguna XS 2.1 GGUFs. The scorer and
+comparator do not care which model produced the manifest; the manifest path
+selects the continuation set.
 
 For a full-residency vs SSD-streaming comparison, score the same model twice and
 add the streaming flags to one run:

@@ -1,0 +1,1 @@
+A confidence interval is a range of values that, based on the data from a sample, is used to estimate an unknown

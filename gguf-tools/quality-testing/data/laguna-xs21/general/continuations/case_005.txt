@@ -1,0 +1,2 @@
+The pseudocode for a binary heap push operation (adding an element while maintaining the max-heap property) is as follows:
+

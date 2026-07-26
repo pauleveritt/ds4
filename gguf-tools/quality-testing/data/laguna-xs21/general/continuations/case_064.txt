@@ -1,0 +1,1 @@
+Latency and throughput are two fundamental concepts in computing and networking that measure the performance of a system, but they focus on different

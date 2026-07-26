@@ -1,0 +1,1 @@
+To create a Flask route that streams a large file in chunks, we can use a generator function to read and yield the

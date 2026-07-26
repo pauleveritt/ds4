@@ -1,0 +1,1 @@
+The role of a router in a Mixture-of-Experts (MoE) layer is to **selectively activate and assign

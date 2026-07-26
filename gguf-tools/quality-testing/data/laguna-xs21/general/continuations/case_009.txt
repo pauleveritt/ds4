@@ -1,0 +1,4 @@
+Here are three invariants for a tokenizer's special-token table:
+
+1. **Token String Uniqueness**  
+   Each

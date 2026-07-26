@@ -1,0 +1,1 @@
+Sorted arrays enable faster membership tests with binary search due to their inherent ordering, which allows a logarithmic-time algorithm. Here's

@@ -1,0 +1,1 @@
+Un formato sicuro per salvare l'header di un checkpoint modello può essere strutturato

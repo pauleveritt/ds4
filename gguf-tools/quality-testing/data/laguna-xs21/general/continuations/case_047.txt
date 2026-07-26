@@ -1,0 +1,1 @@
+In distributed systems, particularly those involving key-value stores, the distinction between **raw KV rows** and **compressed KV rows

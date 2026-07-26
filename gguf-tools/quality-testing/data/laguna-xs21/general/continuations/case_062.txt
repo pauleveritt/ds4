@@ -1,0 +1,1 @@
+**Eventual consistency** is a consistency model in distributed databases where all replicas or nodes eventually converge to the same value, **

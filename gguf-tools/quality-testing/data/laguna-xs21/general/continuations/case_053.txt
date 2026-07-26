@@ -1,0 +1,2 @@
+Ecco uno schema JSON minimo per una funzione `tool_call` con nome e argomenti:
+

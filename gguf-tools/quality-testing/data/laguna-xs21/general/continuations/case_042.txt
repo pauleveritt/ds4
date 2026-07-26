@@ -1,0 +1,1 @@
+Online softmax in attention simplifies the computation of softmax during incremental processing by maintaining a running normalization term. This avoids recalculating softmax from
