@@ -84,7 +84,7 @@ Recipe A detour (spends imatrix effort on a throwaway ~2 bpw recipe).
   `(il%4)==0 ? 48 : 72` (ds4.c:6054) into shape fields
   `n_head_global` / `n_head_swa`, values per variant.
 - Extend `weights_validate_laguna_layout` with XS 2.1 entries: official
-  Q8_0 and Q4_K_M initially; the biased custom mix later.
+  BF16 and Q4_K_M initially; the biased custom mix later.
 - Metal kernels: dims flow from the shape struct. A tile-size perf pass
   for 512-wide experts is flagged and deferred; correctness first.
 
@@ -109,7 +109,7 @@ Recipe A detour (spends imatrix effort on a throwaway ~2 bpw recipe).
   Laguna-format renderer (chat template, interleaved thinking, tagged
   tool calls — as defined by the S 2.1 port). Composition per the bias
   mix above; size target ~3M tokens, matching the DS corpus scale.
-- Collect the imatrix on the laptop against official Q8_0.
+- Collect the imatrix on the laptop against the official BF16 file.
 - **Work item, not footnote**: the imatrix collector targets
   DeepSeek/GLM routed tensors; verify/extend it for Laguna tensor names
   and the Laguna inference graph.
