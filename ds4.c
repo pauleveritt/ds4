@@ -5075,14 +5075,35 @@ static void weights_validate_laguna_layout(
 
         tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32,
                              1, DS4_N_EMBD, 0, 0);
+        /* Legacy-layout attention signal type differs by recipe: S 2.1's
+         * official Q4_K_M file keeps attn_q/k/gate/output in F16, while
+         * XS 2.1's official Q4_K_M file quantizes them to Q4_K. */
         const uint32_t attn_type =
-            signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_F16;
+            signal_q8 ? DS4_TENSOR_Q8_0 :
+            (DS4_MODEL_VARIANT == DS4_VARIANT_LAGUNA_XS21 ? DS4_TENSOR_Q4_K : DS4_TENSOR_F16);
         tensor_expect_layout(l->attn_q, attn_type,
                              2, DS4_N_EMBD, q_dim, 0);
         tensor_expect_layout(l->attn_k, attn_type,
                              2, DS4_N_EMBD, kv_dim, 0);
-        tensor_expect_layout(l->attn_v, attn_type,
-                             2, DS4_N_EMBD, kv_dim, 0);
+        /* XS 2.1's attn_v varies Q4_K/Q6_K per layer (moves together with
+         * ffn_down_exps/ffn_down_shexp, uncorrelated with SWA/global
+         * pattern) — tolerate both rather than expecting a fixed type. */
+        const bool attn_v_tolerant =
+            !signal_q8 && DS4_MODEL_VARIANT == DS4_VARIANT_LAGUNA_XS21;
+        if (attn_v_tolerant) {
+            const uint32_t attn_v_type = l->attn_v->type;
+            if (attn_v_type != DS4_TENSOR_Q4_K && attn_v_type != DS4_TENSOR_Q6_K) {
+                fprintf(stderr,
+                        "ds4: Laguna attn_v tensor for layer %u has unsupported type %s\n",
+                        il, tensor_type_name(attn_v_type));
+                exit(1);
+            }
+            tensor_expect_layout(l->attn_v, attn_v_type,
+                                 2, DS4_N_EMBD, kv_dim, 0);
+        } else {
+            tensor_expect_layout(l->attn_v, attn_type,
+                                 2, DS4_N_EMBD, kv_dim, 0);
+        }
         tensor_expect_layout(l->attn_gate, attn_type,
                              2, DS4_N_EMBD, n_head, 0);
         tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32,
