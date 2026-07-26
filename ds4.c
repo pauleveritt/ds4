@@ -477,67 +477,9 @@ enum {
     DS4_MAX_HC_SINKHORN_ITER = 20,
 };
 
-typedef enum {
-    DS4_MODEL_FAMILY_DEEPSEEK4 = 0,
-    DS4_MODEL_FAMILY_GLM_DSA   = 1,
-    DS4_MODEL_FAMILY_LAGUNA    = 2,
-} ds4_model_family;
-
-typedef enum {
-    DS4_VARIANT_FLASH = 0,
-    DS4_VARIANT_PRO   = 1,
-    DS4_VARIANT_GLM52 = 2,
-    DS4_VARIANT_LAGUNA_S21 = 3,
-} ds4_variant;
-
-typedef struct {
-    const char *name;
-    ds4_model_family family;
-    ds4_variant variant;
-    uint32_t n_layer;
-    uint32_t n_embd;
-    uint32_t n_vocab;
-    uint32_t n_head;
-    uint32_t n_head_kv;
-    uint32_t n_head_dim;
-    uint32_t n_value_dim;
-    uint32_t n_rot;
-    uint32_t n_out_group;
-    uint32_t n_lora_q;
-    uint32_t n_lora_o;
-    uint32_t n_expert;
-    uint32_t n_expert_used;
-    uint32_t n_expert_shared;
-    uint32_t n_ff_exp;
-    uint32_t n_ff_shared;
-    uint32_t n_ff_dense;
-    uint32_t n_hash_layer;
-    uint32_t n_swa;
-    uint32_t n_indexer_head;
-    uint32_t n_indexer_head_dim;
-    uint32_t n_indexer_top_k;
-    uint32_t n_hc;
-    uint32_t n_hc_sinkhorn_iter;
-    uint32_t n_nextn_predict;
-    uint32_t n_leading_dense;
-    uint32_t n_kv_lora;
-    uint32_t n_key_mla;
-    uint32_t n_value_mla;
-    uint32_t n_rot_swa;
-    float rms_eps;
-    float hc_eps;
-    float expert_weight_scale;
-    float swiglu_clamp_exp;
-    float rope_freq_base;
-    float rope_scale_factor;
-    float rope_yarn_beta_fast;
-    float rope_yarn_beta_slow;
-    float rope_yarn_attn_factor;
-    float rope_freq_base_swa;
-    float compress_rope_freq_base;
-    uint64_t context_length;
-    uint64_t rope_orig_ctx;
-} ds4_shape;
+/* ds4_model_family, ds4_variant, and ds4_shape live in ds4.h: tests link
+ * against ds4.o and need the type definitions plus the extern shape
+ * constants declared there to verify per-variant constants directly. */
 
 static const ds4_shape DS4_SHAPE_FLASH = {
     .name = "DeepSeek V4 Flash",
@@ -668,7 +610,7 @@ static const ds4_shape DS4_SHAPE_GLM52 = {
     .rope_orig_ctx = 1048576,
 };
 
-static const ds4_shape DS4_SHAPE_LAGUNA_S21 = {
+const ds4_shape DS4_SHAPE_LAGUNA_S21 = {
     .name = "Laguna S 2.1",
     .family = DS4_MODEL_FAMILY_LAGUNA,
     .variant = DS4_VARIANT_LAGUNA_S21,
@@ -676,6 +618,8 @@ static const ds4_shape DS4_SHAPE_LAGUNA_S21 = {
     .n_embd = 3072,
     .n_vocab = 100352,
     .n_head = 72,
+    .n_head_global = 48,
+    .n_head_swa = 72,
     .n_head_kv = 8,
     .n_head_dim = 128,
     .n_value_dim = 128,
@@ -694,6 +638,41 @@ static const ds4_shape DS4_SHAPE_LAGUNA_S21 = {
     .rope_freq_base = 500000.0f,
     .rope_scale_factor = 32.0f,
     .rope_yarn_beta_fast = 32.0f,
+    .rope_yarn_beta_slow = 1.0f,
+    .rope_yarn_attn_factor = 1.0f,
+    .rope_freq_base_swa = 10000.0f,
+    .context_length = 262144,
+    .rope_orig_ctx = 8192,
+};
+
+const ds4_shape DS4_SHAPE_LAGUNA_XS21 = {
+    .name = "Laguna XS 2.1",
+    .family = DS4_MODEL_FAMILY_LAGUNA,
+    .variant = DS4_VARIANT_LAGUNA_XS21,
+    .n_layer = 40,
+    .n_embd = 2048,
+    .n_vocab = 100352,
+    .n_head = 64,            /* majority/SWA value, mirrors S21's n_head=72 */
+    .n_head_global = 48,     /* head_count array [48,64,64,64] x10 */
+    .n_head_swa = 64,
+    .n_head_kv = 8,
+    .n_head_dim = 128,
+    .n_value_dim = 128,
+    .n_rot = 64,
+    .n_expert = 256,
+    .n_expert_used = 8,
+    .n_expert_shared = 1,
+    .n_ff_exp = 512,
+    .n_ff_shared = 512,
+    .n_ff_dense = 8192,
+    .n_swa = 512,
+    .n_leading_dense = 1,    /* 39 sparse layers, 9984 routed experts */
+    .n_rot_swa = 128,
+    .rms_eps = 1.0e-6f,
+    .expert_weight_scale = 2.5f,
+    .rope_freq_base = 500000.0f,
+    .rope_scale_factor = 32.0f,
+    .rope_yarn_beta_fast = 64.0f,
     .rope_yarn_beta_slow = 1.0f,
     .rope_yarn_attn_factor = 1.0f,
     .rope_freq_base_swa = 10000.0f,
@@ -5992,11 +5971,18 @@ static void config_validate_glm_dsa_model(const ds4_model *m) {
 }
 
 static void config_validate_laguna_model(const ds4_model *m) {
-    g_ds4_shape = DS4_SHAPE_LAGUNA_S21;
+    const uint32_t n_layer = required_u32(m, "laguna.block_count");
+    if (n_layer == 48) {
+        g_ds4_shape = DS4_SHAPE_LAGUNA_S21;
+    } else if (n_layer == 40) {
+        g_ds4_shape = DS4_SHAPE_LAGUNA_XS21;
+    } else {
+        fprintf(stderr, "ds4: unsupported Laguna block_count %u\n", n_layer);
+        exit(1);
+    }
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
     memset(g_ds4_head_counts, 0, sizeof(g_ds4_head_counts));
 
-    const uint32_t n_layer = required_u32(m, "laguna.block_count");
     const uint64_t n_ctx = required_u64_compat(m, "laguna.context_length");
     const uint32_t n_embd = required_u32(m, "laguna.embedding_length");
     const uint32_t n_vocab = required_u32(m, "laguna.vocab_size");
@@ -6050,7 +6036,9 @@ static void config_validate_laguna_model(const ds4_model *m) {
             if (v <= 0) ds4_die("Laguna head-count metadata contains a non-positive value");
             got = (uint32_t)v;
         }
-        const uint32_t expected = (il % 4u) == 0 ? 48u : 72u;
+        const uint32_t expected = (il % 4u) == 0
+                ? g_ds4_shape.n_head_global
+                : g_ds4_shape.n_head_swa;
         if (got != expected) {
             fprintf(stderr,
                     "ds4: unexpected Laguna head count at layer %u: got %u, expected %u\n",
