@@ -47572,7 +47572,7 @@ static bool laguna_graph_forward_token(
                         DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
                         n_head,
                         g->attn_norm) != 0;
-            } else {
+            } else if (l->attn_q->type == DS4_TENSOR_Q8_0) {
                 ok = ds4_gpu_matmul_q8_0_pair_tensor(
                         g->q,
                         g->k,
@@ -47597,6 +47597,23 @@ static bool laguna_graph_forward_token(
                         n_head,
                         g->attn_norm,
                         1) != 0;
+            } else {
+                /* XS 2.1 legacy attention: attn_q/k/gate are Q4_K, attn_v is
+                 * Q4_K or Q6_K per layer. Neither the F16 fused kernel nor
+                 * the Q8_0 paired kernel applies; dispatch each projection
+                 * individually through the generic type-dispatching helper
+                 * (same one used for FFN weights above and by the batch/
+                 * prefill path for these same Q/K/V/gate projections). */
+                ok = laguna_graph_matmul(g->q, model, l->attn_q, g->attn_norm, 1);
+                if (ok) {
+                    ok = laguna_graph_matmul(g->k, model, l->attn_k, g->attn_norm, 1);
+                }
+                if (ok) {
+                    ok = laguna_graph_matmul(g->v, model, l->attn_v, g->attn_norm, 1);
+                }
+                if (ok) {
+                    ok = laguna_graph_matmul(g->gate, model, l->attn_gate, g->attn_norm, 1);
+                }
             }
         }
         if (ok) {
