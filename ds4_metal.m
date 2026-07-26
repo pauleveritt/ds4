@@ -233,6 +233,9 @@ static id<MTLComputePipelineState> g_glm_q6_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_laguna_routed_shared_pair_pipeline;
 static id<MTLComputePipelineState> g_laguna_routed_shared_q4_down_pipeline;
 static id<MTLComputePipelineState> g_laguna_routed_shared_q6_down_pipeline;
+static id<MTLComputePipelineState> g_laguna_addr_routed_shared_pair_pipeline;
+static id<MTLComputePipelineState> g_laguna_addr_routed_shared_q4_down_pipeline;
+static id<MTLComputePipelineState> g_laguna_addr_routed_shared_q6_down_pipeline;
 static id<MTLComputePipelineState> g_laguna_head_norm_rope_pipeline;
 static id<MTLComputePipelineState> g_laguna_qk_head_norm_rope_pipeline;
 static id<MTLComputePipelineState> g_laguna_store_kv_pipeline;
@@ -7953,6 +7956,15 @@ int ds4_gpu_init(void) {
         g_laguna_routed_shared_q6_down_pipeline =
             ds4_gpu_get_pipeline(
                 "kernel_laguna_q6_K_routed_shared_down_f32");
+        g_laguna_addr_routed_shared_pair_pipeline =
+            ds4_gpu_get_pipeline(
+                "kernel_laguna_q4_K_addr_routed_shared_pair_swiglu_f32");
+        g_laguna_addr_routed_shared_q4_down_pipeline =
+            ds4_gpu_get_pipeline(
+                "kernel_laguna_q4_K_addr_routed_shared_down_f32");
+        g_laguna_addr_routed_shared_q6_down_pipeline =
+            ds4_gpu_get_pipeline(
+                "kernel_laguna_q6_K_addr_routed_shared_down_f32");
         g_laguna_head_norm_rope_pipeline =
             ds4_gpu_get_pipeline("kernel_laguna_head_rms_norm_rope_neox");
         g_laguna_qk_head_norm_rope_pipeline =
@@ -8045,6 +8057,9 @@ int ds4_gpu_init(void) {
             !g_laguna_routed_shared_pair_pipeline ||
             !g_laguna_routed_shared_q4_down_pipeline ||
             !g_laguna_routed_shared_q6_down_pipeline ||
+            !g_laguna_addr_routed_shared_pair_pipeline ||
+            !g_laguna_addr_routed_shared_q4_down_pipeline ||
+            !g_laguna_addr_routed_shared_q6_down_pipeline ||
             !g_laguna_head_norm_rope_pipeline ||
             !g_laguna_qk_head_norm_rope_pipeline ||
             !g_laguna_store_kv_pipeline ||
@@ -9405,6 +9420,9 @@ void ds4_gpu_cleanup(void) {
         g_laguna_routed_shared_pair_pipeline = nil;
         g_laguna_routed_shared_q4_down_pipeline = nil;
         g_laguna_routed_shared_q6_down_pipeline = nil;
+        g_laguna_addr_routed_shared_pair_pipeline = nil;
+        g_laguna_addr_routed_shared_q4_down_pipeline = nil;
+        g_laguna_addr_routed_shared_q6_down_pipeline = nil;
         g_laguna_head_norm_rope_pipeline = nil;
         g_laguna_qk_head_norm_rope_pipeline = nil;
         g_laguna_store_kv_pipeline = nil;
@@ -34375,6 +34393,7 @@ int ds4_gpu_laguna_routed_shared_moe_one_tensor(
         uint32_t                       n_expert,
         const ds4_gpu_tensor          *shared_selected,
         const ds4_gpu_tensor          *shared_weight,
+        uint32_t                       layer_index,
         const ds4_gpu_tensor          *x) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!routed_out || !routed_mid || !shared_out || !shared_mid ||
@@ -34478,15 +34497,6 @@ int ds4_gpu_laguna_routed_shared_moe_one_tensor(
         uint64_t routed_gate_inner = 0, routed_up_inner = 0;
         uint64_t routed_down_inner = 0, shared_gate_inner = 0;
         uint64_t shared_up_inner = 0, shared_down_inner = 0;
-        id<MTLBuffer> routedgatebuf = ds4_gpu_wrap_model_range(
-            model_map, model_size, routed->gate_offset, routed_gate_bytes,
-            &routed_gate_inner);
-        id<MTLBuffer> routedupbuf = ds4_gpu_wrap_model_range(
-            model_map, model_size, routed->up_offset, routed_up_bytes,
-            &routed_up_inner);
-        id<MTLBuffer> routeddownbuf = ds4_gpu_wrap_model_range(
-            model_map, model_size, routed->down_offset, routed_down_bytes,
-            &routed_down_inner);
         id<MTLBuffer> sharedgatebuf = ds4_gpu_wrap_model_range(
             model_map, model_size, shared->gate_offset,
             shared->gate_expert_bytes, &shared_gate_inner);
@@ -34496,10 +34506,230 @@ int ds4_gpu_laguna_routed_shared_moe_one_tensor(
         id<MTLBuffer> shareddownbuf = ds4_gpu_wrap_model_range(
             model_map, model_size, shared->down_offset,
             shared->down_expert_bytes, &shared_down_inner);
-        id<MTLComputePipelineState> pair_pipeline = ds4_gpu_hot_pipeline(
-            g_laguna_routed_shared_pair_pipeline,
-            "kernel_laguna_q4_K_routed_shared_pair_swiglu_f32");
-        id<MTLComputePipelineState> down_pipeline =
+        if (!sharedgatebuf || !sharedupbuf || !shareddownbuf) {
+            return 0;
+        }
+
+        /*
+         * Streaming expert cache (Metal --ssd-streaming): mirrors the GLM
+         * decode integration (ds4_gpu_glm_routed_moe_one_tensor) using the
+         * same generic cache primitives (peek / load_selected_missing /
+         * set_addr_slot / addr_buffers / prune_layer / prune_global). The
+         * cache is a single-size-class slab allocator: its class is pinned
+         * once, at engine startup, to the FIRST sparse layer's routed
+         * gate+down byte size (ds4_streaming_routed_expert_bytes in ds4.c,
+         * generic/family-agnostic, not something this function controls).
+         * For XS 2.1's official Q4_K_M file that first layer's down
+         * projection happens to be Q6_K (llama.cpp's per-layer Q4_K/Q6_K
+         * "extra bits" heuristic, uncorrelated with the SWA pattern), so
+         * ds4_gpu_stream_expert_cache_note_expert_size below only accepts
+         * Q6_K-down layers at runtime even though a Q4_K addr-table kernel
+         * also exists (gate/up are always Q4_K for every XS 2.1 layer, so a
+         * Q4_K-down layer's pair projection could stream too, if some other
+         * XS 2.1 quant recipe ever pins the class to Q4_K instead). Layers
+         * whose bytes don't match the pinned class always take the
+         * mapped-model path below, exactly like GLM's mixed-precision
+         * "boosted" layers that fall off the cache's slab size class.
+         */
+        const BOOL down_addr_q4 = routed->down_type == DS4_METAL_TENSOR_Q4_K;
+        const BOOL down_addr_q6 = routed->down_type == DS4_METAL_TENSOR_Q6_K;
+        const BOOL stream_eligible =
+            getenv("DS4_METAL_LAGUNA_DISABLE_STREAMING_EXPERT_ADDR_TABLE") == NULL &&
+            g_ssd_streaming_mode &&
+            (down_addr_q4 || down_addr_q6) &&
+            g_laguna_addr_routed_shared_pair_pipeline != nil &&
+            (down_addr_q4 ?
+                g_laguna_addr_routed_shared_q4_down_pipeline != nil :
+                g_laguna_addr_routed_shared_q6_down_pipeline != nil) &&
+            layer_index < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER &&
+            n_total_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
+            n_expert <= 8u &&
+            ds4_gpu_stream_expert_cache_note_expert_size(
+                    routed->gate_expert_bytes, routed->down_expert_bytes) &&
+            ds4_gpu_stream_expert_cache_effective_cap(
+                    layer_index, n_total_expert, n_expert) != 0;
+
+        int32_t stream_selected_ids[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        ds4_gpu_stream_expert_cache_entry *stream_entries[8] = {
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+        };
+        uint64_t stream_gate_abs_offsets[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        uint64_t stream_up_abs_offsets[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        uint64_t stream_down_abs_offsets[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        uint32_t stream_missing_mask = 0;
+        id<MTLBuffer> stream_gate_addr_buf = nil;
+        id<MTLBuffer> stream_up_addr_buf = nil;
+        id<MTLBuffer> stream_down_addr_buf = nil;
+
+        if (stream_eligible) {
+            const int had_batch = g_batch_cb != nil;
+            int stream_ok = 1;
+            if (had_batch && ds4_gpu_end_commands() == 0) stream_ok = 0;
+            if (stream_ok &&
+                ds4_gpu_tensor_read(
+                        selected,
+                        0,
+                        stream_selected_ids,
+                        (uint64_t)n_expert * sizeof(stream_selected_ids[0])) == 0) {
+                stream_ok = 0;
+            }
+            for (uint32_t i = 0; stream_ok && i < n_expert; i++) {
+                if (stream_selected_ids[i] < 0 ||
+                    (uint32_t)stream_selected_ids[i] >= n_total_expert) {
+                    fprintf(stderr,
+                            "ds4: Metal Laguna routed MoE selected expert id %d is outside 0..%u\n",
+                            stream_selected_ids[i],
+                            n_total_expert);
+                    stream_ok = 0;
+                }
+            }
+            if (stream_ok) {
+                ds4_gpu_stream_expert_cache_note_selected_hotness(
+                        layer_index, stream_selected_ids, n_expert);
+                if (!ds4_gpu_moe_selected_hotlist_record(layer_index,
+                                                         stream_selected_ids,
+                                                         n_expert,
+                                                         n_total_expert)) {
+                    stream_ok = 0;
+                }
+            }
+            if (stream_ok) {
+                g_glm_stream_expert_addr_table_building++;
+                for (uint32_t i = 0; stream_ok && i < n_expert; i++) {
+                    const uint64_t expert_id =
+                        (uint64_t)(uint32_t)stream_selected_ids[i];
+                    if (expert_id > UINT64_MAX / routed->gate_expert_bytes ||
+                        expert_id > UINT64_MAX / routed->down_expert_bytes) {
+                        fprintf(stderr,
+                                "ds4: Metal Laguna routed MoE selected expert offset overflow\n");
+                        stream_ok = 0;
+                        break;
+                    }
+                    const uint64_t gate_rel =
+                        expert_id * routed->gate_expert_bytes;
+                    const uint64_t down_rel =
+                        expert_id * routed->down_expert_bytes;
+                    if (gate_rel > UINT64_MAX - routed->gate_offset ||
+                        gate_rel > UINT64_MAX - routed->up_offset ||
+                        down_rel > UINT64_MAX - routed->down_offset) {
+                        fprintf(stderr,
+                                "ds4: Metal Laguna routed MoE selected expert offset overflow\n");
+                        stream_ok = 0;
+                        break;
+                    }
+                    stream_gate_abs_offsets[i] = routed->gate_offset + gate_rel;
+                    stream_up_abs_offsets[i] = routed->up_offset + gate_rel;
+                    stream_down_abs_offsets[i] = routed->down_offset + down_rel;
+                    stream_entries[i] = ds4_gpu_stream_expert_cache_peek(
+                            model_map,
+                            model_size,
+                            layer_index,
+                            (uint32_t)stream_selected_ids[i],
+                            n_total_expert,
+                            n_expert,
+                            stream_gate_abs_offsets[i],
+                            stream_up_abs_offsets[i],
+                            stream_down_abs_offsets[i],
+                            routed->gate_expert_bytes,
+                            routed->down_expert_bytes);
+                    if (!stream_entries[i]) {
+                        stream_missing_mask |= 1u << i;
+                    }
+                }
+                if (stream_ok && stream_missing_mask != 0 &&
+                    !ds4_gpu_stream_expert_cache_load_selected_missing(
+                            model_map,
+                            model_size,
+                            layer_index,
+                            stream_selected_ids,
+                            n_total_expert,
+                            n_expert,
+                            stream_gate_abs_offsets,
+                            stream_up_abs_offsets,
+                            stream_down_abs_offsets,
+                            routed->gate_expert_bytes,
+                            routed->down_expert_bytes,
+                            stream_missing_mask,
+                            stream_entries)) {
+                    fprintf(stderr,
+                            "ds4: Metal Laguna streaming expert cache failed to load "
+                            "layer=%u missing=0x%x budget=%u\n",
+                            layer_index,
+                            stream_missing_mask,
+                            ds4_gpu_stream_expert_cache_configured_budget());
+                    stream_ok = 0;
+                }
+                for (uint32_t i = 0; stream_ok && i < n_expert; i++) {
+                    ds4_gpu_stream_expert_cache_entry *entry = stream_entries[i];
+                    if (!entry) {
+                        stream_ok = 0;
+                        break;
+                    }
+                    if (!ds4_gpu_stream_expert_cache_set_addr_slot(
+                                layer_index,
+                                (uint32_t)stream_selected_ids[i],
+                                entry->gate_buffer,
+                                entry->gate_inner,
+                                entry->up_buffer,
+                                entry->up_inner,
+                                entry->down_buffer,
+                                entry->down_inner)) {
+                        stream_ok = 0;
+                        break;
+                    }
+                }
+                if (stream_ok &&
+                    !ds4_gpu_stream_expert_cache_addr_buffers(layer_index,
+                                                              &stream_gate_addr_buf,
+                                                              &stream_up_addr_buf,
+                                                              &stream_down_addr_buf)) {
+                    stream_ok = 0;
+                }
+                g_glm_stream_expert_addr_table_building--;
+            }
+            if (had_batch && ds4_gpu_begin_commands() == 0) stream_ok = 0;
+            if (!stream_ok) return 0;
+            ds4_gpu_stream_expert_cache_prune_layer(layer_index,
+                                                    n_total_expert,
+                                                    n_expert,
+                                                    stream_selected_ids,
+                                                    n_expert);
+            ds4_gpu_stream_expert_cache_prune_global(layer_index,
+                                                     stream_selected_ids,
+                                                     n_expert);
+        }
+
+        id<MTLBuffer> routedgatebuf = nil;
+        id<MTLBuffer> routedupbuf = nil;
+        id<MTLBuffer> routeddownbuf = nil;
+        if (!stream_eligible) {
+            routedgatebuf = ds4_gpu_wrap_model_range(
+                model_map, model_size, routed->gate_offset, routed_gate_bytes,
+                &routed_gate_inner);
+            routedupbuf = ds4_gpu_wrap_model_range(
+                model_map, model_size, routed->up_offset, routed_up_bytes,
+                &routed_up_inner);
+            routeddownbuf = ds4_gpu_wrap_model_range(
+                model_map, model_size, routed->down_offset, routed_down_bytes,
+                &routed_down_inner);
+            if (!routedgatebuf || !routedupbuf || !routeddownbuf) return 0;
+        }
+
+        id<MTLComputePipelineState> pair_pipeline = stream_eligible ?
+            ds4_gpu_hot_pipeline(
+                g_laguna_addr_routed_shared_pair_pipeline,
+                "kernel_laguna_q4_K_addr_routed_shared_pair_swiglu_f32") :
+            ds4_gpu_hot_pipeline(
+                g_laguna_routed_shared_pair_pipeline,
+                "kernel_laguna_q4_K_routed_shared_pair_swiglu_f32");
+        id<MTLComputePipelineState> down_pipeline = stream_eligible ?
+            (down_addr_q4 ?
+                ds4_gpu_hot_pipeline(
+                    g_laguna_addr_routed_shared_q4_down_pipeline,
+                    "kernel_laguna_q4_K_addr_routed_shared_down_f32") :
+                ds4_gpu_hot_pipeline(
+                    g_laguna_addr_routed_shared_q6_down_pipeline,
+                    "kernel_laguna_q6_K_addr_routed_shared_down_f32")) :
             routed->down_type == DS4_METAL_TENSOR_Q4_K ?
             ds4_gpu_hot_pipeline(
                 g_laguna_routed_shared_q4_down_pipeline,
@@ -34507,9 +34737,7 @@ int ds4_gpu_laguna_routed_shared_moe_one_tensor(
             ds4_gpu_hot_pipeline(
                 g_laguna_routed_shared_q6_down_pipeline,
                 "kernel_laguna_q6_K_routed_shared_down_f32");
-        if (!routedgatebuf || !routedupbuf || !routeddownbuf ||
-            !sharedgatebuf || !sharedupbuf || !shareddownbuf ||
-            !pair_pipeline || !down_pipeline) {
+        if (!pair_pipeline || !down_pipeline) {
             return 0;
         }
 
@@ -34559,8 +34787,12 @@ int ds4_gpu_laguna_routed_shared_moe_one_tensor(
         [enc setComputePipelineState:pair_pipeline];
         [enc setBytes:&routed_args length:sizeof(routed_args) atIndex:0];
         [enc setBytes:&shared_args length:sizeof(shared_args) atIndex:1];
-        [enc setBuffer:routedgatebuf offset:(NSUInteger)routed_gate_inner atIndex:2];
-        [enc setBuffer:routedupbuf offset:(NSUInteger)routed_up_inner atIndex:3];
+        [enc setBuffer:stream_eligible ? stream_gate_addr_buf : routedgatebuf
+                offset:stream_eligible ? 0u : (NSUInteger)routed_gate_inner
+               atIndex:2];
+        [enc setBuffer:stream_eligible ? stream_up_addr_buf : routedupbuf
+                offset:stream_eligible ? 0u : (NSUInteger)routed_up_inner
+               atIndex:3];
         [enc setBuffer:sharedgatebuf offset:(NSUInteger)shared_gate_inner atIndex:4];
         [enc setBuffer:sharedupbuf offset:(NSUInteger)shared_up_inner atIndex:5];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:6];
@@ -34574,6 +34806,12 @@ int ds4_gpu_laguna_routed_shared_moe_one_tensor(
                 atIndex:11];
         [enc setBuffer:sharedmidbuf offset:ds4_gpu_tensor_offset(shared_mid)
                 atIndex:12];
+        if (stream_eligible) {
+            for (uint32_t i = 0; i < n_expert; i++) {
+                [enc useResource:stream_entries[i]->gate_buffer usage:MTLResourceUsageRead];
+                [enc useResource:stream_entries[i]->up_buffer usage:MTLResourceUsageRead];
+            }
+        }
         [enc dispatchThreadgroups:MTLSizeMake(
                 ((NSUInteger)expert_mid_dim + 1u) / 2u,
                 (NSUInteger)n_expert + 1u,
@@ -34585,7 +34823,9 @@ int ds4_gpu_laguna_routed_shared_moe_one_tensor(
         [enc setComputePipelineState:down_pipeline];
         [enc setBytes:&routed_args length:sizeof(routed_args) atIndex:0];
         [enc setBytes:&shared_args length:sizeof(shared_args) atIndex:1];
-        [enc setBuffer:routeddownbuf offset:(NSUInteger)routed_down_inner atIndex:2];
+        [enc setBuffer:stream_eligible ? stream_down_addr_buf : routeddownbuf
+                offset:stream_eligible ? 0u : (NSUInteger)routed_down_inner
+               atIndex:2];
         [enc setBuffer:shareddownbuf offset:(NSUInteger)shared_down_inner atIndex:3];
         [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:4];
         [enc setBuffer:sharedselectedbuf
@@ -34598,6 +34838,11 @@ int ds4_gpu_laguna_routed_shared_moe_one_tensor(
                 atIndex:8];
         [enc setBuffer:sharedoutbuf offset:ds4_gpu_tensor_offset(shared_out)
                 atIndex:9];
+        if (stream_eligible) {
+            for (uint32_t i = 0; i < n_expert; i++) {
+                [enc useResource:stream_entries[i]->down_buffer usage:MTLResourceUsageRead];
+            }
+        }
         [enc dispatchThreadgroups:MTLSizeMake(
                 ((NSUInteger)out_dim + 3u) / 4u, 2u, 1u)
              threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];

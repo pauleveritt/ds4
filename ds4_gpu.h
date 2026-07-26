@@ -2289,6 +2289,7 @@ int ds4_gpu_laguna_routed_shared_moe_one_tensor(
         uint32_t                          n_expert,
         const ds4_gpu_tensor             *shared_selected,
         const ds4_gpu_tensor             *shared_weight,
+        uint32_t                          layer_index,
         const ds4_gpu_tensor             *x);
 
 int ds4_gpu_glm_routed_moe_batch_tensor(

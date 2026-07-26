@@ -6653,6 +6653,20 @@ static bool glm_stream_decode_experts_are_streamed(
  * Boosted layers, mixed GLM quant layouts such as Q4 gate/up plus Q5 down, or
  * undersized expert caches fall back to direct model-range reads. Include
  * those expert tensors so cache-hit prefill extension and decode are covered.
+ *
+ * Laguna reuses the plain !weights_streaming_layer_experts_uniform check
+ * below unmodified (no family special-case needed): its fused decode kernel
+ * (ds4_gpu_laguna_routed_shared_moe_one_tensor) has address-table streaming
+ * variants for both a Q4_K and a Q6_K routed down projection (gate/up are
+ * always Q4_K for XS 2.1), matching exactly the two byte-size classes
+ * "uniform" can compare against -- whichever type the FIRST sparse layer
+ * happens to be (Q6_K for XS 2.1's official Q4_K_M file) becomes the pinned
+ * slab class at startup (ds4_streaming_routed_expert_bytes in
+ * ds4_engine_open_internal), and only layers matching that exact byte
+ * signature are actually served from the cache at runtime
+ * (ds4_gpu_stream_expert_cache_note_expert_size in ds4_metal.m). Layers off
+ * that class always fall back to wrapping the whole routed-expert tensor
+ * from the mapped model range, so they must stay in this static set.
  */
 static void model_map_span_vec_include_layer_decode(
         ds4_model_map_span_vec *spans,
@@ -47290,6 +47304,12 @@ typedef struct {
     uint32_t prefill_cap;
     uint64_t scratch_bytes;
     uint64_t kv_bytes;
+    /* Recorded at alloc time; not currently consumed here (both prefill and
+     * decode unconditionally (re)install the static decode span set below,
+     * which is a cheap no-op once the map already covers it -- see
+     * laguna_graph_forward_token / laguna_graph_forward_batch). Kept for
+     * visibility/future use rather than threading it back out. */
+    bool     ssd_streaming;
 
     ds4_gpu_tensor *tokens;
     ds4_gpu_tensor *cur;
@@ -47369,7 +47389,8 @@ static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
     memset(g, 0, sizeof(*g));
 }
 
-static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
+static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size,
+                               bool ssd_streaming) {
     if (!g || ctx_size == 0 || ctx_size > DS4_CONTEXT_LENGTH ||
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) {
         return false;
@@ -47377,6 +47398,7 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
     memset(g, 0, sizeof(*g));
     g->ctx_size = ctx_size;
     g->prefill_cap = ctx_size < 16384u ? ctx_size : 16384u;
+    g->ssd_streaming = ssd_streaming;
 
     const uint64_t f32 = sizeof(float);
     const uint64_t rows = g->prefill_cap;
@@ -47512,6 +47534,30 @@ static bool laguna_graph_forward_token(
         float                *logits_out) {
     if (!g || !model || !weights || token < 0 ||
         token >= (int)DS4_N_VOCAB || pos >= g->ctx_size) {
+        return false;
+    }
+
+    /* Under --ssd-streaming the engine starts with only the token-embedding
+     * tensor mapped (see the "initial ... model map restricted to token
+     * embedding" startup log). Every non-routed tensor (attn/dense/router
+     * weights for every layer, output) must be mapped before this function
+     * touches them, or the very first attention-norm read dies with "Metal
+     * model range ... is not covered by mapped model views". Routed-expert
+     * tensors stay excluded when their layer is servable from the streaming
+     * expert cache (weights_streaming_layer_experts_uniform), matching the
+     * eligibility check in ds4_gpu_laguna_routed_shared_moe_one_tensor; a
+     * boosted/off-slab-class layer's routed tensors are still included here
+     * so its mapped-model fallback path has real bytes to read. In resident
+     * (non-streaming) mode the whole file is already mapped, so this is a
+     * cheap no-op (ds4_gpu_model_views_cover_spans short-circuits). */
+    ds4_model_map_span_vec laguna_decode_spans;
+    if (weights_model_map_decode_static_spans(weights, true, true,
+                                              &laguna_decode_spans)) {
+        const bool spans_ok = metal_graph_install_model_spans(
+                model, &laguna_decode_spans, "Laguna static decode");
+        free(laguna_decode_spans.v);
+        if (!spans_ok) return false;
+    } else {
         return false;
     }
 
@@ -47819,6 +47865,7 @@ static bool laguna_graph_forward_token(
                         DS4_N_EXPERT_USED,
                         g->shared_selected,
                         g->shared_weight,
+                        il,
                         g->ffn_norm) != 0;
             } else if (ok) {
                 ok = ds4_gpu_glm_routed_moe_one_tensor(
@@ -47847,7 +47894,12 @@ static bool laguna_graph_forward_token(
                         DS4_N_EXPERT_USED,
                         il,
                         g->ffn_norm,
-                        true) != 0;
+                        /* force_resident=false: let the shared GLM-template
+                         * kernel use the streaming address-table path when
+                         * ssd-streaming is active and this layer's types
+                         * qualify; it falls back to a plain mapped-model
+                         * read otherwise (byte-identical output). */
+                        false) != 0;
                 if (ok) {
                     ok = ds4_gpu_shared_mid_swiglu_q8_0_tensor(
                             g->ffn_mid,
@@ -47947,6 +47999,30 @@ static bool laguna_graph_forward_batch(
     if (!g || !model || !weights || !tokens || n_tokens == 0 ||
         n_tokens > g->prefill_cap || pos0 > g->ctx_size - n_tokens) {
         return false;
+    }
+
+    /* Unlike decode's ds4_gpu_laguna_routed_shared_moe_one_tensor (which has
+     * a streaming address-table path), the batch routed-MoE kernel used
+     * below (ds4_gpu_glm_routed_moe_batch_tensor) always wraps the WHOLE
+     * routed-expert tensor from the mapped model range -- it ignores its own
+     * force_resident argument. So prefill needs every layer's routed
+     * experts resident, not just the decode-narrowed set that
+     * laguna_graph_forward_token installs. This widens back out to the full
+     * per-layer span set (a no-op in resident mode, same short-circuit as
+     * forward_token). Laguna does not implement GLM's windowed
+     * partial-resident prefill (deferred perf work); this is simpler and
+     * always correct, at the cost of prefill needing the whole file mapped
+     * while streaming. */
+    {
+        ds4_model_map_span_vec laguna_prefill_spans;
+        if (!weights_model_map_spans(weights, 0, DS4_N_LAYER - 1u, true,
+                                     &laguna_prefill_spans)) {
+            return false;
+        }
+        const bool spans_ok = metal_graph_install_model_spans(
+                model, &laguna_prefill_spans, "Laguna streaming prefill");
+        free(laguna_prefill_spans.v);
+        if (!spans_ok) return false;
     }
 
     uint32_t *token_ids = xmalloc((size_t)n_tokens * sizeof(*token_ids));
@@ -48381,6 +48457,7 @@ static int generate_laguna_metal_argmax(
         const token_vec   *prompt,
         int                n_predict,
         int                ctx_size,
+        bool               ssd_streaming,
         ds4_token_emit_fn  emit,
         ds4_generation_done_fn done,
         void              *emit_ud,
@@ -48391,7 +48468,7 @@ static int generate_laguna_metal_argmax(
         return 1;
     }
     ds4_laguna_gpu_graph g;
-    if (!laguna_graph_alloc(&g, (uint32_t)ctx_size)) return 1;
+    if (!laguna_graph_alloc(&g, (uint32_t)ctx_size, ssd_streaming)) return 1;
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     bool ok = true;
     const double prefill_t0 = now_sec();
@@ -48440,6 +48517,11 @@ static int generate_laguna_metal_argmax(
                 (double)prompt->len / (prefill_t1 - prefill_t0) : 0.0,
             decode_t1 > decode_t0 ?
                 (double)generated / (decode_t1 - decode_t0) : 0.0);
+    /* Surface the shared streaming expert cache's hit/miss counters the same
+     * way GLM's generation path does (ds4_gpu_print_memory_report), so
+     * --ssd-streaming runs always show cache effectiveness without needing
+     * the separate DS4_METAL_MEMORY_REPORT opt-in GLM uses elsewhere. */
+    if (ssd_streaming) ds4_gpu_print_memory_report("before Laguna graph free");
     free(logits);
     laguna_graph_free(&g);
     return ok ? 0 : 1;
@@ -48520,6 +48602,7 @@ static int generate_metal_graph_raw_swa(
                                             prompt,
                                             n_predict,
                                             ctx_size,
+                                            ssd_streaming,
                                             emit,
                                             done,
                                             emit_ud,
@@ -58759,7 +58842,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->engine = e;
     s->ctx_size = ctx_size;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
-        if (!laguna_graph_alloc(&s->laguna_graph, (uint32_t)ctx_size)) {
+        if (!laguna_graph_alloc(&s->laguna_graph, (uint32_t)ctx_size,
+                                e->ssd_streaming)) {
             free(s);
             return 1;
         }
@@ -59048,6 +59132,15 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     ds4_session_print_dspark_stats(s);
+    /* The CLI's default single-shot generation path runs entirely through
+     * ds4_session_create/sync/eval, not generate_laguna_metal_argmax, so
+     * this is where a --ssd-streaming Laguna run gets to show the shared
+     * streaming expert cache's hit/miss counters (silently a no-op when
+     * nothing was ever streamed, per ds4_gpu_print_memory_report's own
+     * zero-check). */
+    if (s->engine && s->engine->ssd_streaming && ds4_session_is_laguna(s)) {
+        ds4_gpu_print_memory_report("before Laguna session free");
+    }
 #endif
     ds4_dist_session_free(s->distributed);
     if (ds4_session_is_cpu(s)) {
