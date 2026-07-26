@@ -1,4 +1,4 @@
-**Pull Request Checklist: Memory Lifetime Changes**  
+**Pull Request Review Checklist: Memory Lifetimes**  
 
-1. **Ownership Verification**  
-   - ✅ Ensure ownership
+- **Ownership & Borrowing**  
+  - Verify correct

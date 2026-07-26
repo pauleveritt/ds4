@@ -1,1 +1,1 @@
-**Latenza** e **throughput** sono due metriche fondamentali per valutare le prestazioni di
+La **latency** (latenza) e il **throughput** (throughput) sono due metriche fondament

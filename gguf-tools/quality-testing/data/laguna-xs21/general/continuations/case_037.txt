@@ -1,1 +1,1 @@
-Una **matrice di importanza** nella quantizzazione low-bit è uno strumento utilizzato
+Una **matrice di importanza** (o **importance matrix**) nella quantizzazione low-bit è uno

@@ -1,1 +1,1 @@
-Top-p sampling and temperature-zero decoding (greedy decoding) represent two distinct approaches in text generation, each with unique tradeoffs
+The tradeoffs between **top-p sampling** and **temperature zero decoding** (greedy decoding) involve balancing **diversity

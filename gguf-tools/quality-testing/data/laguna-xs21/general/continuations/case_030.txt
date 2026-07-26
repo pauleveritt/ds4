@@ -1,1 +1,1 @@
-Ecco una descrizione ordinata della **ricerca binaria per trovare il punto di inserimento
+Ecco una descrizione ordinata della ricerca binaria per trovare il punto di inserimento in

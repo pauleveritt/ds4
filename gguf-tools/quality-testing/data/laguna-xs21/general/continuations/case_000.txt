@@ -1,1 +1,2 @@
-B-trees are a self-balancing tree data structure that maintains sorted data and allows for efficient insertion, deletion, and search operations
+B-tree insertion is a process that maintains the tree's properties while adding new keys. Here's a structured explanation:
+

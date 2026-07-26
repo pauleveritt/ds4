@@ -1,1 +1,1 @@
-RMSNorm (Root Mean Square Layer Normalization) requires a sum of squares and a scaling pass to normalize the input tensor effectively
+RMSNorm (Root Mean Square Normalization) is a normalization technique designed to stabilize neural network training by normalizing the input features.

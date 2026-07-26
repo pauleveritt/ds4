@@ -1,1 +1,1 @@
-Quantization reduces memory but may alter logits.
+Quantization reduces memory but may alter the logits.

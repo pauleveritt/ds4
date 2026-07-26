@@ -1,4 +1,1 @@
-Here's a concise Python function to find the median of three numbers:
-
-```python
-def median(a, b,
+To solve this problem, we need to write a Python function that returns the median of three given numbers. The median is

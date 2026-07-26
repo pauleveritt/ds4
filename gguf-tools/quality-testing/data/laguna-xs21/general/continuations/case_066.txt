@@ -1,1 +1,3 @@
-Testing a command-line parser for edge cases is critical to ensure robustness. Below is a structured approach to identify and test edge
+Testing a command-line parser with edge cases requires a systematic approach to ensure robustness. Here's a structured method:
+
+###

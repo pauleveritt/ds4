@@ -1,1 +1,1 @@
-**Backpressure** in a network server refers to a mechanism for managing the flow of data when a system component (e.g
+Backpressure in a network server refers to the mechanism that manages the flow of data when the server cannot process incoming requests as fast

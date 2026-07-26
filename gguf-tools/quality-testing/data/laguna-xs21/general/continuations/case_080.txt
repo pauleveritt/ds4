@@ -1,1 +1,1 @@
-A good benchmark should measure **the performance of a system or process in a way that reflects real-world usage, provides meaningful
+A good benchmark should measure **the performance and efficiency of a system or component under realistic and representative workloads, providing reliable,

@@ -1,1 +1,1 @@
-Per verificare che un `mmap` su un file non venga ripetutamente rimappato, è
+Per testare che un `mmap` su file non venga rimappato ripetutamente, è necessario

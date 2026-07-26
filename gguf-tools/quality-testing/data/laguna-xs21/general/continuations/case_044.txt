@@ -1,1 +1,1 @@
-To verify that a file-backed memory-mapped region is not remapped repeatedly and remains stable after initial setup, follow these steps
+To test that a file-backed mmap is not repeatedly remapped, we can use a combination of memory mapping, file modification

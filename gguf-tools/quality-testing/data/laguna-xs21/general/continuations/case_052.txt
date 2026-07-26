@@ -1,1 +1,1 @@
-L'**softmax** è una funzione matematica utilizzata nell'attenzione (attention mechanism)
+Ecco una spiegazione semplice del **softmax** nel contesto dell'**attenzione**, con es

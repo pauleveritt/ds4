@@ -1,1 +1,1 @@
-Un **trie** (o **albero di prefissi**) rappresenta un insieme di
+Un **trie** (o **albero delle prefissioni**) rappresenta un insieme

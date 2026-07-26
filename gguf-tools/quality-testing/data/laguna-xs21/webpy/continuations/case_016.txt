@@ -1,5 +1,1 @@
-```json
-{
-  "tool_calls": [
-    {
-      "name": "read_file",
+{"name": "read_file", "arguments": {"path": "config/settings.json"}}

@@ -1,1 +1,1 @@
-Binary search finds the insertion point in a sorted array by maintaining a range where the target could fit. Here's a step
+Binary search finds the insertion point in a sorted array by maintaining two pointers, `low` and `high`, which define

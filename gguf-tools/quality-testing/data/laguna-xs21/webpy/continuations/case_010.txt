@@ -1,2 +1,4 @@
-The difference between `asyncio.gather` and `asyncio.wait` lies in their handling of task results and execution control:
+### Key Differences Between `asyncio.gather` and `asyncio.wait`
 
+1. **`asyncio.gather`**  
+   -

@@ -1,1 +1,1 @@
-L'inserimento in un **B-tree** è un processo che mantiene l'albero bil
+L'inserimento in un B-tree segue un processo strutturato per mantenere le proprietà

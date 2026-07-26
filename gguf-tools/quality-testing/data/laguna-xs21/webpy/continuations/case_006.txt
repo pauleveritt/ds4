@@ -1,2 +1,2 @@
-Here's an HTML form with client-side validation for an email field and a password field requiring at least eight characters:
+Here's an HTML form with client-side validation for an email field and a password field with a minimum length requirement:
 

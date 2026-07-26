@@ -1,1 +1,3 @@
-Ecco una funzione C che limita un intero a un intervallo specificato da due valori
+Ecco una funzione C che limita un intero a un intervallo specificato:
+
+```c

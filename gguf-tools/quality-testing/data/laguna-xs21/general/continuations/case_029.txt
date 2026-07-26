@@ -1,3 +1,1 @@
-To compare two model quantizations without relying on a single answer, follow these systematic steps:
-
-1. **Quantize
+To compare two model quantizations without relying on a single answer, follow these structured steps to evaluate their performance comprehensively:

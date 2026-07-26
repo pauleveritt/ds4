@@ -1,1 +1,1 @@
-Il **backpressure** (tradotto in italiano come "pressione di rete" o "controllo
+**Backpressure** in un server di rete si riferisce al meccanismo che gestisce la

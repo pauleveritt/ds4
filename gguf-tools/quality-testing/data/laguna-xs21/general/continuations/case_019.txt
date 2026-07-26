@@ -1,1 +1,1 @@
-Ecco tre esempi di invarianti per una tabella di token speciali in un'architett
+Ecco tre esempi di invarianti per una tabella di token speciali in un linguaggio di

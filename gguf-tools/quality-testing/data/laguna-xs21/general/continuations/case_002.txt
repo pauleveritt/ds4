@@ -1,1 +1,1 @@
-When comparing memory-mapped model weights versus copying weights into private buffers on macOS, the trade-offs revolve around memory efficiency, performance
+When comparing memory-mapped model weights (using `mmap`) with copying all weights into private buffers on macOS, the key differences

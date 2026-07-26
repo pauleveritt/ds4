@@ -1,1 +1,1 @@
-A **ring buffer** (or circular buffer) is a data structure that uses a fixed-size array as a circular queue
+A ring buffer (or circular buffer) is a fixed-size data structure that efficiently manages a stream of data by reusing memory

@@ -1,3 +1,1 @@
-### Il ruolo del router in un layer Mixture-of-Experts (MoE)
-
-Il **router** è un
+Il **router** in un modello **Mixture-of-Experts (MoE)** svolge un ruolo

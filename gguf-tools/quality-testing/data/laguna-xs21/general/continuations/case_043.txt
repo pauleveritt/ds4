@@ -1,5 +1,4 @@
-Here is a concise JSON Schema for a tool call structure containing a name and arguments:
+Here's a minimal JSON schema for a tool call with `name` and `arguments`:
 
 ```json
 {
- 

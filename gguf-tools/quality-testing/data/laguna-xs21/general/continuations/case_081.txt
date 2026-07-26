@@ -1,3 +1,1 @@
-/* This lock protects the shared resource accessed by multiple threads, ensuring mutual exclusion and preventing race conditions */
-
-**Step-by
+/* This lock protects the shared data structure accessed by multiple threads, ensuring mutual exclusion and preventing race conditions during concurrent operations.

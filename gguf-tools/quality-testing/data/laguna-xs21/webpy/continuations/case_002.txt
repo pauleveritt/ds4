@@ -1,1 +1,1 @@
-To add a POST /users route to the Express app that validates a JSON body with name and email fields and returns 
+To add a POST /users route to the Express app that validates a JSON body with `name` and `email`

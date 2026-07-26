@@ -1,1 +1,1 @@
-Evaluating 50 prompts is more informative than relying on a single favorite prompt because it provides a broader understanding of the model
+Evaluating 50 prompts is more informative than relying on a single favorite prompt because it provides a broader, more nuanced understanding

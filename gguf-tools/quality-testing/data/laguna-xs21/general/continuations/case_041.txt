@@ -1,1 +1,1 @@
-Small logit differences can change a greedy continuation because even minor adjustments in the input values to the argmax function can result in
+Small logit differences can change a greedy continuation because the greedy algorithm selects the action with the highest probability, and even minor changes

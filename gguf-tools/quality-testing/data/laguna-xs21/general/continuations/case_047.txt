@@ -1,1 +1,1 @@
-In distributed systems, particularly those involving key-value stores, the distinction between **raw KV rows** and **compressed KV rows
+The difference between raw and compressed KV (key-value) rows lies in how the data is stored and represented. Here's

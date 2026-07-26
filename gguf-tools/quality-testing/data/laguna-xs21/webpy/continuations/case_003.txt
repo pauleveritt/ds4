@@ -1,4 +1,4 @@
-Here's a TypeScript interface for a paginated API response containing a list of `Product` objects:
+Here's a TypeScript interface for a paginated API response containing a list of Product objects:
 
 ```typescript
-interface
+interface Product {

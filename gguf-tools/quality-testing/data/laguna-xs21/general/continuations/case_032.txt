@@ -1,1 +1,1 @@
-I **mutex** e i **contatori atomici** sono strumenti utilizzati per la gestione
+La differenza tra **mutex** e **contatore atomico** risiede nel loro scopo,

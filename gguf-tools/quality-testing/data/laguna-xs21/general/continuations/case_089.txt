@@ -1,1 +1,1 @@
-Hash tables resolve collisions using two primary strategies: **collision resolution** and **collision reduction**. Here's a detailed explanation of
+Hash tables handle collisions using several strategies, with the most common being **chaining** and **open addressing**. Here's

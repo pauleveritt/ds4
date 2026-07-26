@@ -1,1 +1,1 @@
-Per testare un parser da riga di comando con casi limite, è fondamentale verificare il
+Per testare un parser da riga di comando con casi limite, segui una strategia struttur

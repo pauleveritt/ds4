@@ -1,4 +1,4 @@
-Here's the SQLAlchemy model for a Task table with the specified columns and default timestamp:
+Here's the SQLAlchemy model for the Task table with the specified fields:
 
 ```python
-from sqlalchemy import
+from sqlalchemy import Column, Integer

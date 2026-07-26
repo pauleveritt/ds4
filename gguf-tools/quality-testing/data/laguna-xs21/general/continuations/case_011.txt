@@ -1,2 +1,2 @@
-**Progetto Echo TCP con Client Lento**  
-*Obiettivo*: Implementare un server TCP
+**Progetto: Server TCP Echo con Client Lento**  
+**Obiettivo**: Implementare un

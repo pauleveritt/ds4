@@ -1,1 +1,1 @@
-I need to use the create_file tool to write a file at notes/todo.txt with the content "Buy milk".
+{"name": "create_file", "arguments": {"path": "notes/todo.txt", "content": "Buy

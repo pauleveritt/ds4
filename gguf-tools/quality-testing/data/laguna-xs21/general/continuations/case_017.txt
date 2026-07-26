@@ -1,1 +1,1 @@
-La decodifica speculativa può mantenere l'output esatto se le sue previsioni in
+La **decodifica speculativa** (o *speculative decoding*) è una tecnica utilizzata

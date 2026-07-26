@@ -1,1 +1,3 @@
-Specetulative decoding preserves the exact greedy output through a mechanism that combines sampling from a fast but approximate model with rejection sampling
+Specpeculative decoding preserves exact greedy output through a careful verification process:
+
+1. **Generate candidate sequences**: A fast

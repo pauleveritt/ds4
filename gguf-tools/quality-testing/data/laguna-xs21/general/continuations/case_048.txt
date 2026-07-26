@@ -1,3 +1,4 @@
-Here's a comprehensive checklist for validating that a quantized model adheres to instructions:
+Here's a comprehensive checklist for validating that a quantized model still follows instructions:
 
-### **1. Functional Correctness**
+## Pre-Quantization Baseline Validation
+-

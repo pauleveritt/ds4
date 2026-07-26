@@ -1,1 +1,1 @@
-Quando si tratta di caricare i pesi di un modello su macOS, due opzioni com
+Quando si lavora con i pesi di un modello su macOS, due approcci comuni sono **mmap

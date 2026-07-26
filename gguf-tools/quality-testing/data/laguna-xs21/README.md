@@ -109,10 +109,17 @@ python3 gguf-tools/quality-testing/collect_local.py \
 
 `--nothink` was used for both sets (direct/short continuations, no reasoning
 traces), matching the `max-tokens 24` convention of the existing hosted
-fixtures. Each case is one independent `ds4 -p <prompt> -n 24 --nothink`
-process, greedy (temperature 0 is ds4's teacher-forced/greedy default for
-scoring; sampling defaults do not apply to `--dump`/score paths). All 120
-continuations (100 general + 20 webpy) were non-empty.
+fixtures. Each case is one independent
+`ds4 -p <prompt> -n 24 --temp 0 --nothink` process, explicitly greedy.
+
+**Correction:** the first pass of this fixture set was captured *without*
+`--temp 0` in `collect_local.py`'s `cmd = [...]` construction. Laguna's
+sampling default is temperature 1.0 (`ds4_engine_sampling_defaults`, and
+`./ds4 --help`: "0 is greedy/deterministic"), so every case in the original
+capture was randomly sampled, not greedy. `collect_local.py` now passes
+`--temp 0` explicitly and both fixture sets were regenerated from scratch.
+All 120 continuations (100 general + 20 webpy) were non-empty in both the
+original and the regenerated capture.
 
 Wall-clock: general (100 prompts) took ~60s; webpy (20 prompts) a few
 seconds; both single foreground runs, no backgrounding needed.
@@ -148,22 +155,60 @@ minutes earlier in a separate process):
 
 | Fixture | cases | tokens | avg_nll | first_token_match | avg_greedy_lcp |
 |---|---|---|---|---|---|
-| general | 100 | 2443 | 1.5138 | 70/100 | 5.000 |
-| webpy   | 20  | 502  | 1.1381 | 9/20   | 5.100 |
+| general | 100 | 2439 | 1.235013 | 71/100 | 6.330 |
+| webpy   | 20  | 514  | 0.948913 | 9/20   | 4.700 |
 
-`avg_nll` is not near-zero and `first_token_match` is well below 100%, even
-though the scorer is teacher-forcing the model's own prior greedy output.
-This is expected: each `collect_local.py` case and each `score_official` case
-is a **separate process/prefill**, and Metal's parallel-reduction order is
-not guaranteed identical run to run, so floating-point rounding differs
-slightly and can flip a near-tied greedy argmax, especially deeper into a
-continuation where small differences compound. This noise floor (roughly
-1.1-1.5 avg_nll, ~45-70% first-token agreement at 24 generated tokens) is the
-P0 baseline: it is the same-model, same-weights comparison, so any future
-quant-vs-Q4_K_M score in this range or better is statistically
-indistinguishable from Q4_K_M compared with itself; materially higher avg_nll
-or materially lower first-token-match indicates real degradation, not just
-kernel-order noise.
+**Correction (superseding the numbers and explanation below this
+paragraph in the original version of this section):** the numbers above
+were re-measured after fixing `collect_local.py` to pass `--temp 0` (see
+"How the local snapshots were captured" above). The *original* capture
+(temperature 1.0, unintentionally sampled) scored general=1.5138 avg_nll /
+70/100 first-match / 5.000 avg_lcp and webpy=1.1381 avg_nll / 9/20
+first-match / 5.100 avg_lcp. Fixing the sampling bug changed avg_nll
+noticeably but barely moved `first_token_match` (general 70→71/100, webpy
+unchanged at 9/20) and left `avg_greedy_lcp` in the same range. Greedy
+capture is still the correct thing to do (a temp=1.0 fixture is not a
+reproducible reference), but the hypothesis that missing `--temp 0` was the
+main driver of the low first-token-match rate is **not** supported by the
+data — something else dominates.
+
+That something else is **not** run-to-run Metal non-determinism either. That
+was the original (also wrong) theory in this section; it was tested
+directly and falsified:
+
+- Running `./ds4 -m ... --temp 0 -p <same prompt>` twice, in two separate
+  process invocations, produced byte-identical stdout both times.
+- Running `score_official` twice against the same manifest, in two separate
+  process invocations, produced byte-identical output TSVs both times.
+
+So neither the generation path nor the scoring path is internally
+non-deterministic across process invocations — each is reproducible on its
+own. The actual source of the ~70-71% first-token / non-zero avg_nll gap is
+a **systematic (deterministic, reproducible) numerical divergence between
+two different code paths inside ds4**: `collect_local.py` captures
+continuations via `ds4`'s free-running autoregressive generate loop (`-p`
+prefill, then decode-and-sample-argmax one token at a time), while
+`score_official` captures the "self-consistency" comparison via
+`ds4_session_sync` (batched prompt prefill) followed by
+`ds4_session_eval` (teacher-forced one-token-at-a-time decode, feeding the
+fixture's *recorded* token back in regardless of what the scorer's own
+argmax says). These two paths are not guaranteed to hit identical
+floating-point rounding at every step even with identical weights and
+identical token history — e.g. prefill batch shape, KV-cache precision, or
+kernel selection can differ between "generate" and "sync+eval" — and a
+close-margin greedy argmax can flip as a result, compounding over a
+24-token continuation (`case_000`'s lcp=5 in the regenerated run is a good
+example: the two paths agree for 5 tokens, then drift).
+
+This noise floor (roughly 0.9-1.2 avg_nll, ~45-71% first-token agreement at
+24 generated tokens, post-fix) is the corrected P0 baseline: it is a
+same-model, same-weights comparison across two different ds4 code paths, so
+any future quant-vs-Q4_K_M score in this range or better is not
+distinguishable from this floor; materially higher avg_nll or materially
+lower first-token-match indicates real degradation. Pinning down exactly
+which kernel/batch-path difference between "generate" and "sync+eval"
+causes the divergence is out of scope for this task; flagged as a follow-up
+if later tasks need tighter precision than this floor allows.
 
 ## Known limitation: webpy tool-call prompts
 

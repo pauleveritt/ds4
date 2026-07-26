@@ -83,7 +83,7 @@ def main() -> int:
     for i, prompt in enumerate(prompts[: args.count]):
         case_id = f"case_{i:03d}"
         print(f"local {i + 1}/{total}: {case_id}", file=sys.stderr, flush=True)
-        cmd = [args.ds4, "-m", args.model, "-n", str(args.max_tokens)]
+        cmd = [args.ds4, "-m", args.model, "-n", str(args.max_tokens), "--temp", "0"]
         if think_flag:
             cmd.append(think_flag)
         cmd.extend(args.extra_arg)

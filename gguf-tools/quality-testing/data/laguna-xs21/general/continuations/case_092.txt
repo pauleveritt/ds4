@@ -1,1 +1,4 @@
-To write a simple SQL query that counts rows per category, you can use the `COUNT()` aggregate function along with `
+To count rows per category in a table, you can use the following SQL query:
+
+```sql
+SELECT category,

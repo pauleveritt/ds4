@@ -1,4 +1,5 @@
-# TCP Echo Server Design for Handling Slow Clients
+Here's a concise design for a TCP echo server that handles slow clients:
 
-## Overview
-This design implements a TCP echo server that gracefully handles slow
+```python
+import socket
+import select

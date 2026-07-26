@@ -1,1 +1,1 @@
-Piccole variazioni nei logit possono alterare drasticamente le decisioni di una strategia greedy perch
+Piccole differenze nei **logit** possono alterare una **continuazione greedy** perch
