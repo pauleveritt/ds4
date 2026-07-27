@@ -39,12 +39,16 @@ Q4_K is thus the minimum useful probe:
 
 | Item | Value |
 |---|---|
-| Source | `gguf/Laguna-XS-2.1-BF16.gguf` (63.8 GiB) |
-| Quantizer | Local `llama-quantize`; before execution, record its version and full command line |
-| Output (untracked) | `gguf/laguna-xs-2.1-uniform-routed-q4k-probe.gguf` |
+| Source | `/Users/pauleveritt/projects/ds4/gguf/Laguna-XS-2.1-BF16.gguf` (63.8 GiB) |
+| Quantizer | Local Homebrew `llama.cpp` 9580; record its version and full command line at execution |
+| Output (untracked) | `/Users/pauleveritt/projects/ds4/gguf/laguna-xs-2.1-uniform-routed-q4k-probe.gguf` |
 | Base recipe | `Q4_K_M` |
 | Required overrides | `ffn_gate_exps=q4_k`, `ffn_up_exps=q4_k`, `ffn_down_exps=q4_k` |
 | Explicit exclusions | No `--imatrix`; no corpus; no quality decision |
+
+The models live in the primary checkout's shared `gguf/` directory; this
+worktree intentionally has no `gguf/` path.  Use the absolute paths above
+rather than adding a worktree-local symlink.
 
 The overrides deliberately name all three routed tensors.  Overriding only
 the down projection is insufficient: ds4's cache slab eligibility is based on
@@ -69,6 +73,20 @@ These may be performed before authorizing a quantization run:
 
 No model-generation command belongs in this preflight stage.
 
+### Completed preflight — 2026-07-27
+
+- `llama-quantize` resolves to `/opt/homebrew/bin/llama-quantize`, from
+  Homebrew `llama.cpp` 9580.  Its executable SHA-256 is
+  `ac563c18f7431637f3c191c3fc7fb6a835a7a6aaa6fefdb51335924c525a5ee5`.
+- Its local help confirms `--tensor-type`, `--tensor-type-file`, `--pure`,
+  and `--dry-run` are available.
+- The shared BF16 and official Q4_K_M inputs exist at the absolute paths
+  above (63,829.6 MiB and 19,335.1 MiB respectively).
+- The source filesystem has 277 GiB free.  No `ds4` or `ds4_test` process was
+  active at the time of this check.
+- No `--dry-run`, quantization, imatrix collection, inference, or GPU command
+  was run.
+
 ## Authorized execution only after explicit approval
 
 Quantization is CPU/disk intensive and writes a multi-GiB artifact.  Do not
@@ -80,8 +98,8 @@ llama-quantize \
   --tensor-type ffn_gate_exps=q4_k \
   --tensor-type ffn_up_exps=q4_k \
   --tensor-type ffn_down_exps=q4_k \
-  gguf/Laguna-XS-2.1-BF16.gguf \
-  gguf/laguna-xs-2.1-uniform-routed-q4k-probe.gguf \
+  /Users/pauleveritt/projects/ds4/gguf/Laguna-XS-2.1-BF16.gguf \
+  /Users/pauleveritt/projects/ds4/gguf/laguna-xs-2.1-uniform-routed-q4k-probe.gguf \
   Q4_K_M
 ```
 
@@ -125,7 +143,8 @@ official Q4_K_M baseline; the target is the ~8.4 GiB reduction described in
 Only after A and B pass, run:
 
 ```sh
-./tests/xs21_stream_ab.sh gguf/laguna-xs-2.1-uniform-routed-q4k-probe.gguf
+./tests/xs21_stream_ab.sh \
+  /Users/pauleveritt/projects/ds4/gguf/laguna-xs-2.1-uniform-routed-q4k-probe.gguf
 ```
 
 Require `xs21 stream A/B: OK`.  This is the authoritative correctness check;
