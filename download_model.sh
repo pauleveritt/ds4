@@ -6,6 +6,8 @@ GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
 LAGUNA_REPO="poolside/Laguna-S-2.1-GGUF"
 LAGUNA_ANTIREZ_REPO="antirez/Laguna-S-2.1-GGUF"
 LAGUNA_REVISION="706fa69799926b6afde1af9e24ca2a4923f110a1"
+LAGUNA_XS21_REPO="poolside/Laguna-XS-2.1-GGUF"
+LAGUNA_XS21_REVISION="1a37c0a5fb8c7a18e6106decb6be6327d1b63fa6"
 REPO="antirez/deepseek-v4-gguf"
 Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
 Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
@@ -23,6 +25,7 @@ GLM_ANTIREZ_Q2_FILE="GLM-5.2-UD-Q2_K_RoutedQ2K.gguf"
 GLM_ANTIREZ_Q4_FILE="GLM-5.2-UD-Q4_K_RoutedQ4K.gguf"
 LAGUNA_Q4_FILE="laguna-s-2.1-Q4_K_M.gguf"
 LAGUNA_Q2_Q3_FILE="laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf"
+LAGUNA_XS21_Q4_FILE="Laguna-XS-2.1-Q4_K_M.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -53,6 +56,7 @@ Usage:
   ./download_model.sh glm-antirez-q4 [--token TOKEN]
   ./download_model.sh laguna-q4 [--token TOKEN]
   ./download_model.sh laguna-q2-q3 [--token TOKEN]
+  ./download_model.sh xs21-q4 [--token TOKEN]
 
 Targets:
 
@@ -120,6 +124,13 @@ Targets:
        Mixed Laguna S 2.1 routed-expert quant for 64 GB systems. Routed
        layers 1..20 use Q2_K and layers 21..47 use Q3_K; all other tensors
        retain the official Q4_K_M layout. 44.95 GiB on disk.
+
+  xs21-q4
+       Official imatrix-quantized Laguna XS 2.1 Q4_K_M GGUF from Poolside.
+       18.88 GiB on disk. Supported by the Metal backend both with full
+       model residency and with --ssd-streaming, which streams routed
+       experts through the expert cache so the model runs on smaller
+       machines.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
@@ -208,6 +219,12 @@ case "$MODEL" in
         REPO=$LAGUNA_ANTIREZ_REPO
         MODEL_FILE=$LAGUNA_Q2_Q3_FILE
         FORCE_HF_DOWNLOAD=1
+        ;;
+    xs21-q4)
+        REPO=$LAGUNA_XS21_REPO
+        MODEL_FILE=$LAGUNA_XS21_Q4_FILE
+        FORCE_HF_DOWNLOAD=1
+        HF_REVISION=$LAGUNA_XS21_REVISION
         ;;
     -h|--help|help)
         usage
