@@ -6648,24 +6648,45 @@ static bool glm_stream_decode_experts_are_streamed(
 }
 
 /*
+ * weights_streaming_layer_experts_uniform() compares per-expert BYTE SIZE
+ * against the pinned slab class and never inspects the quant type, but Metal's
+ * Laguna address-table streaming kernel (stream_eligible in
+ * ds4_gpu_laguna_routed_shared_moe_one_tensor, ds4_metal.m) only has Q4_K and
+ * Q6_K routed-down variants. Load-time layout validation admits four routed
+ * down types -- Q4_K, Q6_K, and (matching gate/up) Q3_K or Q2_K, see the
+ * layer_routed_type / down_supported checks near ds4.c:5150 -- so a layer can
+ * be uniform-by-bytes yet unservable by the kernel. Such a layer must stay in
+ * the resident span set: dropping it would leave it neither mapped nor cached,
+ * the silent-corruption shape Task 3 already hit once. Reporting it as
+ * not-servable here routes it to the same mapped-model fallback that
+ * off-slab-class layers already use -- correct, just not cache-accelerated.
+ */
+static bool laguna_decode_experts_cache_servable(const ds4_layer_weights *l) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) return true;
+    if (l->ffn_down_exps == NULL) return true;
+    return l->ffn_down_exps->type == DS4_TENSOR_Q4_K ||
+           l->ffn_down_exps->type == DS4_TENSOR_Q6_K;
+}
+
+/*
  * Decode-time spans for one layer. The static set excludes routed expert
  * tensors only when the streaming expert-cache path can really serve them.
  * Boosted layers, mixed GLM quant layouts such as Q4 gate/up plus Q5 down, or
  * undersized expert caches fall back to direct model-range reads. Include
  * those expert tensors so cache-hit prefill extension and decode are covered.
  *
- * Laguna reuses the plain !weights_streaming_layer_experts_uniform check
- * below unmodified (no family special-case needed): its fused decode kernel
+ * Laguna adds one family-specific term, laguna_decode_experts_cache_servable
+ * (see above): its fused decode kernel
  * (ds4_gpu_laguna_routed_shared_moe_one_tensor) has address-table streaming
- * variants for both a Q4_K and a Q6_K routed down projection (gate/up are
- * always Q4_K for XS 2.1), matching exactly the two byte-size classes
- * "uniform" can compare against -- whichever type the FIRST sparse layer
- * happens to be (Q6_K for XS 2.1's official Q4_K_M file) becomes the pinned
- * slab class at startup (ds4_streaming_routed_expert_bytes in
- * ds4_engine_open_internal), and only layers matching that exact byte
- * signature are actually served from the cache at runtime
- * (ds4_gpu_stream_expert_cache_note_expert_size in ds4_metal.m). Layers off
- * that class always fall back to wrapping the whole routed-expert tensor
+ * variants for a Q4_K and a Q6_K routed down projection only, while the
+ * byte-size "uniform" test can also pass for the Q3_K/Q2_K routed layouts
+ * load-time validation accepts. Whichever type the FIRST sparse layer happens
+ * to be (Q6_K for XS 2.1's official Q4_K_M file) becomes the pinned slab class
+ * at startup (ds4_streaming_routed_expert_bytes in ds4_engine_open_internal),
+ * and only layers matching that exact byte signature are actually served from
+ * the cache at runtime (ds4_gpu_stream_expert_cache_note_expert_size in
+ * ds4_metal.m). Layers off that class -- or of a type the kernel has no
+ * variant for -- always fall back to wrapping the whole routed-expert tensor
  * from the mapped model range, so they must stay in this static set.
  */
 static void model_map_span_vec_include_layer_decode(
@@ -6675,6 +6696,7 @@ static void model_map_span_vec_include_layer_decode(
     const ds4_layer_weights *l = &w->layer[il];
     model_map_span_vec_include_layer_decode_static(spans, l);
     if (!weights_streaming_layer_experts_uniform(w, il) ||
+        !laguna_decode_experts_cache_servable(l) ||
         (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
          !glm_stream_decode_experts_are_streamed(w, l, il)) ||
         glm_stream_resident_decode_layer_enabled(l, il)) {
