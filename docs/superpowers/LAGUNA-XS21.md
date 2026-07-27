@@ -348,18 +348,23 @@ matching greedy output across a real 6,642-token chunk boundary. Full evidence
 and the remaining benchmark follow-up are in
 `research/laguna-xs21-p21-graph-scratch.md`.
 
-**P2.2 — Biased corpus builder** (original Task 9, `plan.md:483`).
-Unblocked, no GPU, independently startable. 55% web/Python, 30%
-prose/reasoning, 15% shell/C; zero Java/C#/Kotlin/PHP/Go/Rust. Fork
-`build_ds4_imatrix_dataset.py`, swap in the Laguna chat/tool template.
+**P2.2 — Biased corpus builder** (complete, 2026-07-27; original Task 9,
+`plan.md:483`). 9,874 Laguna-rendered prompts, 3.00M estimated tokens and
+55% web/Python, 30% prose/reasoning, 15% shell/C. The builder and its tracked
+manifest are in `gguf-tools/imatrix/dataset/`.
 
-**P2.3 — Collect imatrix, build the artifact** (original Task 10, `:515`).
-Out-of-tree llama.cpp. Quantize **from BF16** (no Q8_0 exists). Carry P2.0's
-uniformity overrides into this step.
+**P2.3 — Collect imatrix, build the artifact** (complete, 2026-07-27;
+original Task 10, `:515`). The pinned upstream build collected a 400-chunk,
+179.1 MiB GGUF imatrix and produced the untracked 14.64 GiB uniform
+RoutedQ3_K artifact from BF16. Exact commands, hashes and type map are in
+`gguf-tools/imatrix/laguna-xs21-README.md`.
 
-**P2.4 — Accept the layout in ds4 + quality A/B** (original Task 11, `:575`).
-Compare against T4's P0 baseline. Note the pre-existing self-consistency floor
-(§7) — do not mistake it for a regression.
+**P2.4 — Accept the layout in ds4 + quality A/B** (complete, 2026-07-27;
+original Task 11, `:575`). The Phase 1 generic layout validator already
+accepts Q3_K routed triples with the Q8_0 signal path. Resident smoke and the
+undersized-cache stream A/B passed. Q3_K improved average NLL by 0.88% on the
+general set and 1.16% on web/Python; record and caveat are in
+`gguf-tools/quality-testing/data/laguna-xs21/README.md`.
 
 **P2.5 — Re-measure footprint.** Re-run the §4 sweep and `mini-notes.md`
 numbers against the new artifact. This is where the §5 projections get tested.

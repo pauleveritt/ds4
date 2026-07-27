@@ -262,3 +262,20 @@ bug. The prompts are still useful biased fixtures for comparing GGUF variants
 against each other on tool-call-flavored input, since scoring is relative
 (same prompt, different GGUF), not an assertion that the exact tag syntax
 was produced.
+
+## P2.4 RoutedQ3_K-biased comparison
+
+On 2026-07-27, the 400-chunk web/Python-biased imatrix was used to quantize
+all 117 routed gate/up/down tensors to uniform Q3_K, with the signal path at
+Q8_0. Both models were scored at context 4096 against these same locally
+captured Q4_K_M continuations:
+
+| fixture | Q4_K_M avg NLL | RoutedQ3_K avg NLL | delta | Q4/Q3 first token | Q4/Q3 avg LCP |
+|---|---:|---:|---:|---:|---:|
+| general (100 cases, 2,439 tokens) | 1.235013 | 1.224140 | -0.88% | 71 / 66 | 6.330 / 5.840 |
+| webpy (20 cases, 514 tokens) | 0.948913 | 0.937891 | -1.16% | 9 / 8 | 4.700 / 3.600 |
+
+The quant improves average NLL on both sets (58/100 general cases and 9/20
+webpy cases improve). The first-token/LCP movement is within the documented
+self-consistency floor above, so it is not a quality rejection. Resident
+smoke generation and the undersized-cache streamed A/B gate also passed.
