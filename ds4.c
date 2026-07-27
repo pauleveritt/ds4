@@ -12538,6 +12538,43 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
     return cap;
 }
 
+/* Laguna's graph preallocates every batched activation at this width.  Keep
+ * the policy and the memory estimate together: previously the graph silently
+ * ignored --prefill-chunk while the estimate reported a one-token scratch. */
+static uint32_t laguna_graph_prefill_cap(uint32_t ctx_size,
+                                         uint32_t requested_chunk) {
+    if (ctx_size == 0) return 1;
+    uint32_t cap = requested_chunk != 0 ? requested_chunk : 16384u;
+    if (cap > ctx_size) cap = ctx_size;
+    return cap == 0 ? 1 : cap;
+}
+
+static uint64_t laguna_graph_scratch_bytes(uint32_t prefill_cap) {
+    const uint64_t f32 = sizeof(float);
+    const uint64_t embd = DS4_N_EMBD;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t ffn_max = DS4_N_FF_DENSE >
+        (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP ?
+        DS4_N_FF_DENSE : (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP;
+    const uint64_t per_row =
+        sizeof(uint32_t) +
+        8ull * embd * f32 +
+        2ull * q_dim * f32 +
+        2ull * kv_dim * f32 +
+        (uint64_t)DS4_N_HEAD * f32 +
+        3ull * ffn_max * f32 +
+        (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * f32 +
+        2ull * DS4_N_EXPERT * f32 +
+        (uint64_t)DS4_N_EXPERT_USED * (sizeof(int32_t) + sizeof(float)) +
+        2ull * kv_dim * sizeof(uint16_t);
+    const uint64_t fixed =
+        (uint64_t)DS4_N_EMBD * f32 +
+        (uint64_t)DS4_N_VOCAB * f32 +
+        sizeof(int32_t) + sizeof(float);
+    return (uint64_t)prefill_cap * per_row + fixed;
+}
+
 /* Allocate all CPU decode temporaries once.  This keeps generation deterministic
  * from the VM's point of view and makes accidental hot-loop malloc visible. */
 static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ctx_size) {
@@ -35328,24 +35365,8 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
                 m.raw_bytes += (uint64_t)cap * kv_row_bytes;
             }
 
-            const uint64_t q_dim =
-                (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
-            const uint64_t kv_dim =
-                (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
-            const uint64_t ffn_max = DS4_N_FF_DENSE >
-                (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP ?
-                DS4_N_FF_DENSE :
-                (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP;
-            uint64_t scratch_f32 = 9ull * DS4_N_EMBD +
-                                   2ull * q_dim +
-                                   2ull * kv_dim +
-                                   DS4_N_HEAD +
-                                   3ull * ffn_max +
-                                   (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP +
-                                   2ull * DS4_N_EXPERT +
-                                   2ull * DS4_N_EXPERT_USED +
-                                   DS4_N_VOCAB;
-            m.scratch_bytes = scratch_f32 * sizeof(float);
+            m.prefill_cap = laguna_graph_prefill_cap(ctx, prefill_chunk);
+            m.scratch_bytes = laguna_graph_scratch_bytes(m.prefill_cap);
             m.total_bytes = m.raw_bytes + m.scratch_bytes;
             return m;
         }
@@ -47411,15 +47432,17 @@ static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
     memset(g, 0, sizeof(*g));
 }
 
-static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size,
-                               bool ssd_streaming) {
+static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g,
+                               uint32_t              ctx_size,
+                               uint32_t              prefill_chunk,
+                               bool                  ssd_streaming) {
     if (!g || ctx_size == 0 || ctx_size > DS4_CONTEXT_LENGTH ||
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) {
         return false;
     }
     memset(g, 0, sizeof(*g));
     g->ctx_size = ctx_size;
-    g->prefill_cap = ctx_size < 16384u ? ctx_size : 16384u;
+    g->prefill_cap = laguna_graph_prefill_cap(ctx_size, prefill_chunk);
     g->ssd_streaming = ssd_streaming;
 
     const uint64_t f32 = sizeof(float);
@@ -48480,6 +48503,7 @@ static int generate_laguna_metal_argmax(
         int                n_predict,
         int                ctx_size,
         bool               ssd_streaming,
+        uint32_t           prefill_chunk,
         ds4_token_emit_fn  emit,
         ds4_generation_done_fn done,
         void              *emit_ud,
@@ -48490,7 +48514,8 @@ static int generate_laguna_metal_argmax(
         return 1;
     }
     ds4_laguna_gpu_graph g;
-    if (!laguna_graph_alloc(&g, (uint32_t)ctx_size, ssd_streaming)) return 1;
+    if (!laguna_graph_alloc(&g, (uint32_t)ctx_size, prefill_chunk,
+                            ssd_streaming)) return 1;
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     bool ok = true;
     const double prefill_t0 = now_sec();
@@ -48625,6 +48650,7 @@ static int generate_metal_graph_raw_swa(
                                             n_predict,
                                             ctx_size,
                                             ssd_streaming,
+                                            prefill_chunk,
                                             emit,
                                             done,
                                             emit_ud,
@@ -57664,18 +57690,26 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+        if (opt->prefill_chunk != 0 &&
+            DS4_MODEL_VARIANT != DS4_VARIANT_LAGUNA_XS21) {
+            fprintf(stderr,
+                    "ds4: --prefill-chunk for Laguna is only supported "
+                    "for Laguna XS 2.1\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         if ((opt->directional_steering_file &&
              opt->directional_steering_file[0]) ||
             opt->directional_steering_attn != 0.0f ||
             opt->directional_steering_ffn != 0.0f ||
             e->power_percent < 100 ||
-            opt->prefill_chunk != 0 ||
             (opt->mtp_path && opt->mtp_path[0]) ||
             opt->dspark || opt->glm_mtp || opt->first_token_test) {
             fprintf(stderr,
                     "ds4: Laguna S 2.1 currently supports the standard Metal "
                     "generation path only (no steering, power cap, custom "
-                    "prefill chunk, MTP/DSpark, or first-token diagnostic)\n");
+                    "MTP/DSpark, or first-token diagnostic)\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -58865,7 +58899,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->ctx_size = ctx_size;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
         if (!laguna_graph_alloc(&s->laguna_graph, (uint32_t)ctx_size,
-                                e->ssd_streaming)) {
+                                e->prefill_chunk, e->ssd_streaming)) {
             free(s);
             return 1;
         }

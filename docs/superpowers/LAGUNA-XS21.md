@@ -248,8 +248,11 @@ get under 10 GiB. **These are projections, not measurements.**
    real value is SSD traffic and throughput, not memory.
 2. **Graph scratch becomes the second-largest item** — 3.97 GiB at prefill
    16384 (it scales with prefill width: 4096→0.99, 8192→1.99, 16384→3.97,
-   where prefill caps). Laguna refuses `--prefill-chunk`, so there is no lever
-   today. **This is not in the original plan and probably should be.**
+   where prefill caps). The original Laguna `--prefill-chunk` refusal was a
+   stale guard, not a kernel limitation. P2.1 now enables it for XS 2.1 and
+   corrects its memory accounting; `--prefill-chunk 4096` measured 0.99 GiB
+   scratch at ctx 16384. See
+   `docs/superpowers/research/laguna-xs21-p21-graph-scratch.md`.
 
 ---
 
@@ -336,12 +339,13 @@ routed layers share one byte-size class. A single small experiment answers it.
 **If this fails, the whole footprint thesis needs rethinking** — so do it
 first, cheaply.
 
-**P2.1 — Graph scratch investigation (new).**
-3.97 GiB at prefill 16384 is the second-largest consumer and has no lever
-today. Understand what scratch is used for, whether Laguna's `--prefill-chunk`
-refusal is fundamental or incidental, and whether a smaller prefill window is
-viable. Potentially the cheapest large win available, and it is entirely
-absent from the original plan.
+**P2.1 — Graph scratch investigation (complete, 2026-07-27).**
+The `--prefill-chunk` refusal was incidental: the allocator already had a
+chunked prefill loop, but a stale family guard rejected the option and the
+allocator ignored it. XS 2.1 now supports it; a 4096-token cap measured 0.99
+GiB scratch at ctx 16384 rather than 3.97 GiB, with matching greedy output and
+a successful 6,642-token two-chunk prefill. Full evidence and the remaining
+benchmark follow-up are in `research/laguna-xs21-p21-graph-scratch.md`.
 
 **P2.2 — Biased corpus builder** (original Task 9, `plan.md:483`).
 Unblocked, no GPU, independently startable. 55% web/Python, 30%
