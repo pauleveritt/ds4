@@ -72,9 +72,14 @@ stream gate also passed:
 # xs21 stream A/B: OK
 \`\`\`
 
+That A/B establishes the safe fallback only: Q3_K routed experts remain mapped
+in streaming decode because the generic cache path has no Q3 address-table
+kernels. P2.5 confirmed that no Q3 cache entries are live yet, so this artifact
+must not be used to claim the projected cache/footprint benefit until that
+kernel and a nonzero-hit regression test exist.
+
 Quality results against the local Q4_K_M snapshot fixtures are recorded in
 \`gguf-tools/quality-testing/data/laguna-xs21/README.md\`. They pass the P2.4
 gate: average NLL improved on both general and web/Python fixtures. As noted
 there, the local self-consistency metric has a documented numerical floor, so
 first-token and LCP movement alone is not a regression verdict.
-

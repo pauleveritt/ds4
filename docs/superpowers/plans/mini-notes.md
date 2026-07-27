@@ -103,10 +103,17 @@ through mmap and do not appear in the hit/miss counters — so the 0.907 hit
 rate describes roughly half the model. (Sanity check on the smoke run: 63
 decode steps x 19 layers x 8 experts = 9,576 = hits + misses exactly.)
 
-This is what Tasks 10-13 attack. A biased RoutedQ3_K quant shrinks experts so
-more fit in cache, and the Python expert hotlist targets exactly this workload.
-Expect both memory and throughput figures to improve once those land; re-run
-this sweep afterward rather than trusting these numbers.
+This is what Tasks 10-13 attack. A biased uniform RoutedQ3_K artifact now
+exists, but it does **not** yet obtain the cache benefit: its Q3 routed triples
+take ds4's correct mapped-model fallback because the generic streaming decode
+path has no Q3_K address-table kernels. A 16k-context, 4096-token-prefill,
+256-token Q3 run reported the planned 1.01 GiB expert-cache reservation but
+**0.00 GiB live streaming experts** after graph free; 800/1,600/3,200/4,800
+expert budgets all had no cache statistics and held near 62 t/s. Do not use the
+startup reservation as a footprint result.
+
+Q3 cache kernels and a nonzero-hit correctness test now precede the Python
+expert hotlist. Re-run this sweep only after that gate passes.
 
 ## 6. Download target
 

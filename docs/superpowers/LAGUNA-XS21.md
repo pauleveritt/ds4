@@ -362,15 +362,32 @@ RoutedQ3_K artifact from BF16. Exact commands, hashes and type map are in
 **P2.4 — Accept the layout in ds4 + quality A/B** (complete, 2026-07-27;
 original Task 11, `:575`). The Phase 1 generic layout validator already
 accepts Q3_K routed triples with the Q8_0 signal path. Resident smoke and the
-undersized-cache stream A/B passed. Q3_K improved average NLL by 0.88% on the
-general set and 1.16% on web/Python; record and caveat are in
+undersized-cache stream A/B passed using the safe mapped-model fallback.
+Q3_K improved average NLL by 0.88% on the general set and 1.16% on web/Python;
+record and caveat are in
 `gguf-tools/quality-testing/data/laguna-xs21/README.md`.
 
-**P2.5 — Re-measure footprint.** Re-run the §4 sweep and `mini-notes.md`
-numbers against the new artifact. This is where the §5 projections get tested.
+**P2.5 — Re-measure footprint (blocked, 2026-07-27).** The uniform Q3_K
+artifact does reserve the intended cache budget at startup, but it is not yet
+cache-served in decode: the shipped engine deliberately keeps Q3 routed
+tensors mapped because its generic streaming address-table path has Q2_K and
+Q4_K kernels only. A ctx-16384 / `--prefill-chunk 4096` / 256-token run at an
+800-expert budget measured **0.00 GiB streaming experts**, a 1.68 GiB runtime
+after graph free, and 61.90 t/s — correct fallback behavior, not a footprint
+result. The 1,600/3,200/4,800-expert repeats likewise stayed at 0.00 GiB and
+about 62 t/s. Therefore the planned 2.89/3.89/5.91/7.92 GiB startup totals are
+reservations, not measured live Q3 cache use.
+
+The next blocking implementation item is a numerically exact Q3_K
+address-table pair/down path for the generic routed-MoE decode kernel, plus a
+targeted resident-vs-cached test that asserts nonzero cache entries and hits.
+An initial direct kernel experiment did fill the cache (1.01 GiB live, 78,466
+hits) but produced `|UNK|` immediately; it was reverted rather than weakening
+the safe fallback. Only after that test passes may P2.5 rerun the footprint
+sweep and claim the §5 projection.
 
 **P2.6 — Python expert hotlist** (original Tasks 12–13, `:609`, `:658`).
-Deliberately *after* re-measurement, because §5 shows it is a
+Deliberately *after* cache support and re-measurement, because §5 shows it is a
 throughput/SSD-traffic lever rather than a footprint one — its priority
 depends on what P2.5 finds.
 
