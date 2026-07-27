@@ -86,6 +86,8 @@ next sections.
   and CSV generation.
 - [tests/test-vectors/README.md](tests/test-vectors/README.md): official
   continuation vectors used for regression checks.
+- [docs/superpowers/roadmap.md](docs/superpowers/roadmap.md): cross-task
+  roadmap, active work, and deferred inference-sampling backlog.
 
 ## Model Weights
 
