@@ -1,7 +1,9 @@
 # P2.0 — Laguna XS 2.1 uniform routed-Q4_K probe
 
-**Status:** planned.  Preflight only has been completed; no quantization,
-imatrix collection, model inference, or GPU work has run.
+**Status:** uniformity premise proven for Q4_K (2026-07-27).  The probe is
+intentionally **not** a quality artifact: without imatrix it immediately
+reaches EOS on the A/B prompts, so it does not pass the stock A/B harness even
+though its resident and streamed outputs agree.
 
 ## Purpose
 
@@ -165,3 +167,75 @@ plausible generated text is insufficient evidence for this model family.
 When execution is authorized, append the exact command, quantizer version or
 commit, GGUF tensor-map evidence, ds4 startup lines, A/B transcript, artifact
 size, and final decision to this document.  Do not commit the generated GGUF.
+
+### Execution record — 2026-07-27
+
+#### Quantizer compatibility finding
+
+The local Homebrew `llama-quantize` (llama.cpp build 9580) failed before
+quantization with `unknown model architecture: 'laguna'`.  This is an
+architecture-support problem, not an override-syntax problem.  Current
+upstream contains `LLM_ARCH_LAGUNA`, so P2.0 used a fresh out-of-tree clone at
+commit `0e4a0362239713ea95a6864a17a8de4b0ad90d62` (llama.cpp build 10154),
+built with `GGML_METAL=ON`.  Future P2.3 work must pin a Laguna-capable
+llama.cpp revision; Homebrew 9580 is insufficient.
+
+#### Artifact and tensor-map result (A: pass)
+
+Command run, with no imatrix:
+
+```sh
+/Users/pauleveritt/src/llama.cpp/build/bin/llama-quantize \
+  --tensor-type ffn_gate_exps=q4_k \
+  --tensor-type ffn_up_exps=q4_k \
+  --tensor-type ffn_down_exps=q4_k \
+  /Users/pauleveritt/projects/ds4/gguf/Laguna-XS-2.1-BF16.gguf \
+  /Users/pauleveritt/projects/ds4/gguf/laguna-xs-2.1-uniform-routed-q4k-probe.gguf \
+  Q4_K_M
+```
+
+The untracked probe is 17.66 GiB by `ds4 --inspect`.  A GGUFReader inspection
+found exactly 117 routed tensors (39 sparse layers × gate/up/down): every one
+is GGML type 12 (`Q4_K`), with an identical 150,994,944-byte tensor size for
+each projection in every layer.  There are no Q6_K routed tensors.  Its full
+type histogram is F32 239 tensors / 0.08 GiB, Q4_K 398 / 17.36 GiB, Q6_K 41 /
+0.22 GiB.
+
+#### Runtime cache coverage (B: pass)
+
+With `--ssd-streaming --ssd-streaming-cache-experts 800 -c 8192` and the
+`def fizzbuzz(n):` prompt, ds4 emitted no mixed-precision or bypass-layer
+warning.  Cache statistics were 10,696 hits + 3,656 misses = 14,352 accesses.
+That is exactly 46 processed input tokens × 39 sparse layers × 8 selected
+experts, proving that every routed layer went through the cache.  The prior
+official Q4_K_M artifact could only account for 19 layers in this arithmetic.
+
+#### Correctness and quality result (C: qualified)
+
+The stock `tests/xs21_stream_ab.sh` exits at its first resident invocation
+because the no-imatrix probe generates `To` and then returns exit 1 on EOS;
+it therefore cannot print `xs21 stream A/B: OK`.  The official Q4_K_M baseline
+completes the same 128-token FizzBuzz prompt normally, so this probe must not
+be used as a quality artifact.
+
+To isolate the stream path, resident and streamed runs were compared manually
+under the same conditions.  They matched byte-for-byte and returned the same
+exit status for all four gate prompts:
+
+| prompt | output | exit status |
+|---|---|---:|
+| `def fizzbuzz(n):` | `To` | 1 |
+| `<html><head><title>` | `It` | 1 |
+| `Explain HTTP caching briefly.` | `HTTP` | 1 |
+| `import asyncio` | `To` | 1 |
+
+This establishes streaming equivalence for the uniform layout but does not
+replace the stock gate's quality-relevant success condition.
+
+#### Decision
+
+**P2.0 succeeds as its blocking premise test:** llama.cpp overrides can defeat
+the Q4_K_M boost heuristic and make all 39 Laguna routed layers cache-served.
+The footprint thesis therefore remains viable.  The no-imatrix Q4_K probe is
+discarded as a production candidate; P2.3 must use a Laguna-capable llama.cpp
+build and quality/imatrix work before evaluating any production quant.
