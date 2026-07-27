@@ -251,7 +251,7 @@ get under 10 GiB. **These are projections, not measurements.**
    where prefill caps). The original Laguna `--prefill-chunk` refusal was a
    stale guard, not a kernel limitation. P2.1 now enables it for XS 2.1 and
    corrects its memory accounting; `--prefill-chunk 4096` measured 0.99 GiB
-   scratch at ctx 16384. See
+   instrumented graph tensor payload at ctx 16384. See
    `docs/superpowers/research/laguna-xs21-p21-graph-scratch.md`.
 
 ---
@@ -343,9 +343,10 @@ first, cheaply.
 The `--prefill-chunk` refusal was incidental: the allocator already had a
 chunked prefill loop, but a stale family guard rejected the option and the
 allocator ignored it. XS 2.1 now supports it; a 4096-token cap measured 0.99
-GiB scratch at ctx 16384 rather than 3.97 GiB, with matching greedy output and
-a successful 6,642-token two-chunk prefill. Full evidence and the remaining
-benchmark follow-up are in `research/laguna-xs21-p21-graph-scratch.md`.
+GiB instrumented graph tensor payload at ctx 16384 rather than 3.97 GiB, with
+matching greedy output across a real 6,642-token chunk boundary. Full evidence
+and the remaining benchmark follow-up are in
+`research/laguna-xs21-p21-graph-scratch.md`.
 
 **P2.2 — Biased corpus builder** (original Task 9, `plan.md:483`).
 Unblocked, no GPU, independently startable. 55% web/Python, 30%

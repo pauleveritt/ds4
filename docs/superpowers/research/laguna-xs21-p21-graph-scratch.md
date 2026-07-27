@@ -1,6 +1,8 @@
 # P2.1 — Laguna XS 2.1 graph-scratch investigation and fix
 
-**Status:** complete, 2026-07-27.
+**Status:** complete, 2026-07-27.  The implementation has focused runtime and
+CPU-only regression coverage; the fixture-dependent full `ds4_test` suite is
+environment-blocked in this worktree (see Verification).
 
 ## Finding
 
@@ -38,15 +40,17 @@ so no kernel or routing change was required.
 Official `Laguna-XS-2.1-Q4_K_M`, Metal streaming, context 16384, 800-expert
 cache, one greedy output token:
 
-| prefill cap | graph scratch | planned graph context (KV + scratch) |
+| prefill cap | instrumented graph tensor payload | planned graph context (KV + scratch) |
 |---:|---:|---:|
 | default 16384 | 4069.45 MiB / 3.97 GiB | 4.66 GiB |
 | 4096 | 1017.66 MiB / 0.99 GiB | 1.68 GiB |
 
-The practical 4096-token cap saves **3.0 GiB** of graph scratch at context
-16384 while leaving the full KV context intact.  This is a measurement, not a
-projection.  Throughput needs a separate long-prompt benchmark; these short
-runs establish allocation and correctness, not a performance verdict.
+The practical 4096-token cap saves **3.0 GiB** of requested graph tensor
+payload at context 16384 while leaving the full KV context intact.  These
+figures instrument the allocator's requested tensor bytes; they do not claim
+to include Metal allocation granularity, tensor-object overhead, or the driver
+working set.  Throughput needs a separate long-prompt benchmark; no
+performance conclusion follows from these allocation measurements.
 
 ## Verification
 
@@ -58,7 +62,13 @@ runs establish allocation and correctness, not a performance verdict.
 - Greedy resident and streamed output with the 4096-token cap matched
   bytewise for the same 128-token run.
 - A temporary 6,642-token prompt ran under the 4096-token cap as two chunks:
-  `4096/6642`, then `6642/6642`.
+  `4096/6642`, then `6642/6642`.  Its 8-token greedy resident continuation
+  matched bytewise against the default 8192-token workspace, exercising an
+  actual chunk boundary.
+- `tests/test_engine_mgpu_placement` passed 103/103 checks, including the new
+  default/explicit/capped Laguna prefill policy and row-scaled scratch tests.
+- The existing Laguna S 2.1 artifact still rejects `--prefill-chunk` with the
+  XS-only diagnostic, preserving its prior contract.
 - `make ds4_test` built, but `./ds4_test` could not run because this dedicated
   worktree intentionally lacks its `ds4flash.gguf` fixture.  No symlink or
   default-model change was made to work around that environmental limitation.
@@ -66,7 +76,8 @@ runs establish allocation and correctness, not a performance verdict.
 ## Consequences for Phase 2
 
 P2.1 is no longer an open investigation.  A 4096-token prefill cap reduces
-the uniform-Q4_K projection at context 16384 from about 9.1 GiB to about
-6.1 GiB before any cache-budget tuning, and it makes 16 GB substantially more
-comfortable.  A production quality artifact must still satisfy the pending
-P2.0 stock A/B requirement before those projections become deployment claims.
+the uniform-Q4_K **payload-accounting projection** at context 16384 from about
+9.1 GiB to about 6.1 GiB before any cache-budget tuning, and it makes 16 GB
+substantially more comfortable.  A production quality artifact must still
+satisfy the pending P2.0 stock A/B requirement before those projections become
+deployment claims.

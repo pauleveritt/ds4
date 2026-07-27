@@ -1,0 +1,27 @@
+# P2.1 validation transcript, 2026-07-27
+# Model: /Users/pauleveritt/projects/ds4/gguf/Laguna-XS-2.1-Q4_K_M.gguf
+
+## ctx 16384 allocation accounting, --ssd-streaming --ssd-streaming-cache-experts 800
+default:
+ds4: memory detail: ctx=16384 prefill_cap=16384 raw_kv_rows=16384 compressed_kv_rows=512 backend=metal
+ds4: Laguna Metal graph: ctx=16384, prefill=16384, KV 0.68 GiB, scratch 4069.45 MiB
+
+--prefill-chunk 4096:
+ds4: memory detail: ctx=16384 prefill_cap=4096 raw_kv_rows=16384 compressed_kv_rows=512 backend=metal
+ds4: Laguna Metal graph: ctx=16384, prefill=4096, KV 0.68 GiB, scratch 1017.66 MiB
+
+## greedy output checks
+default-vs-chunk: OK
+chunked-resident-vs-streamed: OK
+long-resident-default-vs-chunk: OK
+
+## long prefill scheduling
+ds4: Laguna Metal graph: ctx=8192, prefill=4096, KV 0.37 GiB, scratch 1017.66 MiB
+processing 6642 input tokens: 4096/6642 (61.7%)
+processing 6642 input tokens: 6642/6642 (100.0%)
+
+## legacy contract
+ds4: --prefill-chunk for Laguna is only supported for Laguna XS 2.1
+
+## CPU-only regression target
+test_engine_mgpu_placement: 103/103 checks passed (0 failed)

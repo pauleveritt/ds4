@@ -57422,6 +57422,15 @@ uint32_t ds4_test_planner_raw_cap(int ctx_size, uint32_t prefill_cap) {
     return engine_planner_raw_cap(ctx_size, prefill_cap);
 }
 
+uint32_t ds4_test_laguna_prefill_cap(uint32_t ctx_size,
+                                     uint32_t prefill_chunk) {
+    return laguna_graph_prefill_cap(ctx_size, prefill_chunk);
+}
+
+uint64_t ds4_test_laguna_scratch_bytes(uint32_t prefill_cap) {
+    return laguna_graph_scratch_bytes(prefill_cap);
+}
+
 size_t ds4_test_per_tier_graph_overhead_bytes_with_prefill(
         int placement_ctx_hint,
         uint32_t prefill_chunk) {
