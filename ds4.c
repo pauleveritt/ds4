@@ -57431,6 +57431,14 @@ uint64_t ds4_test_laguna_scratch_bytes(uint32_t prefill_cap) {
     return laguna_graph_scratch_bytes(prefill_cap);
 }
 
+uint64_t ds4_test_laguna_xs21_scratch_bytes(uint32_t prefill_cap) {
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_LAGUNA_XS21;
+    const uint64_t bytes = laguna_graph_scratch_bytes(prefill_cap);
+    g_ds4_shape = saved;
+    return bytes;
+}
+
 size_t ds4_test_per_tier_graph_overhead_bytes_with_prefill(
         int placement_ctx_hint,
         uint32_t prefill_chunk) {

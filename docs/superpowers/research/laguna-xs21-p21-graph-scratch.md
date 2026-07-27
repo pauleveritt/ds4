@@ -6,7 +6,7 @@ environment-blocked in this worktree (see Verification).
 
 ## Finding
 
-The Phase 2 handoff correctly measured Laguna graph scratch but misidentified
+The Phase 2 handoff correctly reported Laguna graph tensor payload but misidentified
 the constraint as a fundamental lack of a `--prefill-chunk` lever.  The actual
 state was a stale family-level guard: the CLI accepted the option, then the
 Laguna engine rejected it before graph construction.  Beneath that guard,
@@ -65,8 +65,9 @@ performance conclusion follows from these allocation measurements.
   `4096/6642`, then `6642/6642`.  Its 8-token greedy resident continuation
   matched bytewise against the default 8192-token workspace, exercising an
   actual chunk boundary.
-- `tests/test_engine_mgpu_placement` passed 103/103 checks, including the new
-  default/explicit/capped Laguna prefill policy and row-scaled scratch tests.
+- `tests/test_engine_mgpu_placement` passed 104/104 checks, including the new
+  default/explicit/capped Laguna prefill policy, the exact XS 2.1 4096-row
+  payload total, and row-scaled scratch tests.
 - The existing Laguna S 2.1 artifact still rejects `--prefill-chunk` with the
   XS-only diagnostic, preserving its prior contract.
 - `make ds4_test` built, but `./ds4_test` could not run because this dedicated

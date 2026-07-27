@@ -77,7 +77,7 @@ uint32_t ds4_test_planner_prefill_cap(int prompt_len,
 uint32_t ds4_test_planner_raw_cap(int ctx_size, uint32_t prefill_cap);
 uint32_t ds4_test_laguna_prefill_cap(uint32_t ctx_size,
                                      uint32_t prefill_chunk);
-uint64_t ds4_test_laguna_scratch_bytes(uint32_t prefill_cap);
+uint64_t ds4_test_laguna_xs21_scratch_bytes(uint32_t prefill_cap);
 size_t ds4_test_glm_per_layer_kv_bytes(uint32_t layer, int ctx_size);
 
 /* DS4_N_LAYER constant is private to ds4.c; for the test we use
@@ -581,11 +581,15 @@ static void test_laguna_prefill_chunk_accounting(void) {
     CHECK(ds4_test_laguna_prefill_cap(8192, 32768) == 8192,
           "Laguna caps an explicit prefill chunk at context");
 
-    const uint64_t one = ds4_test_laguna_scratch_bytes(1);
-    const uint64_t two = ds4_test_laguna_scratch_bytes(2);
-    const uint64_t four_k = ds4_test_laguna_scratch_bytes(4096);
-    const uint64_t eight_k = ds4_test_laguna_scratch_bytes(8192);
+    const uint64_t one = ds4_test_laguna_xs21_scratch_bytes(1);
+    const uint64_t two = ds4_test_laguna_xs21_scratch_bytes(2);
+    const uint64_t four_k = ds4_test_laguna_xs21_scratch_bytes(4096);
+    const uint64_t eight_k = ds4_test_laguna_xs21_scratch_bytes(8192);
     const uint64_t per_row = two - one;
+    /* XS 2.1 independently totals 260420 bytes per activation row plus
+     * 409608 fixed bytes for input/logits/scalars. */
+    CHECK(four_k == 1067089928ull,
+          "Laguna XS 2.1 4096-row graph payload matches the independent layout total");
     CHECK(eight_k > four_k,
           "Laguna graph scratch grows with prefill width");
     CHECK(eight_k - four_k == 4096ull * per_row,
