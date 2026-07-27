@@ -1,9 +1,10 @@
 # P2.0 — Laguna XS 2.1 uniform routed-Q4_K probe
 
-**Status:** uniformity premise proven for Q4_K (2026-07-27).  The probe is
-intentionally **not** a quality artifact: without imatrix it immediately
-reaches EOS on the A/B prompts, so it does not pass the stock A/B harness even
-though its resident and streamed outputs agree.
+**Status:** the uniformity and decode-static-footprint premises are proven for
+Q4_K (2026-07-27); **P2.0 as originally specified is not fully accepted**.
+The no-imatrix probe immediately reaches EOS on the A/B prompts, so it cannot
+pass the authoritative stock A/B harness.  It proves layout/cache admission,
+not production correctness or quality.
 
 ## Purpose
 
@@ -210,6 +211,14 @@ That is exactly 46 processed input tokens × 39 sparse layers × 8 selected
 experts, proving that every routed layer went through the cache.  The prior
 official Q4_K_M artifact could only account for 19 layers in this arithmetic.
 
+Automatic-cache startup measured the decode-static span directly.  The
+official Q4_K_M artifact reports **9.64 GiB** of non-routed weights and warns
+that 20/39 routed layers bypass the cache; the uniform probe reports **1.20
+GiB** and no bypass warning.  The measured reduction is therefore **8.44
+GiB**, matching the §5 estimate closely.  Raw startup extracts are preserved
+in `docs/superpowers/research/laguna-xs21-p20/`; the exhaustive 117-tensor
+routed map is preserved there as well.
+
 #### Correctness and quality result (C: qualified)
 
 The stock `tests/xs21_stream_ab.sh` exits at its first resident invocation
@@ -229,13 +238,19 @@ exit status for all four gate prompts:
 | `Explain HTTP caching briefly.` | `HTTP` | 1 |
 | `import asyncio` | `To` | 1 |
 
-This establishes streaming equivalence for the uniform layout but does not
-replace the stock gate's quality-relevant success condition.
+This establishes only degenerate early-EOS equivalence for the uniform layout.
+It does **not** replace the stock gate's quality-relevant 128-token success
+condition and must not be presented as decode-stream correctness acceptance.
 
 #### Decision
 
-**P2.0 succeeds as its blocking premise test:** llama.cpp overrides can defeat
-the Q4_K_M boost heuristic and make all 39 Laguna routed layers cache-served.
-The footprint thesis therefore remains viable.  The no-imatrix Q4_K probe is
-discarded as a production candidate; P2.3 must use a Laguna-capable llama.cpp
-build and quality/imatrix work before evaluating any production quant.
+**The P2.0 uniformity subgate succeeds:** llama.cpp overrides can defeat the
+Q4_K_M boost heuristic, make all 39 Laguna routed layers cache-served, and
+reduce the measured decode-static span by 8.44 GiB.  The footprint thesis
+therefore remains viable.
+
+**Full P2.0 acceptance remains pending.** The no-imatrix Q4_K probe is
+discarded as a production candidate.  Before a production quant or P2.3 is
+accepted, a quality-viable uniform artifact must use the pinned
+Laguna-capable llama.cpp build, preserve its full evidence, and pass
+`tests/xs21_stream_ab.sh` through all four 128-token prompts.
