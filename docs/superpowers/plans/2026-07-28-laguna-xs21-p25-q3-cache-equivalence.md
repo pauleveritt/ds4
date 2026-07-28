@@ -24,8 +24,10 @@ The direct-buffer controls are now exact for both one expert and eight
 selected experts at production dimensions (2048 output / 512 mid), with a
 permuted selected-id order. The raw-GPU-address candidate is exact over the
 same fixture. Basic direct-buffer binding, slot order, selected ids, Q3 down
-geometry, and raw-address consumption are no longer leading hypotheses. The
-next rung is an artifact-backed single-layer integration harness.
+geometry, and raw-address consumption for owned MTL buffers are no longer
+leading hypotheses. The artifact-backed check shows raw addresses into the
+mmap-backed model view yield zero, so the next rung is owned cache-style
+buffers and cache address-table/resource-lifetime integration.
 
 ## Current topology
 
@@ -57,11 +59,11 @@ as shipped and must remain so until the new proof succeeds.
 
 ## Design hypotheses to test
 
-1. **The old engine experiment does not identify the failing contract.** Its
-   direct-slot down candidate diverged, but its mapped-model-address toggle
-   was ineffective because that kernel did not read the table. The new
-   production-shape direct-buffer and raw-address controls are exact, so the
-   remaining issue is their integration into the engine path.
+1. **Raw pointers depend on buffer provenance.** The old engine
+   mapped-model-address toggle was ineffective because its direct-slot kernel
+   did not read the table. The replacement artifact-backed raw-address check
+   establishes that owned MTL buffers are valid, whereas mmap-backed model-view
+   addresses yield zero. The remaining issue is owned cache-buffer integration.
 2. **The Q3 down path is the failure locus.** The experiment matched the
    complete gate/up intermediate exactly, then diverged at output byte 16,385
    (the first down float).  Cache bytes and CPU address-table entries were
@@ -136,10 +138,11 @@ Use several block patterns, including nonzero high masks/scales and multiple
 selected experts, so a zero-filled fixture cannot hide Q3 packing errors.
 The fixture may be generated at test time, but its encoding must be explicit
 and deterministic. The committed controls cover one and eight selected experts,
-including direct-buffer and raw-address candidates at production shape. Add an
-artifact-backed single-layer harness before Levels A/C/D; it may use the local
-model for diagnosis but must not become the portable regression test because
-it would depend on an untracked 14.64 GiB model.
+including direct-buffer and raw-address candidates at production shape. The
+artifact-backed mapped-model check is diagnostic only; next compare owned
+cache-style buffers before Levels A/C/D. It may use the local model but must
+not become the portable regression test because it would depend on an
+untracked 14.64 GiB model.
 
 ### 3. Cache-integration proof
 

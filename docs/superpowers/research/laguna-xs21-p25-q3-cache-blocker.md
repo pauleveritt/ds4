@@ -92,7 +92,10 @@ valid.
 
 The old mapped-model-address conclusion was corrected by source review: that
 toggle changed an address table while the experiment had selected a direct-slot
-kernel that did not read it. It is not evidence against raw GPU addresses.
+kernel that did not read it. A new opt-in artifact-backed check now tests that
+case for real: a raw address into the mmap-backed model view yields zero while
+the resident bound-buffer kernel reads the same Q3 bytes correctly. Raw GPU
+addresses work for owned MTL buffers, but not for this model-view buffer.
 
 This is now a Q3 down kernel/invocation-contract blocker.  It is not evidence
 against the artifact, its cache contents, pair path, or cache accounting.
@@ -111,7 +114,9 @@ and raw-address semantics. It does **not** overturn the real-artifact
 eight-slot failure; that discrepancy is now an engine-integration or prior
 experimental-wiring problem rather than a Q3 down-kernel problem. In
 particular, the prior mapped-model-address result was inconclusive, not a
-counterexample to the passing raw-address control.
+counterexample to the passing raw-address control. The replacement
+artifact-backed result establishes the relevant distinction: owned cache
+buffers can use raw addresses; mmap-backed model views cannot.
 
 ## Independent review
 
@@ -141,11 +146,11 @@ are lower, and the scorer has a documented tokenization/path floor.
 
 ## Required next implementation sequence
 
-1. Build an artifact-backed single-layer harness using the real Q3 tensor
-   slices, selected ids, and `mid` input captured from a decode step. Compare
-   resident, direct-buffer, and raw-address down dispatches before running the
-   full routed-MoE engine path.
-2. Diagnose the resulting integration discrepancy until the selected candidate is
+1. Extend the artifact-backed check to selected experts copied into owned
+   cache-style MTL buffers. Compare direct-buffer and raw-address down output
+   with the resident result, then verify cache address-table publication and
+   resource lifetime in the generic routed-MoE path.
+2. Diagnose the resulting cache-buffer integration discrepancy until the selected candidate is
    exact.  Do not enable Q3 cache service beforehand.
 3. Enable coherent Q3 cache eligibility in both the generic Metal path and
    `laguna_decode_experts_cache_servable()`, so cache-service eligibility and
