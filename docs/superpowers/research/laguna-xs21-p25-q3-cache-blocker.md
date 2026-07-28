@@ -29,7 +29,7 @@ footprint claim.  Startup reservations alone do not answer it.
 The artifact retains Q8 shared experts and has uniform Q3 routed gate/up/down
 tensors.  Its format is not the problem.
 
-## Measurement result
+## Superseded mapped-fallback measurement
 
 All runs used context 16384, `--prefill-chunk 4096`, and a 256-token greedy
 generation.  The figures below distinguish ds4's planned startup total from
@@ -46,6 +46,22 @@ No run reported cache entries, hits, or a live Q3 expert allocation.  The
 stable generation rate across budgets is consistent with a mapped fallback,
 not a cache whose capacity is changing.  Therefore the startup totals are
 reservations, **not measured streaming footprints**.
+
+## Measured Q3 cache footprint (2026-07-28)
+
+After exact Q3 cache admission, the same ctx-16384 / prefill-chunk-4096 /
+256-token greedy sweep reports live allocations as intended:
+
+| cache budget | live cache | hit rate | prefill | generation |
+|---:|---:|---:|---:|---:|
+| 800 experts | 1.01 GiB | 48.4% | 224.02 t/s | 33.55 t/s |
+| 1,600 experts | 2.01 GiB | 63.4% | 226.41 t/s | 34.47 t/s |
+| 3,200 experts | 4.03 GiB | 79.2% | 223.84 t/s | 36.85 t/s |
+| 4,800 experts | 6.04 GiB | 87.6% | 226.57 t/s | 37.41 t/s |
+
+Context runtime is 1.68 GiB after graph free and the resident model span is
+0.20 GiB. Planned totals are 2.89/3.89/5.91/7.92 GiB respectively. These are
+now measured cache footprints, not the previous mapped-fallback reservations.
 
 ## Source-level diagnosis
 
