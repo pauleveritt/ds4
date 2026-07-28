@@ -95,6 +95,16 @@ against the artifact, its cache contents, pair path, or cache accounting.
 The removed code must not be restored as a starting point; an isolated down
 equivalence test is required before another production-path attempt.
 
+### First isolated control
+
+The first committed harness rung now uses one selected expert, nonzero
+deterministic Q3_K data, the resident 64-thread Q3 geometry, and a separately
+allocated directly-bound MTL buffer.  Its candidate is bit-exact to the
+resident Q3 down output.  This proves that a basic Q3 direct buffer binding
+and the shared down reduction are sound in isolation; it does **not** overturn
+the real-artifact eight-slot failure.  The next rung must add production
+multi-expert slot selection before retesting raw GPU addresses.
+
 ## Independent review
 
 Sol independently reviewed commits `538d2ab..2f26d91` and found no blocking
@@ -123,10 +133,10 @@ are lower, and the scorer has a documented tokenization/path floor.
 
 ## Required next implementation sequence
 
-1. Commit an isolated Q3 down-equivalence harness with controlled nonzero
-   Q3_K blocks and production dispatch geometry.  It must compare resident
-   down with both a mapped-model address candidate and a regular
-   slot-buffer-bound candidate, using the same supplied `mid` input.
+1. Extend the passing one-expert direct-buffer control to eight selected
+   experts and production dimensions (2048 input/output, 512 mid), retaining
+   the same supplied `mid` input.  Only then add the mapped-model raw-address
+   candidate to the same ladder.
 2. Diagnose the resulting minimal failure until the selected candidate is
    exact.  Do not enable Q3 cache service beforehand.
 3. Enable coherent Q3 cache eligibility in both the generic Metal path and

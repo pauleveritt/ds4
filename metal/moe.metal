@@ -2219,6 +2219,43 @@ kernel void kernel_glm_q3_K_down_f32(
     (void)scratch;
 }
 
+/* Test-only one-expert control for the Q3 streamed-cache investigation.  It
+ * deliberately consumes a distinct directly-bound buffer rather than the
+ * resident tensor base, while preserving the resident Q3 reduction and
+ * dispatch geometry.  This establishes the minimal buffer-binding baseline
+ * before raw-address or multi-slot candidates are considered. */
+kernel void kernel_glm_q3_K_down_one_bound_f32(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *down,
+        device const float *mid,
+        device float *out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const short NSG = 2;
+    const uint row0 =
+        ((uint)tgpig.x * (uint)NSG + (uint)sgitg) * N_R0_Q3_K;
+    const uint token = tgpig.y;
+    if (row0 >= args.out_dim || token >= args.n_tokens) return;
+
+    const uint64_t mid_base =
+        (uint64_t)token * args.mid_token_stride;
+    const float2 sum = ds4_glm_q3_K_dot2(
+        down + (uint64_t)row0 * args.down_row_bytes,
+        args.down_row_bytes,
+        args.mid_dim,
+        mid + mid_base,
+        tiisg);
+    for (short row = 0;
+         row < N_R0_Q3_K && row0 + (uint)row < args.out_dim;
+         row++) {
+        const float value = simd_sum(sum[row]);
+        if (tiisg == 0u) {
+            out[(uint64_t)token * args.out_dim + row0 + (uint)row] = value;
+        }
+    }
+}
+
 kernel void kernel_glm_q2_K_down_f32(
         constant ds4_metal_glm_routed_moe_args &args,
         device const char *down,

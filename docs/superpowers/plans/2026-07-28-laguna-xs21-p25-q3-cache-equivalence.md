@@ -19,6 +19,12 @@ variant also diverged.  The investigation should therefore begin with a
 minimal Q3 down invocation contract, rather than revisiting quantization, the
 cache allocator, or Phase 1's Laguna dispatch.
 
+The minimal one-expert direct-buffer control is now implemented and exact. It
+uses a separate MTL buffer with deterministic nonzero Q3_K data, so basic
+direct-buffer binding is no longer the leading hypothesis. The next rung is
+multi-expert slot selection at production dimensions, followed by raw-address
+consumption.
+
 ## Current topology
 
 Laguna XS 2.1 has Q8 shared experts, so its routed Q3 decode takes the generic
@@ -127,10 +133,12 @@ gate.
 Use several block patterns, including nonzero high masks/scales and multiple
 selected experts, so a zero-filled fixture cannot hide Q3 packing errors.
 The fixture may be generated at test time, but its encoding must be explicit
-and deterministic.  Start with Level B alone, then add Levels A/C/D only
-after B is exact.  An interim artifact-backed harness may accelerate local
-diagnosis; it is not the final regression test because it would make the
-suite depend on an untracked 14.64 GiB model.
+and deterministic. The committed first rung is a one-expert direct-buffer
+control. Extend it to eight selected experts at production dimensions before
+adding the raw-address candidate; then add Levels A/C/D only after that
+multi-expert Level B is exact. An interim artifact-backed harness may
+accelerate local diagnosis; it is not the final regression test because it
+would make the suite depend on an untracked 14.64 GiB model.
 
 ### 3. Cache-integration proof
 
