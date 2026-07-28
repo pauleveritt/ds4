@@ -82,13 +82,17 @@ checks localize that failure more tightly:
 | Q3 down output immediately following that `mid` | First differing byte: 16,385 | Divergence begins at the first down-output float. |
 | Cached gate/up/down bytes | Exact `memcmp` against each mapped GGUF tensor slice | Not a pread/copy, expert-stride, or slab-content failure. |
 | Address-table entries | Exact cached MTL buffer GPU address plus inner offset | Not CPU-side address-table construction. |
-| Q3 down address entries replaced with the mapped model-view addresses | Same divergence | Not specific to cached slabs or cache-buffer lifetime. |
+| Old “mapped-model address” toggle | Inconclusive | The selected direct-slot kernel did not consume the address table, so changing its entries could not test mapped raw addresses. |
 | Direct slot-bound cached-down buffers, bypassing raw address-table lookup | Same down divergence | A simple raw-address indirection replacement is not a fix. |
 
 The resident down result has magnitudes around `1e4`; the candidate down
 result was around `1e-2`.  The live cache allocation and hit count therefore
 prove only that loading and accounting ran, not that its Q3 down output was
 valid.
+
+The old mapped-model-address conclusion was corrected by source review: that
+toggle changed an address table while the experiment had selected a direct-slot
+kernel that did not read it. It is not evidence against raw GPU addresses.
 
 This is now a Q3 down kernel/invocation-contract blocker.  It is not evidence
 against the artifact, its cache contents, pair path, or cache accounting.
@@ -105,7 +109,9 @@ candidate are bit-exact to the resident Q3 down output. This rules out basic
 Q3 direct-buffer binding, slot order, selected-id permutation, down geometry,
 and raw-address semantics. It does **not** overturn the real-artifact
 eight-slot failure; that discrepancy is now an engine-integration or prior
-experimental-wiring problem rather than a Q3 down-kernel problem.
+experimental-wiring problem rather than a Q3 down-kernel problem. In
+particular, the prior mapped-model-address result was inconclusive, not a
+counterexample to the passing raw-address control.
 
 ## Independent review
 

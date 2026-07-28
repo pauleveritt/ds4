@@ -384,8 +384,9 @@ The next blocking implementation item is a numerically exact Q3_K down
 projection equivalence harness for the generic routed-MoE decode kernel. The
 real-artifact experiment proved exact gate/up intermediate agreement, then
 diverged at the first down-output float. Its cache bytes and CPU address table
-were exact; using mapped-model raw addresses, and separately direct
-slot-bound buffers, still diverged. A diagnostic run allocated 1.01 GiB and
+were exact. The old mapped-model-address toggle was later found inconclusive:
+the selected direct-slot down kernel did not read that address table. A
+diagnostic run allocated 1.01 GiB and
 recorded 38,612 hits / 1,012 misses, then produced `|UNK|`; it was fully
 removed rather than weakening the safe fallback. The harness must make a
 resident Q3 down reference and each candidate consume the same nonzero

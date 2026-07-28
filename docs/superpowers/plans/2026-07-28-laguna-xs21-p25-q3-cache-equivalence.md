@@ -13,9 +13,10 @@ output.
 
 The first failed experiment is useful evidence: cache allocation and the Q3
 gate/up pair worked exactly, while divergence began at the first Q3 down
-output float.  Cached bytes, cache GPU addresses, and a mapped-model raw
-address variant were independently verified; a direct slot-buffer down
-variant also diverged.  The investigation should therefore begin with a
+output float. Cached bytes and cache GPU addresses were independently
+verified; the prior mapped-model-address toggle was later found inconclusive
+because the selected direct-slot kernel did not read its address table. The
+investigation should therefore begin with a
 minimal Q3 down invocation contract, rather than revisiting quantization, the
 cache allocator, or Phase 1's Laguna dispatch.
 
@@ -56,11 +57,11 @@ as shipped and must remain so until the new proof succeeds.
 
 ## Design hypotheses to test
 
-1. **The Q3 down invocation contract is not yet known.** A raw GPU-address
-   candidate diverges even when pointed at the mapped model view, and a
-   direct-slot MTL-buffer candidate also diverges.  Q4's architecture is only
-   an architectural reference; it cannot be treated as evidence that Q3 can
-   consume the same bindings.
+1. **The old engine experiment does not identify the failing contract.** Its
+   direct-slot down candidate diverged, but its mapped-model-address toggle
+   was ineffective because that kernel did not read the table. The new
+   production-shape direct-buffer and raw-address controls are exact, so the
+   remaining issue is their integration into the engine path.
 2. **The Q3 down path is the failure locus.** The experiment matched the
    complete gate/up intermediate exactly, then diverged at output byte 16,385
    (the first down float).  Cache bytes and CPU address-table entries were
