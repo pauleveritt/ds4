@@ -165,12 +165,9 @@ table supports lower teacher-forced average NLL versus the local Q4 fixtures,
 not a general claim that Q3 quality improved.  First-token agreement and LCP
 are lower, and the scorer has a documented tokenization/path floor.
 
-## Required next implementation sequence
+## Completed implementation sequence
 
-1. **Complete:** Q3 address-table pair/down kernels now run only behind
-   `DS4_METAL_GLM_Q3_STREAM_ADDR_DIAGNOSTIC`; normal Q3 eligibility and static
-   spans are unchanged.
-2. **Failed diagnostic integration:** the real Q3 cache path populated 800
+1. The diagnostic Q3 address-table pair/down implementation populated 800
    entries (1.01 GiB live; 5,323 hits / 4,349 misses over a 32-token greedy
    run) but diverged immediately from the resident continuation.  This proves
    the cache tables are live, but not numerically correct end-to-end.  The new
@@ -180,16 +177,11 @@ are lower, and the scorer has a documented tokenization/path floor.
    and down kernels. Moving the collectives outside the lane-0 store made all
    39 layers' cache `mid` and down output bit-exact; the four-prompt,
    128-token resident-vs-streamed A/B then passed with nonzero live cache.
-3. Enable coherent Q3 cache eligibility in both the generic Metal path and
-   `laguna_decode_experts_cache_servable()`, so cache-service eligibility and
+2. Q3 now has coherent generic Metal eligibility and
+   `laguna_decode_experts_cache_servable()` admission, so cache service and
    decode static-span construction agree.
-4. Extend the regression test to require nonzero cache entries, hits, and
-   live bytes and to assert the expected Q3 routed static-span reduction.
-5. Run `tests/xs21_stream_ab.sh`, then rerun the 800/1600/3200/4800 MiB sweep.
-   Only those results may replace the provisional footprint projections.
-
-P2.6 hotlist work and any constrained-hardware acceptance claim remain
-blocked behind this sequence.
+3. `tests/xs21_stream_ab.sh` passed, and the 800/1600/3200/4800 sweep is
+   recorded above. P2.6 hotlisting is now the next optional throughput work.
 
 ## Evidence and scope
 

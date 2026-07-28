@@ -369,38 +369,17 @@ Q3_K improved average NLL by 0.88% on the general set and 1.16% on web/Python;
 record and caveat are in
 `gguf-tools/quality-testing/data/laguna-xs21/README.md`.
 
-**P2.5 — Q3 cache equivalence, then re-measure footprint (equivalence complete, 2026-07-28).** The uniform Q3_K
-artifact does reserve the intended cache budget at startup, but it is not yet
-cache-served in decode: the shipped engine deliberately keeps Q3 routed
-tensors mapped because its generic streaming address-table path has Q2_K and
-Q4_K kernels only. A ctx-16384 / `--prefill-chunk 4096` / 256-token run at an
-800-expert budget measured **0.00 GiB streaming experts**, a 1.68 GiB runtime
-after graph free, and 61.90 t/s — correct fallback behavior, not a footprint
-result. The 1,600/3,200/4,800-expert repeats likewise stayed at 0.00 GiB and
-about 62 t/s. Therefore the planned 2.89/3.89/5.91/7.92 GiB startup totals are
-reservations, not measured live Q3 cache use.
-
-The numerically exact Q3_K down-projection harness is now complete: controlled
-one/eight-expert cases and a real artifact layer are exact for rebound mapped
-views, an owned full-tensor copy, and raw GPU addressing. The artifact check
-initially reported zero candidates because it read an uncommitted graph batch;
-its opt-in diagnostic now commits/waits before readback. The old cache
-experiment still matters: it allocated 1.01 GiB and recorded 38,612 hits /
-1,012 misses, then produced `|UNK|`; it remains fully removed rather than
-weakening the safe fallback. The next implementation item is diagnostic-only
-Q3 cache-service integration using actual selected cache buffers and address
-tables. It must assert intermediate gate/up and final down equality, nonzero
-cache entries/hits/live bytes, and the expected drop in routed decode static
-span. A working kernel is not enough:
-`laguna_decode_experts_cache_servable()` must also admit coherent Q3, or the
-tensors will remain mapped and the footprint objective will still fail. Only
-after these gates pass may P2.5 rerun the footprint sweep and claim the §5
-projection. Full evidence, the independent review, and the implementation
-sequence are in
+**P2.5 — Q3 cache equivalence and footprint sweep (complete, 2026-07-28).**
+Sol identified a lane-0-only `simd_sum` bug in the Q3 address pair/down
+kernels. The corrected cache path is bit-exact across all 39 layers, passes
+the four-prompt greedy A/B, and Q3 is admitted coherently into both cache
+service and decode static-span construction. At ctx 16384 / prefill-chunk 4096
+/ 256 greedy tokens, 800/1600/3200/4800 entries measured live cache
+1.01/2.01/4.03/6.04 GiB at 33.55/34.47/36.85/37.41 t/s. Full evidence is in
 `research/laguna-xs21-p25-q3-cache-blocker.md`.
-The staged kernel/test/admission proposal is in
+The staged proposal is retained in
 `plans/2026-07-28-laguna-xs21-p25-q3-cache-equivalence.md`; it is a
-brainstorming plan, not an implementation commitment.
+historical brainstorming plan.
 
 **P2.6 — Python expert hotlist** (original Tasks 12–13, `:609`, `:658`).
 Deliberately *after* cache support and re-measurement, because §5 shows it is a
@@ -417,9 +396,7 @@ On real constrained hardware. `mini-notes.md` §7 is the checklist.
   reliably catches it.
 - **Re-measure rather than trusting §4/§5 numbers** once the artifact changes.
   The projections in §5 are arithmetic, not measurement.
-- **Keep raw measurement transcripts with any future P2.5 table.** The
-  current 0-live-cache result is source-supported, but future exact memory,
-  throughput, and hit-rate comparisons need retained command output.
+- **Keep raw measurement transcripts with any future P2.5 table.**
 - **State quality narrowly.** Lower local teacher-forced average NLL versus
   the Q4 fixtures is a provisional artifact gate, not a general quality
   improvement claim; agreement/LCP and scorer limitations remain material.
