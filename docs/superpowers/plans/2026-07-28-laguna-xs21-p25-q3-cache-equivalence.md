@@ -21,9 +21,10 @@ cache allocator, or Phase 1's Laguna dispatch.
 
 The direct-buffer controls are now exact for both one expert and eight
 selected experts at production dimensions (2048 output / 512 mid), with a
-permuted selected-id order. Basic direct-buffer binding, slot order, selected
-ids, and Q3 down geometry are no longer leading hypotheses. The next rung is
-raw-address consumption over that exact same fixture.
+permuted selected-id order. The raw-GPU-address candidate is exact over the
+same fixture. Basic direct-buffer binding, slot order, selected ids, Q3 down
+geometry, and raw-address consumption are no longer leading hypotheses. The
+next rung is an artifact-backed single-layer integration harness.
 
 ## Current topology
 
@@ -133,12 +134,11 @@ gate.
 Use several block patterns, including nonzero high masks/scales and multiple
 selected experts, so a zero-filled fixture cannot hide Q3 packing errors.
 The fixture may be generated at test time, but its encoding must be explicit
-and deterministic. The committed direct-buffer controls cover one and eight
-selected experts, including the production-shape multi-expert Level B. Add the
-raw-address candidate to that exact fixture; then add Levels A/C/D only after
-it is exact. An interim artifact-backed harness may accelerate local diagnosis;
-it is not the final regression test because it would make the suite depend on
-an untracked 14.64 GiB model.
+and deterministic. The committed controls cover one and eight selected experts,
+including direct-buffer and raw-address candidates at production shape. Add an
+artifact-backed single-layer harness before Levels A/C/D; it may use the local
+model for diagnosis but must not become the portable regression test because
+it would depend on an untracked 14.64 GiB model.
 
 ### 3. Cache-integration proof
 

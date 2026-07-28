@@ -224,6 +224,7 @@ static id<MTLComputePipelineState> g_glm_q2_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q3_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q3_k_down_one_bound_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q3_k_down_slots8_bound_f32_pipeline;
+static id<MTLComputePipelineState> g_glm_q3_k_down_addr_test_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_addr_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_addr_down_f32_pipeline;
@@ -7937,6 +7938,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_q3_K_down_one_bound_f32");
         g_glm_q3_k_down_slots8_bound_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q3_K_down_slots8_bound_f32");
+        g_glm_q3_k_down_addr_test_f32_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_q3_K_down_addr_test_f32");
         g_glm_q4_k_down_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q4_K_down_simd_f32");
         g_glm_q2_k_addr_down_f32_pipeline =
@@ -8054,6 +8057,7 @@ int ds4_gpu_init(void) {
             !g_glm_q3_k_down_f32_pipeline ||
             !g_glm_q3_k_down_one_bound_f32_pipeline ||
             !g_glm_q3_k_down_slots8_bound_f32_pipeline ||
+            !g_glm_q3_k_down_addr_test_f32_pipeline ||
             !g_glm_q4_k_down_f32_pipeline ||
             !g_glm_q2_k_addr_down_f32_pipeline ||
             !g_glm_q4_k_addr_down_f32_pipeline ||
@@ -8362,6 +8366,7 @@ int ds4_gpu_test_glm_q3_down_slots8_bound_equivalence(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!g_glm_q3_k_down_f32_pipeline ||
         !g_glm_q3_k_down_slots8_bound_f32_pipeline ||
+        !g_glm_q3_k_down_addr_test_f32_pipeline ||
         sizeof(ds4_gpu_test_block_q3_k) != 110u) {
         return 0;
     }
@@ -8388,13 +8393,18 @@ int ds4_gpu_test_glm_q3_down_slots8_bound_equivalence(void) {
         }
         id<MTLBuffer> selected =
             [g_device newBufferWithLength:n_expert * sizeof(int32_t) options:shared];
+        id<MTLBuffer> addresses =
+            [g_device newBufferWithLength:n_expert * sizeof(uint64_t) options:shared];
         id<MTLBuffer> mid =
             [g_device newBufferWithLength:(NSUInteger)mid_bytes options:shared];
         id<MTLBuffer> out_ref =
             [g_device newBufferWithLength:(NSUInteger)out_bytes options:shared];
         id<MTLBuffer> out_slots =
             [g_device newBufferWithLength:(NSUInteger)out_bytes options:shared];
-        if (!down_ref || !selected || !mid || !out_ref || !out_slots) return 0;
+        id<MTLBuffer> out_addr =
+            [g_device newBufferWithLength:(NSUInteger)out_bytes options:shared];
+        if (!down_ref || !selected || !addresses || !mid || !out_ref || !out_slots ||
+            !out_addr) return 0;
         for (uint32_t slot = 0; slot < n_expert; slot++) {
             if (!slots[slot]) return 0;
         }
@@ -8402,7 +8412,8 @@ int ds4_gpu_test_glm_q3_down_slots8_bound_equivalence(void) {
         uint8_t *reference_bytes = (uint8_t *)[down_ref contents];
         float *mid_values = (float *)[mid contents];
         int32_t *selected_values = (int32_t *)[selected contents];
-        if (!reference_bytes || !mid_values || !selected_values) return 0;
+        uint64_t *address_values = (uint64_t *)[addresses contents];
+        if (!reference_bytes || !mid_values || !selected_values || !address_values) return 0;
         memset(reference_bytes, 0, (size_t)total_bytes);
         for (uint32_t expert = 0; expert < n_expert; expert++) {
             for (uint32_t row = 0; row < out_dim; row++) {
@@ -8433,6 +8444,8 @@ int ds4_gpu_test_glm_q3_down_slots8_bound_equivalence(void) {
             memcpy([slots[slot] contents],
                    reference_bytes + (uint64_t)selected_ids[slot] * expert_bytes,
                    (size_t)expert_bytes);
+            address_values[selected_ids[slot]] = (uint64_t)[slots[slot] gpuAddress];
+            if (address_values[selected_ids[slot]] == 0) return 0;
             for (uint32_t i = 0; i < mid_dim; i++) {
                 const int value =
                     (int)((slot * 43u + i * 17u + (i >> 2u) * 7u) % 127u) - 63;
@@ -8441,6 +8454,7 @@ int ds4_gpu_test_glm_q3_down_slots8_bound_equivalence(void) {
         }
         memset([out_ref contents], 0, (size_t)out_bytes);
         memset([out_slots contents], 0, (size_t)out_bytes);
+        memset([out_addr contents], 0, (size_t)out_bytes);
 
         const ds4_gpu_glm_routed_moe_args args = {
             .in_dim = mid_dim,
@@ -8473,6 +8487,20 @@ int ds4_gpu_test_glm_q3_down_slots8_bound_equivalence(void) {
         ds4_gpu_end_compute_encoder(cb, enc);
 
         enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_glm_q3_k_down_addr_test_f32_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:addresses offset:0 atIndex:1];
+        [enc setBuffer:selected offset:0 atIndex:2];
+        [enc setBuffer:mid offset:0 atIndex:3];
+        [enc setBuffer:out_addr offset:0 atIndex:4];
+        for (uint32_t slot = 0; slot < n_expert; slot++) {
+            [enc useResource:slots[slot] usage:MTLResourceUsageRead];
+        }
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:g_glm_q3_k_down_slots8_bound_f32_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         for (uint32_t slot = 0; slot < n_expert; slot++) {
@@ -8489,12 +8517,19 @@ int ds4_gpu_test_glm_q3_down_slots8_bound_equivalence(void) {
 
         const float *reference = (const float *)[out_ref contents];
         const float *candidate = (const float *)[out_slots contents];
-        if (!reference || !candidate) return 0;
+        const float *raw_candidate = (const float *)[out_addr contents];
+        if (!reference || !candidate || !raw_candidate) return 0;
         for (uint32_t i = 0; i < out_dim; i++) {
             if (memcmp(&reference[i], &candidate[i], sizeof(float)) != 0) {
                 fprintf(stderr,
                         "ds4: Q3 slots8 down mismatch index=%u reference=%g candidate=%g\n",
                         i, reference[i], candidate[i]);
+                return 0;
+            }
+            if (memcmp(&reference[i], &raw_candidate[i], sizeof(float)) != 0) {
+                fprintf(stderr,
+                        "ds4: Q3 raw-address down mismatch index=%u reference=%g candidate=%g\n",
+                        i, reference[i], raw_candidate[i]);
                 return 0;
             }
         }
@@ -9687,6 +9722,7 @@ void ds4_gpu_cleanup(void) {
         g_glm_q3_k_down_f32_pipeline = nil;
         g_glm_q3_k_down_one_bound_f32_pipeline = nil;
         g_glm_q3_k_down_slots8_bound_f32_pipeline = nil;
+        g_glm_q3_k_down_addr_test_f32_pipeline = nil;
         g_glm_q4_k_down_f32_pipeline = nil;
         g_glm_q2_k_addr_down_f32_pipeline = nil;
         g_glm_q4_k_addr_down_f32_pipeline = nil;

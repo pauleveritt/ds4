@@ -100,11 +100,12 @@ equivalence test is required before another production-path attempt.
 The committed harness now covers both one expert and eight selected experts at
 the production 2048 output / 512 mid dimensions. It uses nonzero deterministic
 Q3_K data, the resident 64-thread geometry, distinct direct MTL buffers, and a
-permuted selected-id order. Both candidates are bit-exact to the resident Q3
-down output. This rules out basic Q3 direct-buffer binding, slot order,
-selected-id permutation, and the Q3 down geometry. It does **not** overturn
-the real-artifact eight-slot failure; the remaining isolated suspect is raw
-GPU-address consumption, followed by host cache integration details.
+permuted selected-id order. Both direct-buffer candidates and a raw-GPU-address
+candidate are bit-exact to the resident Q3 down output. This rules out basic
+Q3 direct-buffer binding, slot order, selected-id permutation, down geometry,
+and raw-address semantics. It does **not** overturn the real-artifact
+eight-slot failure; that discrepancy is now an engine-integration or prior
+experimental-wiring problem rather than a Q3 down-kernel problem.
 
 ## Independent review
 
@@ -134,10 +135,11 @@ are lower, and the scorer has a documented tokenization/path floor.
 
 ## Required next implementation sequence
 
-1. Add a mapped-model raw-address candidate to the exact eight-slot ladder,
-   retaining the same supplied `mid` input and resource lifetime. Compare it
-   directly with the passing direct-buffer candidate.
-2. Diagnose the resulting minimal failure until the selected candidate is
+1. Build an artifact-backed single-layer harness using the real Q3 tensor
+   slices, selected ids, and `mid` input captured from a decode step. Compare
+   resident, direct-buffer, and raw-address down dispatches before running the
+   full routed-MoE engine path.
+2. Diagnose the resulting integration discrepancy until the selected candidate is
    exact.  Do not enable Q3 cache service beforehand.
 3. Enable coherent Q3 cache eligibility in both the generic Metal path and
    `laguna_decode_experts_cache_servable()`, so cache-service eligibility and

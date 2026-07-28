@@ -2302,6 +2302,47 @@ kernel void kernel_glm_q3_K_down_slots8_bound_f32(
     }
 }
 
+/* Diagnostic-only raw GPU-address candidate for the isolated Q3 down ladder. */
+kernel void kernel_glm_q3_K_down_addr_test_f32(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const uint64_t *down_addrs,
+        device const int32_t *selected,
+        device const float *mid,
+        device float *out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const short NSG = 2;
+    const uint row0 =
+        ((uint)tgpig.x * (uint)NSG + (uint)sgitg) * N_R0_Q3_K;
+    const uint token = tgpig.y;
+    if (row0 >= args.out_dim || token >= args.n_tokens) return;
+    const uint64_t selected_base = (uint64_t)token * args.n_expert_used;
+    const uint64_t mid_base = (uint64_t)token * args.mid_token_stride;
+    float2 sum = {0.0f, 0.0f};
+    for (uint slot = 0; slot < args.n_expert_used; slot++) {
+        const int expert = selected[selected_base + slot];
+        if (expert < 0 || (uint)expert >= args.n_total_expert) continue;
+        const uint64_t down_addr = down_addrs[(uint)expert];
+        if (down_addr == 0) continue;
+        sum += ds4_glm_q3_K_dot2(
+            reinterpret_cast<device const char *>(down_addr) +
+                (uint64_t)row0 * args.down_row_bytes,
+            args.down_row_bytes,
+            args.mid_dim,
+            mid + mid_base + (uint64_t)slot * args.mid_dim,
+            tiisg);
+    }
+    for (short row = 0;
+         row < N_R0_Q3_K && row0 + (uint)row < args.out_dim;
+         row++) {
+        const float value = simd_sum(sum[row]);
+        if (tiisg == 0u) {
+            out[(uint64_t)token * args.out_dim + row0 + (uint)row] = value;
+        }
+    }
+}
+
 kernel void kernel_glm_q2_K_down_f32(
         constant ds4_metal_glm_routed_moe_args &args,
         device const char *down,
