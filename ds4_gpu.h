@@ -78,6 +78,7 @@ int ds4_gpu_pack_slot_rows_f32_tensor(
  * It compares resident Q3 down output with the one-expert direct-buffer
  * control; it neither enables cache admission nor requires a model file. */
 int ds4_gpu_test_glm_q3_down_one_bound_equivalence(void);
+int ds4_gpu_test_glm_q3_down_slots8_bound_equivalence(void);
 
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
