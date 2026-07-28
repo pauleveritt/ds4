@@ -20702,6 +20702,21 @@ static bool metal_graph_streaming_expert_cache_seed_layer_expected(
         return false;
     }
     if (metal_graph_decode_iq2_selected_slots_expected(g, layer)) return true;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        if (g->quality ||
+            layer->ffn_gate_exps->type != layer->ffn_up_exps->type ||
+            layer->ffn_gate_exps->type != layer->ffn_down_exps->type ||
+            DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT_USED > 8 ||
+            DS4_N_EXPERT < 128) {
+            return false;
+        }
+        /* P2.5 added Q3_K to Laguna's selected-expert cache kernels.  The
+         * hotlist seeder must use the same routed-triple eligibility or an
+         * XS 2.1 profile will load without placing any experts in the cache. */
+        const uint32_t type = layer->ffn_gate_exps->type;
+        return type == DS4_TENSOR_Q3_K || type == DS4_TENSOR_Q4_K ||
+               type == DS4_TENSOR_Q6_K;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
         !g->quality &&
         layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
@@ -48504,6 +48519,8 @@ static int generate_laguna_metal_argmax(
         int                n_predict,
         int                ctx_size,
         bool               ssd_streaming,
+        bool               ssd_streaming_cold,
+        uint32_t           ssd_streaming_preload_experts,
         uint32_t           prefill_chunk,
         ds4_token_emit_fn  emit,
         ds4_generation_done_fn done,
@@ -48536,6 +48553,18 @@ static int generate_laguna_metal_argmax(
                                         prompt->len);
         i += (int)n;
         if (progress) progress(progress_ud, "prefill_chunk", i, prompt->len);
+    }
+    if (ok && ssd_streaming) {
+        /* Seed after prefill: prefill itself populates an LRU cache, so an
+         * earlier seed is churned away before first-token decode.  This is
+         * also where the shared graph path applies its hotlist. */
+        ds4_gpu_graph seed_graph;
+        memset(&seed_graph, 0, sizeof(seed_graph));
+        seed_graph.ssd_streaming = true;
+        seed_graph.ssd_streaming_cold = ssd_streaming_cold;
+        seed_graph.streaming_preload_experts = ssd_streaming_preload_experts;
+        ok = metal_graph_seed_streaming_expert_cache_from_hotlist(
+                &seed_graph, model, weights);
     }
     const double prefill_t1 = now_sec();
 
@@ -48651,6 +48680,8 @@ static int generate_metal_graph_raw_swa(
                                             n_predict,
                                             ctx_size,
                                             ssd_streaming,
+                                            ssd_streaming_cold,
+                                            ssd_streaming_preload_experts,
                                             prefill_chunk,
                                             emit,
                                             done,

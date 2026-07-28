@@ -8,6 +8,20 @@ Everything here was measured on the development laptop (M5 Max, 128 GB) with
 `gguf/Laguna-XS-2.1-Q4_K_M.gguf` at commit 003733f. **The acceptance run on
 real 32 GB hardware has not happened yet** — see "Still to verify".
 
+## P2.7 local preflight update (2026-07-28)
+
+The active artifact is now the uniform routed-Q3 file, not the historical Q4
+file used by the sizing sweep below.  A ctx-32768, `--prefill-chunk 4096`,
+3,200-expert Q3 streaming smoke constructs successfully: 6.53 GiB planned
+(2.30 GiB context runtime, 4.03 GiB target cache) and 6.46 GiB task footprint
+after eight generated tokens.  Only 1.57 GiB of cache was live at that point,
+which is expected for a short smoke rather than a steady-state measurement.
+
+This validates the local allocation configuration only.  It does not replace
+the real-32-GB acceptance items in §7, particularly memory pressure, SSD
+miss behavior, and a sustained agent session.  Full evidence:
+`docs/superpowers/research/laguna-xs21-p26-p27-hotlist-acceptance.md`.
+
 ## 1. Why 16 GB was dropped
 
 Fixed costs at the plan's originally specified `--ctx 32768`, independent of

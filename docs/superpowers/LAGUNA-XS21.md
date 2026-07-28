@@ -24,6 +24,7 @@ is the most important section in this document.
 | 32 GB sizing measurements | `docs/superpowers/plans/mini-notes.md` |
 | **Preserved SDD research** | `docs/superpowers/research/laguna-xs21-sdd/` |
 | **P2.5 Q3 cache research** | `docs/superpowers/research/laguna-xs21-p25-q3-cache-blocker.md` |
+| **P2.6--P2.7 hotlist / acceptance research** | `docs/superpowers/research/laguna-xs21-p26-p27-hotlist-acceptance.md` |
 | **P2.5 implementation brainstorm** | `docs/superpowers/plans/2026-07-28-laguna-xs21-p25-q3-cache-equivalence.md` |
 | Quality fixtures + README | `gguf-tools/quality-testing/data/laguna-xs21/` |
 | Python/web fixture prompts | `gguf-tools/quality-testing/prompts_laguna_xs21_webpy.jsonl` |
@@ -381,13 +382,18 @@ The staged proposal is retained in
 `plans/2026-07-28-laguna-xs21-p25-q3-cache-equivalence.md`; it is a
 historical brainstorming plan.
 
-**P2.6 — Python expert hotlist** (original Tasks 12–13, `:609`, `:658`).
-Deliberately *after* cache support and re-measurement, because §5 shows it is a
-throughput/SSD-traffic lever rather than a footprint one — its priority
-depends on what P2.5 finds.
+**P2.6 — Python expert hotlist** (complete, 2026-07-28; original Tasks 12–13,
+`:609`, `:658`).  The eight-prompt selected-id profile spans every sparse
+layer and the existing runtime loader is now connected to Laguna's separate
+generation graph.  At cache 800 it regressed the fixed 256-token Python
+benchmark (44.3% hit / 30.54 t/s vs ordinary LRU's 45.8% / 32.15 t/s), so it
+remains an opt-in file rather than a baked default.  Evidence and the runtime
+override are in `research/laguna-xs21-p26-p27-hotlist-acceptance.md`.
 
-**P2.7 — Acceptance run** (original Task 14, `:721`, plus T8's open Step 2).
-On real constrained hardware. `mini-notes.md` §7 is the checklist.
+**P2.7 — Acceptance preflight** (complete locally, 2026-07-28; original Task
+14, `:721`, plus T8's open Step 2).  The ctx-32768 / prefill-4096 / 3,200
+cache configuration constructs at a 6.53 GiB planned total.  Actual acceptance
+on real 32 GB hardware is still required: `mini-notes.md` §7 is the checklist.
 
 ### Standing rules for Phase 2
 
