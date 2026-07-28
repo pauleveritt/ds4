@@ -12,9 +12,12 @@ until a committed isolated test proves cache-address output equal to resident
 output.
 
 The first failed experiment is useful evidence: cache allocation and the Q3
-gate/up pair worked; only the Q3 down result diverged.  The investigation
-should therefore begin at the Q3 down pointer/address contract rather than
-revisiting quantization, the cache allocator, or Phase 1's Laguna dispatch.
+gate/up pair worked exactly, while divergence began at the first Q3 down
+output float.  Cached bytes, cache GPU addresses, and a mapped-model raw
+address variant were independently verified; a direct slot-buffer down
+variant also diverged.  The investigation should therefore begin with a
+minimal Q3 down invocation contract, rather than revisiting quantization, the
+cache allocator, or Phase 1's Laguna dispatch.
 
 ## Current topology
 
@@ -46,16 +49,19 @@ as shipped and must remain so until the new proof succeeds.
 
 ## Design hypotheses to test
 
-1. **Q3 pointer indirection is sufficient.** The resident Q3 pair and down
-   arithmetic can be retained unchanged after resolving each selected expert
-   through `uint64_t` cache address tables.  Q4 demonstrates this general
-   architecture, but its quant block layout must not be copied into Q3.
-2. **The Q3 down path is the failure locus.** The prior temporary harness
-   matched pair output but not down output.  Its failure may be an address-base
-   error, row stride, expert-table indexing, dispatch geometry, or a
-   cache-buffer visibility/alignment issue.  It is not yet evidence of a
-   defect in `ds4_glm_q3_K_dot2` itself, because the resident kernel uses that
-   helper successfully.
+1. **The Q3 down invocation contract is not yet known.** A raw GPU-address
+   candidate diverges even when pointed at the mapped model view, and a
+   direct-slot MTL-buffer candidate also diverges.  Q4's architecture is only
+   an architectural reference; it cannot be treated as evidence that Q3 can
+   consume the same bindings.
+2. **The Q3 down path is the failure locus.** The experiment matched the
+   complete gate/up intermediate exactly, then diverged at output byte 16,385
+   (the first down float).  Cache bytes and CPU address-table entries were
+   exact.  The remaining candidates include a binding-index/signature issue,
+   Metal address-space/compiler behavior, dispatch geometry, or a subtle
+   departure from the resident kernel.  It is not evidence of a defect in
+   `ds4_glm_q3_K_dot2` itself, because the resident kernel uses that helper
+   successfully.
 3. **Cache service and residency are one contract.** Enabling a Q3 pipeline
    alone is incomplete: `laguna_decode_experts_cache_servable()` must change
    only after the pipeline is proven, otherwise cached Q3 can coexist with
@@ -65,14 +71,16 @@ as shipped and must remain so until the new proof succeeds.
 
 ### 1. Isolated address-table kernels — no admission change
 
-Add Q3 address-table variants that mirror the Q3 resident kernels, rather than
+Do not re-add a production Q3 address-table kernel yet.  First create a
+test-only down harness that dispatches a resident Q3 down reference and one
+candidate binding form over the exact same controlled buffers.  Only after a
+candidate is exact should its narrow production kernel be added.  The pair
+variant may be retained as a later, independently tested seam because the
+real-artifact diagnostic already established its arithmetic/path agreement.
+
+The candidate variant must mirror the Q3 resident down kernel, rather than
 porting Q4 arithmetic:
 
-- `kernel_glm_q3_K_addr_pair_swiglu_f32`
-  - accepts `gate_addrs` and `up_addrs`;
-  - validates the selected id and nonzero addresses like the Q4 variant;
-  - resolves both cached base addresses and invokes the existing Q3 dot/pair
-    logic with a local one-expert view.
 - `kernel_glm_q3_K_addr_down_f32`
   - accepts `down_addrs`;
   - resolves the selected expert's cached base once per slot;
@@ -84,12 +92,11 @@ porting Q4 arithmetic:
 Do not start from `kernel_glm_q4_K_addr_down_simd_f32`: its Q4 block decoding
 is irrelevant and is a likely route to a plausible-but-wrong Q3 result.
 
-Register both pipelines and their startup checks in `ds4_metal.m`.  Add a
-local `stream_addr_q3` predicate beside `stream_addr_q2` and `stream_addr_q4`;
-wire it into pipeline selection, diagnostics, address-table enablement, and
-pair/down dispatch labels.  The pre-existing Q3 geometry already uses
-64-thread groups and `(dim + 3) / 4` groups, so preserve it unless the
-isolated test demonstrates a geometry mismatch.
+The harness must also test a direct MTL-buffer binding form, but only as a
+diagnostic control rather than a presumed fallback.  The real-artifact direct
+slot attempt diverged too, so both forms need independent proof.  Preserve the
+resident Q3 64-thread geometry and `(dim + 3) / 4` groups unless the isolated
+test demonstrates a geometry mismatch.
 
 At this stage, leave `laguna_decode_experts_cache_servable()` unchanged.
 Normal Q3 model execution must still take the current safe mapped fallback.
@@ -120,7 +127,8 @@ gate.
 Use several block patterns, including nonzero high masks/scales and multiple
 selected experts, so a zero-filled fixture cannot hide Q3 packing errors.
 The fixture may be generated at test time, but its encoding must be explicit
-and deterministic.  An interim artifact-backed harness may accelerate local
+and deterministic.  Start with Level B alone, then add Levels A/C/D only
+after B is exact.  An interim artifact-backed harness may accelerate local
 diagnosis; it is not the final regression test because it would make the
 suite depend on an untracked 14.64 GiB model.
 

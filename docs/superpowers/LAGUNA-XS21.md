@@ -380,18 +380,24 @@ result. The 1,600/3,200/4,800-expert repeats likewise stayed at 0.00 GiB and
 about 62 t/s. Therefore the planned 2.89/3.89/5.91/7.92 GiB startup totals are
 reservations, not measured live Q3 cache use.
 
-The next blocking implementation item is a numerically exact Q3_K
-address-table pair/down path for the generic routed-MoE decode kernel, plus a
-targeted resident-vs-cached equivalence test.  It must assert intermediate
-gate/up equality, final down equality, nonzero cache entries/hits/live bytes,
-and the expected drop in routed decode static span.  A working kernel is not
-enough: `laguna_decode_experts_cache_servable()` must also admit coherent Q3,
-or the tensors will remain mapped and the footprint objective will still fail.
-An initial direct kernel experiment did fill the cache (1.01 GiB live, 78,466
-hits) but produced `|UNK|` immediately; it was reverted rather than weakening
-the safe fallback. Only after these gates pass may P2.5 rerun the footprint
-sweep and claim the §5 projection.  Full evidence, the independent review,
-and the implementation sequence are in
+The next blocking implementation item is a numerically exact Q3_K down
+projection equivalence harness for the generic routed-MoE decode kernel. The
+real-artifact experiment proved exact gate/up intermediate agreement, then
+diverged at the first down-output float. Its cache bytes and CPU address table
+were exact; using mapped-model raw addresses, and separately direct
+slot-bound buffers, still diverged. A diagnostic run allocated 1.01 GiB and
+recorded 38,612 hits / 1,012 misses, then produced `|UNK|`; it was fully
+removed rather than weakening the safe fallback. The harness must make a
+resident Q3 down reference and each candidate consume the same nonzero
+controlled buffers before another production kernel is attempted. After it is
+exact, integration must assert intermediate gate/up and final down equality,
+nonzero cache entries/hits/live bytes, and the expected drop in routed decode
+static span. A working kernel is not enough:
+`laguna_decode_experts_cache_servable()` must also admit coherent Q3, or the
+tensors will remain mapped and the footprint objective will still fail. Only
+after these gates pass may P2.5 rerun the footprint sweep and claim the §5
+projection. Full evidence, the independent review, and the implementation
+sequence are in
 `research/laguna-xs21-p25-q3-cache-blocker.md`.
 The staged kernel/test/admission proposal is in
 `plans/2026-07-28-laguna-xs21-p25-q3-cache-equivalence.md`; it is a

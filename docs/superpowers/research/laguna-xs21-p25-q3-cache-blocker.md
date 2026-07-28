@@ -64,18 +64,36 @@ The fallback is correct: it preserves output correctness by reading the Q3
 weights through mapped model views.  It cannot meet the footprint goal,
 because those routed tensors still contribute to the static mapped span.
 
-## Failed implementation experiment
+## Failed implementation experiment — strengthened localization
 
-An experimental direct Q3 address-table pair/down implementation was tried and
-fully reverted.  A temporary synthetic harness showed exact resident/cache
-agreement for the gate/up pair, but the Q3 down projection diverged.  In a
-real artifact run the experimental cache allocated 1.01 GiB and reported
-78,466 hits, then the continuation immediately collapsed to `|UNK|`.
+An experimental Q3 address-table pair/down implementation was tried against
+the real biased-Q3 artifact and then fully removed.  The cache path was
+deliberately kept outside normal Q3 cache admission, so this was diagnostic
+only and never a footprint result.
 
-This narrows the failure to the Q3 down kernel/its invocation contract; it is
-not evidence that the artifact, cache accounting, or pair path is invalid.
-The reverted code must not be restored as a starting point without an
-equivalence test.
+A streamed run allocated 1.01 GiB of live cache and showed 38,612 hits and
+1,012 misses, but its continuation diverged immediately after `To solve the
+F...` and subsequently emitted `|UNK|`.  The following readback and byte
+checks localize that failure more tightly:
+
+| Check | Result | Consequence |
+|---|---|---|
+| Q3 gate/up intermediate (`mid`) at decode layer 1 | Exact resident/cache match for all 16 KiB (8 x 512 floats) | Q3 pair arithmetic, selected ids, cache gate/up bytes, and its address-table consumption are not the observed failure. |
+| Q3 down output immediately following that `mid` | First differing byte: 16,385 | Divergence begins at the first down-output float. |
+| Cached gate/up/down bytes | Exact `memcmp` against each mapped GGUF tensor slice | Not a pread/copy, expert-stride, or slab-content failure. |
+| Address-table entries | Exact cached MTL buffer GPU address plus inner offset | Not CPU-side address-table construction. |
+| Q3 down address entries replaced with the mapped model-view addresses | Same divergence | Not specific to cached slabs or cache-buffer lifetime. |
+| Direct slot-bound cached-down buffers, bypassing raw address-table lookup | Same down divergence | A simple raw-address indirection replacement is not a fix. |
+
+The resident down result has magnitudes around `1e4`; the candidate down
+result was around `1e-2`.  The live cache allocation and hit count therefore
+prove only that loading and accounting ran, not that its Q3 down output was
+valid.
+
+This is now a Q3 down kernel/invocation-contract blocker.  It is not evidence
+against the artifact, its cache contents, pair path, or cache accounting.
+The removed code must not be restored as a starting point; an isolated down
+equivalence test is required before another production-path attempt.
 
 ## Independent review
 
@@ -105,11 +123,11 @@ are lower, and the scorer has a documented tokenization/path floor.
 
 ## Required next implementation sequence
 
-1. Commit an isolated Q3 cache-equivalence test using a tiny synthetic Q3
-   model or mmap fixture.  Compare generic resident and cached routed MoE,
-   separately asserting gate/up intermediate equality and final down output
-   equality.
-2. Diagnose and correct the Q3 address-table down path until that test is
+1. Commit an isolated Q3 down-equivalence harness with controlled nonzero
+   Q3_K blocks and production dispatch geometry.  It must compare resident
+   down with both a mapped-model address candidate and a regular
+   slot-buffer-bound candidate, using the same supplied `mid` input.
+2. Diagnose the resulting minimal failure until the selected candidate is
    exact.  Do not enable Q3 cache service beforehand.
 3. Enable coherent Q3 cache eligibility in both the generic Metal path and
    `laguna_decode_experts_cache_servable()`, so cache-service eligibility and
