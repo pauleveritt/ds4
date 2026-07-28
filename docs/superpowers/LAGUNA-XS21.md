@@ -23,6 +23,7 @@ is the most important section in this document.
 | GGUF ground truth (verified against the file, not config.json) | `docs/superpowers/plans/xs2-facts.md` |
 | 32 GB sizing measurements | `docs/superpowers/plans/mini-notes.md` |
 | **Preserved SDD research** | `docs/superpowers/research/laguna-xs21-sdd/` |
+| **P2.5 Q3 cache research** | `docs/superpowers/research/laguna-xs21-p25-q3-cache-blocker.md` |
 | Quality fixtures + README | `gguf-tools/quality-testing/data/laguna-xs21/` |
 | Python/web fixture prompts | `gguf-tools/quality-testing/prompts_laguna_xs21_webpy.jsonl` |
 | A/B correctness gate | `tests/xs21_stream_ab.sh` |
@@ -367,7 +368,7 @@ Q3_K improved average NLL by 0.88% on the general set and 1.16% on web/Python;
 record and caveat are in
 `gguf-tools/quality-testing/data/laguna-xs21/README.md`.
 
-**P2.5 — Re-measure footprint (blocked, 2026-07-27).** The uniform Q3_K
+**P2.5 — Q3 cache equivalence, then re-measure footprint (blocked, 2026-07-28).** The uniform Q3_K
 artifact does reserve the intended cache budget at startup, but it is not yet
 cache-served in decode: the shipped engine deliberately keeps Q3 routed
 tensors mapped because its generic streaming address-table path has Q2_K and
@@ -380,11 +381,17 @@ reservations, not measured live Q3 cache use.
 
 The next blocking implementation item is a numerically exact Q3_K
 address-table pair/down path for the generic routed-MoE decode kernel, plus a
-targeted resident-vs-cached test that asserts nonzero cache entries and hits.
+targeted resident-vs-cached equivalence test.  It must assert intermediate
+gate/up equality, final down equality, nonzero cache entries/hits/live bytes,
+and the expected drop in routed decode static span.  A working kernel is not
+enough: `laguna_decode_experts_cache_servable()` must also admit coherent Q3,
+or the tensors will remain mapped and the footprint objective will still fail.
 An initial direct kernel experiment did fill the cache (1.01 GiB live, 78,466
 hits) but produced `|UNK|` immediately; it was reverted rather than weakening
-the safe fallback. Only after that test passes may P2.5 rerun the footprint
-sweep and claim the §5 projection.
+the safe fallback. Only after these gates pass may P2.5 rerun the footprint
+sweep and claim the §5 projection.  Full evidence, the independent review,
+and the implementation sequence are in
+`research/laguna-xs21-p25-q3-cache-blocker.md`.
 
 **P2.6 — Python expert hotlist** (original Tasks 12–13, `:609`, `:658`).
 Deliberately *after* cache support and re-measurement, because §5 shows it is a
@@ -401,6 +408,12 @@ On real constrained hardware. `mini-notes.md` §7 is the checklist.
   reliably catches it.
 - **Re-measure rather than trusting §4/§5 numbers** once the artifact changes.
   The projections in §5 are arithmetic, not measurement.
+- **Keep raw measurement transcripts with any future P2.5 table.** The
+  current 0-live-cache result is source-supported, but future exact memory,
+  throughput, and hit-rate comparisons need retained command output.
+- **State quality narrowly.** Lower local teacher-forced average NLL versus
+  the Q4 fixtures is a provisional artifact gate, not a general quality
+  improvement claim; agreement/LCP and scorer limitations remain material.
 - **Any t/s figure measured on the 128 GB laptop is optimistic** for the
   reasons in §4.
 

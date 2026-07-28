@@ -113,7 +113,13 @@ expert budgets all had no cache statistics and held near 62 t/s. Do not use the
 startup reservation as a footprint result.
 
 Q3 cache kernels and a nonzero-hit correctness test now precede the Python
-expert hotlist. Re-run this sweep only after that gate passes.
+expert hotlist.  The fix must also remove Q3 from the decode static mapped
+span; cache hits alone are not a footprint result.  The regression gate needs
+resident-vs-cached output equivalence, nonzero cache entries/hits/live bytes,
+and the expected static-span drop.  Re-run this sweep only after that gate
+passes.  See `docs/superpowers/research/laguna-xs21-p25-q3-cache-blocker.md`
+for the source diagnosis, reverted experiment, review, and raw-evidence
+retention requirement.
 
 ## 6. Download target
 
