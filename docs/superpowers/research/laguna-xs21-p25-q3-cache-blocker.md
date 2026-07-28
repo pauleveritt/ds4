@@ -158,9 +158,11 @@ are lower, and the scorer has a documented tokenization/path floor.
 2. **Failed diagnostic integration:** the real Q3 cache path populated 800
    entries (1.01 GiB live; 5,323 hits / 4,349 misses over a 32-token greedy
    run) but diverged immediately from the resident continuation.  This proves
-   the cache tables are live, but not numerically correct end-to-end.  Add
-   layer-level resident/cache `mid` and down-output readbacks to localize pair
-   versus down before changing admission.
+   the cache tables are live, but not numerically correct end-to-end.  The new
+   in-place readback localizes the first error to the **pair** stage: at decode
+   layer 1, `mid[0]` is `4.06352e-06` from cache versus resident `0.0122323`.
+   Down is not yet implicated.  Next isolate the Q3 cache gate/up address
+   binding against the same selected cache buffers before changing admission.
 3. Enable coherent Q3 cache eligibility in both the generic Metal path and
    `laguna_decode_experts_cache_servable()`, so cache-service eligibility and
    decode static-span construction agree.

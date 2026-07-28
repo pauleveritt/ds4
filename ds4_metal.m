@@ -34339,7 +34339,9 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         id<MTLBuffer> gatebuf = nil;
         id<MTLBuffer> upbuf = nil;
         id<MTLBuffer> downbuf = nil;
-        if (!use_stream_expert_addr_table) {
+        const BOOL q3_stream_addr_readback =
+            use_stream_expert_addr_table && stream_addr_q3_diagnostic;
+        if (!use_stream_expert_addr_table || q3_stream_addr_readback) {
             gatebuf = ds4_gpu_wrap_model_range(model_map, model_size,
                                                gate_offset, gate_tensor_bytes,
                                                &gate_inner);
@@ -34350,6 +34352,17 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                                                down_offset, down_tensor_bytes,
                                                &down_inner);
             if (!gatebuf || !upbuf || !downbuf) return 0;
+        }
+        id<MTLBuffer> q3_stream_ref_mid = nil;
+        id<MTLBuffer> q3_stream_ref_out = nil;
+        if (q3_stream_addr_readback) {
+            q3_stream_ref_mid = [g_device newBufferWithLength:(NSUInteger)mid_bytes
+                                                       options:MTLResourceStorageModeShared];
+            q3_stream_ref_out = [g_device newBufferWithLength:(NSUInteger)out_bytes
+                                                       options:MTLResourceStorageModeShared];
+            if (!q3_stream_ref_mid || !q3_stream_ref_out) return 0;
+            memset([q3_stream_ref_mid contents], 0, (size_t)mid_bytes);
+            memset([q3_stream_ref_out contents], 0, (size_t)out_bytes);
         }
 
         /* Opt-in artifact-backed Q3 down check.  This leaves the resident
@@ -34762,6 +34775,35 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
         DS4_METAL_PROFILE_GLM_MOE_ONE_STAGE("down");
 
+        if (q3_stream_addr_readback) {
+            enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:g_glm_q3_k_pair_swiglu_f32_pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:gatebuf offset:(NSUInteger)gate_inner atIndex:1];
+            [enc setBuffer:upbuf offset:(NSUInteger)up_inner atIndex:2];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
+            [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:4];
+            [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:5];
+            [enc setBuffer:q3_stream_ref_mid offset:0 atIndex:6];
+            [enc useResource:gatebuf usage:MTLResourceUsageRead];
+            [enc useResource:upbuf usage:MTLResourceUsageRead];
+            [enc dispatchThreadgroups:MTLSizeMake(pair_x_groups, (NSUInteger)n_expert, 1)
+                 threadsPerThreadgroup:MTLSizeMake(pair_threads, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+
+            enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:g_glm_q3_k_down_f32_pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:downbuf offset:(NSUInteger)down_inner atIndex:1];
+            [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+            [enc setBuffer:q3_stream_ref_mid offset:0 atIndex:3];
+            [enc setBuffer:q3_stream_ref_out offset:0 atIndex:4];
+            [enc useResource:downbuf usage:MTLResourceUsageRead];
+            [enc dispatchThreadgroups:MTLSizeMake(down_x_groups, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(down_threads, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
+
         if (q3_artifact_down_equiv) {
             /* Keep the real selected/mid values and command sequence, but
              * bind the owned full tensor directly.  This separates a raw
@@ -34819,7 +34861,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
          * diagnostic reads CPU-visible comparison buffers, so it alone must
          * force that batch to finish before inspecting them. */
         const BOOL q3_artifact_forced_batch_sync =
-            q3_artifact_down_equiv && !owned;
+            (q3_artifact_down_equiv || q3_stream_addr_readback) && !owned;
         if (q3_artifact_forced_batch_sync) {
             if (!ds4_gpu_end_commands()) return 0;
         } else if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM routed MoE")) {
@@ -34868,6 +34910,28 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                 }
             }
             fprintf(stderr, "ds4: Q3 artifact down equivalence layer=%u OK\n", layer_index);
+        }
+        if (q3_stream_addr_readback) {
+            const float *cache_mid = (const float *)[midbuf contents] +
+                ds4_gpu_tensor_offset(mid) / sizeof(float);
+            const float *cache_out = (const float *)[outbuf contents] +
+                ds4_gpu_tensor_offset(out) / sizeof(float);
+            const float *ref_mid = (const float *)[q3_stream_ref_mid contents];
+            const float *ref_out = (const float *)[q3_stream_ref_out contents];
+            if (!cache_mid || !cache_out || !ref_mid || !ref_out) return 0;
+            for (uint32_t i = 0; i < n_expert * expert_mid_dim; i++) {
+                if (memcmp(&cache_mid[i], &ref_mid[i], sizeof(float)) != 0) {
+                    fprintf(stderr, "ds4: Q3 cache pair mismatch layer=%u index=%u cache=%g resident=%g\n", layer_index, i, cache_mid[i], ref_mid[i]);
+                    return 0;
+                }
+            }
+            for (uint32_t i = 0; i < out_dim; i++) {
+                if (memcmp(&cache_out[i], &ref_out[i], sizeof(float)) != 0) {
+                    fprintf(stderr, "ds4: Q3 cache down mismatch layer=%u index=%u cache=%g resident=%g\n", layer_index, i, cache_out[i], ref_out[i]);
+                    return 0;
+                }
+            }
+            fprintf(stderr, "ds4: Q3 cache readback equivalence layer=%u OK\n", layer_index);
         }
         if (q3_artifact_forced_batch_sync && !ds4_gpu_begin_commands()) return 0;
 #undef DS4_METAL_PROFILE_GLM_MOE_ONE_STAGE

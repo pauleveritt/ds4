@@ -40,8 +40,10 @@ real cache (800 entries, 1.01 GiB live, 5,323 hits / 4,349 misses for a
 resident run. This is a useful, bounded failure: generic artifact Q3 pair/down
 addressability is proven, while the actual cache-service integration remains
 incorrect. Do not proceed to admission or footprint measurement. The next
-diagnostic must read back and compare resident/cache gate-up `mid` and down
-output by layer to isolate the first wrong stage.
+diagnostic now reads back resident/cache gate-up `mid` and down output by
+layer. It localizes the first mismatch to the Q3 pair stage at layer 1
+(`mid[0]`: cache `4.06352e-06`, resident `0.0122323`); down is not yet
+implicated. Isolate the cache gate/up address binding next.
 
 ## Current topology
 
