@@ -6664,7 +6664,8 @@ static bool glm_stream_decode_experts_are_streamed(
 static bool laguna_decode_experts_cache_servable(const ds4_layer_weights *l) {
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) return true;
     if (l->ffn_down_exps == NULL) return true;
-    return l->ffn_down_exps->type == DS4_TENSOR_Q4_K ||
+    return l->ffn_down_exps->type == DS4_TENSOR_Q3_K ||
+           l->ffn_down_exps->type == DS4_TENSOR_Q4_K ||
            l->ffn_down_exps->type == DS4_TENSOR_Q6_K;
 }
 

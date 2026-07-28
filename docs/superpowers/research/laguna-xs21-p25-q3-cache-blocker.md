@@ -1,10 +1,9 @@
 # P2.5 — Laguna XS 2.1 Q3 streamed-cache blocker
 
-**Status:** in progress, 2026-07-28.  The uniform RoutedQ3_K artifact is
-valid, and the generic Q3 down binding/address forms now have an
-artifact-backed exactness proof.  ds4 still uses a mapped-model fallback for
-its routed experts during decode, so the footprint reduction remains
-unmeasured pending a diagnostic cache-service integration.
+**Status:** cache-equivalence complete, 2026-07-28. The uniform RoutedQ3_K
+artifact is cache-served during decode with exact per-layer readbacks and a
+passing resident-vs-streamed gate. Footprint measurement is the remaining
+P2.5 work.
 
 ## Research question
 
@@ -161,8 +160,10 @@ are lower, and the scorer has a documented tokenization/path floor.
    the cache tables are live, but not numerically correct end-to-end.  The new
    in-place readback localizes the first error to the **pair** stage: at decode
    layer 1, `mid[0]` is `4.06352e-06` from cache versus resident `0.0122323`.
-   Down is not yet implicated.  Next isolate the Q3 cache gate/up address
-   binding against the same selected cache buffers before changing admission.
+   Sol identified lane-0-only `simd_sum` reductions in the Q3 address pair
+   and down kernels. Moving the collectives outside the lane-0 store made all
+   39 layers' cache `mid` and down output bit-exact; the four-prompt,
+   128-token resident-vs-streamed A/B then passed with nonzero live cache.
 3. Enable coherent Q3 cache eligibility in both the generic Metal path and
    `laguna_decode_experts_cache_servable()`, so cache-service eligibility and
    decode static-span construction agree.

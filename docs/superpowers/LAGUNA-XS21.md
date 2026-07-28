@@ -369,7 +369,7 @@ Q3_K improved average NLL by 0.88% on the general set and 1.16% on web/Python;
 record and caveat are in
 `gguf-tools/quality-testing/data/laguna-xs21/README.md`.
 
-**P2.5 — Q3 cache equivalence, then re-measure footprint (blocked, 2026-07-28).** The uniform Q3_K
+**P2.5 — Q3 cache equivalence, then re-measure footprint (equivalence complete, 2026-07-28).** The uniform Q3_K
 artifact does reserve the intended cache budget at startup, but it is not yet
 cache-served in decode: the shipped engine deliberately keeps Q3 routed
 tensors mapped because its generic streaming address-table path has Q2_K and

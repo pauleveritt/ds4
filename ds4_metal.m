@@ -34094,8 +34094,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             !gate_pair_q2 && !gate_pair_q5 && down_scalar_q4 &&
             g_glm_q4_k_addr_pair_swiglu_f32_pipeline != nil &&
             g_glm_q4_k_addr_down_f32_pipeline != nil;
-        const BOOL stream_addr_q3_diagnostic =
-            getenv("DS4_METAL_GLM_Q3_STREAM_ADDR_DIAGNOSTIC") != NULL &&
+        const BOOL stream_addr_q3 =
             gate_pair_q3 && down_simd_q3 &&
             g_glm_q3_k_addr_pair_swiglu_f32_pipeline != nil &&
             g_glm_q3_k_addr_down_f32_pipeline != nil;
@@ -34103,7 +34102,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             g_ssd_streaming_mode &&
             !force_resident &&
             getenv("DS4_METAL_GLM_DISABLE_STREAMING_EXPERT_CACHE") == NULL &&
-            (stream_addr_q2 || stream_addr_q4 || stream_addr_q3_diagnostic) &&
+            (stream_addr_q2 || stream_addr_q4 || stream_addr_q3) &&
             layer_index < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER &&
             n_total_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
             n_expert <= 8u &&
@@ -34237,7 +34236,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                     ds4_gpu_stream_expert_split_worthwhile(stream_resident_mask,
                                                            stream_missing_mask) &&
                     ds4_gpu_stream_expert_split_ready() &&
-                    (!stream_addr_q3_diagnostic &&
+                    (!stream_addr_q3 &&
                      ((gate_pair_q2 &&
                       g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline != nil) ||
                      (!gate_pair_q2 && !gate_pair_q5 &&
@@ -34340,7 +34339,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         id<MTLBuffer> upbuf = nil;
         id<MTLBuffer> downbuf = nil;
         const BOOL q3_stream_addr_readback =
-            use_stream_expert_addr_table && stream_addr_q3_diagnostic;
+            use_stream_expert_addr_table && stream_addr_q3 &&
+            getenv("DS4_METAL_GLM_Q3_STREAM_ADDR_READBACK") != NULL;
         if (!use_stream_expert_addr_table || q3_stream_addr_readback) {
             gatebuf = ds4_gpu_wrap_model_range(model_map, model_size,
                                                gate_offset, gate_tensor_bytes,

@@ -927,10 +927,24 @@ kernel void kernel_glm_q3_K_addr_pair_swiglu_f32(
     const uint64_t mid_base = (uint64_t)token * args.mid_token_stride +
                               (uint64_t)slot * args.mid_dim;
     const int expert = selected[selected_off];
-    if (expert < 0 || (uint)expert >= args.n_total_expert) return;
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tiisg == 0u) {
+            for (short row = 0; row < N_R0_Q3_K && row0 + (uint)row < args.mid_dim; row++) {
+                mid[mid_base + row0 + (uint)row] = 0.0f;
+            }
+        }
+        return;
+    }
     const uint64_t gate_addr = gate_addrs[(uint)expert];
     const uint64_t up_addr = up_addrs[(uint)expert];
-    if (gate_addr == 0 || up_addr == 0) return;
+    if (gate_addr == 0 || up_addr == 0) {
+        if (tiisg == 0u) {
+            for (short row = 0; row < N_R0_Q3_K && row0 + (uint)row < args.mid_dim; row++) {
+                mid[mid_base + row0 + (uint)row] = 0.0f;
+            }
+        }
+        return;
+    }
     device const float *token_x = x + (uint64_t)token * args.in_dim;
     const float2 gate_dot = ds4_glm_q3_K_dot2(
         reinterpret_cast<device const char *>(gate_addr) +
@@ -941,9 +955,9 @@ kernel void kernel_glm_q3_K_addr_pair_swiglu_f32(
             (uint64_t)row0 * args.up_row_bytes,
         args.up_row_bytes, args.in_dim, token_x, tiisg);
     for (short row = 0; row < N_R0_Q3_K && row0 + (uint)row < args.mid_dim; row++) {
+        const float g = simd_sum(gate_dot[row]);
+        const float u = simd_sum(up_dot[row]);
         if (tiisg == 0u) {
-            const float g = simd_sum(gate_dot[row]);
-            const float u = simd_sum(up_dot[row]);
             mid[mid_base + row0 + (uint)row] =
                 (g / (1.0f + exp(-g))) * u * weights[selected_off];
         }
@@ -2417,7 +2431,8 @@ kernel void kernel_glm_q3_K_addr_down_f32(
             mid + mid_base + (uint64_t)slot * args.mid_dim, tiisg);
     }
     for (short row = 0; row < N_R0_Q3_K && row0 + (uint)row < args.out_dim; row++) {
-        if (tiisg == 0u) out[(uint64_t)token * args.out_dim + row0 + (uint)row] = simd_sum(sum[row]);
+        const float value = simd_sum(sum[row]);
+        if (tiisg == 0u) out[(uint64_t)token * args.out_dim + row0 + (uint)row] = value;
     }
 }
 
