@@ -387,8 +387,11 @@ historical brainstorming plan.
 layer and the existing runtime loader is now connected to Laguna's separate
 generation graph.  At cache 800 it regressed the fixed 256-token Python
 benchmark (44.3% hit / 30.54 t/s vs ordinary LRU's 45.8% / 32.15 t/s), so it
-remains an opt-in file rather than a baked default.  Evidence and the runtime
-override are in `research/laguna-xs21-p26-p27-hotlist-acceptance.md`.
+remains an opt-in file rather than a baked default.  A final 400-of-800
+stateful-agent test also regressed (42.4% vs 44.1% hits), so static Python
+hotlist tuning is closed unless a future adaptive policy changes the premise.
+Evidence and the runtime override are in
+`research/laguna-xs21-p26-p27-hotlist-acceptance.md`.
 
 **P2.7 — Acceptance preflight** (complete locally, 2026-07-28; original Task
 14, `:721`, plus T8's open Step 2).  The ctx-32768 / prefill-4096 / 3,200

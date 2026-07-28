@@ -53,6 +53,28 @@ per-workload experiments, but do **not** generate a compiled-in XS default.
 `./tests/xs21_stream_ab.sh` against the biased Q3 artifact passes after the
 integration change.
 
+### Stateful-agent closure
+
+Sol noted that the table above only exercises one-shot `./ds4`, while the
+intended consumer is the stateful `ds4-agent` session.  The only plausible
+remaining static policy was therefore tested with a temporary, environment-
+gated post-sync session seed and then removed.
+
+The same Python retry task ran through `ds4-agent --non-interactive`, cache
+800, context 8192, and prefill chunk 4096.  The partial run verified a
+400-entry seed spanning all 39 layers and returned the identical answer.
+
+| session policy | cache hit rate | miss pread | pread time |
+|---|---:|---:|---:|
+| ordinary LRU | 44.1% | 41.72 GiB | 898.0 ms |
+| 400-of-800 selected-id seed | 42.4% | 43.25 GiB | 912.9 ms |
+
+This rejects both full-cache and partial static seeding on the real Python
+agent path.  **Decision: stop Python-hot-expert tuning.**  Keep the profile
+artifact and the opt-in one-shot loader as research tools, but do not spend
+more roadmap time on static Python hotlists without a materially different,
+adaptive cache policy.
+
 ## P2.7: 32 GB acceptance preflight
 
 The development machine is a 128 GB M5 Max, so it cannot substantiate the
