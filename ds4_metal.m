@@ -34349,21 +34349,34 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             g_tp_split_world <= 1 &&
             (!strcmp(q3_artifact_layer, "all") ||
              strtoul(q3_artifact_layer, NULL, 10) == (unsigned long)layer_index);
+        const BOOL q3_artifact_owned_buffers =
+            getenv("DS4_METAL_GLM_Q3_ARTIFACT_DOWN_EQUIV_OWNED") != NULL;
         id<MTLBuffer> q3_artifact_addr_buf = nil;
         id<MTLBuffer> q3_artifact_out_buf = nil;
+        id<MTLBuffer> q3_artifact_down_buf = nil;
         if (q3_artifact_down_equiv) {
             const NSUInteger addr_bytes = (NSUInteger)n_total_expert * sizeof(uint64_t);
             q3_artifact_addr_buf = [g_device newBufferWithLength:addr_bytes
                                                            options:MTLResourceStorageModeShared];
             q3_artifact_out_buf = [g_device newBufferWithLength:(NSUInteger)out_bytes
                                                           options:MTLResourceStorageModeShared];
+            if (q3_artifact_owned_buffers) {
+                q3_artifact_down_buf =
+                    [g_device newBufferWithBytes:(const uint8_t *)model_map + down_offset
+                                           length:(NSUInteger)down_tensor_bytes
+                                          options:MTLResourceStorageModeShared];
+            }
             uint64_t *addresses = q3_artifact_addr_buf ?
                 (uint64_t *)[q3_artifact_addr_buf contents] : NULL;
-            if (!addresses || !q3_artifact_out_buf) return 0;
+            if (!addresses || !q3_artifact_out_buf ||
+                (q3_artifact_owned_buffers && !q3_artifact_down_buf)) return 0;
             for (uint32_t expert = 0; expert < n_total_expert; expert++) {
                 addresses[expert] = ds4_gpu_buffer_address(
-                    downbuf, (NSUInteger)(down_inner +
-                                           (uint64_t)expert * down_expert_bytes));
+                    q3_artifact_owned_buffers ? q3_artifact_down_buf : downbuf,
+                    q3_artifact_owned_buffers ?
+                        (NSUInteger)((uint64_t)expert * down_expert_bytes) :
+                        (NSUInteger)(down_inner +
+                                    (uint64_t)expert * down_expert_bytes));
                 if (addresses[expert] == 0) return 0;
             }
             [q3_artifact_addr_buf didModifyRange:NSMakeRange(0, addr_bytes)];
@@ -34721,7 +34734,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
             [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:3];
             [enc setBuffer:q3_artifact_out_buf offset:0 atIndex:4];
-            [enc useResource:downbuf usage:MTLResourceUsageRead];
+            [enc useResource:q3_artifact_owned_buffers ? q3_artifact_down_buf : downbuf
+                    usage:MTLResourceUsageRead];
             [enc dispatchThreadgroups:MTLSizeMake(down_x_groups, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(down_threads, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);

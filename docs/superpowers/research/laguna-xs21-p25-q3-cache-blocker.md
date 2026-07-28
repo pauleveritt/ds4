@@ -94,8 +94,10 @@ The old mapped-model-address conclusion was corrected by source review: that
 toggle changed an address table while the experiment had selected a direct-slot
 kernel that did not read it. A new opt-in artifact-backed check now tests that
 case for real: a raw address into the mmap-backed model view yields zero while
-the resident bound-buffer kernel reads the same Q3 bytes correctly. Raw GPU
-addresses work for owned MTL buffers, but not for this model-view buffer.
+the resident bound-buffer kernel reads the same Q3 bytes correctly. The same
+check with an owned copy of the full real down tensor also yields zero. Raw GPU
+addresses work for the controlled owned-buffer fixture, but the generic
+routed-MoE invocation has an additional unresolved integration difference.
 
 This is now a Q3 down kernel/invocation-contract blocker.  It is not evidence
 against the artifact, its cache contents, pair path, or cache accounting.
@@ -115,8 +117,9 @@ eight-slot failure; that discrepancy is now an engine-integration or prior
 experimental-wiring problem rather than a Q3 down-kernel problem. In
 particular, the prior mapped-model-address result was inconclusive, not a
 counterexample to the passing raw-address control. The replacement
-artifact-backed result establishes the relevant distinction: owned cache
-buffers can use raw addresses; mmap-backed model views cannot.
+artifact-backed result establishes that buffer provenance alone is not the
+answer: both mapped and owned full-tensor inputs fail in the generic invocation,
+despite the controlled owned-buffer proof.
 
 ## Independent review
 
@@ -146,10 +149,11 @@ are lower, and the scorer has a documented tokenization/path floor.
 
 ## Required next implementation sequence
 
-1. Extend the artifact-backed check to selected experts copied into owned
-   cache-style MTL buffers. Compare direct-buffer and raw-address down output
-   with the resident result, then verify cache address-table publication and
-   resource lifetime in the generic routed-MoE path.
+1. In the artifact-backed generic invocation, dispatch the resident Q3 down
+   kernel against the owned full-tensor copy before the raw-address candidate.
+   This separates the copied tensor/binding from selected-id and address-table
+   publication. Then reduce to selected cache-style buffers and verify table
+   visibility/resource lifetime.
 2. Diagnose the resulting cache-buffer integration discrepancy until the selected candidate is
    exact.  Do not enable Q3 cache service beforehand.
 3. Enable coherent Q3 cache eligibility in both the generic Metal path and

@@ -24,10 +24,11 @@ The direct-buffer controls are now exact for both one expert and eight
 selected experts at production dimensions (2048 output / 512 mid), with a
 permuted selected-id order. The raw-GPU-address candidate is exact over the
 same fixture. Basic direct-buffer binding, slot order, selected ids, Q3 down
-geometry, and raw-address consumption for owned MTL buffers are no longer
-leading hypotheses. The artifact-backed check shows raw addresses into the
-mmap-backed model view yield zero, so the next rung is owned cache-style
-buffers and cache address-table/resource-lifetime integration.
+geometry, and raw-address consumption for controlled owned MTL buffers are no
+longer leading hypotheses. The artifact-backed check yields zero for both the
+mmap-backed view and an owned copy of the full real down tensor, so the next
+rung is a resident-kernel control inside that exact generic invocation, then
+address-table publication/resource-lifetime isolation.
 
 ## Current topology
 
@@ -62,8 +63,9 @@ as shipped and must remain so until the new proof succeeds.
 1. **Raw pointers depend on buffer provenance.** The old engine
    mapped-model-address toggle was ineffective because its direct-slot kernel
    did not read the table. The replacement artifact-backed raw-address check
-   establishes that owned MTL buffers are valid, whereas mmap-backed model-view
-   addresses yield zero. The remaining issue is owned cache-buffer integration.
+   establishes a remaining generic-invocation discrepancy: both the mapped view
+   and an owned full-tensor copy yield zero, despite the controlled exact test.
+   The remaining issue is address-table publication or another host contract.
 2. **The Q3 down path is the failure locus.** The experiment matched the
    complete gate/up intermediate exactly, then diverged at output byte 16,385
    (the first down float).  Cache bytes and CPU address-table entries were
