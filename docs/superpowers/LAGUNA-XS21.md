@@ -24,6 +24,7 @@ is the most important section in this document.
 | 32 GB sizing measurements | `docs/superpowers/plans/mini-notes.md` |
 | **Preserved SDD research** | `docs/superpowers/research/laguna-xs21-sdd/` |
 | **P2.5 Q3 cache research** | `docs/superpowers/research/laguna-xs21-p25-q3-cache-blocker.md` |
+| **P2.5 implementation brainstorm** | `docs/superpowers/plans/2026-07-28-laguna-xs21-p25-q3-cache-equivalence.md` |
 | Quality fixtures + README | `gguf-tools/quality-testing/data/laguna-xs21/` |
 | Python/web fixture prompts | `gguf-tools/quality-testing/prompts_laguna_xs21_webpy.jsonl` |
 | A/B correctness gate | `tests/xs21_stream_ab.sh` |
@@ -392,6 +393,9 @@ the safe fallback. Only after these gates pass may P2.5 rerun the footprint
 sweep and claim the §5 projection.  Full evidence, the independent review,
 and the implementation sequence are in
 `research/laguna-xs21-p25-q3-cache-blocker.md`.
+The staged kernel/test/admission proposal is in
+`plans/2026-07-28-laguna-xs21-p25-q3-cache-equivalence.md`; it is a
+brainstorming plan, not an implementation commitment.
 
 **P2.6 — Python expert hotlist** (original Tasks 12–13, `:609`, `:658`).
 Deliberately *after* cache support and re-measurement, because §5 shows it is a
