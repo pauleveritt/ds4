@@ -1,7 +1,8 @@
 # Laguna XS 2.1 on ds4 — consolidated state and Phase 2 kickoff
 
-**Status as of 2026-07-27.** Branch `laguna-xs21-footprint`, forked from
-`laguna-xs2.1` at `05965c9`.
+**Status as of 2026-07-28.** Branch `laguna-xs21-footprint`, forked from
+`laguna-xs2.1` at `05965c9`.  Phase 2 engineering is complete; real-32-GB
+hardware acceptance is the sole remaining operational handoff.
 
 Phase 1 (streaming bring-up) is done and green: Laguna XS 2.1 loads, generates
 correctly, and streams its routed experts through the Metal expert cache with a
@@ -143,7 +144,7 @@ mapped-model fallback. Correct on every model, no barrier to Q2_K/Q3_K work.
 
 ---
 
-## 4. Measured performance and memory
+## 4. Historical baseline — before P2.5
 
 All measured on the dev laptop (M5 Max, **128 GB**) at `05965c9`.
 
@@ -185,9 +186,11 @@ transfer; t/s will not.** Do not quote 52 t/s as a small-machine expectation.
 
 ---
 
-## 5. The reframe — read this before planning Phase 2
+## 5. Historical reframe — resolved by P2.5
 
-Every run prints this warning, and it is the central fact of the project:
+At kickoff, every Q4 run printed this warning, which motivated the uniform
+artifact work.  It is preserved for the causal record; P2.5 resolves it for
+the uniform Q3 artifact.
 
 ```
 SSD streaming mixed-precision model: 20/39 routed layers off the slab size
@@ -261,22 +264,24 @@ get under 10 GiB. **These are projections, not measurements.**
 
 ## 6. Current sizing recommendation
 
-Target was moved from the plan's 16 GB Mac Mini to **32 GB** (user decision,
-2026-07-27) because 16 GB does not fit today: at ctx 32768 the decode static
-span set (9.64 GiB) + KV (1.31) + scratch (3.97) = 14.92 GiB before a single
-cached expert.
+The development handoff target is **32 GB**.  Use the uniform RoutedQ3_K
+artifact with the already-validated prefill cap and begin with a 3,200-expert
+target:
 
 ```bash
-./ds4-agent -m gguf/Laguna-XS-2.1-Q4_K_M.gguf \
-    --ssd-streaming --ssd-streaming-cache-experts 4000 -c 32768
+./ds4-agent -m gguf/laguna-xs-2.1-RoutedQ3_K-biased.gguf \
+    --ssd-streaming --ssd-streaming-cache-experts 3200 \
+    --prefill-chunk 4096 -c 32768
 ```
 
-≈13.1 GiB task footprint, ≈22.7 GiB including hot mmap pages, ≈9.3 GiB left for
-OS and other apps. A 3,200-expert variant gives ~20.5 GiB total for a 0.907 →
-0.902 hit-rate cost.
+The local 32k smoke reported 6.53 GiB planned (2.30 GiB context runtime +
+4.03 GiB target cache) and 6.46 GiB task footprint after eight tokens, with
+1.57 GiB cache live.  It is an allocation preflight, **not** a steady-state
+or 32-GB performance claim.  Validate the checklist in `mini-notes.md` §7
+before operational use.
 
-**16 GB becomes viable if Phase 2's uniformity work lands** — that is the §5
-projection. It is a "support it" target, not a "design for it" target.
+The former Q4/16-GB arithmetic remains historical context only; it is
+superseded by the measured Q3 cache work in P2.5 and the preflight above.
 
 ---
 
@@ -317,26 +322,28 @@ projection. It is a "support it" target, not a "design for it" target.
 
 ---
 
-## 8. Proposed Phase 2 kickoff plan
+## 8. Phase 2 completion summary
 
-Intended for Superpowers. This is a **proposal to brainstorm against, not a
-committed plan** — §5 changed the goal late, and the task order below reflects
-that reframe rather than the original plan's ordering.
+This was the Superpowers kickoff proposal.  It is retained as historical
+sequence; its P2.0--P2.7 items are now resolved below, except for the explicit
+real-32-GB operational handoff.
 
 The original plan's Tasks 9–14 remain the substrate; find them at
 `docs/superpowers/plans/2026-07-25-laguna-xs2-streaming.md:483` onward.
 
 ### Phase 2 goal
 
-Reduce Laguna XS 2.1's streaming footprint far enough that 16 GB is usable and
-32 GB is comfortable, without losing the correctness Phase 1 established.
+Make the uniform RoutedQ3_K artifact genuinely cache-served, bound its live
+cache/context footprint, and preserve Phase 1 correctness.  The resulting
+32-GB candidate still needs a real constrained-hardware acceptance run; 16 GB
+is no longer a release target.
 
-### Proposed ordering
+### Completed ordering
 
-**P2.0 — Validate the uniformity premise first (new, blocking).**
-Everything below assumes a uniform routed quant is achievable. That is
-unproven: llama.cpp's per-layer boost heuristic is what created the 20/19
-split. Before investing in corpus and imatrix work, confirm that quantizing
+**P2.0 — Validate the uniformity premise first (complete, 2026-07-27).**
+At kickoff, everything below assumed a uniform routed quant was achievable.
+llama.cpp's per-layer boost heuristic created the 20/19 split, so the first
+step was to confirm that quantizing
 from BF16 with explicit per-tensor overrides produces an artifact where all 39
 routed layers share one byte-size class. A single small experiment answers it.
 **If this fails, the whole footprint thesis needs rethinking** — so do it
@@ -395,8 +402,9 @@ Evidence and the runtime override are in
 
 **P2.7 — Acceptance preflight** (complete locally, 2026-07-28; original Task
 14, `:721`, plus T8's open Step 2).  The ctx-32768 / prefill-4096 / 3,200
-cache configuration constructs at a 6.53 GiB planned total.  Actual acceptance
-on real 32 GB hardware is still required: `mini-notes.md` §7 is the checklist.
+cache configuration constructs at a 6.53 GiB planned total.  This closes the
+developer branch; actual acceptance on real 32 GB hardware remains an
+operational handoff, with `mini-notes.md` §7 as the checklist.
 
 ### Standing rules for Phase 2
 

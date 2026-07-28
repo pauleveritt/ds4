@@ -102,38 +102,21 @@ path).
 Expect the **memory and cache-budget numbers to hold** and the **throughput
 numbers not to**. Do not quote 52 t/s as a 32 GB expectation.
 
-## 5. The dominant remaining constraint
+## 5. Resolved cache blocker; remaining acceptance constraint
 
-Startup reports, on every run:
+The 20/19 mixed-slab warning and Q3 mapped fallback described in earlier
+versions of this note are resolved.  The uniform RoutedQ3_K artifact now
+cache-serves all 39 sparse layers; P2.5 established bit-exact cache readbacks
+and a passing resident-vs-streamed gate.  At ctx 16384 / prefill chunk 4096,
+800/1600/3200/4800 entries measured 1.01/2.01/4.03/6.04 GiB live cache and
+33.55/34.47/36.85/37.41 t/s.  Full evidence is in
+`docs/superpowers/research/laguna-xs21-p25-q3-cache-blocker.md`.
 
-```
-SSD streaming mixed-precision model: 20/39 routed layers off the slab size
-class will bypass the expert cache and read experts via mapped model views
-WARNING: the majority of routed layers (20/39) are off the slab size class
-```
-
-Only 19 of 39 sparse layers use the expert cache at all. The other 20 read
-through mmap and do not appear in the hit/miss counters — so the 0.907 hit
-rate describes roughly half the model. (Sanity check on the smoke run: 63
-decode steps x 19 layers x 8 experts = 9,576 = hits + misses exactly.)
-
-This is what Tasks 10-13 attack. A biased uniform RoutedQ3_K artifact now
-exists, but it does **not** yet obtain the cache benefit: its Q3 routed triples
-take ds4's correct mapped-model fallback because the generic streaming decode
-path has no Q3_K address-table kernels. A 16k-context, 4096-token-prefill,
-256-token Q3 run reported the planned 1.01 GiB expert-cache reservation but
-**0.00 GiB live streaming experts** after graph free; 800/1,600/3,200/4,800
-expert budgets all had no cache statistics and held near 62 t/s. Do not use the
-startup reservation as a footprint result.
-
-Q3 cache kernels and a nonzero-hit correctness test now precede the Python
-expert hotlist.  The fix must also remove Q3 from the decode static mapped
-span; cache hits alone are not a footprint result.  The regression gate needs
-resident-vs-cached output equivalence, nonzero cache entries/hits/live bytes,
-and the expected static-span drop.  Re-run this sweep only after that gate
-passes.  See `docs/superpowers/research/laguna-xs21-p25-q3-cache-blocker.md`
-for the source diagnosis, reverted experiment, review, and raw-evidence
-retention requirement.
+The remaining constraint is not an engine blocker: a 128-GB development
+laptop cannot validate page-cache misses, memory pressure, or a sustained
+agent task on real 32-GB hardware.  Static Python hotlists were also closed as
+a tuning path after both full and partial seeded agent tests regressed; see
+`docs/superpowers/research/laguna-xs21-p26-p27-hotlist-acceptance.md`.
 
 ## 6. Download target
 
@@ -155,10 +138,10 @@ ln -sf "$PWD/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-im
 ## 7. Still to verify on real 32 GB hardware
 
 - [ ] Startup expert-cache budget chosen by the automatic sizing (compare to
-      the 4,000 recommended here — the auto-budget derives from Metal's
-      `recommendedMaxWorkingSetSize`, ~84% of RAM, then 80% of that, minus
-      the 9.64 GiB of non-routed weights)
-- [ ] Warm-cache decode t/s (expect below the 52 t/s measured here, per §4)
+      the local 3,200-entry Q3 candidate; retain its startup allocation
+      report)
+- [ ] Warm-cache decode t/s and miss-read rate (do not extrapolate the
+      128-GB laptop's page-cache-backed result)
 - [ ] Cache hit rate after a 10-minute agent session
 - [ ] Memory pressure / whether the system swaps
 - [ ] Whether `iogpu.wired_limit_mb` needed adjusting
