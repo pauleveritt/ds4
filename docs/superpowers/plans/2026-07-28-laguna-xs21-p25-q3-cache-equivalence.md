@@ -20,15 +20,17 @@ investigation should therefore begin with a
 minimal Q3 down invocation contract, rather than revisiting quantization, the
 cache allocator, or Phase 1's Laguna dispatch.
 
-The direct-buffer controls are now exact for both one expert and eight
-selected experts at production dimensions (2048 output / 512 mid), with a
-permuted selected-id order. The raw-GPU-address candidate is exact over the
-same fixture. Basic direct-buffer binding, slot order, selected ids, Q3 down
-geometry, and raw-address consumption for controlled owned MTL buffers are no
-longer leading hypotheses. The artifact-backed check yields zero for both the
-mmap-backed view and an owned copy of the full real down tensor, so the next
-rung is a resident-kernel control inside that exact generic invocation, then
-address-table publication/resource-lifetime isolation.
+The direct-buffer controls are exact for both one expert and eight selected
+experts at production dimensions (2048 output / 512 mid), with a permuted
+selected-id order. The raw-GPU-address candidate is exact over the same
+fixture. The artifact-backed generic invocation is now also exact for a
+rebound mmap model view, a direct bound owned full-tensor copy, and a raw
+address into that owned copy. An initial zero result was a diagnostic bug: it
+read a graph-batched command buffer before commit. Basic direct-buffer
+binding, slot order, selected ids, Q3 down geometry, and raw-address
+consumption are no longer leading hypotheses. The next rung is a
+diagnostic-only cache-service integration using the actual selected cache
+buffers and address table.
 
 ## Current topology
 
@@ -60,12 +62,13 @@ as shipped and must remain so until the new proof succeeds.
 
 ## Design hypotheses to test
 
-1. **Raw pointers depend on buffer provenance.** The old engine
+1. **Raw pointers are now proven for the relevant forms.** The old engine
    mapped-model-address toggle was ineffective because its direct-slot kernel
-   did not read the table. The replacement artifact-backed raw-address check
-   establishes a remaining generic-invocation discrepancy: both the mapped view
-   and an owned full-tensor copy yield zero, despite the controlled exact test.
-   The remaining issue is address-table publication or another host contract.
+   did not read the table. The replacement artifact-backed check initially
+   read stale graph-batch outputs, then passed exactly after an opt-in
+   commit/wait. It covers rebound mapped view, owned full copy, and raw address
+   to that copy. The remaining issue is the prior cache integration, not raw
+   pointer provenance in the generic Q3 down invocation.
 2. **The Q3 down path is the failure locus.** The experiment matched the
    complete gate/up intermediate exactly, then diverged at output byte 16,385
    (the first down float).  Cache bytes and CPU address-table entries were
@@ -141,10 +144,11 @@ selected experts, so a zero-filled fixture cannot hide Q3 packing errors.
 The fixture may be generated at test time, but its encoding must be explicit
 and deterministic. The committed controls cover one and eight selected experts,
 including direct-buffer and raw-address candidates at production shape. The
-artifact-backed mapped-model check is diagnostic only; next compare owned
-cache-style buffers before Levels A/C/D. It may use the local model but must
-not become the portable regression test because it would depend on an
-untracked 14.64 GiB model.
+artifact-backed mapped-model, owned-copy, and raw-address checks are
+diagnostic only; they now pass after synchronizing their graph batch. The
+next integration check must use cache-style selected buffers/address table.
+The local model must not become a portable regression fixture because it is an
+untracked 14.64 GiB artifact.
 
 ### 3. Cache-integration proof
 

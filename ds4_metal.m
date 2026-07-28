@@ -34354,6 +34354,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         id<MTLBuffer> q3_artifact_addr_buf = nil;
         id<MTLBuffer> q3_artifact_out_buf = nil;
         id<MTLBuffer> q3_artifact_down_buf = nil;
+        id<MTLBuffer> q3_artifact_model_out_buf = nil;
+        id<MTLBuffer> q3_artifact_direct_out_buf = nil;
         if (q3_artifact_down_equiv) {
             const NSUInteger addr_bytes = (NSUInteger)n_total_expert * sizeof(uint64_t);
             q3_artifact_addr_buf = [g_device newBufferWithLength:addr_bytes
@@ -34365,11 +34367,19 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                     [g_device newBufferWithBytes:(const uint8_t *)model_map + down_offset
                                            length:(NSUInteger)down_tensor_bytes
                                           options:MTLResourceStorageModeShared];
+                q3_artifact_model_out_buf =
+                    [g_device newBufferWithLength:(NSUInteger)out_bytes
+                                           options:MTLResourceStorageModeShared];
+                q3_artifact_direct_out_buf =
+                    [g_device newBufferWithLength:(NSUInteger)out_bytes
+                                           options:MTLResourceStorageModeShared];
             }
             uint64_t *addresses = q3_artifact_addr_buf ?
                 (uint64_t *)[q3_artifact_addr_buf contents] : NULL;
             if (!addresses || !q3_artifact_out_buf ||
-                (q3_artifact_owned_buffers && !q3_artifact_down_buf)) return 0;
+                (q3_artifact_owned_buffers &&
+                 (!q3_artifact_down_buf || !q3_artifact_model_out_buf ||
+                  !q3_artifact_direct_out_buf))) return 0;
             for (uint32_t expert = 0; expert < n_total_expert; expert++) {
                 addresses[expert] = ds4_gpu_buffer_address(
                     q3_artifact_owned_buffers ? q3_artifact_down_buf : downbuf,
@@ -34381,6 +34391,10 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             }
             [q3_artifact_addr_buf didModifyRange:NSMakeRange(0, addr_bytes)];
             memset([q3_artifact_out_buf contents], 0, (size_t)out_bytes);
+            if (q3_artifact_direct_out_buf) {
+                memset([q3_artifact_model_out_buf contents], 0, (size_t)out_bytes);
+                memset([q3_artifact_direct_out_buf contents], 0, (size_t)out_bytes);
+            }
         }
 
         id<MTLComputePipelineState> pair_pipeline =
@@ -34727,6 +34741,43 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         DS4_METAL_PROFILE_GLM_MOE_ONE_STAGE("down");
 
         if (q3_artifact_down_equiv) {
+            /* Keep the real selected/mid values and command sequence, but
+             * bind the owned full tensor directly.  This separates a raw
+             * address-table failure from copied-data or invocation state. */
+            if (q3_artifact_owned_buffers) {
+                /* Rebind the resident model view into a fresh encoder/output
+                 * first, proving this diagnostic's extra dispatch itself. */
+                enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:down_pipeline];
+                [enc setBytes:&args length:sizeof(args) atIndex:0];
+                [enc setBuffer:downbuf offset:(NSUInteger)down_inner atIndex:1];
+                [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+                [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:3];
+                [enc setBuffer:q3_artifact_model_out_buf offset:0 atIndex:4];
+                [enc useResource:downbuf usage:MTLResourceUsageRead];
+                if (down_threadgroup_bytes != 0u) {
+                    [enc setThreadgroupMemoryLength:down_threadgroup_bytes atIndex:0];
+                }
+                [enc dispatchThreadgroups:MTLSizeMake(down_x_groups, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(down_threads, 1, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+
+                enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:down_pipeline];
+                [enc setBytes:&args length:sizeof(args) atIndex:0];
+                [enc setBuffer:q3_artifact_down_buf offset:0 atIndex:1];
+                [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+                [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:3];
+                [enc setBuffer:q3_artifact_direct_out_buf offset:0 atIndex:4];
+                [enc useResource:q3_artifact_down_buf usage:MTLResourceUsageRead];
+                if (down_threadgroup_bytes != 0u) {
+                    [enc setThreadgroupMemoryLength:down_threadgroup_bytes atIndex:0];
+                }
+                [enc dispatchThreadgroups:MTLSizeMake(down_x_groups, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(down_threads, 1, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+            }
+
             enc = ds4_gpu_compute_encoder(cb);
             [enc setComputePipelineState:g_glm_q3_k_down_addr_test_f32_pipeline];
             [enc setBytes:&args length:sizeof(args) atIndex:0];
@@ -34742,12 +34793,50 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         }
 
         if (!ok) return 0;
-        if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM routed MoE")) return 0;
+        /* Graph generation keeps the normal command buffer open.  The
+         * diagnostic reads CPU-visible comparison buffers, so it alone must
+         * force that batch to finish before inspecting them. */
+        const BOOL q3_artifact_forced_batch_sync =
+            q3_artifact_down_equiv && !owned;
+        if (q3_artifact_forced_batch_sync) {
+            if (!ds4_gpu_end_commands()) return 0;
+        } else if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM routed MoE")) {
+            return 0;
+        }
         if (q3_artifact_down_equiv) {
             const float *resident = (const float *)[outbuf contents] +
                 ds4_gpu_tensor_offset(out) / sizeof(float);
             const float *candidate = (const float *)[q3_artifact_out_buf contents];
             if (!resident || !candidate) return 0;
+            if (q3_artifact_owned_buffers) {
+                const float *model =
+                    (const float *)[q3_artifact_model_out_buf contents];
+                const float *direct =
+                    (const float *)[q3_artifact_direct_out_buf contents];
+                if (!model || !direct) return 0;
+                for (uint32_t i = 0; i < out_dim; i++) {
+                    if (memcmp(&resident[i], &model[i], sizeof(float)) != 0) {
+                        fprintf(stderr,
+                                "ds4: Q3 artifact rebind-model mismatch layer=%u index=%u resident=%g model=%g\n",
+                                layer_index, i, resident[i], model[i]);
+                        return 0;
+                    }
+                }
+                fprintf(stderr,
+                        "ds4: Q3 artifact rebind-model equivalence layer=%u OK\n",
+                        layer_index);
+                for (uint32_t i = 0; i < out_dim; i++) {
+                    if (memcmp(&resident[i], &direct[i], sizeof(float)) != 0) {
+                        fprintf(stderr,
+                                "ds4: Q3 artifact direct-owned mismatch layer=%u index=%u resident=%g direct=%g\n",
+                                layer_index, i, resident[i], direct[i]);
+                        return 0;
+                    }
+                }
+                fprintf(stderr,
+                        "ds4: Q3 artifact direct-owned equivalence layer=%u OK\n",
+                        layer_index);
+            }
             for (uint32_t i = 0; i < out_dim; i++) {
                 if (memcmp(&resident[i], &candidate[i], sizeof(float)) != 0) {
                     fprintf(stderr,
@@ -34758,6 +34847,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             }
             fprintf(stderr, "ds4: Q3 artifact down equivalence layer=%u OK\n", layer_index);
         }
+        if (q3_artifact_forced_batch_sync && !ds4_gpu_begin_commands()) return 0;
 #undef DS4_METAL_PROFILE_GLM_MOE_ONE_STAGE
     }
 

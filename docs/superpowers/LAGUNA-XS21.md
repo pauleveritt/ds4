@@ -380,20 +380,18 @@ result. The 1,600/3,200/4,800-expert repeats likewise stayed at 0.00 GiB and
 about 62 t/s. Therefore the planned 2.89/3.89/5.91/7.92 GiB startup totals are
 reservations, not measured live Q3 cache use.
 
-The next blocking implementation item is a numerically exact Q3_K down
-projection equivalence harness for the generic routed-MoE decode kernel. The
-real-artifact experiment proved exact gate/up intermediate agreement, then
-diverged at the first down-output float. Its cache bytes and CPU address table
-were exact. The old mapped-model-address toggle was later found inconclusive:
-the selected direct-slot down kernel did not read that address table. A
-diagnostic run allocated 1.01 GiB and
-recorded 38,612 hits / 1,012 misses, then produced `|UNK|`; it was fully
-removed rather than weakening the safe fallback. The harness must make a
-resident Q3 down reference and each candidate consume the same nonzero
-controlled buffers before another production kernel is attempted. After it is
-exact, integration must assert intermediate gate/up and final down equality,
-nonzero cache entries/hits/live bytes, and the expected drop in routed decode
-static span. A working kernel is not enough:
+The numerically exact Q3_K down-projection harness is now complete: controlled
+one/eight-expert cases and a real artifact layer are exact for rebound mapped
+views, an owned full-tensor copy, and raw GPU addressing. The artifact check
+initially reported zero candidates because it read an uncommitted graph batch;
+its opt-in diagnostic now commits/waits before readback. The old cache
+experiment still matters: it allocated 1.01 GiB and recorded 38,612 hits /
+1,012 misses, then produced `|UNK|`; it remains fully removed rather than
+weakening the safe fallback. The next implementation item is diagnostic-only
+Q3 cache-service integration using actual selected cache buffers and address
+tables. It must assert intermediate gate/up and final down equality, nonzero
+cache entries/hits/live bytes, and the expected drop in routed decode static
+span. A working kernel is not enough:
 `laguna_decode_experts_cache_servable()` must also admit coherent Q3, or the
 tensors will remain mapped and the footprint objective will still fail. Only
 after these gates pass may P2.5 rerun the footprint sweep and claim the §5

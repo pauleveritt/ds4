@@ -1,8 +1,10 @@
 # P2.5 — Laguna XS 2.1 Q3 streamed-cache blocker
 
-**Status:** blocked, 2026-07-28.  The uniform RoutedQ3_K artifact is valid,
-but ds4 currently uses a mapped-model fallback for its routed experts during
-decode.  It has not demonstrated the footprint reduction that Phase 2 needs.
+**Status:** in progress, 2026-07-28.  The uniform RoutedQ3_K artifact is
+valid, and the generic Q3 down binding/address forms now have an
+artifact-backed exactness proof.  ds4 still uses a mapped-model fallback for
+its routed experts during decode, so the footprint reduction remains
+unmeasured pending a diagnostic cache-service integration.
 
 ## Research question
 
@@ -90,19 +92,20 @@ result was around `1e-2`.  The live cache allocation and hit count therefore
 prove only that loading and accounting ran, not that its Q3 down output was
 valid.
 
-The old mapped-model-address conclusion was corrected by source review: that
-toggle changed an address table while the experiment had selected a direct-slot
-kernel that did not read it. A new opt-in artifact-backed check now tests that
-case for real: a raw address into the mmap-backed model view yields zero while
-the resident bound-buffer kernel reads the same Q3 bytes correctly. The same
-check with an owned copy of the full real down tensor also yields zero. Raw GPU
-addresses work for the controlled owned-buffer fixture, but the generic
-routed-MoE invocation has an additional unresolved integration difference.
+The old mapped-model-address conclusion was corrected twice.  First, source
+review showed that its selected direct-slot kernel did not read the altered
+address table.  Then the replacement artifact diagnostic initially read
+fresh output buffers while the graph command batch was still uncommitted,
+which made every candidate appear as zero.  The diagnostic now commits/waits
+only its opt-in batch before readback and reopens the batch afterwards.
 
-This is now a Q3 down kernel/invocation-contract blocker.  It is not evidence
-against the artifact, its cache contents, pair path, or cache accounting.
-The removed code must not be restored as a starting point; an isolated down
-equivalence test is required before another production-path attempt.
+With that correction, layer 1 is bit-exact for all of the following against
+the authoritative resident output: a fresh rebind of the mapped model view,
+a fresh direct binding of an owned full copy of the real down tensor, and the
+raw GPU-address kernel addressing that owned copy.  The result closes the
+generic Q3 down invocation-contract question; it is not evidence that the
+old cache integration was correct.  Its real divergence remains a
+cache-path/wiring problem to reintroduce only behind a diagnostic switch.
 
 ### First isolated control
 
@@ -116,10 +119,10 @@ and raw-address semantics. It does **not** overturn the real-artifact
 eight-slot failure; that discrepancy is now an engine-integration or prior
 experimental-wiring problem rather than a Q3 down-kernel problem. In
 particular, the prior mapped-model-address result was inconclusive, not a
-counterexample to the passing raw-address control. The replacement
-artifact-backed result establishes that buffer provenance alone is not the
-answer: both mapped and owned full-tensor inputs fail in the generic invocation,
-despite the controlled owned-buffer proof.
+counterexample to the passing raw-address control. The artifact-backed
+diagnostic now also establishes exact mapped-view, owned-copy, and raw-address
+results in the real generic invocation once command-batch completion is
+honored.
 
 ## Independent review
 
@@ -149,13 +152,12 @@ are lower, and the scorer has a documented tokenization/path floor.
 
 ## Required next implementation sequence
 
-1. In the artifact-backed generic invocation, dispatch the resident Q3 down
-   kernel against the owned full-tensor copy before the raw-address candidate.
-   This separates the copied tensor/binding from selected-id and address-table
-   publication. Then reduce to selected cache-style buffers and verify table
-   visibility/resource lifetime.
-2. Diagnose the resulting cache-buffer integration discrepancy until the selected candidate is
-   exact.  Do not enable Q3 cache service beforehand.
+1. Add Q3 address-table pair/down kernels and enable them only behind an
+   explicit diagnostic switch.  Reuse the now-exact Q3 down indexing and bind
+   the actual cache-selected buffers/address table.
+2. Run the diagnostic cache service until continuation and per-layer
+   gate/up/down readbacks are exact with nonzero entries, hits, and live bytes.
+   Do not enable normal Q3 cache service beforehand.
 3. Enable coherent Q3 cache eligibility in both the generic Metal path and
    `laguna_decode_experts_cache_servable()`, so cache-service eligibility and
    decode static-span construction agree.
