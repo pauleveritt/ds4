@@ -152,12 +152,15 @@ are lower, and the scorer has a documented tokenization/path floor.
 
 ## Required next implementation sequence
 
-1. Add Q3 address-table pair/down kernels and enable them only behind an
-   explicit diagnostic switch.  Reuse the now-exact Q3 down indexing and bind
-   the actual cache-selected buffers/address table.
-2. Run the diagnostic cache service until continuation and per-layer
-   gate/up/down readbacks are exact with nonzero entries, hits, and live bytes.
-   Do not enable normal Q3 cache service beforehand.
+1. **Complete:** Q3 address-table pair/down kernels now run only behind
+   `DS4_METAL_GLM_Q3_STREAM_ADDR_DIAGNOSTIC`; normal Q3 eligibility and static
+   spans are unchanged.
+2. **Failed diagnostic integration:** the real Q3 cache path populated 800
+   entries (1.01 GiB live; 5,323 hits / 4,349 misses over a 32-token greedy
+   run) but diverged immediately from the resident continuation.  This proves
+   the cache tables are live, but not numerically correct end-to-end.  Add
+   layer-level resident/cache `mid` and down-output readbacks to localize pair
+   versus down before changing admission.
 3. Enable coherent Q3 cache eligibility in both the generic Metal path and
    `laguna_decode_experts_cache_servable()`, so cache-service eligibility and
    decode static-span construction agree.

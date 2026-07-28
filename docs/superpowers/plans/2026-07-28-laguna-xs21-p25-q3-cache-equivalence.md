@@ -32,6 +32,17 @@ consumption are no longer leading hypotheses. The next rung is a
 diagnostic-only cache-service integration using the actual selected cache
 buffers and address table.
 
+### Integration result (2026-07-28)
+
+The first diagnostic-only Q3 address-table cache run did allocate and use the
+real cache (800 entries, 1.01 GiB live, 5,323 hits / 4,349 misses for a
+32-token greedy run), but its continuation diverged immediately from the
+resident run. This is a useful, bounded failure: generic artifact Q3 pair/down
+addressability is proven, while the actual cache-service integration remains
+incorrect. Do not proceed to admission or footprint measurement. The next
+diagnostic must read back and compare resident/cache gate-up `mid` and down
+output by layer to isolate the first wrong stage.
+
 ## Current topology
 
 Laguna XS 2.1 has Q8 shared experts, so its routed Q3 decode takes the generic

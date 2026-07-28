@@ -216,12 +216,14 @@ static id<MTLComputePipelineState> g_glm_q4_k_pair_swiglu2_mapped_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_pair_swiglu2_mapped_row_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q3_k_pair_swiglu_f32_pipeline;
+static id<MTLComputePipelineState> g_glm_q3_k_addr_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_addr_pair_swiglu2_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_addr_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_addr_pair_swiglu_masked_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q3_k_down_f32_pipeline;
+static id<MTLComputePipelineState> g_glm_q3_k_addr_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q3_k_down_one_bound_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q3_k_down_slots8_bound_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q3_k_down_addr_test_f32_pipeline;
@@ -7922,6 +7924,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_q2_K_pair_swiglu_f32");
         g_glm_q3_k_pair_swiglu_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q3_K_pair_swiglu_f32");
+        g_glm_q3_k_addr_pair_swiglu_f32_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_q3_K_addr_pair_swiglu_f32");
         g_glm_q2_k_addr_pair_swiglu2_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q2_K_addr_pair_swiglu2_f32");
         g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline =
@@ -7934,6 +7938,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_q2_K_down_f32");
         g_glm_q3_k_down_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q3_K_down_f32");
+        g_glm_q3_k_addr_down_f32_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_q3_K_addr_down_f32");
         g_glm_q3_k_down_one_bound_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_q3_K_down_one_bound_f32");
         g_glm_q3_k_down_slots8_bound_f32_pipeline =
@@ -9714,12 +9720,14 @@ void ds4_gpu_cleanup(void) {
         g_glm_q4_k_pair_swiglu2_mapped_row_f32_pipeline = nil;
         g_glm_q2_k_pair_swiglu_f32_pipeline = nil;
         g_glm_q3_k_pair_swiglu_f32_pipeline = nil;
+        g_glm_q3_k_addr_pair_swiglu_f32_pipeline = nil;
         g_glm_q2_k_addr_pair_swiglu2_f32_pipeline = nil;
         g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline = nil;
         g_glm_q4_k_addr_pair_swiglu_f32_pipeline = nil;
         g_glm_q4_k_addr_pair_swiglu_masked_f32_pipeline = nil;
         g_glm_q2_k_down_f32_pipeline = nil;
         g_glm_q3_k_down_f32_pipeline = nil;
+        g_glm_q3_k_addr_down_f32_pipeline = nil;
         g_glm_q3_k_down_one_bound_f32_pipeline = nil;
         g_glm_q3_k_down_slots8_bound_f32_pipeline = nil;
         g_glm_q3_k_down_addr_test_f32_pipeline = nil;
@@ -34086,11 +34094,16 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             !gate_pair_q2 && !gate_pair_q5 && down_scalar_q4 &&
             g_glm_q4_k_addr_pair_swiglu_f32_pipeline != nil &&
             g_glm_q4_k_addr_down_f32_pipeline != nil;
+        const BOOL stream_addr_q3_diagnostic =
+            getenv("DS4_METAL_GLM_Q3_STREAM_ADDR_DIAGNOSTIC") != NULL &&
+            gate_pair_q3 && down_simd_q3 &&
+            g_glm_q3_k_addr_pair_swiglu_f32_pipeline != nil &&
+            g_glm_q3_k_addr_down_f32_pipeline != nil;
         BOOL use_stream_expert_addr_table =
             g_ssd_streaming_mode &&
             !force_resident &&
             getenv("DS4_METAL_GLM_DISABLE_STREAMING_EXPERT_CACHE") == NULL &&
-            (stream_addr_q2 || stream_addr_q4) &&
+            (stream_addr_q2 || stream_addr_q4 || stream_addr_q3_diagnostic) &&
             layer_index < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER &&
             n_total_expert <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
             n_expert <= 8u &&
@@ -34224,10 +34237,11 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                     ds4_gpu_stream_expert_split_worthwhile(stream_resident_mask,
                                                            stream_missing_mask) &&
                     ds4_gpu_stream_expert_split_ready() &&
-                    ((gate_pair_q2 &&
+                    (!stream_addr_q3_diagnostic &&
+                     ((gate_pair_q2 &&
                       g_glm_q2_k_addr_pair_swiglu2_masked_f32_pipeline != nil) ||
                      (!gate_pair_q2 && !gate_pair_q5 &&
-                      g_glm_q4_k_addr_pair_swiglu_masked_f32_pipeline != nil));
+                      g_glm_q4_k_addr_pair_swiglu_masked_f32_pipeline != nil)));
                 if (use_stream_split_deferred) {
                     const ds4_gpu_stream_expert_table table = {
                         .model_map = model_map,
@@ -34408,6 +34422,9 @@ int ds4_gpu_glm_routed_moe_one_tensor(
              (gate_pair_q2 ?
               ds4_gpu_hot_pipeline(g_glm_q2_k_addr_pair_swiglu2_f32_pipeline,
                                    "kernel_glm_q2_K_addr_pair_swiglu2_f32") :
+              gate_pair_q3 ?
+              ds4_gpu_hot_pipeline(g_glm_q3_k_addr_pair_swiglu_f32_pipeline,
+                                   "kernel_glm_q3_K_addr_pair_swiglu_f32") :
               ds4_gpu_hot_pipeline(g_glm_q4_k_addr_pair_swiglu_f32_pipeline,
                                    "kernel_glm_q4_K_addr_pair_swiglu_f32")) :
              gate_pair_q2 ?
@@ -34426,6 +34443,9 @@ int ds4_gpu_glm_routed_moe_one_tensor(
              (down_scalar_q2 ?
               ds4_gpu_hot_pipeline(g_glm_q2_k_addr_down_f32_pipeline,
                                    "kernel_glm_q2_K_addr_down_f32") :
+              down_simd_q3 ?
+              ds4_gpu_hot_pipeline(g_glm_q3_k_addr_down_f32_pipeline,
+                                   "kernel_glm_q3_K_addr_down_f32") :
               ds4_gpu_hot_pipeline(g_glm_q4_k_addr_down_f32_pipeline,
                                    "kernel_glm_q4_K_addr_down_f32")) :
              down_scalar_q2 ?
@@ -34459,6 +34479,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         const char *glm_pair_path =
             use_stream_expert_addr_table ?
             (gate_pair_q2 ? "q2_stream_addr_swiglu" :
+             gate_pair_q3 ? "q3_stream_addr_swiglu" :
                             "q4_stream_addr_swiglu") :
             gate_pair_q2 ? "q2_scalar_swiglu" :
             gate_pair_q3 ? "q3_pair_simd_swiglu" :
@@ -34466,6 +34487,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         const char *glm_down_path =
             use_stream_expert_addr_table ?
             (down_scalar_q2 ? "q2_stream_addr_down" :
+             down_simd_q3 ? "q3_stream_addr_down" :
                               "q4_stream_addr_down_simd") :
             down_scalar_q2 ? "q2_down_simd" :
             down_simd_q3 ? "q3_down_simd" :
