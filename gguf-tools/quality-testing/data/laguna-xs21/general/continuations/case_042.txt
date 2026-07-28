@@ -1,0 +1,1 @@
+Online softmax in attention is a method to compute attention weights incrementally, avoiding the need to store all intermediate values. Here's

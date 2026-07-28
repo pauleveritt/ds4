@@ -1,0 +1,1 @@
+Write an HTML form with client-side validation that requires an email field and a password field of at least eight characters.

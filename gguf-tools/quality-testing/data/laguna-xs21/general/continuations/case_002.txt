@@ -1,0 +1,1 @@
+When comparing memory-mapped model weights (using `mmap`) with copying all weights into private buffers on macOS, the key differences

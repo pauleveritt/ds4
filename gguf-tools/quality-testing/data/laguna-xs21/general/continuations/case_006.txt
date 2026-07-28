@@ -1,0 +1,1 @@
+The tradeoffs between **top-p sampling** and **temperature zero decoding** (greedy decoding) involve balancing **diversity

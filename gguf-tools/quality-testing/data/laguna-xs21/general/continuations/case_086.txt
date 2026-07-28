@@ -1,0 +1,1 @@
+Checksums detect accidental data corruption by generating a compact numerical value derived from a data block's contents, allowing receivers to verify integrity

@@ -1,0 +1,1 @@
+A page cache accelerates a second file read by leveraging the operating system's in-memory caching mechanism. Here's a step-by

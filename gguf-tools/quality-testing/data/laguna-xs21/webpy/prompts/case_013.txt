@@ -1,0 +1,1 @@
+Write a Python dataclass for a Point3D with x, y, z floats and a method that returns the Euclidean distance to another Point3D.

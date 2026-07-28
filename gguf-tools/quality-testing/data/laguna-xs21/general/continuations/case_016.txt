@@ -1,0 +1,1 @@
+La **top-p** (nucleus sampling) e la **temperatura zero** (greedy decoding) sono

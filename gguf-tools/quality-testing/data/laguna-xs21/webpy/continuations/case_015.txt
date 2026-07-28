@@ -1,0 +1,4 @@
+{
+  "tool": "get_weather",
+  "arguments": {
+    "city": "Tokyo

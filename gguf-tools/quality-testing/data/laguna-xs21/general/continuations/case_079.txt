@@ -1,0 +1,5 @@
+Ecco una checklist concisa per verificare i lifetime di memoria in una PR:
+
+---
+
+###

@@ -1,0 +1,1 @@
+You have access to a tool named run_query that takes a sql argument and returns query results as rows. Using Laguna's native tool-call format, call run_query with sql set to SELECT count(*) FROM users. Respond with only the tool call.

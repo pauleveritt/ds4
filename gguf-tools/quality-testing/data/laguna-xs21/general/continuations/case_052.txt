@@ -1,0 +1,1 @@
+Ecco una spiegazione semplice del **softmax** nel contesto dell'**attenzione**, con es

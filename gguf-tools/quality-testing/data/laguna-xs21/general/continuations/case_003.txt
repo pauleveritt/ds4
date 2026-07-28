@@ -1,0 +1,1 @@
+RMSNorm (Root Mean Square Normalization) is a normalization technique designed to stabilize neural network training by normalizing the input features.

@@ -1,0 +1,1 @@
+Write a small Flask route that streams a large file to the client in chunks instead of loading it into memory.

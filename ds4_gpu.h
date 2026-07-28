@@ -74,6 +74,12 @@ int ds4_gpu_pack_slot_rows_f32_tensor(
         uint32_t                n_slots,
         uint32_t                slot_cap);
 
+/* Focused Metal regression for the Laguna XS 2.1 Q3 streamed-cache work.
+ * It compares resident Q3 down output with the one-expert direct-buffer
+ * control; it neither enables cache admission nor requires a model file. */
+int ds4_gpu_test_glm_q3_down_one_bound_equivalence(void);
+int ds4_gpu_test_glm_q3_down_slots8_bound_equivalence(void);
+
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
@@ -2289,6 +2295,7 @@ int ds4_gpu_laguna_routed_shared_moe_one_tensor(
         uint32_t                          n_expert,
         const ds4_gpu_tensor             *shared_selected,
         const ds4_gpu_tensor             *shared_weight,
+        uint32_t                          layer_index,
         const ds4_gpu_tensor             *x);
 
 int ds4_gpu_glm_routed_moe_batch_tensor(

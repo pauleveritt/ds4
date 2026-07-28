@@ -477,67 +477,9 @@ enum {
     DS4_MAX_HC_SINKHORN_ITER = 20,
 };
 
-typedef enum {
-    DS4_MODEL_FAMILY_DEEPSEEK4 = 0,
-    DS4_MODEL_FAMILY_GLM_DSA   = 1,
-    DS4_MODEL_FAMILY_LAGUNA    = 2,
-} ds4_model_family;
-
-typedef enum {
-    DS4_VARIANT_FLASH = 0,
-    DS4_VARIANT_PRO   = 1,
-    DS4_VARIANT_GLM52 = 2,
-    DS4_VARIANT_LAGUNA_S21 = 3,
-} ds4_variant;
-
-typedef struct {
-    const char *name;
-    ds4_model_family family;
-    ds4_variant variant;
-    uint32_t n_layer;
-    uint32_t n_embd;
-    uint32_t n_vocab;
-    uint32_t n_head;
-    uint32_t n_head_kv;
-    uint32_t n_head_dim;
-    uint32_t n_value_dim;
-    uint32_t n_rot;
-    uint32_t n_out_group;
-    uint32_t n_lora_q;
-    uint32_t n_lora_o;
-    uint32_t n_expert;
-    uint32_t n_expert_used;
-    uint32_t n_expert_shared;
-    uint32_t n_ff_exp;
-    uint32_t n_ff_shared;
-    uint32_t n_ff_dense;
-    uint32_t n_hash_layer;
-    uint32_t n_swa;
-    uint32_t n_indexer_head;
-    uint32_t n_indexer_head_dim;
-    uint32_t n_indexer_top_k;
-    uint32_t n_hc;
-    uint32_t n_hc_sinkhorn_iter;
-    uint32_t n_nextn_predict;
-    uint32_t n_leading_dense;
-    uint32_t n_kv_lora;
-    uint32_t n_key_mla;
-    uint32_t n_value_mla;
-    uint32_t n_rot_swa;
-    float rms_eps;
-    float hc_eps;
-    float expert_weight_scale;
-    float swiglu_clamp_exp;
-    float rope_freq_base;
-    float rope_scale_factor;
-    float rope_yarn_beta_fast;
-    float rope_yarn_beta_slow;
-    float rope_yarn_attn_factor;
-    float rope_freq_base_swa;
-    float compress_rope_freq_base;
-    uint64_t context_length;
-    uint64_t rope_orig_ctx;
-} ds4_shape;
+/* ds4_model_family, ds4_variant, and ds4_shape live in ds4.h: tests link
+ * against ds4.o and need the type definitions plus the extern shape
+ * constants declared there to verify per-variant constants directly. */
 
 static const ds4_shape DS4_SHAPE_FLASH = {
     .name = "DeepSeek V4 Flash",
@@ -668,7 +610,7 @@ static const ds4_shape DS4_SHAPE_GLM52 = {
     .rope_orig_ctx = 1048576,
 };
 
-static const ds4_shape DS4_SHAPE_LAGUNA_S21 = {
+const ds4_shape DS4_SHAPE_LAGUNA_S21 = {
     .name = "Laguna S 2.1",
     .family = DS4_MODEL_FAMILY_LAGUNA,
     .variant = DS4_VARIANT_LAGUNA_S21,
@@ -676,6 +618,8 @@ static const ds4_shape DS4_SHAPE_LAGUNA_S21 = {
     .n_embd = 3072,
     .n_vocab = 100352,
     .n_head = 72,
+    .n_head_global = 48,
+    .n_head_swa = 72,
     .n_head_kv = 8,
     .n_head_dim = 128,
     .n_value_dim = 128,
@@ -694,6 +638,41 @@ static const ds4_shape DS4_SHAPE_LAGUNA_S21 = {
     .rope_freq_base = 500000.0f,
     .rope_scale_factor = 32.0f,
     .rope_yarn_beta_fast = 32.0f,
+    .rope_yarn_beta_slow = 1.0f,
+    .rope_yarn_attn_factor = 1.0f,
+    .rope_freq_base_swa = 10000.0f,
+    .context_length = 262144,
+    .rope_orig_ctx = 8192,
+};
+
+const ds4_shape DS4_SHAPE_LAGUNA_XS21 = {
+    .name = "Laguna XS 2.1",
+    .family = DS4_MODEL_FAMILY_LAGUNA,
+    .variant = DS4_VARIANT_LAGUNA_XS21,
+    .n_layer = 40,
+    .n_embd = 2048,
+    .n_vocab = 100352,
+    .n_head = 64,            /* majority/SWA value, mirrors S21's n_head=72 */
+    .n_head_global = 48,     /* head_count array [48,64,64,64] x10 */
+    .n_head_swa = 64,
+    .n_head_kv = 8,
+    .n_head_dim = 128,
+    .n_value_dim = 128,
+    .n_rot = 64,
+    .n_expert = 256,
+    .n_expert_used = 8,
+    .n_expert_shared = 1,
+    .n_ff_exp = 512,
+    .n_ff_shared = 512,
+    .n_ff_dense = 8192,
+    .n_swa = 512,
+    .n_leading_dense = 1,    /* 39 sparse layers, 9984 routed experts */
+    .n_rot_swa = 128,
+    .rms_eps = 1.0e-6f,
+    .expert_weight_scale = 2.5f,
+    .rope_freq_base = 500000.0f,
+    .rope_scale_factor = 32.0f,
+    .rope_yarn_beta_fast = 64.0f,
     .rope_yarn_beta_slow = 1.0f,
     .rope_yarn_attn_factor = 1.0f,
     .rope_freq_base_swa = 10000.0f,
@@ -5096,14 +5075,35 @@ static void weights_validate_laguna_layout(
 
         tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32,
                              1, DS4_N_EMBD, 0, 0);
+        /* Legacy-layout attention signal type differs by recipe: S 2.1's
+         * official Q4_K_M file keeps attn_q/k/gate/output in F16, while
+         * XS 2.1's official Q4_K_M file quantizes them to Q4_K. */
         const uint32_t attn_type =
-            signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_F16;
+            signal_q8 ? DS4_TENSOR_Q8_0 :
+            (DS4_MODEL_VARIANT == DS4_VARIANT_LAGUNA_XS21 ? DS4_TENSOR_Q4_K : DS4_TENSOR_F16);
         tensor_expect_layout(l->attn_q, attn_type,
                              2, DS4_N_EMBD, q_dim, 0);
         tensor_expect_layout(l->attn_k, attn_type,
                              2, DS4_N_EMBD, kv_dim, 0);
-        tensor_expect_layout(l->attn_v, attn_type,
-                             2, DS4_N_EMBD, kv_dim, 0);
+        /* XS 2.1's attn_v varies Q4_K/Q6_K per layer (moves together with
+         * ffn_down_exps/ffn_down_shexp, uncorrelated with SWA/global
+         * pattern) — tolerate both rather than expecting a fixed type. */
+        const bool attn_v_tolerant =
+            !signal_q8 && DS4_MODEL_VARIANT == DS4_VARIANT_LAGUNA_XS21;
+        if (attn_v_tolerant) {
+            const uint32_t attn_v_type = l->attn_v->type;
+            if (attn_v_type != DS4_TENSOR_Q4_K && attn_v_type != DS4_TENSOR_Q6_K) {
+                fprintf(stderr,
+                        "ds4: Laguna attn_v tensor for layer %u has unsupported type %s\n",
+                        il, tensor_type_name(attn_v_type));
+                exit(1);
+            }
+            tensor_expect_layout(l->attn_v, attn_v_type,
+                                 2, DS4_N_EMBD, kv_dim, 0);
+        } else {
+            tensor_expect_layout(l->attn_v, attn_type,
+                                 2, DS4_N_EMBD, kv_dim, 0);
+        }
         tensor_expect_layout(l->attn_gate, attn_type,
                              2, DS4_N_EMBD, n_head, 0);
         tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32,
@@ -5992,11 +5992,18 @@ static void config_validate_glm_dsa_model(const ds4_model *m) {
 }
 
 static void config_validate_laguna_model(const ds4_model *m) {
-    g_ds4_shape = DS4_SHAPE_LAGUNA_S21;
+    const uint32_t n_layer = required_u32(m, "laguna.block_count");
+    if (n_layer == 48) {
+        g_ds4_shape = DS4_SHAPE_LAGUNA_S21;
+    } else if (n_layer == 40) {
+        g_ds4_shape = DS4_SHAPE_LAGUNA_XS21;
+    } else {
+        fprintf(stderr, "ds4: unsupported Laguna block_count %u\n", n_layer);
+        exit(1);
+    }
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
     memset(g_ds4_head_counts, 0, sizeof(g_ds4_head_counts));
 
-    const uint32_t n_layer = required_u32(m, "laguna.block_count");
     const uint64_t n_ctx = required_u64_compat(m, "laguna.context_length");
     const uint32_t n_embd = required_u32(m, "laguna.embedding_length");
     const uint32_t n_vocab = required_u32(m, "laguna.vocab_size");
@@ -6050,7 +6057,9 @@ static void config_validate_laguna_model(const ds4_model *m) {
             if (v <= 0) ds4_die("Laguna head-count metadata contains a non-positive value");
             got = (uint32_t)v;
         }
-        const uint32_t expected = (il % 4u) == 0 ? 48u : 72u;
+        const uint32_t expected = (il % 4u) == 0
+                ? g_ds4_shape.n_head_global
+                : g_ds4_shape.n_head_swa;
         if (got != expected) {
             fprintf(stderr,
                     "ds4: unexpected Laguna head count at layer %u: got %u, expected %u\n",
@@ -6639,11 +6648,47 @@ static bool glm_stream_decode_experts_are_streamed(
 }
 
 /*
+ * weights_streaming_layer_experts_uniform() compares per-expert BYTE SIZE
+ * against the pinned slab class and never inspects the quant type, but Metal's
+ * Laguna address-table streaming kernel (stream_eligible in
+ * ds4_gpu_laguna_routed_shared_moe_one_tensor, ds4_metal.m) only has Q4_K and
+ * Q6_K routed-down variants. Load-time layout validation admits four routed
+ * down types -- Q4_K, Q6_K, and (matching gate/up) Q3_K or Q2_K, see the
+ * layer_routed_type / down_supported checks near ds4.c:5150 -- so a layer can
+ * be uniform-by-bytes yet unservable by the kernel. Such a layer must stay in
+ * the resident span set: dropping it would leave it neither mapped nor cached,
+ * the silent-corruption shape Task 3 already hit once. Reporting it as
+ * not-servable here routes it to the same mapped-model fallback that
+ * off-slab-class layers already use -- correct, just not cache-accelerated.
+ */
+static bool laguna_decode_experts_cache_servable(const ds4_layer_weights *l) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) return true;
+    if (l->ffn_down_exps == NULL) return true;
+    return l->ffn_down_exps->type == DS4_TENSOR_Q3_K ||
+           l->ffn_down_exps->type == DS4_TENSOR_Q4_K ||
+           l->ffn_down_exps->type == DS4_TENSOR_Q6_K;
+}
+
+/*
  * Decode-time spans for one layer. The static set excludes routed expert
  * tensors only when the streaming expert-cache path can really serve them.
  * Boosted layers, mixed GLM quant layouts such as Q4 gate/up plus Q5 down, or
  * undersized expert caches fall back to direct model-range reads. Include
  * those expert tensors so cache-hit prefill extension and decode are covered.
+ *
+ * Laguna adds one family-specific term, laguna_decode_experts_cache_servable
+ * (see above): its fused decode kernel
+ * (ds4_gpu_laguna_routed_shared_moe_one_tensor) has address-table streaming
+ * variants for a Q4_K and a Q6_K routed down projection only, while the
+ * byte-size "uniform" test can also pass for the Q3_K/Q2_K routed layouts
+ * load-time validation accepts. Whichever type the FIRST sparse layer happens
+ * to be (Q6_K for XS 2.1's official Q4_K_M file) becomes the pinned slab class
+ * at startup (ds4_streaming_routed_expert_bytes in ds4_engine_open_internal),
+ * and only layers matching that exact byte signature are actually served from
+ * the cache at runtime (ds4_gpu_stream_expert_cache_note_expert_size in
+ * ds4_metal.m). Layers off that class -- or of a type the kernel has no
+ * variant for -- always fall back to wrapping the whole routed-expert tensor
+ * from the mapped model range, so they must stay in this static set.
  */
 static void model_map_span_vec_include_layer_decode(
         ds4_model_map_span_vec *spans,
@@ -6652,6 +6697,7 @@ static void model_map_span_vec_include_layer_decode(
     const ds4_layer_weights *l = &w->layer[il];
     model_map_span_vec_include_layer_decode_static(spans, l);
     if (!weights_streaming_layer_experts_uniform(w, il) ||
+        !laguna_decode_experts_cache_servable(l) ||
         (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
          !glm_stream_decode_experts_are_streamed(w, l, il)) ||
         glm_stream_resident_decode_layer_enabled(l, il)) {
@@ -12491,6 +12537,43 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
     if (cap == 0) cap = 1;
     if (cap > (uint32_t)prompt_len) cap = (uint32_t)prompt_len;
     return cap;
+}
+
+/* Laguna's graph preallocates every batched activation at this width.  Keep
+ * the policy and the memory estimate together: previously the graph silently
+ * ignored --prefill-chunk while the estimate reported a one-token scratch. */
+static uint32_t laguna_graph_prefill_cap(uint32_t ctx_size,
+                                         uint32_t requested_chunk) {
+    if (ctx_size == 0) return 1;
+    uint32_t cap = requested_chunk != 0 ? requested_chunk : 16384u;
+    if (cap > ctx_size) cap = ctx_size;
+    return cap == 0 ? 1 : cap;
+}
+
+static uint64_t laguna_graph_scratch_bytes(uint32_t prefill_cap) {
+    const uint64_t f32 = sizeof(float);
+    const uint64_t embd = DS4_N_EMBD;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t ffn_max = DS4_N_FF_DENSE >
+        (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP ?
+        DS4_N_FF_DENSE : (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP;
+    const uint64_t per_row =
+        sizeof(uint32_t) +
+        8ull * embd * f32 +
+        2ull * q_dim * f32 +
+        2ull * kv_dim * f32 +
+        (uint64_t)DS4_N_HEAD * f32 +
+        3ull * ffn_max * f32 +
+        (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * f32 +
+        2ull * DS4_N_EXPERT * f32 +
+        (uint64_t)DS4_N_EXPERT_USED * (sizeof(int32_t) + sizeof(float)) +
+        2ull * kv_dim * sizeof(uint16_t);
+    const uint64_t fixed =
+        (uint64_t)DS4_N_EMBD * f32 +
+        (uint64_t)DS4_N_VOCAB * f32 +
+        sizeof(int32_t) + sizeof(float);
+    return (uint64_t)prefill_cap * per_row + fixed;
 }
 
 /* Allocate all CPU decode temporaries once.  This keeps generation deterministic
@@ -20619,6 +20702,21 @@ static bool metal_graph_streaming_expert_cache_seed_layer_expected(
         return false;
     }
     if (metal_graph_decode_iq2_selected_slots_expected(g, layer)) return true;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        if (g->quality ||
+            layer->ffn_gate_exps->type != layer->ffn_up_exps->type ||
+            layer->ffn_gate_exps->type != layer->ffn_down_exps->type ||
+            DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT_USED > 8 ||
+            DS4_N_EXPERT < 128) {
+            return false;
+        }
+        /* P2.5 added Q3_K to Laguna's selected-expert cache kernels.  The
+         * hotlist seeder must use the same routed-triple eligibility or an
+         * XS 2.1 profile will load without placing any experts in the cache. */
+        const uint32_t type = layer->ffn_gate_exps->type;
+        return type == DS4_TENSOR_Q3_K || type == DS4_TENSOR_Q4_K ||
+               type == DS4_TENSOR_Q6_K;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
         !g->quality &&
         layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
@@ -35283,24 +35381,8 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
                 m.raw_bytes += (uint64_t)cap * kv_row_bytes;
             }
 
-            const uint64_t q_dim =
-                (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
-            const uint64_t kv_dim =
-                (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
-            const uint64_t ffn_max = DS4_N_FF_DENSE >
-                (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP ?
-                DS4_N_FF_DENSE :
-                (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP;
-            uint64_t scratch_f32 = 9ull * DS4_N_EMBD +
-                                   2ull * q_dim +
-                                   2ull * kv_dim +
-                                   DS4_N_HEAD +
-                                   3ull * ffn_max +
-                                   (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP +
-                                   2ull * DS4_N_EXPERT +
-                                   2ull * DS4_N_EXPERT_USED +
-                                   DS4_N_VOCAB;
-            m.scratch_bytes = scratch_f32 * sizeof(float);
+            m.prefill_cap = laguna_graph_prefill_cap(ctx, prefill_chunk);
+            m.scratch_bytes = laguna_graph_scratch_bytes(m.prefill_cap);
             m.total_bytes = m.raw_bytes + m.scratch_bytes;
             return m;
         }
@@ -47281,6 +47363,12 @@ typedef struct {
     uint32_t prefill_cap;
     uint64_t scratch_bytes;
     uint64_t kv_bytes;
+    /* Recorded at alloc time; not currently consumed here (both prefill and
+     * decode unconditionally (re)install the static decode span set below,
+     * which is a cheap no-op once the map already covers it -- see
+     * laguna_graph_forward_token / laguna_graph_forward_batch). Kept for
+     * visibility/future use rather than threading it back out. */
+    bool     ssd_streaming;
 
     ds4_gpu_tensor *tokens;
     ds4_gpu_tensor *cur;
@@ -47360,14 +47448,18 @@ static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
     memset(g, 0, sizeof(*g));
 }
 
-static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
+static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g,
+                               uint32_t              ctx_size,
+                               uint32_t              prefill_chunk,
+                               bool                  ssd_streaming) {
     if (!g || ctx_size == 0 || ctx_size > DS4_CONTEXT_LENGTH ||
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) {
         return false;
     }
     memset(g, 0, sizeof(*g));
     g->ctx_size = ctx_size;
-    g->prefill_cap = ctx_size < 16384u ? ctx_size : 16384u;
+    g->prefill_cap = laguna_graph_prefill_cap(ctx_size, prefill_chunk);
+    g->ssd_streaming = ssd_streaming;
 
     const uint64_t f32 = sizeof(float);
     const uint64_t rows = g->prefill_cap;
@@ -47506,6 +47598,30 @@ static bool laguna_graph_forward_token(
         return false;
     }
 
+    /* Under --ssd-streaming the engine starts with only the token-embedding
+     * tensor mapped (see the "initial ... model map restricted to token
+     * embedding" startup log). Every non-routed tensor (attn/dense/router
+     * weights for every layer, output) must be mapped before this function
+     * touches them, or the very first attention-norm read dies with "Metal
+     * model range ... is not covered by mapped model views". Routed-expert
+     * tensors stay excluded when their layer is servable from the streaming
+     * expert cache (weights_streaming_layer_experts_uniform), matching the
+     * eligibility check in ds4_gpu_laguna_routed_shared_moe_one_tensor; a
+     * boosted/off-slab-class layer's routed tensors are still included here
+     * so its mapped-model fallback path has real bytes to read. In resident
+     * (non-streaming) mode the whole file is already mapped, so this is a
+     * cheap no-op (ds4_gpu_model_views_cover_spans short-circuits). */
+    ds4_model_map_span_vec laguna_decode_spans;
+    if (weights_model_map_decode_static_spans(weights, true, true,
+                                              &laguna_decode_spans)) {
+        const bool spans_ok = metal_graph_install_model_spans(
+                model, &laguna_decode_spans, "Laguna static decode");
+        free(laguna_decode_spans.v);
+        if (!spans_ok) return false;
+    } else {
+        return false;
+    }
+
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
         ok = ds4_gpu_embed_token_quant_tensor(g->cur,
@@ -47563,7 +47679,7 @@ static bool laguna_graph_forward_token(
                         DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
                         n_head,
                         g->attn_norm) != 0;
-            } else {
+            } else if (l->attn_q->type == DS4_TENSOR_Q8_0) {
                 ok = ds4_gpu_matmul_q8_0_pair_tensor(
                         g->q,
                         g->k,
@@ -47588,6 +47704,23 @@ static bool laguna_graph_forward_token(
                         n_head,
                         g->attn_norm,
                         1) != 0;
+            } else {
+                /* XS 2.1 legacy attention: attn_q/k/gate are Q4_K, attn_v is
+                 * Q4_K or Q6_K per layer. Neither the F16 fused kernel nor
+                 * the Q8_0 paired kernel applies; dispatch each projection
+                 * individually through the generic type-dispatching helper
+                 * (same one used for FFN weights above and by the batch/
+                 * prefill path for these same Q/K/V/gate projections). */
+                ok = laguna_graph_matmul(g->q, model, l->attn_q, g->attn_norm, 1);
+                if (ok) {
+                    ok = laguna_graph_matmul(g->k, model, l->attn_k, g->attn_norm, 1);
+                }
+                if (ok) {
+                    ok = laguna_graph_matmul(g->v, model, l->attn_v, g->attn_norm, 1);
+                }
+                if (ok) {
+                    ok = laguna_graph_matmul(g->gate, model, l->attn_gate, g->attn_norm, 1);
+                }
             }
         }
         if (ok) {
@@ -47793,6 +47926,7 @@ static bool laguna_graph_forward_token(
                         DS4_N_EXPERT_USED,
                         g->shared_selected,
                         g->shared_weight,
+                        il,
                         g->ffn_norm) != 0;
             } else if (ok) {
                 ok = ds4_gpu_glm_routed_moe_one_tensor(
@@ -47821,7 +47955,12 @@ static bool laguna_graph_forward_token(
                         DS4_N_EXPERT_USED,
                         il,
                         g->ffn_norm,
-                        true) != 0;
+                        /* force_resident=false: let the shared GLM-template
+                         * kernel use the streaming address-table path when
+                         * ssd-streaming is active and this layer's types
+                         * qualify; it falls back to a plain mapped-model
+                         * read otherwise (byte-identical output). */
+                        false) != 0;
                 if (ok) {
                     ok = ds4_gpu_shared_mid_swiglu_q8_0_tensor(
                             g->ffn_mid,
@@ -47921,6 +48060,30 @@ static bool laguna_graph_forward_batch(
     if (!g || !model || !weights || !tokens || n_tokens == 0 ||
         n_tokens > g->prefill_cap || pos0 > g->ctx_size - n_tokens) {
         return false;
+    }
+
+    /* Unlike decode's ds4_gpu_laguna_routed_shared_moe_one_tensor (which has
+     * a streaming address-table path), the batch routed-MoE kernel used
+     * below (ds4_gpu_glm_routed_moe_batch_tensor) always wraps the WHOLE
+     * routed-expert tensor from the mapped model range -- it ignores its own
+     * force_resident argument. So prefill needs every layer's routed
+     * experts resident, not just the decode-narrowed set that
+     * laguna_graph_forward_token installs. This widens back out to the full
+     * per-layer span set (a no-op in resident mode, same short-circuit as
+     * forward_token). Laguna does not implement GLM's windowed
+     * partial-resident prefill (deferred perf work); this is simpler and
+     * always correct, at the cost of prefill needing the whole file mapped
+     * while streaming. */
+    {
+        ds4_model_map_span_vec laguna_prefill_spans;
+        if (!weights_model_map_spans(weights, 0, DS4_N_LAYER - 1u, true,
+                                     &laguna_prefill_spans)) {
+            return false;
+        }
+        const bool spans_ok = metal_graph_install_model_spans(
+                model, &laguna_prefill_spans, "Laguna streaming prefill");
+        free(laguna_prefill_spans.v);
+        if (!spans_ok) return false;
     }
 
     uint32_t *token_ids = xmalloc((size_t)n_tokens * sizeof(*token_ids));
@@ -48355,6 +48518,10 @@ static int generate_laguna_metal_argmax(
         const token_vec   *prompt,
         int                n_predict,
         int                ctx_size,
+        bool               ssd_streaming,
+        bool               ssd_streaming_cold,
+        uint32_t           ssd_streaming_preload_experts,
+        uint32_t           prefill_chunk,
         ds4_token_emit_fn  emit,
         ds4_generation_done_fn done,
         void              *emit_ud,
@@ -48365,7 +48532,8 @@ static int generate_laguna_metal_argmax(
         return 1;
     }
     ds4_laguna_gpu_graph g;
-    if (!laguna_graph_alloc(&g, (uint32_t)ctx_size)) return 1;
+    if (!laguna_graph_alloc(&g, (uint32_t)ctx_size, prefill_chunk,
+                            ssd_streaming)) return 1;
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     bool ok = true;
     const double prefill_t0 = now_sec();
@@ -48385,6 +48553,18 @@ static int generate_laguna_metal_argmax(
                                         prompt->len);
         i += (int)n;
         if (progress) progress(progress_ud, "prefill_chunk", i, prompt->len);
+    }
+    if (ok && ssd_streaming) {
+        /* Seed after prefill: prefill itself populates an LRU cache, so an
+         * earlier seed is churned away before first-token decode.  This is
+         * also where the shared graph path applies its hotlist. */
+        ds4_gpu_graph seed_graph;
+        memset(&seed_graph, 0, sizeof(seed_graph));
+        seed_graph.ssd_streaming = true;
+        seed_graph.ssd_streaming_cold = ssd_streaming_cold;
+        seed_graph.streaming_preload_experts = ssd_streaming_preload_experts;
+        ok = metal_graph_seed_streaming_expert_cache_from_hotlist(
+                &seed_graph, model, weights);
     }
     const double prefill_t1 = now_sec();
 
@@ -48414,6 +48594,11 @@ static int generate_laguna_metal_argmax(
                 (double)prompt->len / (prefill_t1 - prefill_t0) : 0.0,
             decode_t1 > decode_t0 ?
                 (double)generated / (decode_t1 - decode_t0) : 0.0);
+    /* Surface the shared streaming expert cache's hit/miss counters the same
+     * way GLM's generation path does (ds4_gpu_print_memory_report), so
+     * --ssd-streaming runs always show cache effectiveness without needing
+     * the separate DS4_METAL_MEMORY_REPORT opt-in GLM uses elsewhere. */
+    if (ssd_streaming) ds4_gpu_print_memory_report("before Laguna graph free");
     free(logits);
     laguna_graph_free(&g);
     return ok ? 0 : 1;
@@ -48494,6 +48679,10 @@ static int generate_metal_graph_raw_swa(
                                             prompt,
                                             n_predict,
                                             ctx_size,
+                                            ssd_streaming,
+                                            ssd_streaming_cold,
+                                            ssd_streaming_preload_experts,
+                                            prefill_chunk,
                                             emit,
                                             done,
                                             emit_ud,
@@ -57265,6 +57454,23 @@ uint32_t ds4_test_planner_raw_cap(int ctx_size, uint32_t prefill_cap) {
     return engine_planner_raw_cap(ctx_size, prefill_cap);
 }
 
+uint32_t ds4_test_laguna_prefill_cap(uint32_t ctx_size,
+                                     uint32_t prefill_chunk) {
+    return laguna_graph_prefill_cap(ctx_size, prefill_chunk);
+}
+
+uint64_t ds4_test_laguna_scratch_bytes(uint32_t prefill_cap) {
+    return laguna_graph_scratch_bytes(prefill_cap);
+}
+
+uint64_t ds4_test_laguna_xs21_scratch_bytes(uint32_t prefill_cap) {
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_LAGUNA_XS21;
+    const uint64_t bytes = laguna_graph_scratch_bytes(prefill_cap);
+    g_ds4_shape = saved;
+    return bytes;
+}
+
 size_t ds4_test_per_tier_graph_overhead_bytes_with_prefill(
         int placement_ctx_hint,
         uint32_t prefill_chunk) {
@@ -57516,9 +57722,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        if (e->ssd_streaming) {
+        if (e->ssd_streaming && DS4_MODEL_VARIANT != DS4_VARIANT_LAGUNA_XS21) {
             fprintf(stderr,
-                    "ds4: --ssd-streaming is not implemented for Laguna S 2.1 yet\n");
+                    "ds4: --ssd-streaming for Laguna is only supported "
+                    "for Laguna XS 2.1\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -57532,18 +57739,26 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+        if (opt->prefill_chunk != 0 &&
+            DS4_MODEL_VARIANT != DS4_VARIANT_LAGUNA_XS21) {
+            fprintf(stderr,
+                    "ds4: --prefill-chunk for Laguna is only supported "
+                    "for Laguna XS 2.1\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         if ((opt->directional_steering_file &&
              opt->directional_steering_file[0]) ||
             opt->directional_steering_attn != 0.0f ||
             opt->directional_steering_ffn != 0.0f ||
             e->power_percent < 100 ||
-            opt->prefill_chunk != 0 ||
             (opt->mtp_path && opt->mtp_path[0]) ||
             opt->dspark || opt->glm_mtp || opt->first_token_test) {
             fprintf(stderr,
                     "ds4: Laguna S 2.1 currently supports the standard Metal "
                     "generation path only (no steering, power cap, custom "
-                    "prefill chunk, MTP/DSpark, or first-token diagnostic)\n");
+                    "MTP/DSpark, or first-token diagnostic)\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -58732,7 +58947,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->engine = e;
     s->ctx_size = ctx_size;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
-        if (!laguna_graph_alloc(&s->laguna_graph, (uint32_t)ctx_size)) {
+        if (!laguna_graph_alloc(&s->laguna_graph, (uint32_t)ctx_size,
+                                e->prefill_chunk, e->ssd_streaming)) {
             free(s);
             return 1;
         }
@@ -59021,6 +59237,15 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     ds4_session_print_dspark_stats(s);
+    /* The CLI's default single-shot generation path runs entirely through
+     * ds4_session_create/sync/eval, not generate_laguna_metal_argmax, so
+     * this is where a --ssd-streaming Laguna run gets to show the shared
+     * streaming expert cache's hit/miss counters (silently a no-op when
+     * nothing was ever streamed, per ds4_gpu_print_memory_report's own
+     * zero-check). */
+    if (s->engine && s->engine->ssd_streaming && ds4_session_is_laguna(s)) {
+        ds4_gpu_print_memory_report("before Laguna session free");
+    }
 #endif
     ds4_dist_session_free(s->distributed);
     if (ds4_session_is_cpu(s)) {

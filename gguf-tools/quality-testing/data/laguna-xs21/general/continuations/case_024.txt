@@ -1,0 +1,3 @@
+To ensure a safe format for storing a model checkpoint header, the following structure and considerations are recommended:
+
+### **Header

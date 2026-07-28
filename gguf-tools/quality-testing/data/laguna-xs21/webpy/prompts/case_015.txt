@@ -1,0 +1,1 @@
+You have access to a tool named get_weather that takes a city argument and returns the current weather. Using Laguna's native tool-call format, call get_weather for Tokyo. Respond with only the tool call.

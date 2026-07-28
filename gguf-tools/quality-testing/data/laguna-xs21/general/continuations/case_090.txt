@@ -1,0 +1,1 @@
+Calibration data plays a critical role in the quantization of neural networks by enabling the determination of optimal quantization parameters, such as scaling

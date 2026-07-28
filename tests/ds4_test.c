@@ -3900,6 +3900,31 @@ static void test_metal_laguna_qk_norm_rope_pair_exact(void) {
 }
 #endif
 
+static void test_laguna_variant_shapes(void) {
+    /* S 2.1 stays intact. */
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_S21.n_layer == 48);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_S21.n_head == 72);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_S21.n_head_global == 48);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_S21.n_head_swa == 72);
+    /* XS 2.1, GGUF-verified (xs2-facts.md). */
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_XS21.n_layer == 40);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_XS21.n_embd == 2048);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_XS21.n_vocab == 100352);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_XS21.n_head == 64);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_XS21.n_head_global == 48);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_XS21.n_head_swa == 64);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_XS21.n_expert == 256);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_XS21.n_expert_used == 8);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_XS21.n_ff_exp == 512);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_XS21.n_ff_dense == 8192);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_XS21.n_leading_dense == 1);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_XS21.n_rot == 64);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_XS21.n_rot_swa == 128);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_XS21.rope_scale_factor == 32.0f);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_XS21.rope_orig_ctx == 8192);
+    TEST_ASSERT(DS4_SHAPE_LAGUNA_XS21.rope_yarn_attn_factor == 1.0f);
+}
+
 #if defined(__APPLE__)
 static void test_metal_hc_split_weighted_sum_norm_batch_exact(void) {
     /* Compare the batched HC+RMSNorm fusion against the exact two-dispatch
@@ -5196,6 +5221,8 @@ static void test_metal_kernel_group(void) {
     test_dspark_cache_window_crop();
     test_metal_q8_0_decode_pair_exact();
 #if defined(__APPLE__)
+    TEST_ASSERT(ds4_gpu_test_glm_q3_down_one_bound_equivalence() != 0);
+    TEST_ASSERT(ds4_gpu_test_glm_q3_down_slots8_bound_equivalence() != 0);
     test_metal_q8_0_output_nr4_exact();
     test_metal_f16_compressor_pair_state_store_exact();
     test_metal_compressor_ape_add_exact();
@@ -7007,6 +7034,7 @@ static void test_dspark_verify_depth(void) {
 
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
+    test_laguna_variant_shapes();
 }
 
 typedef void (*test_fn)(void);

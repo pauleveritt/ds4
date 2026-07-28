@@ -1,0 +1,3 @@
+Specpeculative decoding preserves exact greedy output through a careful verification process:
+
+1. **Generate candidate sequences**: A fast

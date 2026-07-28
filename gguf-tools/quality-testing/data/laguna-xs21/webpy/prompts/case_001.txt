@@ -1,0 +1,1 @@
+Debug this CSS flexbox issue: two sibling divs in a flex row won't stay the same height even though I set align-items: stretch on the parent. What else could be wrong?
