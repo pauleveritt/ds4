@@ -1,8 +1,15 @@
 # Laguna XS 2.1 on ds4 — consolidated state and Phase 2 kickoff
 
 **Status as of 2026-07-28.** Branch `laguna-xs21-footprint`, forked from
-`laguna-xs2.1` at `05965c9`.  Phase 2 engineering is complete; real-32-GB
+`laguna-xs2.1` at `05965c9`.  Phase 2 engineering is complete; real-16-GB
 hardware acceptance is the sole remaining operational handoff.
+
+**Target correction (2026-07-28, after this document's body was written).**
+The release target is **16 GB**, not 32 GB.  The target moved 16 GB -> 32 GB
+during Phase 2 and has since moved back.  Statements below that name 32 GB as
+the goal are stale and are corrected in §6 and the Phase 2 goal; references to
+"32 GB sizing measurements" remain accurate as provenance, because the measured
+footprint is unchanged and comfortably fits 16 GB.
 
 Phase 1 (streaming bring-up) is done and green: Laguna XS 2.1 loads, generates
 correctly, and streams its routed experts through the Metal expert cache with a
@@ -264,7 +271,7 @@ get under 10 GiB. **These are projections, not measurements.**
 
 ## 6. Current sizing recommendation
 
-The development handoff target is **32 GB**.  Use the uniform RoutedQ3_K
+The release and handoff target is **16 GB**.  Use the uniform RoutedQ3_K
 artifact with the already-validated prefill cap and begin with a 3,200-expert
 target:
 
@@ -276,12 +283,15 @@ target:
 
 The local 32k smoke reported 6.53 GiB planned (2.30 GiB context runtime +
 4.03 GiB target cache) and 6.46 GiB task footprint after eight tokens, with
-1.57 GiB cache live.  It is an allocation preflight, **not** a steady-state
-or 32-GB performance claim.  Validate the checklist in `mini-notes.md` §7
-before operational use.
+1.57 GiB cache live.  With SSD streaming the artifact therefore fits easily
+under 10 GB including context, and this configuration carries to 16 GB
+unchanged -- no re-sizing is required.  It remains an allocation preflight,
+**not** a steady-state or performance claim.  Validate the checklist in
+`mini-notes.md` §7 before operational use.
 
-The former Q4/16-GB arithmetic remains historical context only; it is
-superseded by the measured Q3 cache work in P2.5 and the preflight above.
+The former Q4/16-GB *arithmetic* remains superseded by the measured Q3 cache
+work in P2.5 and the preflight above; the 16 GB *target* it was computed for is
+current again.
 
 ---
 
@@ -302,8 +312,9 @@ superseded by the measured Q3 cache work in P2.5 and the preflight above.
 
 **Other known issues:**
 
-- **The original plan text still says "Mini" and 16 GB** in Tasks 8 and 14.
-  Read as 32 GB. Not yet edited.
+- **The original plan text says "Mini" and 16 GB** in Tasks 8 and 14. That
+  text is correct again after the target correction above; the earlier
+  instruction to read it as 32 GB is withdrawn.
 - **`download_model.sh` relinks `ds4flash.gguf` on every target**, and that is
   `ds4_test`'s default model. Running `xs21-q4` silently repoints the suite
   away from the DeepSeek IQ2XXS model it expects. Restore with:
@@ -335,8 +346,8 @@ The original plan's Tasks 9–14 remain the substrate; find them at
 
 Make the uniform RoutedQ3_K artifact genuinely cache-served, bound its live
 cache/context footprint, and preserve Phase 1 correctness.  The resulting
-32-GB candidate still needs a real constrained-hardware acceptance run; 16 GB
-is no longer a release target.
+candidate still needs a real constrained-hardware acceptance run on 16 GB,
+which is the current release target.
 
 ### Completed ordering
 
@@ -403,7 +414,7 @@ Evidence and the runtime override are in
 **P2.7 — Acceptance preflight** (complete locally, 2026-07-28; original Task
 14, `:721`, plus T8's open Step 2).  The ctx-32768 / prefill-4096 / 3,200
 cache configuration constructs at a 6.53 GiB planned total.  This closes the
-developer branch; actual acceptance on real 32 GB hardware remains an
+developer branch; actual acceptance on real 16 GB hardware remains an
 operational handoff, with `mini-notes.md` §7 as the checklist.
 
 ### Standing rules for Phase 2
