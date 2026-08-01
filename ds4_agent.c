@@ -4319,8 +4319,9 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         snprintf(err, err_len, "live KV state does not match session transcript");
         return false;
     }
+    const bool save_payload = ds4_session_supports_payload(w->session);
     const int quant_bits = ds4_engine_routed_quant_bits(w->engine);
-    if (quant_bits != 2 && quant_bits != 4) {
+    if (save_payload && quant_bits != 2 && quant_bits != 4) {
         snprintf(err, err_len, "unsupported routed quantization for KV save");
         return false;
     }
@@ -4350,14 +4351,15 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
 
     ds4_session_payload_file staged = {0};
     char save_err[160] = {0};
-    if (ds4_session_stage_payload(w->session, &staged,
+    if (save_payload &&
+        ds4_session_stage_payload(w->session, &staged,
                                   save_err, sizeof(save_err)) != 0) {
         snprintf(err, err_len, "%s",
                  save_err[0] ? save_err : "session has no valid KV payload");
         free(text);
         return false;
     }
-    uint64_t payload_bytes = staged.bytes;
+    uint64_t payload_bytes = save_payload ? staged.bytes : 0;
 
     agent_buf tmpl = {0};
     agent_buf_puts(&tmpl, path);
@@ -4397,8 +4399,9 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_write_staged_payload(&staged, fp,
-                                               save_err, sizeof(save_err)) == 0 &&
+              (!save_payload ||
+               ds4_session_write_staged_payload(&staged, fp,
+                                                save_err, sizeof(save_err)) == 0) &&
               (!session_identity ||
                agent_kv_write_title_trailer(fp, session_title,
                                             save_err, sizeof(save_err))) &&
@@ -6999,10 +7002,35 @@ static void test_agent_read_default_lines_follow_context(void) {
                       AGENT_READ_DEFAULT_LINES_LARGE);
 }
 
+static bool agent_test_read_q8_header(uint64_t payload_bytes) {
+    FILE *fp = tmpfile();
+    if (!fp) return false;
+    uint8_t header[DS4_KVSTORE_FIXED_HEADER];
+    uint8_t text_bytes[4];
+    ds4_kvstore_fill_header(header, 1, 8, DS4_KVSTORE_REASON_AGENT_SESSION,
+                            0, 3, 0, 64, 1, 1, payload_bytes);
+    ds4_kvstore_le_put32(text_bytes, 0);
+    bool ok = fwrite(header, 1, sizeof(header), fp) == sizeof(header) &&
+              fwrite(text_bytes, 1, sizeof(text_bytes), fp) ==
+                  sizeof(text_bytes) &&
+              fseek(fp, 0, SEEK_SET) == 0;
+    ds4_kvstore_entry entry = {0};
+    uint32_t read_text_bytes = UINT32_MAX;
+    if (ok) ok = ds4_kvstore_read_header(fp, &entry, &read_text_bytes);
+    fclose(fp);
+    return ok;
+}
+
+static void test_agent_q8_transcript_only_header(void) {
+    AGENT_TEST_ASSERT(agent_test_read_q8_header(0));
+    AGENT_TEST_ASSERT(!agent_test_read_q8_header(1));
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_read_default_lines_follow_context();
+    test_agent_q8_transcript_only_header();
     test_agent_glm_template_policy();
     test_agent_glm_tools_prompt_is_native();
     test_agent_glm_tool_parser_single_arg();
@@ -11196,7 +11224,7 @@ int main(int argc, char **argv) {
         }
         if (skip_cuda) {
             cfg.engine.backend = DS4_BACKEND_CPU;
-            if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+            if (ds4_engine_open_for_agent(&engine, &cfg.engine) != 0) return 1;
         } else {
             const bool was_auto =
                 (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto")) ||
@@ -11211,7 +11239,7 @@ int main(int argc, char **argv) {
             if (ds4_engine_create_with_gpu_config(
                     &engine, &cfg.engine, &gpu_cfg) != 0) return 1;
         }
-    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+    } else if (ds4_engine_open_for_agent(&engine, &cfg.engine) != 0) {
         return 1;
     }
     agent_apply_model_sampling_defaults(engine, &cfg.gen);

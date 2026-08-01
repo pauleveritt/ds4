@@ -276,6 +276,10 @@ typedef struct {
 } ds4_session_payload_file;
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
+/* Agent-owned engines may opt into model-family session paths that are not
+ * exposed by the generic CLI/server entry points yet. */
+int ds4_engine_open_for_agent(ds4_engine **out,
+                              const ds4_engine_options *opt);
 
 /* Diagnostic-only Mellum oracle probe.  Replays the pinned 26-token fixture
  * through layer 0 without creating a session or enabling generation. */
@@ -316,6 +320,13 @@ int ds4_engine_mellum_session_decode_probe(ds4_engine *engine,
 int ds4_engine_mellum_session_isolation_probe(ds4_engine *engine,
                                               FILE       *out,
                                               int         ctx_size);
+
+/* Inspect-only Mellum interactive-session gate. Exercises sequential replay,
+ * selection, interruption, divergent rebuild, and reset without authorizing
+ * ordinary inspect sessions or another frontend. */
+int ds4_engine_mellum_interactive_session_probe(ds4_engine *engine,
+                                                FILE       *out,
+                                                int         ctx_size);
 
 /* Diagnostic-only Mellum output-head oracle. Replays the fixed fixture through
  * final RMSNorm and the Q8 output projection, but does not select a token. */
@@ -464,6 +475,8 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
+/* False when the session can be restored only by replaying its transcript. */
+bool ds4_session_supports_payload(ds4_session *s);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
 bool ds4_session_is_distributed(ds4_session *s);

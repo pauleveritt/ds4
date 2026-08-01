@@ -436,7 +436,14 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
     if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) return false;
     *text_bytes = ds4_kvstore_le_get32(tb);
     e->text_bytes = *text_bytes;
-    return e->tokens != 0 && (e->quant_bits == 2 || e->quant_bits == 4);
+    /* A transcript-only record restores no quantized backend state. Its quant
+     * byte is informational, so model families outside the persistent 2/4-bit
+     * KV ABI may still use the common text/session container. */
+    const bool supported_payload_quant =
+        e->quant_bits == 2 || e->quant_bits == 4;
+    const bool transcript_only =
+        e->payload_bytes == 0 && e->quant_bits != 0;
+    return e->tokens != 0 && (supported_payload_quant || transcript_only);
 }
 
 bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],

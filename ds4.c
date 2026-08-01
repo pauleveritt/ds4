@@ -36114,6 +36114,7 @@ struct ds4_engine {
     uint32_t mellum_layer_start;
     uint32_t mellum_layer_end;
     bool mellum_decode_contract_ready;
+    bool mellum_interactive_sessions;
     ds4_mellum_decode_state *mellum_decode_state;
     ds4_mtp_weights mtp_weights;
     ds4_dspark_weights dspark_weights;
@@ -36551,6 +36552,7 @@ struct ds4_mellum_session_state {
     ds4_mellum_decode_state *decode;
     uint32_t ctx_size;
     bool decode_enabled;
+    bool interactive_enabled;
 };
 
 typedef struct {
@@ -36827,10 +36829,12 @@ static bool ds4_mellum_decode_token(const ds4_engine       *e,
 static ds4_mellum_session_state *ds4_mellum_session_state_create(
         const ds4_engine *e,
         uint32_t          ctx_size,
-        bool              decode_enabled) {
+        bool              decode_enabled,
+        bool              interactive_enabled) {
     ds4_mellum_session_state *state = xcalloc(1, sizeof(*state));
     state->ctx_size = ctx_size;
     state->decode_enabled = decode_enabled;
+    state->interactive_enabled = interactive_enabled;
     if (decode_enabled) {
         state->decode = ds4_mellum_decode_state_create(e, ctx_size);
         if (!state->decode ||
@@ -37002,6 +37006,7 @@ int ds4_engine_mellum_logits_probe(ds4_engine *e,
     (void)e;
     (void)out;
     (void)raw_output_path;
+    (void)report_top_k;
     fprintf(stderr, "ds4: Mellum logits probe requires Metal support\n");
     return 1;
 #else
@@ -51687,6 +51692,20 @@ static bool ds4_session_is_mellum_decode_only(const ds4_session *s) {
 #endif
 }
 
+/* A normal Mellum session deliberately has a smaller surface than the other
+ * model families: it can run the validated one-token decoder and select its
+ * resulting logits, but it has no generic graph, persistent KV, or batched
+ * prefill state.  Probe sessions retain their decode-only boundary. */
+static bool ds4_session_is_mellum_interactive(const ds4_session *s) {
+#ifndef DS4_NO_GPU
+    return ds4_session_is_mellum(s) && s->mellum->decode_enabled &&
+           s->mellum->interactive_enabled;
+#else
+    (void)s;
+    return false;
+#endif
+}
+
 static bool ds4_session_reject_mellum_layout_only(const ds4_session *s,
                                                   char              *err,
                                                   size_t             errlen) {
@@ -51705,6 +51724,19 @@ static bool ds4_session_reject_mellum_unsupported(const ds4_session *s,
     if (err && errlen) {
         snprintf(err, errlen,
                  "Mellum session does not support this operation in inspect mode");
+    }
+    return true;
+}
+
+static bool ds4_session_reject_mellum_noninteractive(const ds4_session *s,
+                                                      char              *err,
+                                                      size_t             errlen) {
+    if (!ds4_session_is_mellum(s) || ds4_session_is_mellum_interactive(s)) {
+        return false;
+    }
+    if (err && errlen) {
+        snprintf(err, errlen,
+                 "Mellum token selection is available only to interactive sessions");
     }
     return true;
 }
@@ -52776,6 +52808,10 @@ static void session_greedy_splitkv_reset(ds4_session *s) {
     spec_frontier_free(&s->greedy_splitkv_anchor);
 }
 #endif
+
+bool ds4_session_supports_payload(ds4_session *s) {
+    return s && !ds4_session_is_mellum(s);
+}
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
@@ -54510,7 +54546,11 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
-    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return -1;
+    if (ds4_session_is_mellum(s)) {
+        if (ds4_session_reject_mellum_noninteractive(s, err, errlen) ||
+            ds4_session_eval(s, token, err, errlen) != 0) return -1;
+        return ds4_session_argmax(s);
+    }
     if (ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
@@ -58911,21 +58951,28 @@ static int engine_install_dspark_support_cache(ds4_engine *e);
 static int engine_install_gpu_placement(ds4_engine *e);
 static int ds4_engine_open_internal(ds4_engine **out,
                                     const ds4_engine_options *opt,
-                                    const ds4_gpu_config *gpu_cfg);
+                                    const ds4_gpu_config *gpu_cfg,
+                                    bool agent_owner);
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
-    return ds4_engine_open_internal(out, opt, NULL);
+    return ds4_engine_open_internal(out, opt, NULL, false);
+}
+
+int ds4_engine_open_for_agent(ds4_engine **out,
+                              const ds4_engine_options *opt) {
+    return ds4_engine_open_internal(out, opt, NULL, true);
 }
 
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
                                        const ds4_engine_options *opt,
                                        const struct ds4_gpu_config *gpu_cfg) {
-    return ds4_engine_open_internal(out, opt, gpu_cfg);
+    return ds4_engine_open_internal(out, opt, gpu_cfg, false);
 }
 
 static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
-                                     const ds4_gpu_config *gpu_cfg) {
+                                     const ds4_gpu_config *gpu_cfg,
+                                     bool agent_owner) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
@@ -58989,6 +59036,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     e->placement_ctx_hint = opt->placement_ctx_hint;
     e->share_session_prefill_workspace = opt->share_session_prefill_workspace;
+    e->mellum_interactive_sessions = agent_owner && !opt->inspect_only;
     ds4_acquire_instance_lock();
 
     if (opt->simulate_used_memory_bytes != 0 &&
@@ -59091,12 +59139,35 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = e;
             return 0;
         }
-        fprintf(stderr,
-                "ds4: Mellum 2 loader support is inspect-only; "
-                "session generation remains disabled\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
+        if (!e->mellum_interactive_sessions) {
+            fprintf(stderr,
+                    "ds4: Mellum 2 resident sessions are currently available only in ds4-agent\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->backend != DS4_BACKEND_METAL) {
+            fprintf(stderr,
+                    "ds4: Mellum 2 inference currently requires --metal\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->ssd_streaming) {
+            fprintf(stderr,
+                    "ds4: Mellum 2 does not yet support --ssd-streaming\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
+            opt->tp.role != DS4_TP_NONE || gpu_cfg) {
+            fprintf(stderr,
+                    "ds4: Mellum 2 does not yet support layer slicing, distributed inference, tensor parallelism, or multi-GPU placement\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
         if (opt->inspect_only) {
@@ -60301,7 +60372,16 @@ static int ds4_session_tp_register(ds4_session *s) {
 }
 
 static int ds4_mellum_session_create(ds4_session **out, ds4_engine *e,
-                                     int ctx_size, bool decode_enabled) {
+                                     int ctx_size, bool decode_enabled,
+                                     bool interactive_enabled) {
+#ifdef DS4_NO_GPU
+    (void)out;
+    (void)e;
+    (void)ctx_size;
+    (void)decode_enabled;
+    (void)interactive_enabled;
+    return 1;
+#else
     if (!out || !e || ctx_size <= 0 ||
         !e->mellum_decode_contract_ready ||
         !ds4_backend_uses_graph(e->backend)) return 1;
@@ -60309,7 +60389,7 @@ static int ds4_mellum_session_create(ds4_session **out, ds4_engine *e,
     s->engine = e;
     s->ctx_size = ctx_size;
     s->mellum = ds4_mellum_session_state_create(
-        e, (uint32_t)ctx_size, decode_enabled);
+        e, (uint32_t)ctx_size, decode_enabled, interactive_enabled);
     if (!s->mellum) {
         fprintf(stderr, "ds4: Mellum session allocation failed\n");
         free(s);
@@ -60318,8 +60398,13 @@ static int ds4_mellum_session_create(ds4_session **out, ds4_engine *e,
     if (decode_enabled) {
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     }
+    if (interactive_enabled) {
+        s->sample_probs =
+            xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+    }
     *out = s;
     return 0;
+#endif
 }
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
@@ -60356,7 +60441,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     return 1;
 #else
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
-        return ds4_mellum_session_create(out, e, ctx_size, false);
+        return ds4_mellum_session_create(
+            out, e, ctx_size, e->mellum_interactive_sessions,
+            e->mellum_interactive_sessions);
     }
     if (!ds4_backend_uses_graph(e->backend) || !e->metal_ready) return 1;
 
@@ -60713,7 +60800,7 @@ int ds4_engine_mellum_session_lifecycle_probe(ds4_engine *e,
         return 1;
     }
     ds4_session *session = NULL;
-    if (ds4_session_create(&session, e, ctx_size) != 0 || !session ||
+    if (ds4_mellum_session_create(&session, e, ctx_size, false, false) != 0 || !session ||
         !ds4_session_is_mellum_layout_only(session)) {
         fprintf(stderr, "ds4: Mellum layout-only session creation failed\n");
         ds4_session_free(session);
@@ -60795,7 +60882,7 @@ int ds4_engine_mellum_session_decode_probe(ds4_engine *e,
         return 1;
     }
     ds4_session *session = NULL;
-    if (ds4_mellum_session_create(&session, e, ctx_size, true) != 0 ||
+    if (ds4_mellum_session_create(&session, e, ctx_size, true, false) != 0 ||
         !session || !ds4_session_is_mellum_decode_only(session)) {
         fprintf(stderr, "ds4: Mellum inspect decode session creation failed\n");
         ds4_session_free(session);
@@ -60892,7 +60979,7 @@ int ds4_engine_mellum_session_isolation_probe(ds4_engine *e,
     float *a_logits = xmalloc(logit_bytes);
     float *b_logits = xmalloc(logit_bytes);
     ds4_session *baseline = NULL, *a = NULL, *b = NULL;
-    int ok = ds4_mellum_session_create(&baseline, e, ctx_size, true) == 0 &&
+    int ok = ds4_mellum_session_create(&baseline, e, ctx_size, true, false) == 0 &&
              ds4_mellum_session_decode_fixture(baseline, fixture_a, n_tokens,
                                                err, sizeof(err)) &&
              ds4_session_copy_logits(baseline, a_reference, (int)vocab_dim) ==
@@ -60900,7 +60987,7 @@ int ds4_engine_mellum_session_isolation_probe(ds4_engine *e,
     ds4_session_free(baseline);
     baseline = NULL;
     if (ok) {
-        ok = ds4_mellum_session_create(&baseline, e, ctx_size, true) == 0 &&
+        ok = ds4_mellum_session_create(&baseline, e, ctx_size, true, false) == 0 &&
              ds4_mellum_session_decode_fixture(baseline, fixture_b, n_tokens,
                                                err, sizeof(err)) &&
              ds4_session_copy_logits(baseline, b_reference, (int)vocab_dim) ==
@@ -60909,8 +60996,8 @@ int ds4_engine_mellum_session_isolation_probe(ds4_engine *e,
     ds4_session_free(baseline);
     baseline = NULL;
     if (ok) {
-        ok = ds4_mellum_session_create(&a, e, ctx_size, true) == 0 &&
-             ds4_mellum_session_create(&b, e, ctx_size, true) == 0;
+        ok = ds4_mellum_session_create(&a, e, ctx_size, true, false) == 0 &&
+             ds4_mellum_session_create(&b, e, ctx_size, true, false) == 0;
     }
     for (uint32_t pos = 0; ok && pos < n_tokens; pos++) {
         ok = ds4_session_eval(a, fixture_a[pos], err, sizeof(err)) == 0 &&
@@ -60949,6 +61036,168 @@ int ds4_engine_mellum_session_isolation_probe(ds4_engine *e,
     free(a_reference);
     ds4_session_free(b);
     ds4_session_free(a);
+    return ok ? 0 : 1;
+#endif
+}
+
+typedef struct {
+    int completed;
+    int cancel_after;
+} ds4_mellum_sync_cancel_probe;
+
+static void ds4_mellum_sync_cancel_progress(void *ud, const char *event,
+                                             int current, int total) {
+    (void)total;
+    ds4_mellum_sync_cancel_probe *probe = ud;
+    if (probe && event && !strcmp(event, "prefill_chunk")) {
+        probe->completed = current;
+    }
+}
+
+static bool ds4_mellum_sync_cancelled(void *ud) {
+    const ds4_mellum_sync_cancel_probe *probe = ud;
+    return probe && probe->completed >= probe->cancel_after;
+}
+
+int ds4_engine_mellum_interactive_session_probe(ds4_engine *e,
+                                                FILE       *out,
+                                                int         ctx_size) {
+#ifdef DS4_NO_GPU
+    (void)e;
+    (void)out;
+    (void)ctx_size;
+    fprintf(stderr, "ds4: Mellum interactive session probe requires Metal support\n");
+    return 1;
+#else
+    static int fixture_a[] = {27, 1397, 233, 12998, 497, 2717};
+    static int fixture_b[] = {28, 1397, 233, 12998, 497, 2717};
+    const int n_tokens = (int)(sizeof(fixture_a) / sizeof(fixture_a[0]));
+    if (!e || !out || ctx_size <= n_tokens ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
+        e->backend != DS4_BACKEND_METAL || !e->mellum_decode_contract_ready ||
+        e->mellum_interactive_sessions) {
+        fprintf(stderr,
+                "ds4: Mellum interactive session probe requires an inspect-loaded Metal engine\n");
+        return 1;
+    }
+
+    char err[160] = "";
+    ds4_session *ordinary = NULL;
+    ds4_session *baseline = NULL;
+    ds4_session *session = NULL;
+    const uint64_t vocab_dim = e->weights.output->dim[1];
+    const size_t logit_bytes = (size_t)vocab_dim * sizeof(float);
+    float *a_reference = xmalloc(logit_bytes);
+    float *b_reference = xmalloc(logit_bytes);
+    float *actual = xmalloc(logit_bytes);
+    ds4_tokens a_prefix = {.v = fixture_a, .len = 3, .cap = 3};
+    ds4_tokens a_full = {.v = fixture_a, .len = n_tokens, .cap = n_tokens};
+    ds4_tokens b_full = {.v = fixture_b, .len = n_tokens, .cap = n_tokens};
+
+    int ok = ds4_session_create(&ordinary, e, ctx_size) == 0 && ordinary &&
+             ds4_session_is_mellum_layout_only(ordinary) &&
+             !ds4_session_is_mellum_interactive(ordinary) &&
+             ds4_session_argmax(ordinary) == -1;
+    ds4_session_free(ordinary);
+    ordinary = NULL;
+
+    if (ok) {
+        ok = ds4_mellum_session_create(
+                 &baseline, e, ctx_size, true, true) == 0 && baseline &&
+             ds4_session_sync(baseline, &b_full, err, sizeof(err)) == 0 &&
+             ds4_session_copy_logits(baseline, b_reference, (int)vocab_dim) ==
+                 (int)vocab_dim;
+    }
+    ds4_session_free(baseline);
+    baseline = NULL;
+
+    if (ok) {
+        ok = ds4_mellum_session_create(
+                 &session, e, ctx_size, true, true) == 0 && session &&
+             ds4_session_is_mellum_interactive(session) &&
+             !ds4_session_supports_payload(session) &&
+             ds4_session_sync(session, &a_prefix, err, sizeof(err)) == 0 &&
+             ds4_session_pos(session) == a_prefix.len &&
+             ds4_session_sync(session, &a_full, err, sizeof(err)) == 0 &&
+             ds4_session_pos(session) == a_full.len &&
+             ds4_session_common_prefix(session, &a_full) == a_full.len &&
+             ds4_session_copy_logits(session, a_reference, (int)vocab_dim) ==
+                 (int)vocab_dim;
+    }
+
+    uint64_t rng = 1;
+    ds4_token_score scores[2] = {0};
+    const int argmax = ok ? ds4_session_argmax(session) : -1;
+    if (ok && (argmax < 0 ||
+               ds4_session_argmax_excluding(session, argmax) < 0 ||
+               ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng) < 0 ||
+               ds4_session_top_logprobs(session, scores, 2) != 2 ||
+               ds4_session_token_logprob(session, argmax, &scores[0]) != 1)) {
+        fprintf(stderr, "ds4: Mellum interactive session did not expose token selection\n");
+        ok = 0;
+    }
+
+    if (ok &&
+        (ds4_session_sync(session, &b_full, err, sizeof(err)) != 0 ||
+         ds4_session_pos(session) != b_full.len ||
+         ds4_session_copy_logits(session, actual, (int)vocab_dim) !=
+             (int)vocab_dim ||
+         memcmp(actual, b_reference, logit_bytes) != 0)) {
+        fprintf(stderr,
+                "ds4: Mellum divergent prompt replay did not reproduce its baseline\n");
+        ok = 0;
+    }
+
+    ds4_mellum_sync_cancel_probe cancel_probe = {
+        .cancel_after = 2,
+    };
+    if (ok) {
+        ds4_session_invalidate(session);
+        ds4_session_set_progress(session, ds4_mellum_sync_cancel_progress,
+                                 &cancel_probe);
+        ds4_session_set_cancel(session, ds4_mellum_sync_cancelled,
+                               &cancel_probe);
+        const int sync_rc = ds4_session_sync(session, &a_full, err, sizeof(err));
+        ds4_session_set_cancel(session, NULL, NULL);
+        ds4_session_set_progress(session, NULL, NULL);
+        if (sync_rc != DS4_SESSION_SYNC_INTERRUPTED ||
+            ds4_session_pos(session) != cancel_probe.cancel_after ||
+            ds4_session_common_prefix(session, &a_full) !=
+                cancel_probe.cancel_after ||
+            ds4_session_sync(session, &a_full, err, sizeof(err)) != 0 ||
+            ds4_session_copy_logits(session, actual, (int)vocab_dim) !=
+                (int)vocab_dim ||
+            memcmp(actual, a_reference, logit_bytes) != 0) {
+            fprintf(stderr,
+                    "ds4: Mellum interrupted prompt replay did not resume exactly\n");
+            ok = 0;
+        }
+    }
+
+    if (ok) {
+        ds4_session_rewind(session, 3);
+        if (ds4_session_pos(session) != 0 ||
+            ds4_session_sync(session, &a_full, err, sizeof(err)) != 0 ||
+            ds4_session_copy_logits(session, actual, (int)vocab_dim) !=
+                (int)vocab_dim ||
+            memcmp(actual, a_reference, logit_bytes) != 0) {
+            fprintf(stderr, "ds4: Mellum rewind/reset replay was not exact\n");
+            ok = 0;
+        }
+    }
+
+    if (!ok && err[0]) fprintf(stderr, "ds4: Mellum interactive probe: %s\n", err);
+    if (ok) {
+        fprintf(out,
+                "Mellum interactive session probe tokens=%d ctx=%d sync=fresh,extend,rebuild,resume reset=exact selection=enabled inspect=blocked payload=transcript-only\n",
+                n_tokens, ctx_size);
+    }
+    ds4_session_free(session);
+    ds4_session_free(baseline);
+    ds4_session_free(ordinary);
+    free(actual);
+    free(b_reference);
+    free(a_reference);
     return ok ? 0 : 1;
 #endif
 }
@@ -61884,7 +62133,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
-    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
+    if (ds4_session_is_mellum(s) &&
+        ds4_session_reject_mellum_noninteractive(s, err, errlen)) return 1;
     const bool mirror = ds4_session_tp_leader(s);
     if (mirror && prompt && prompt->len > 0) {
         if (!ds4_tp_send_sync(s->engine->tp.ctx, s->tp_session_id,
@@ -61970,6 +62220,31 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                      s->logits,
                                      err,
                                      errlen);
+    }
+    if (ds4_session_is_mellum(s)) {
+        int start = 0;
+        if (s->checkpoint_valid && prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            start = s->checkpoint.len;
+        } else {
+            ds4_session_invalidate(s);
+        }
+        for (int i = start; i < prompt->len; i++) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = s->checkpoint.len != 0;
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            if (ds4_session_eval(s, prompt->v[i], err, errlen) != 0) {
+                return 1;
+            }
+            if (s->progress) {
+                s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+            }
+        }
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
@@ -62901,12 +63176,14 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 }
 
 int ds4_session_argmax(ds4_session *s) {
-    if (!s || ds4_session_is_mellum(s) || !s->logits) return -1;
+    if (!s || (ds4_session_is_mellum(s) &&
+               !ds4_session_is_mellum_interactive(s)) || !s->logits) return -1;
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
-    if (!s || ds4_session_is_mellum(s) || !s->logits) return -1;
+    if (!s || (ds4_session_is_mellum(s) &&
+               !ds4_session_is_mellum_interactive(s)) || !s->logits) return -1;
     int best = -1;
     float best_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -62932,14 +63209,16 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
-    if (!s || ds4_session_is_mellum(s) || !s->logits ||
+    if (!s || (ds4_session_is_mellum(s) &&
+               !ds4_session_is_mellum_interactive(s)) || !s->logits ||
         !s->sample_probs) return -1;
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
-    if (!s || ds4_session_is_mellum(s) || !s->logits ||
+    if (!s || (ds4_session_is_mellum(s) &&
+               !ds4_session_is_mellum_interactive(s)) || !s->logits ||
         !out || k <= 0) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
     for (int i = 0; i < k; i++) {
@@ -62977,7 +63256,8 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 }
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
-    if (!s || ds4_session_is_mellum(s) || !s->logits ||
+    if (!s || (ds4_session_is_mellum(s) &&
+               !ds4_session_is_mellum_interactive(s)) || !s->logits ||
         !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
 
     float max_logit = DS4_NEG_INF;

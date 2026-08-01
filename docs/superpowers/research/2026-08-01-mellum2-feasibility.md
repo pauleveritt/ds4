@@ -880,6 +880,68 @@ schedule catches aliased KV rows or token positions; it does not claim to test
 concurrent scratch safety or multi-session memory efficiency. It does not enable
 batching, prefill, generation, or SSD streaming.
 
+**First interactive resident path:** only `ds4-agent` can request the explicit
+engine capability that creates an interactive Mellum session backed by the
+independently owned, validated tokenwise decode state. Ordinary `ds4`, server,
+benchmark, evaluation, and generic inspect opens remain outside that boundary;
+an inspect-opened engine still creates only a layout session whose execution
+and selection APIs reject. `ds4_session_sync()` is intentionally sequential:
+it extends a matching live checkpoint token by token, or invalidates and
+replays a changed prompt from token zero. It reports normal sync progress and
+honours cancellation, but it neither allocates a generic batch graph nor
+claims prefill performance. Interactive sessions may use argmax, sampling,
+and log-probability helpers; the fixture-only decode sessions retain their
+strict no-selection boundary. Rewind remains a full reset, so arbitrary
+transcript rewrites replay safely rather than attempting partial KV surgery.
+
+The loader explicitly refuses CPU, layer slicing, distributed or tensor
+parallel placement, multi-GPU placement, and `--ssd-streaming` for this path.
+Mellum KV payload/snapshot persistence, mixed/batched prefill, session batching,
+layer-slice APIs, and speculative decode remain unavailable. The agent now
+saves Mellum sessions in its existing zero-payload format: rendered transcript
+and metadata are durable, and restore replays the transcript sequentially to
+rebuild resident KV. This keeps `/save`, `/switch`, exit-save, and the system
+prompt cache usable without pretending the Mellum tensors implement the shared
+payload ABI. The first agent run must still use an isolated home because ds4's
+cache namespace is not model-specific:
+
+```sh
+HOME=/tmp/mellum2 ./ds4-agent --metal -m MODEL --non-interactive \
+  --raw-prompt --nothink --temp 0 -n 32 \
+  -p 'Count upward from one, placing a space after every integer.'
+```
+
+On the M5 Max (128 GB) with the pinned Q8 artifact, the final run completed a
+13-token sequential sync in 1,110 ms (**11.7 t/s**) and emitted 32 capped
+tokens in 2,164 ms (**14.8 t/s**, including the first immediately sampled
+token). The same model mapping reported 12.03 GiB resident model and 0.07 GiB
+KV at the agent's default 100k context, or 12.10 GiB planned total. A separate
+smoke prompt, `Reply with only: hello`, produced `hello world`; this proves the
+agent sampling/eval loop works, not instruction quality. Initial process setup
+had already paged the model in, so the capped trace's ~157 ms residency request
+is not a cold-start claim.
+
+This is not a like-for-like Laguna benchmark: it is short, one-token-at-a-time
+prefill on a 128 GB M5 Max. Still, it gives the correct direction. The Laguna
+XS record on the same class of machine reports 379.90 t/s resident prefill and
+84.59 t/s resident generation; its later streamed-Q3 matched run reports
+406.56 t/s prefill and 39.82 t/s generation (M1 Pro 32 GB: 67.86 / 14.87
+t/s). Mellum's **14.8 t/s** decode is therefore far below resident Laguna XS
+and roughly the 32 GB streamed-Laguna decode threshold, before Mellum has any
+SSD path or batched prefill. The next performance gate is a reproducible
+long-prompt/capped-decode harness, followed by batched resident prefill and
+only then selected-expert SSD streaming.
+
+The inspect-only `--mellum-interactive-session-probe` is the acceptance gate
+for this promotion. On the pinned Q8 model it verifies that a generic inspect
+session remains layout-only, then privately exercises fresh sequential sync,
+suffix extension, divergent-prompt reset/replay, cancellation after a valid
+two-token checkpoint and exact resume, full-reset rewind, argmax/sampling and
+log-probability selection, and transcript-only persistence. The rebuilt and
+resumed final logits are F32-bit-identical to independent baselines. Ordinary
+`ds4` opening of the same model is separately rejected before it can enter the
+incompatible generic graph.
+
 **Review hardening:** Sol's post-commit review found that the initial oracle
 checker could accidentally accept a NaN because comparisons with NaN are false,
 and its fixture paths depended on the caller's current directory. The checker
