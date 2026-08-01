@@ -1271,6 +1271,15 @@ same resident-versus-streamed A/B gate used for Laguna XS.
   gate is intentionally narrower than generation: a multi-row layer result and
   cache comparison against repeated decode, followed by the equivalent
   authentic-model layer/logit oracle.
+- Closed the synthetic multi-row layer gate. A three-token Q8 layer batch with
+  distinct hidden states agrees with repeated one-token decode within
+  `9.53674e-06` at the final output, while both the F16 K and V rings are
+  bitwise identical (`0/384` entries differ). The fixture deliberately uses
+  zeroed attention projections, so it isolates batch router/MoE/residual
+  wiring and causal KV staging; the independent nonzero, wrapped-YaRN
+  attention regression remains the attention numerical oracle. The next gate
+  is an authentic-model multi-token layer/logit comparison before session sync
+  may select true prefill.
 
 ### 2026-08-01 M5 prefill/decode target research
 

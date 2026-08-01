@@ -2024,6 +2024,130 @@ static void test_metal_mellum_q8_layer(void) {
             model, model_bytes, &desc, hidden_t, 0u, 1u, 1u) != 0);
         TEST_ASSERT(ds4_gpu_tensor_read(out_t, 0, out_actual, embd_bytes) != 0);
         TEST_ASSERT(test_mellum_max_abs(out_actual, out_ref, n_embd) < 3.0e-3f);
+
+        /* Full-layer batch composition against repeated decode.  Attention
+         * projections in this fixture are zero, intentionally isolating the
+         * new batch F32-router/Q8-MoE path while still exercising its causal
+         * KV staging and layer residual wiring. */
+        enum { batch_tokens = 3 };
+        const uint64_t batch_embd_bytes = batch_tokens * embd_bytes;
+        const uint64_t batch_q_bytes = batch_tokens * q_bytes;
+        const uint64_t batch_kv_bytes = batch_tokens * kv_bytes;
+        const uint64_t batch_cache_bytes = batch_tokens * cache_bytes;
+        const uint64_t batch_mid_bytes = batch_tokens * mid_bytes;
+        ds4_gpu_tensor *bh = ds4_gpu_tensor_alloc(batch_embd_bytes);
+        ds4_gpu_tensor *bo = ds4_gpu_tensor_alloc(batch_embd_bytes);
+        ds4_gpu_tensor *bao = ds4_gpu_tensor_alloc(batch_embd_bytes);
+        ds4_gpu_tensor *ban = ds4_gpu_tensor_alloc(batch_embd_bytes);
+        ds4_gpu_tensor *bq = ds4_gpu_tensor_alloc(batch_q_bytes);
+        ds4_gpu_tensor *bk = ds4_gpu_tensor_alloc(batch_kv_bytes);
+        ds4_gpu_tensor *bv = ds4_gpu_tensor_alloc(batch_kv_bytes);
+        ds4_gpu_tensor *bheads = ds4_gpu_tensor_alloc(batch_q_bytes);
+        ds4_gpu_tensor *bproj = ds4_gpu_tensor_alloc(batch_embd_bytes);
+        ds4_gpu_tensor *bkey = ds4_gpu_tensor_alloc(batch_cache_bytes);
+        ds4_gpu_tensor *bvalue = ds4_gpu_tensor_alloc(batch_cache_bytes);
+        ds4_gpu_tensor *bsk = ds4_gpu_tensor_alloc(batch_tokens * kv_dim * sizeof(uint16_t));
+        ds4_gpu_tensor *bsv = ds4_gpu_tensor_alloc(batch_tokens * kv_dim * sizeof(uint16_t));
+        ds4_gpu_tensor *bffn = ds4_gpu_tensor_alloc(batch_embd_bytes);
+        ds4_gpu_tensor *blogits = ds4_gpu_tensor_alloc(batch_tokens * n_total * sizeof(float));
+        ds4_gpu_tensor *bselected = ds4_gpu_tensor_alloc(batch_tokens * n_selected * sizeof(int32_t));
+        ds4_gpu_tensor *bweights = ds4_gpu_tensor_alloc(batch_tokens * n_selected * sizeof(float));
+        ds4_gpu_tensor *bprobs = ds4_gpu_tensor_alloc(batch_tokens * n_total * sizeof(float));
+        ds4_gpu_tensor *bmid = ds4_gpu_tensor_alloc(batch_mid_bytes);
+        ds4_gpu_tensor *bmoe = ds4_gpu_tensor_alloc(batch_embd_bytes);
+        float *batch_hidden = malloc((size_t)batch_embd_bytes);
+        float *batch_out = malloc((size_t)batch_embd_bytes);
+        float *decode_out = malloc((size_t)batch_embd_bytes);
+        uint16_t *cache_seed = calloc(batch_tokens * kv_dim, sizeof(uint16_t));
+        uint16_t *cache_batch = malloc((size_t)batch_cache_bytes);
+        uint16_t *cache_decode = malloc((size_t)batch_cache_bytes);
+        uint16_t *value_batch = malloc((size_t)batch_cache_bytes);
+        uint16_t *value_decode = malloc((size_t)batch_cache_bytes);
+        const bool batch_ok = bh && bo && bao && ban && bq && bk && bv && bheads &&
+            bproj && bkey && bvalue && bsk && bsv && bffn && blogits && bselected &&
+            bweights && bprobs && bmid && bmoe && batch_hidden && batch_out &&
+            decode_out && cache_seed && cache_batch && cache_decode;
+        const bool batch_cache_allocated = value_batch && value_decode;
+        TEST_ASSERT(batch_ok && batch_cache_allocated);
+        if (batch_ok && batch_cache_allocated) {
+            for (uint32_t token = 0; token < batch_tokens; token++) {
+                for (uint32_t i = 0; i < n_embd; i++)
+                    batch_hidden[(uint64_t)token * n_embd + i] = hidden[i] +
+                        (float)(token + 1u) / 131.0f;
+            }
+            TEST_ASSERT(ds4_gpu_tensor_write(bh, 0, batch_hidden, batch_embd_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(bkey, 0, cache_seed, batch_cache_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(bvalue, 0, cache_seed, batch_cache_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_mellum_q8_0_layer_prefill_tensor(
+                bo, bao, ban, bq, bk, bv, bheads, bproj, bkey, bvalue, bsk, bsv,
+                bffn, blogits, bselected, bweights, bprobs, bmid, bmoe, model,
+                model_bytes, &desc, bh, 0u, batch_tokens, batch_tokens) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(bo, 0, batch_out, batch_embd_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(bkey, 0, cache_batch, batch_cache_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(bvalue, 0, value_batch, batch_cache_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(bkey, 0, cache_seed, batch_cache_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(bvalue, 0, cache_seed, batch_cache_bytes) != 0);
+            for (uint32_t token = 0; token < batch_tokens; token++) {
+#define BV(t, bytes) ds4_gpu_tensor_view((t), (uint64_t)token * (bytes), (bytes))
+                ds4_gpu_tensor *oh = BV(bh, embd_bytes), *oo = BV(bo, embd_bytes);
+                ds4_gpu_tensor *oao = BV(bao, embd_bytes), *oan = BV(ban, embd_bytes);
+                ds4_gpu_tensor *oq = BV(bq, q_bytes), *ok = BV(bk, kv_bytes), *ov = BV(bv, kv_bytes);
+                ds4_gpu_tensor *ohd = BV(bheads, q_bytes), *op = BV(bproj, embd_bytes);
+                ds4_gpu_tensor *of = BV(bffn, embd_bytes), *ol = BV(blogits, n_total * sizeof(float));
+                ds4_gpu_tensor *os = BV(bselected, n_selected * sizeof(int32_t));
+                ds4_gpu_tensor *ow = BV(bweights, n_selected * sizeof(float));
+                ds4_gpu_tensor *opr = BV(bprobs, n_total * sizeof(float));
+                ds4_gpu_tensor *om = BV(bmid, mid_bytes), *omo = BV(bmoe, embd_bytes);
+                TEST_ASSERT(oh && oo && oao && oan && oq && ok && ov && ohd && op && of &&
+                    ol && os && ow && opr && om && omo);
+                if (oh && oo && oao && oan && oq && ok && ov && ohd && op && of && ol &&
+                    os && ow && opr && om && omo) {
+                    TEST_ASSERT(ds4_gpu_mellum_q8_0_layer_decode_tensor(
+                        oo, oao, oan, oq, ok, ov, ohd, op, bkey, bvalue, of, ol, os,
+                        ow, opr, om, omo, model, model_bytes, &desc, oh, token,
+                        batch_tokens, 0u, token + 1u) != 0);
+                    TEST_ASSERT(ds4_gpu_tensor_read(oo, 0,
+                        decode_out + (uint64_t)token * n_embd, embd_bytes) != 0);
+                }
+                ds4_gpu_tensor_free(omo); ds4_gpu_tensor_free(om); ds4_gpu_tensor_free(opr);
+                ds4_gpu_tensor_free(ow); ds4_gpu_tensor_free(os); ds4_gpu_tensor_free(ol);
+                ds4_gpu_tensor_free(of); ds4_gpu_tensor_free(op); ds4_gpu_tensor_free(ohd);
+                ds4_gpu_tensor_free(ov); ds4_gpu_tensor_free(ok); ds4_gpu_tensor_free(oq);
+                ds4_gpu_tensor_free(oan); ds4_gpu_tensor_free(oao); ds4_gpu_tensor_free(oo);
+                ds4_gpu_tensor_free(oh);
+#undef BV
+            }
+            TEST_ASSERT(ds4_gpu_tensor_read(bkey, 0, cache_decode, batch_cache_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(bvalue, 0, value_decode, batch_cache_bytes) != 0);
+            const float layer_batch_error = test_mellum_max_abs(
+                batch_out, decode_out, batch_tokens * n_embd);
+            float kv_max_abs = 0.0f;
+            uint32_t kv_mismatch = 0;
+            for (uint32_t i = 0; i < batch_tokens * kv_dim; i++) {
+                const float kd = fabsf(test_f16_to_f32(cache_batch[i]) -
+                                       test_f16_to_f32(cache_decode[i]));
+                const float vd = fabsf(test_f16_to_f32(value_batch[i]) -
+                                       test_f16_to_f32(value_decode[i]));
+                kv_max_abs = fmaxf(kv_max_abs, fmaxf(kd, vd));
+                kv_mismatch += cache_batch[i] != cache_decode[i] ||
+                    value_batch[i] != value_decode[i];
+            }
+            fprintf(stderr,
+                    "ds4-test: Mellum Q8 batch layer out=%g kv=%u/%u max_abs=%g\n",
+                    layer_batch_error, kv_mismatch, batch_tokens * kv_dim, kv_max_abs);
+            TEST_ASSERT(layer_batch_error < 5.0e-4f);
+            TEST_ASSERT(kv_mismatch == 0u);
+        }
+        free(value_decode); free(value_batch); free(cache_decode); free(cache_batch);
+        free(cache_seed); free(decode_out);
+        free(batch_out); free(batch_hidden);
+        ds4_gpu_tensor_free(bmoe); ds4_gpu_tensor_free(bmid); ds4_gpu_tensor_free(bprobs);
+        ds4_gpu_tensor_free(bweights); ds4_gpu_tensor_free(bselected); ds4_gpu_tensor_free(blogits);
+        ds4_gpu_tensor_free(bffn); ds4_gpu_tensor_free(bsv); ds4_gpu_tensor_free(bsk);
+        ds4_gpu_tensor_free(bvalue); ds4_gpu_tensor_free(bkey); ds4_gpu_tensor_free(bproj);
+        ds4_gpu_tensor_free(bheads); ds4_gpu_tensor_free(bv); ds4_gpu_tensor_free(bk);
+        ds4_gpu_tensor_free(bq); ds4_gpu_tensor_free(ban); ds4_gpu_tensor_free(bao);
+        ds4_gpu_tensor_free(bo); ds4_gpu_tensor_free(bh);
     }
     free(mid_actual); free(weights_actual); free(selected_actual); free(probs_actual);
     free(logits_actual); free(ffn_actual); free(attention_actual); free(out_actual);
