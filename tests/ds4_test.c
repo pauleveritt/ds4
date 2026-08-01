@@ -1020,7 +1020,7 @@ static void test_metal_mellum_gqa_decode(void) {
 
 static void test_metal_mellum_gqa_prefill(void) {
     const uint32_t n_head = 32u, n_head_kv = 4u, head_dim = 128u;
-    const uint32_t cache_cap = 17u, pos0 = 15u, n_tokens = 4u;
+    const uint32_t cache_cap = 17u, pos0 = 15u, n_tokens = cache_cap;
     const uint32_t cache_width = n_head_kv * head_dim;
     const uint64_t q_values = (uint64_t)n_tokens * n_head * head_dim;
     const uint64_t kv_values = (uint64_t)n_tokens * cache_width;
@@ -1128,6 +1128,13 @@ static void test_metal_mellum_gqa_prefill(void) {
                         out, key_cache, value_cache, staged_key, staged_value,
                         q, k, v, pos0, 0, cache_cap, n_head, n_head_kv,
                         head_dim, scale) == 0);
+        /* A larger batch would make post-attention commit write the same
+         * modulo cache row concurrently. It must be rejected before any
+         * buffer-size-dependent dispatch is considered. */
+        TEST_ASSERT(ds4_gpu_mellum_gqa_prefill_tensor(
+                        out, key_cache, value_cache, staged_key, staged_value,
+                        q, k, v, pos0, cache_cap + 1u, cache_cap, n_head,
+                        n_head_kv, head_dim, scale) == 0);
         TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, q_bytes) != 0);
         float max_abs = 0.0f;
         for (uint64_t i = 0; i < q_values; i++) {

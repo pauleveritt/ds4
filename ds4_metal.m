@@ -34080,7 +34080,8 @@ int ds4_gpu_mellum_gqa_prefill_tensor(
         float                 scale) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !key_cache || !value_cache || !staged_key || !staged_value ||
-        !q || !k || !v || n_tokens == 0 || pos0 > UINT32_MAX - n_tokens ||
+        !q || !k || !v || n_tokens == 0 || n_tokens > cache_cap ||
+        pos0 > UINT32_MAX - n_tokens ||
         cache_cap == 0 || n_head == 0 || n_head_kv == 0 ||
         n_head % n_head_kv != 0 || head_dim != 128u ||
         !isfinite(scale) || scale <= 0.0f) return 0;

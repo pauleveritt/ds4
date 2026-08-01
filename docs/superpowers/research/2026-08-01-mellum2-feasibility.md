@@ -1223,3 +1223,14 @@ same resident-versus-streamed A/B gate used for Laguna XS.
   remaining large work item is a batched sparse-MoE path (router and selected
   experts) plus a real-model prefill-versus-decode oracle before session sync
   can opt into this graph.
+- Sol review found and corrected a prefill ring safety issue: a batch longer
+  than the cache capacity would commit two staged tokens to the same modulo
+  F16 KV row concurrently. The primitive now rejects `n_tokens > cache_cap`;
+  the numeric regression runs at the exact 17-token boundary and separately
+  proves the 18-token call is rejected. Replanning order is now explicit:
+  first establish multi-row attention parity (ordinary, sliding-wrap, and
+  YaRN/full cases) and batch-ownership behavior; then add the bias-free
+  batched router and Q8 selected-expert MoE; only then compare a real layer
+  and logits against sequential decode. Session sync remains sequential until
+  those gates pass, and its eventual chunk cap is 1,024 to fit every Mellum
+  sliding ring.
