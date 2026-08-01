@@ -2411,6 +2411,28 @@ int ds4_gpu_mellum_attention_decode_tensor(
         uint32_t                            key_start,
         uint32_t                            key_count);
 
+/* Layer-major batched counterpart of Mellum attention decode. The caller owns
+ * row-major scratch tensors sized for n_tokens and the staged F16 K/V chunk. */
+int ds4_gpu_mellum_attention_prefill_tensor(
+        ds4_gpu_tensor                     *out,
+        ds4_gpu_tensor                     *norm,
+        ds4_gpu_tensor                     *q,
+        ds4_gpu_tensor                     *k,
+        ds4_gpu_tensor                     *v,
+        ds4_gpu_tensor                     *heads,
+        ds4_gpu_tensor                     *projected,
+        ds4_gpu_tensor                     *key_cache,
+        ds4_gpu_tensor                     *value_cache,
+        ds4_gpu_tensor                     *staged_key,
+        ds4_gpu_tensor                     *staged_value,
+        const void                         *model_map,
+        uint64_t                            model_size,
+        const ds4_gpu_mellum_attention_desc *desc,
+        const ds4_gpu_tensor               *hidden,
+        uint32_t                            pos0,
+        uint32_t                            n_tokens,
+        uint32_t                            cache_cap);
+
 /* One complete pre-norm Mellum decode layer for the pinned all-Q8_0 oracle.
  * It composes attention+residual, FFN RMSNorm, bias-free routing, routed MoE,
  * and the FFN residual. The inspect-only Mellum engine graph composes this

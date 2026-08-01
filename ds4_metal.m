@@ -34302,6 +34302,83 @@ int ds4_gpu_mellum_attention_decode_tensor(
            ds4_gpu_add_tensor(out, projected, hidden, desc->n_embd) != 0;
 }
 
+int ds4_gpu_mellum_attention_prefill_tensor(
+        ds4_gpu_tensor                     *out,
+        ds4_gpu_tensor                     *norm,
+        ds4_gpu_tensor                     *q,
+        ds4_gpu_tensor                     *k,
+        ds4_gpu_tensor                     *v,
+        ds4_gpu_tensor                     *heads,
+        ds4_gpu_tensor                     *projected,
+        ds4_gpu_tensor                     *key_cache,
+        ds4_gpu_tensor                     *value_cache,
+        ds4_gpu_tensor                     *staged_key,
+        ds4_gpu_tensor                     *staged_value,
+        const void                         *model_map,
+        uint64_t                            model_size,
+        const ds4_gpu_mellum_attention_desc *desc,
+        const ds4_gpu_tensor               *hidden,
+        uint32_t                            pos0,
+        uint32_t                            n_tokens,
+        uint32_t                            cache_cap) {
+    if (!out || !norm || !q || !k || !v || !heads || !projected ||
+        !key_cache || !value_cache || !staged_key || !staged_value ||
+        !model_map || !desc || !hidden || n_tokens == 0 ||
+        pos0 > UINT32_MAX - n_tokens || desc->n_embd == 0 ||
+        desc->n_head == 0 || desc->n_head_kv == 0 ||
+        desc->n_head % desc->n_head_kv != 0 || desc->head_dim != 128u ||
+        desc->n_rot == 0 || desc->n_rot > desc->head_dim ||
+        (desc->n_rot & 1u) != 0 || (desc->n_embd & 31u) != 0 ||
+        !isfinite(desc->rms_eps) || desc->rms_eps <= 0.0f ||
+        !isfinite(desc->freq_base) || desc->freq_base <= 0.0f ||
+        !isfinite(desc->freq_scale) || desc->freq_scale <= 0.0f ||
+        !isfinite(desc->rope_ext_factor) ||
+        !isfinite(desc->rope_attn_factor) ||
+        !isfinite(desc->yarn_beta_fast) || !isfinite(desc->yarn_beta_slow) ||
+        cache_cap == 0) return 0;
+    const uint64_t q_dim = (uint64_t)desc->n_head * desc->head_dim;
+    const uint64_t kv_dim = (uint64_t)desc->n_head_kv * desc->head_dim;
+    const uint64_t hidden_values = (uint64_t)n_tokens * desc->n_embd;
+    const uint64_t q_values = (uint64_t)n_tokens * q_dim;
+    const uint64_t kv_values = (uint64_t)n_tokens * kv_dim;
+    if (q_dim > UINT32_MAX || kv_dim > UINT32_MAX ||
+        hidden_values > UINT32_MAX ||
+        ds4_gpu_tensor_bytes(hidden) < hidden_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(norm) < hidden_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(q) < q_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(k) < kv_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(v) < kv_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(heads) < q_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(projected) < hidden_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) < hidden_values * sizeof(float)) return 0;
+    const float attention_scale = 1.0f / sqrtf((float)desc->head_dim);
+    return ds4_gpu_rms_norm_weight_rows_tensor(
+               norm, hidden, model_map, model_size, desc->attn_norm_offset,
+               desc->n_embd, n_tokens, desc->rms_eps) != 0 &&
+           ds4_gpu_matmul_q8_0_tensor(q, model_map, model_size, desc->q_offset,
+                                       desc->n_embd, q_dim, norm, n_tokens) != 0 &&
+           ds4_gpu_matmul_q8_0_tensor(k, model_map, model_size, desc->k_offset,
+                                       desc->n_embd, kv_dim, norm, n_tokens) != 0 &&
+           ds4_gpu_matmul_q8_0_tensor(v, model_map, model_size, desc->v_offset,
+                                       desc->n_embd, kv_dim, norm, n_tokens) != 0 &&
+           ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
+               q, k, model_map, model_size, desc->q_norm_offset,
+               desc->k_norm_offset, n_tokens, desc->n_head, desc->n_head_kv,
+               desc->head_dim, desc->n_rot, pos0, desc->n_ctx_orig,
+               desc->freq_base, desc->freq_scale, desc->rope_ext_factor,
+               desc->rope_attn_factor, desc->yarn_beta_fast,
+               desc->yarn_beta_slow, desc->rms_eps) != 0 &&
+           ds4_gpu_mellum_gqa_prefill_tensor(
+               heads, key_cache, value_cache, staged_key, staged_value, q, k,
+               v, pos0, n_tokens, cache_cap, desc->n_head, desc->n_head_kv,
+               desc->head_dim, attention_scale) != 0 &&
+           ds4_gpu_matmul_q8_0_tensor(projected, model_map, model_size,
+                                       desc->output_offset, q_dim, desc->n_embd,
+                                       heads, n_tokens) != 0 &&
+           ds4_gpu_add_tensor(out, projected, hidden,
+                              (uint32_t)hidden_values) != 0;
+}
+
 int ds4_gpu_mellum_q8_0_layer_decode_tensor(
         ds4_gpu_tensor                         *out,
         ds4_gpu_tensor                         *attention_out,

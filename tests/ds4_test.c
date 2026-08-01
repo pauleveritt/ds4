@@ -1279,8 +1279,9 @@ static void test_metal_mellum_attention_prelude(void) {
     const uint32_t n_embd = 256u, n_head = 2u, n_head_kv = 1u;
     const uint32_t head_dim = 128u, q_dim = n_head * head_dim;
     const uint32_t kv_dim = n_head_kv * head_dim;
-    const uint32_t cache_cap = 7u, pos = 37u, key_start = pos - 1u;
-    const uint32_t key_count = 2u;
+    const uint32_t cache_cap = 7u, pos = 37u;
+    const uint32_t key_start = pos + 1u - cache_cap;
+    const uint32_t key_count = cache_cap;
     const float eps = 1.0e-6f, freq_base = 10000.0f;
     const uint64_t q_row_bytes = (uint64_t)(n_embd / 32u) * 34u;
     const uint64_t out_row_bytes = (uint64_t)(q_dim / 32u) * 34u;
@@ -1319,6 +1320,8 @@ static void test_metal_mellum_attention_prelude(void) {
     ds4_gpu_tensor *out_t = ds4_gpu_tensor_alloc(embd_bytes);
     ds4_gpu_tensor *key_cache_t = ds4_gpu_tensor_alloc(cache_bytes);
     ds4_gpu_tensor *value_cache_t = ds4_gpu_tensor_alloc(cache_bytes);
+    ds4_gpu_tensor *staged_key_t = ds4_gpu_tensor_alloc(kv_dim * sizeof(uint16_t));
+    ds4_gpu_tensor *staged_value_t = ds4_gpu_tensor_alloc(kv_dim * sizeof(uint16_t));
     float *hidden = malloc((size_t)embd_bytes);
     float *q_ref = malloc((size_t)q_bytes);
     float *k_ref = malloc((size_t)kv_bytes);
@@ -1334,6 +1337,7 @@ static void test_metal_mellum_attention_prelude(void) {
     uint16_t *value_cache = malloc((size_t)cache_bytes);
     const bool allocated = model && hidden_t && norm_t && q_t && k_t && v_t &&
         heads_t && projected_t && out_t && key_cache_t && value_cache_t &&
+        staged_key_t && staged_value_t &&
         hidden && q_ref && k_ref && v_ref && heads_ref && out_ref && q_actual &&
         k_actual && v_actual && heads_actual && out_actual && key_cache && value_cache;
     TEST_ASSERT(allocated);
@@ -1479,11 +1483,29 @@ static void test_metal_mellum_attention_prelude(void) {
         TEST_ASSERT(v_error < 3.0e-4f);
         TEST_ASSERT(heads_error < 3.0e-4f);
         TEST_ASSERT(out_error < 5.0e-4f);
+        TEST_ASSERT(ds4_gpu_mellum_attention_prefill_tensor(
+                        out_t, norm_t, q_t, k_t, v_t, heads_t, projected_t,
+                        key_cache_t, value_cache_t, staged_key_t, staged_value_t,
+                        model, model_bytes, &desc, hidden_t, pos, 1, cache_cap) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(q_t, 0, q_actual, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(k_t, 0, k_actual, kv_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(heads_t, 0, heads_actual, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(out_t, 0, out_actual, embd_bytes) != 0);
+        fprintf(stderr, "ds4-test: Mellum one-row attention prefill q=%g k=%g heads=%g\n",
+                test_mellum_max_abs(q_actual, q_ref, q_dim),
+                test_mellum_max_abs(k_actual, k_ref, kv_dim),
+                test_mellum_max_abs(heads_actual, heads_ref, q_dim));
+        const float prefill_out_error = test_mellum_max_abs(out_actual, out_ref,
+                                                            n_embd);
+        fprintf(stderr, "ds4-test: Mellum one-row attention prefill out=%g\n",
+                prefill_out_error);
+        TEST_ASSERT(prefill_out_error < 5.0e-4f);
     }
     free(value_cache); free(key_cache); free(out_actual); free(heads_actual);
     free(v_actual); free(k_actual); free(q_actual); free(out_ref); free(heads_ref);
     free(v_ref); free(k_ref); free(q_ref); free(hidden);
     ds4_gpu_tensor_free(value_cache_t); ds4_gpu_tensor_free(key_cache_t);
+    ds4_gpu_tensor_free(staged_value_t); ds4_gpu_tensor_free(staged_key_t);
     ds4_gpu_tensor_free(out_t); ds4_gpu_tensor_free(projected_t);
     ds4_gpu_tensor_free(heads_t); ds4_gpu_tensor_free(v_t);
     ds4_gpu_tensor_free(k_t); ds4_gpu_tensor_free(q_t);

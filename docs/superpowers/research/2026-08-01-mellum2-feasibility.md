@@ -1215,3 +1215,11 @@ same resident-versus-streamed A/B gate used for Laguna XS.
   `4.47e-08` maximum absolute error. This is a foundation only: batched Q8
   projections, Q/K norm/RoPE, routing, and sparse-MoE remain before it can
   replace sequential session sync.
+- Composed the layer-major Mellum attention prelude from existing batched
+  weighted RMSNorm, Q8_0 projections, Q/K norm+RoPE, the new staged GQA, Q8
+  output projection, and residual add. Its one-row result agrees with the
+  independent attention reference within `2.87e-06`; the mult-row causal/ring
+  behavior remains separately locked by the four-token GQA regression. The
+  remaining large work item is a batched sparse-MoE path (router and selected
+  experts) plus a real-model prefill-versus-decode oracle before session sync
+  can opt into this graph.
