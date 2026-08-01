@@ -34468,6 +34468,74 @@ int ds4_gpu_mellum_q8_0_layer_decode_tensor(
            ds4_gpu_add_tensor(out, attention_out, moe_out, n_embd) != 0;
 }
 
+int ds4_gpu_mellum_q8_0_layer_prefill_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *attention_out,
+        ds4_gpu_tensor *attention_norm, ds4_gpu_tensor *q, ds4_gpu_tensor *k,
+        ds4_gpu_tensor *v, ds4_gpu_tensor *heads, ds4_gpu_tensor *projected,
+        ds4_gpu_tensor *key_cache, ds4_gpu_tensor *value_cache,
+        ds4_gpu_tensor *staged_key, ds4_gpu_tensor *staged_value,
+        ds4_gpu_tensor *ffn_norm, ds4_gpu_tensor *router_logits,
+        ds4_gpu_tensor *router_selected, ds4_gpu_tensor *router_weights,
+        ds4_gpu_tensor *router_probs, ds4_gpu_tensor *moe_mid,
+        ds4_gpu_tensor *moe_out, const void *model_map, uint64_t model_size,
+        const ds4_gpu_mellum_q8_0_layer_desc *desc,
+        const ds4_gpu_tensor *hidden, uint32_t pos0, uint32_t n_tokens,
+        uint32_t cache_cap) {
+    if (!out || !attention_out || !attention_norm || !q || !k || !v || !heads ||
+        !projected || !key_cache || !value_cache || !staged_key || !staged_value ||
+        !ffn_norm || !router_logits || !router_selected || !router_weights ||
+        !router_probs || !moe_mid || !moe_out || !model_map || !desc || !hidden ||
+        n_tokens == 0 || desc->attention.n_embd == 0 ||
+        desc->expert_mid_dim == 0 || desc->n_expert == 0 ||
+        desc->n_expert_used == 0 || desc->n_expert_used > desc->n_expert ||
+        n_tokens > UINT32_MAX / desc->attention.n_embd) return 0;
+    const uint32_t n_embd = desc->attention.n_embd;
+    const uint64_t hidden_bytes = (uint64_t)n_tokens * n_embd * sizeof(float);
+    const uint64_t logits_bytes = (uint64_t)n_tokens * desc->n_expert * sizeof(float);
+    const uint64_t route_bytes = (uint64_t)n_tokens * desc->n_expert_used;
+    if (route_bytes > UINT64_MAX / desc->expert_mid_dim ||
+        route_bytes > UINT64_MAX / sizeof(int32_t) ||
+        route_bytes > UINT64_MAX / sizeof(float) ||
+        route_bytes * desc->expert_mid_dim > UINT64_MAX / sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) < hidden_bytes ||
+        ds4_gpu_tensor_bytes(attention_out) < hidden_bytes ||
+        ds4_gpu_tensor_bytes(ffn_norm) < hidden_bytes ||
+        ds4_gpu_tensor_bytes(moe_out) < hidden_bytes ||
+        ds4_gpu_tensor_bytes(router_logits) < logits_bytes ||
+        ds4_gpu_tensor_bytes(router_selected) < route_bytes * sizeof(int32_t) ||
+        ds4_gpu_tensor_bytes(router_weights) < route_bytes * sizeof(float) ||
+        ds4_gpu_tensor_bytes(router_probs) < logits_bytes ||
+        ds4_gpu_tensor_bytes(moe_mid) <
+            route_bytes * desc->expert_mid_dim * sizeof(float)) return 0;
+    return ds4_gpu_mellum_attention_prefill_tensor(
+               attention_out, attention_norm, q, k, v, heads, projected,
+               key_cache, value_cache, staged_key, staged_value, model_map,
+               model_size, &desc->attention, hidden, pos0, n_tokens,
+               cache_cap) != 0 &&
+           ds4_gpu_rms_norm_weight_rows_tensor(
+               ffn_norm, attention_out, model_map, model_size, desc->ffn_norm_offset,
+               n_embd, n_tokens, desc->attention.rms_eps) != 0 &&
+           (desc->router_is_f32 ?
+                ds4_gpu_matmul_f32_tensor(router_logits, model_map, model_size,
+                                          desc->router_offset, n_embd,
+                                          desc->n_expert, ffn_norm, n_tokens) :
+                ds4_gpu_matmul_q8_0_tensor(router_logits, model_map, model_size,
+                                           desc->router_offset, n_embd,
+                                           desc->n_expert, ffn_norm, n_tokens)) != 0 &&
+           ds4_gpu_mellum_router_select_batch_tensor(
+               router_selected, router_weights, router_probs, router_logits,
+               desc->n_expert, desc->n_expert_used, n_tokens) != 0 &&
+           ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
+               moe_out, moe_mid, model_map, model_size, desc->gate_offset,
+               desc->up_offset, desc->down_offset, desc->gate_expert_bytes,
+               desc->gate_row_bytes, desc->down_expert_bytes,
+               desc->down_row_bytes, n_embd, desc->expert_mid_dim, n_embd,
+               router_selected, router_weights, desc->n_expert,
+               desc->n_expert_used, ffn_norm, n_tokens) != 0 &&
+           ds4_gpu_add_tensor(out, attention_out, moe_out,
+                              n_tokens * n_embd) != 0;
+}
+
 int ds4_gpu_mellum_router_select_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,

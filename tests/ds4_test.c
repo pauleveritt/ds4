@@ -1828,6 +1828,8 @@ static void test_metal_mellum_q8_layer(void) {
     ds4_gpu_tensor *projected_t = ds4_gpu_tensor_alloc(embd_bytes);
     ds4_gpu_tensor *key_cache_t = ds4_gpu_tensor_alloc(cache_bytes);
     ds4_gpu_tensor *value_cache_t = ds4_gpu_tensor_alloc(cache_bytes);
+    ds4_gpu_tensor *staged_key_t = ds4_gpu_tensor_alloc(kv_dim * sizeof(uint16_t));
+    ds4_gpu_tensor *staged_value_t = ds4_gpu_tensor_alloc(kv_dim * sizeof(uint16_t));
     ds4_gpu_tensor *ffn_norm_t = ds4_gpu_tensor_alloc(embd_bytes);
     ds4_gpu_tensor *logits_t = ds4_gpu_tensor_alloc(n_total * sizeof(float));
     ds4_gpu_tensor *selected_t = ds4_gpu_tensor_alloc(n_selected * sizeof(int32_t));
@@ -1853,7 +1855,8 @@ static void test_metal_mellum_q8_layer(void) {
     float *mid_actual = malloc((size_t)mid_bytes);
     const bool allocated = model && hidden_t && out_t && attention_out_t &&
         attention_norm_t && q_t && k_t && v_t && heads_t && projected_t &&
-        key_cache_t && value_cache_t && ffn_norm_t && logits_t && selected_t &&
+        key_cache_t && value_cache_t && staged_key_t && staged_value_t &&
+        ffn_norm_t && logits_t && selected_t &&
         weights_t && probs_t && mid_t && moe_out_t && hidden && ffn_ref &&
         logits_ref && probs_ref && selected_ref && weights_ref && mid_ref &&
         out_ref && out_actual && attention_actual && ffn_actual && logits_actual &&
@@ -2014,6 +2017,13 @@ static void test_metal_mellum_q8_layer(void) {
         TEST_ASSERT(weights_max < 3.0e-5f);
         TEST_ASSERT(mid_max < 3.0e-4f);
         TEST_ASSERT(out_max < 3.0e-3f);
+        TEST_ASSERT(ds4_gpu_mellum_q8_0_layer_prefill_tensor(
+            out_t, attention_out_t, attention_norm_t, q_t, k_t, v_t, heads_t,
+            projected_t, key_cache_t, value_cache_t, staged_key_t, staged_value_t,
+            ffn_norm_t, logits_t, selected_t, weights_t, probs_t, mid_t, moe_out_t,
+            model, model_bytes, &desc, hidden_t, 0u, 1u, 1u) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(out_t, 0, out_actual, embd_bytes) != 0);
+        TEST_ASSERT(test_mellum_max_abs(out_actual, out_ref, n_embd) < 3.0e-3f);
     }
     free(mid_actual); free(weights_actual); free(selected_actual); free(probs_actual);
     free(logits_actual); free(ffn_actual); free(attention_actual); free(out_actual);
@@ -2022,7 +2032,8 @@ static void test_metal_mellum_q8_layer(void) {
     ds4_gpu_tensor_free(moe_out_t); ds4_gpu_tensor_free(mid_t);
     ds4_gpu_tensor_free(probs_t); ds4_gpu_tensor_free(weights_t);
     ds4_gpu_tensor_free(selected_t); ds4_gpu_tensor_free(logits_t);
-    ds4_gpu_tensor_free(ffn_norm_t); ds4_gpu_tensor_free(value_cache_t);
+    ds4_gpu_tensor_free(ffn_norm_t); ds4_gpu_tensor_free(staged_value_t);
+    ds4_gpu_tensor_free(staged_key_t); ds4_gpu_tensor_free(value_cache_t);
     ds4_gpu_tensor_free(key_cache_t); ds4_gpu_tensor_free(projected_t);
     ds4_gpu_tensor_free(heads_t); ds4_gpu_tensor_free(v_t); ds4_gpu_tensor_free(k_t);
     ds4_gpu_tensor_free(q_t); ds4_gpu_tensor_free(attention_norm_t);

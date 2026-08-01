@@ -1264,3 +1264,10 @@ same resident-versus-streamed A/B gate used for Laguna XS.
   attention, F32 router projection/selection, this MoE, and the final residual;
   then use a real model to compare that layer and logits against sequential
   decode.
+- Composed the Mellum Q8 batch-layer API: staged causal attention, batched F32
+  router projection and bias-free selection, token-major selected-expert MoE,
+  and final residual stay in the caller's Metal command batch. The established
+  one-row full-layer oracle exercises this composition successfully. The next
+  gate is intentionally narrower than generation: a multi-row layer result and
+  cache comparison against repeated decode, followed by the equivalent
+  authentic-model layer/logit oracle.

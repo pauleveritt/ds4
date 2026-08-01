@@ -2517,6 +2517,36 @@ int ds4_gpu_mellum_q8_0_layer_decode_tensor(
         uint32_t                                key_start,
         uint32_t                                key_count);
 
+/* Token-major Mellum Q8 layer prefill.  Attention stages/commits the F16 KV
+ * ring causally; router and selected-expert MoE remain entirely on Metal. */
+int ds4_gpu_mellum_q8_0_layer_prefill_tensor(
+        ds4_gpu_tensor                         *out,
+        ds4_gpu_tensor                         *attention_out,
+        ds4_gpu_tensor                         *attention_norm,
+        ds4_gpu_tensor                         *q,
+        ds4_gpu_tensor                         *k,
+        ds4_gpu_tensor                         *v,
+        ds4_gpu_tensor                         *heads,
+        ds4_gpu_tensor                         *projected,
+        ds4_gpu_tensor                         *key_cache,
+        ds4_gpu_tensor                         *value_cache,
+        ds4_gpu_tensor                         *staged_key,
+        ds4_gpu_tensor                         *staged_value,
+        ds4_gpu_tensor                         *ffn_norm,
+        ds4_gpu_tensor                         *router_logits,
+        ds4_gpu_tensor                         *router_selected,
+        ds4_gpu_tensor                         *router_weights,
+        ds4_gpu_tensor                         *router_probs,
+        ds4_gpu_tensor                         *moe_mid,
+        ds4_gpu_tensor                         *moe_out,
+        const void                             *model_map,
+        uint64_t                                model_size,
+        const ds4_gpu_mellum_q8_0_layer_desc  *desc,
+        const ds4_gpu_tensor                   *hidden,
+        uint32_t                                pos0,
+        uint32_t                                n_tokens,
+        uint32_t                                cache_cap);
+
 typedef struct {
     uint64_t gate_offset;
     uint64_t up_offset;
