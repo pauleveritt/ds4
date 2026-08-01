@@ -1199,3 +1199,11 @@ same resident-versus-streamed A/B gate used for Laguna XS.
   identified. The mixed-Q4 deployment assessment remains a separate artifact
   gate: the official Q4_K_M file is only 7.52 GiB but has Q5_0 down experts,
   so it cannot yet exercise the resident Q8-only layer graph.
+- Added a warmed in-process resident microprofile to separate final-head cost
+  from the decode stack. On the same M5 Max, three 64-token runs measured
+  **8.504 ms/token (117.6 t/s)** without output logits and **8.963 ms/token
+  (111.6 t/s)** with logits; the final RMSNorm plus 98,304-vocabulary Q8 head
+  costs only **0.459 ms/token** (~5% of the full token). This validates the
+  replan: optimize the 28-layer attention/routed-MoE stack, not the output
+  head. The inspect-only `--mellum-resident-profile` command keeps this result
+  reproducible without widening generation scope.

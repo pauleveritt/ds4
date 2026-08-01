@@ -61363,6 +61363,82 @@ int ds4_engine_mellum_swa_boundary_probe(ds4_engine *e,
 #endif
 }
 
+#ifndef DS4_NO_GPU
+static bool ds4_mellum_resident_profile_pass(
+        const ds4_engine *e, ds4_mellum_decode_state *state,
+        const int *tokens, int n_tokens, bool compute_logits, double *elapsed) {
+    ds4_mellum_decode_state_reset(state);
+    const double t0 = now_sec();
+    for (int i = 0; i < n_tokens; i++) {
+        if (!ds4_mellum_decode_token(e, state, tokens[i], NULL, NULL, NULL,
+                                     NULL, NULL, compute_logits, false)) {
+            return false;
+        }
+    }
+    *elapsed = now_sec() - t0;
+    return true;
+}
+#endif
+
+int ds4_engine_mellum_resident_profile(ds4_engine *e, FILE *out,
+                                       int ctx_size) {
+#ifdef DS4_NO_GPU
+    (void)e;
+    (void)out;
+    (void)ctx_size;
+    fprintf(stderr, "ds4: Mellum resident profile requires Metal support\n");
+    return 1;
+#else
+    enum { warmup_tokens = 8, measured_tokens = 64, repeats = 3 };
+    if (!e || !out || ctx_size <= measured_tokens ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
+        e->backend != DS4_BACKEND_METAL || !e->mellum_decode_contract_ready ||
+        e->mellum_interactive_sessions) {
+        fprintf(stderr, "ds4: Mellum resident profile requires an inspect-loaded Metal engine\n");
+        return 1;
+    }
+    int tokens[measured_tokens];
+    for (int i = 0; i < measured_tokens; i++) {
+        tokens[i] = (int)(((uint32_t)i * 7919u + 27u) % DS4_N_VOCAB);
+    }
+    ds4_session *session = NULL;
+    bool ok = ds4_mellum_session_create(&session, e, ctx_size, true, true) == 0 &&
+              session && session->mellum && session->mellum->decode;
+    double layers_sec = 0.0, logits_sec = 0.0, pass_sec = 0.0;
+    if (ok) {
+        /* Warm both paths before timing to avoid compilation/first-use costs. */
+        ok = ds4_mellum_resident_profile_pass(e, session->mellum->decode,
+                                              tokens, warmup_tokens, false,
+                                              &pass_sec) &&
+             ds4_mellum_resident_profile_pass(e, session->mellum->decode,
+                                              tokens, warmup_tokens, true,
+                                              &pass_sec);
+    }
+    for (int i = 0; ok && i < repeats; i++) {
+        ok = ds4_mellum_resident_profile_pass(e, session->mellum->decode,
+                                              tokens, measured_tokens, false,
+                                              &pass_sec);
+        layers_sec += pass_sec;
+        ok = ok && ds4_mellum_resident_profile_pass(
+                       e, session->mellum->decode, tokens, measured_tokens,
+                       true, &pass_sec);
+        logits_sec += pass_sec;
+    }
+    if (ok) {
+        const double no_head_ms = layers_sec * 1000.0 / (repeats * measured_tokens);
+        const double logits_ms = logits_sec * 1000.0 / (repeats * measured_tokens);
+        fprintf(out,
+                "Mellum resident profile tokens=%d repeats=%d no-head=%.3fms %.1ft/s with-head=%.3fms %.1ft/s output-head-delta=%.3fms\n",
+                measured_tokens, repeats, no_head_ms, 1000.0 / no_head_ms,
+                logits_ms, 1000.0 / logits_ms, logits_ms - no_head_ms);
+    } else {
+        fprintf(stderr, "ds4: Mellum resident profile decode failed\n");
+    }
+    ds4_session_free(session);
+    return ok ? 0 : 1;
+#endif
+}
+
 int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen) {
     if (!s || !s->distributed) {
         if (errlen) snprintf(err, errlen, "session is not a distributed coordinator");

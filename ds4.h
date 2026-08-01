@@ -334,6 +334,11 @@ int ds4_engine_mellum_swa_boundary_probe(ds4_engine *engine,
                                          FILE       *out,
                                          int         ctx_size);
 
+/* Inspect-only Mellum resident microprofile. Separates decode-layer cost from
+ * final RMSNorm/output-head cost without authorizing generation. */
+int ds4_engine_mellum_resident_profile(ds4_engine *engine, FILE *out,
+                                       int ctx_size);
+
 /* Diagnostic-only Mellum output-head oracle. Replays the fixed fixture through
  * final RMSNorm and the Q8 output projection, but does not select a token. */
 int ds4_engine_mellum_logits_probe(ds4_engine *engine,
