@@ -968,6 +968,31 @@ the existing GPU-busy profiler) should confirm the command-buffer collapse.
 Only then should work move to GPU token embedding or true resident batched
 prefill. SSD work remains out of scope.
 
+**Post-batch review and speed plan:** Sol's review found no correctness defect
+in the GPU-resident path: the ping-pong buffers remain distinct, the final
+output head consumes the current activation rather than relying on layer-count
+parity, every Mellum primitive joins the existing command batch, and the
+diagnostic path stays separate. The review did add one ownership regression:
+an interactive Mellum evaluation attempted while a caller owns an empty Metal
+batch must fail, preserve that batch, reset the session safely, and replay
+exactly after the caller ends it. The live interactive probe now verifies this.
+
+The next steps are deliberately ordered:
+
+1. Run three to five warmed, fixed-prompt/capped-decode repetitions; record
+   sync, generation, and wall time separately, and confirm the command-buffer
+   collapse with Metal System Trace or the GPU-busy profiler.
+2. Move the Q8 token embedding into the same owned Metal batch, removing the
+   remaining CPU embedding and 9 KiB upload; accept only byte-identical raw
+   logits and the existing oracle gates.
+3. Build true resident batched prefill while preserving the 21 sliding / 7
+   full KV policy. This is the main remaining agent-latency bottleneck.
+4. Use the trace to target the dominant Q8 decode kernel or output head; do
+   not speculate about fusion before that evidence exists.
+5. Revisit the validated mixed Q4 gate/up plus Q8-down deployment artifact and
+   remeasure quality/bandwidth. SSD streaming remains after resident parity,
+   not before it.
+
 **Review hardening:** Sol's post-commit review found that the initial oracle
 checker could accidentally accept a NaN because comparisons with NaN are false,
 and its fixture paths depended on the caller's current directory. The checker

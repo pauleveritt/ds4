@@ -61199,6 +61199,28 @@ int ds4_engine_mellum_interactive_session_probe(ds4_engine *e,
         ok = 0;
     }
 
+    /* A Mellum token owns its command batch. It must refuse rather than close
+     * a batch opened by a caller, then remain safe to rebuild after that
+     * failed attempt. This regression locks the ownership guard in the fast
+     * GPU-resident decode path. */
+    if (ok) {
+        const bool caller_batch = ds4_gpu_begin_commands() != 0;
+        const int eval_rc = caller_batch ?
+            ds4_session_eval(session, fixture_a[0], err, sizeof(err)) : 0;
+        const bool caller_batch_preserved =
+            caller_batch && eval_rc != 0 && ds4_gpu_commands_active() &&
+            ds4_session_pos(session) == 0 && ds4_gpu_end_commands() != 0;
+        if (!caller_batch_preserved ||
+            ds4_session_sync(session, &a_full, err, sizeof(err)) != 0 ||
+            ds4_session_copy_logits(session, actual, (int)vocab_dim) !=
+                (int)vocab_dim ||
+            memcmp(actual, a_reference, logit_bytes) != 0) {
+            fprintf(stderr,
+                    "ds4: Mellum caller-owned command batch was not preserved\n");
+            ok = 0;
+        }
+    }
+
     if (ok &&
         (ds4_session_sync(session, &b_full, err, sizeof(err)) != 0 ||
          ds4_session_pos(session) != b_full.len ||
@@ -61251,7 +61273,7 @@ int ds4_engine_mellum_interactive_session_probe(ds4_engine *e,
     if (!ok && err[0]) fprintf(stderr, "ds4: Mellum interactive probe: %s\n", err);
     if (ok) {
         fprintf(out,
-                "Mellum interactive session probe tokens=%d ctx=%d sync=fresh,extend,rebuild,resume reset=exact selection=enabled inspect=blocked payload=transcript-only\n",
+                "Mellum interactive session probe tokens=%d ctx=%d sync=fresh,extend,rebuild,resume reset=exact selection=enabled batch=caller-preserved inspect=blocked payload=transcript-only\n",
                 n_tokens, ctx_size);
     }
     ds4_session_free(session);
