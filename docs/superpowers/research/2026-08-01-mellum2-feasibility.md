@@ -1179,3 +1179,23 @@ same resident-versus-streamed A/B gate used for Laguna XS.
   schedule bit-for-bit with per-token decode across the 1,024-token SWA ring
   boundary (21 sliding layers and 7 full layers). This clears the long-context
   correctness gate before a layer-major prefill graph is attempted.
+- Ran the first normal agent-path measurement on an Apple M5 Max, with the
+  pinned Q8_0 model resident, `ctx=4096`, an 11-token raw prompt, and a
+  96-token continuation. Prefill was 254.886 ms (cold/short and therefore not
+  a useful throughput claim); generated tokens were timestamped at roughly
+  10 ms each, or **about 100 t/s**. Metal's accumulated GPU time was 638.1 ms
+  for the first 64 command buffers, also about 10 ms/token. Thus the current
+  resident decode is GPU-compute/bandwidth bound rather than host submission
+  bound; the earlier 31-token microprobe's 111.5 t/s is a compatible,
+  shorter-run result. Moving the embedding fully to GPU was exact but did not
+  materially change either number.
+- Replanned resident optimization accordingly: retain the small 32-token
+  submission batch as a correctness-preserving interim prefill path; do not
+  spend effort on another host-side micro-optimization. The next performance
+  work is a layer-major multi-token graph, which requires batched Mellum
+  attention, Q8 projection, router, and sparse-MoE composition rather than a
+  larger command batch. Before implementation, profile kernel-level time or
+  add a targeted no-output-head comparison so that the expensive primitive is
+  identified. The mixed-Q4 deployment assessment remains a separate artifact
+  gate: the official Q4_K_M file is only 7.52 GiB but has Q5_0 down experts,
+  so it cannot yet exercise the resident Q8-only layer graph.
