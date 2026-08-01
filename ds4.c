@@ -36634,6 +36634,94 @@ struct ds4_mellum_decode_state {
     float *hidden_cpu;
 };
 
+/* Workspace for an inspect-only layer-major batch. It deliberately owns no KV
+ * cache: the caller supplies the per-layer rings from a decode state so the
+ * batch can be compared directly with the established sequential path. */
+typedef struct {
+    uint32_t cap;
+    ds4_gpu_tensor *tokens;
+    ds4_gpu_tensor *hidden;
+    ds4_gpu_tensor *layer_out;
+    ds4_gpu_tensor *attention_out;
+    ds4_gpu_tensor *attention_norm;
+    ds4_gpu_tensor *q;
+    ds4_gpu_tensor *k;
+    ds4_gpu_tensor *v;
+    ds4_gpu_tensor *heads;
+    ds4_gpu_tensor *projected;
+    ds4_gpu_tensor *staged_key;
+    ds4_gpu_tensor *staged_value;
+    ds4_gpu_tensor *ffn_norm;
+    ds4_gpu_tensor *router_logits;
+    ds4_gpu_tensor *router_selected;
+    ds4_gpu_tensor *router_weights;
+    ds4_gpu_tensor *router_probs;
+    ds4_gpu_tensor *moe_mid;
+    ds4_gpu_tensor *moe_out;
+} ds4_mellum_prefill_scratch;
+
+static void ds4_mellum_prefill_scratch_free(ds4_mellum_prefill_scratch *scratch) {
+    if (!scratch) return;
+    ds4_gpu_tensor_free(scratch->moe_out); ds4_gpu_tensor_free(scratch->moe_mid);
+    ds4_gpu_tensor_free(scratch->router_probs); ds4_gpu_tensor_free(scratch->router_weights);
+    ds4_gpu_tensor_free(scratch->router_selected); ds4_gpu_tensor_free(scratch->router_logits);
+    ds4_gpu_tensor_free(scratch->ffn_norm); ds4_gpu_tensor_free(scratch->staged_value);
+    ds4_gpu_tensor_free(scratch->staged_key); ds4_gpu_tensor_free(scratch->projected);
+    ds4_gpu_tensor_free(scratch->heads); ds4_gpu_tensor_free(scratch->v);
+    ds4_gpu_tensor_free(scratch->k); ds4_gpu_tensor_free(scratch->q);
+    ds4_gpu_tensor_free(scratch->attention_norm); ds4_gpu_tensor_free(scratch->attention_out);
+    ds4_gpu_tensor_free(scratch->layer_out); ds4_gpu_tensor_free(scratch->hidden);
+    ds4_gpu_tensor_free(scratch->tokens);
+    memset(scratch, 0, sizeof(*scratch));
+}
+
+static bool ds4_mellum_prefill_scratch_create(ds4_mellum_prefill_scratch *scratch,
+                                              uint32_t                    cap) {
+    if (!scratch || cap == 0) return false;
+    memset(scratch, 0, sizeof(*scratch));
+    const uint64_t embd_bytes = (uint64_t)cap * DS4_N_EMBD * sizeof(float);
+    const uint64_t q_bytes = (uint64_t)cap * DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)cap * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t mid_bytes = (uint64_t)cap * DS4_N_EXPERT_USED *
+        DS4_N_FF_EXP * sizeof(float);
+#define DS4_MELLUM_PREFILL_ALLOC(name, bytes) \
+    do { scratch->name = ds4_gpu_tensor_alloc(bytes); } while (0)
+    DS4_MELLUM_PREFILL_ALLOC(tokens, (uint64_t)cap * sizeof(int32_t));
+    DS4_MELLUM_PREFILL_ALLOC(hidden, embd_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(layer_out, embd_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(attention_out, embd_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(attention_norm, embd_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(q, q_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(k, kv_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(v, kv_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(heads, q_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(projected, embd_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(staged_key, (uint64_t)cap * DS4_N_HEAD_KV *
+                             DS4_N_HEAD_DIM * sizeof(uint16_t));
+    DS4_MELLUM_PREFILL_ALLOC(staged_value, (uint64_t)cap * DS4_N_HEAD_KV *
+                             DS4_N_HEAD_DIM * sizeof(uint16_t));
+    DS4_MELLUM_PREFILL_ALLOC(ffn_norm, embd_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(router_logits, (uint64_t)cap * DS4_N_EXPERT * sizeof(float));
+    DS4_MELLUM_PREFILL_ALLOC(router_selected, (uint64_t)cap * DS4_N_EXPERT_USED * sizeof(int32_t));
+    DS4_MELLUM_PREFILL_ALLOC(router_weights, (uint64_t)cap * DS4_N_EXPERT_USED * sizeof(float));
+    DS4_MELLUM_PREFILL_ALLOC(router_probs, (uint64_t)cap * DS4_N_EXPERT * sizeof(float));
+    DS4_MELLUM_PREFILL_ALLOC(moe_mid, mid_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(moe_out, embd_bytes);
+#undef DS4_MELLUM_PREFILL_ALLOC
+    const bool ok = scratch->tokens && scratch->hidden && scratch->layer_out &&
+        scratch->attention_out && scratch->attention_norm && scratch->q &&
+        scratch->k && scratch->v && scratch->heads && scratch->projected &&
+        scratch->staged_key && scratch->staged_value && scratch->ffn_norm &&
+        scratch->router_logits && scratch->router_selected && scratch->router_weights &&
+        scratch->router_probs && scratch->moe_mid && scratch->moe_out;
+    if (!ok) {
+        ds4_mellum_prefill_scratch_free(scratch);
+        return false;
+    }
+    scratch->cap = cap;
+    return true;
+}
+
 static void ds4_mellum_decode_state_free(ds4_mellum_decode_state *state) {
     if (!state) return;
     ds4_gpu_tensor_free(state->logits); ds4_gpu_tensor_free(state->output_norm);
@@ -36747,6 +36835,73 @@ static bool ds4_mellum_decode_output_prepare(
     state->logits = NULL;
     state->output_norm = NULL;
     return false;
+}
+
+static bool ds4_mellum_prefill_tokens(
+        const ds4_engine                  *e,
+        ds4_mellum_decode_state           *state,
+        ds4_mellum_prefill_scratch        *scratch,
+        const int                         *tokens,
+        uint32_t                           n_tokens,
+        bool                               compute_logits) {
+    if (!e || !state || !scratch || !tokens || n_tokens == 0 ||
+        n_tokens > scratch->cap || n_tokens > DS4_N_SWA ||
+        n_tokens > state->full_cache_cap ||
+        state->position > state->full_cache_cap - n_tokens ||
+        ds4_gpu_commands_active() || !e->weights.token_embd ||
+        e->weights.token_embd->type != DS4_TENSOR_Q8_0) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        if (tokens[i] < 0 || (uint32_t)tokens[i] >= DS4_N_VOCAB) return false;
+    }
+    const uint32_t pos0 = state->position;
+    const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    bool batch_started = false;
+    bool ok = ds4_gpu_tensor_write(scratch->tokens, 0, tokens,
+                                   (uint64_t)n_tokens * sizeof(int32_t)) != 0;
+    if (ok) batch_started = ds4_gpu_begin_commands() != 0;
+    ok = ok && batch_started;
+    ds4_gpu_tensor *current = scratch->hidden;
+    ds4_gpu_tensor *next = scratch->layer_out;
+    if (ok) ok = ds4_gpu_embed_tokens_q8_0_tensor(
+        current, scratch->tokens, e->model.map, e->model.size,
+        e->weights.token_embd->abs_offset, DS4_N_VOCAB, n_tokens,
+        DS4_N_EMBD) != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = ds4_gpu_mellum_q8_0_layer_prefill_tensor(
+            next, scratch->attention_out, scratch->attention_norm,
+            scratch->q, scratch->k, scratch->v, scratch->heads,
+            scratch->projected, state->key_cache[il], state->value_cache[il],
+            scratch->staged_key, scratch->staged_value, scratch->ffn_norm,
+            scratch->router_logits, scratch->router_selected,
+            scratch->router_weights, scratch->router_probs, scratch->moe_mid,
+            scratch->moe_out, e->model.map, e->model.size, &state->desc[il],
+            current, pos0, n_tokens, state->cache_cap[il]) != 0;
+        ds4_gpu_tensor *tmp = current;
+        current = next;
+        next = tmp;
+    }
+    ds4_gpu_tensor *last = NULL;
+    if (ok && compute_logits) {
+        last = ds4_gpu_tensor_view(current, (uint64_t)(n_tokens - 1u) * embd_bytes,
+                                   embd_bytes);
+        const uint64_t vocab_dim = e->weights.output ? e->weights.output->dim[1] : 0;
+        ok = last && state->output_norm && state->logits && vocab_dim != 0 &&
+             ds4_gpu_rms_norm_weight_tensor(
+                 state->output_norm, last, e->model.map, e->model.size,
+                 e->weights.output_norm->abs_offset, DS4_N_EMBD,
+                 DS4_RMS_EPS) != 0 &&
+             ds4_gpu_matmul_q8_0_tensor(
+                 state->logits, e->model.map, e->model.size,
+                 e->weights.output->abs_offset, DS4_N_EMBD, vocab_dim,
+                 state->output_norm, 1) != 0;
+    }
+    ds4_gpu_tensor_free(last);
+    const bool batch_ok = !batch_started || ds4_gpu_end_commands() != 0;
+    if (!ok || !batch_ok) return false;
+    state->position += n_tokens;
+    return true;
 }
 
 static void ds4_mellum_decode_state_reset(ds4_mellum_decode_state *state) {
@@ -61435,6 +61590,120 @@ int ds4_engine_mellum_resident_profile(ds4_engine *e, FILE *out,
         fprintf(stderr, "ds4: Mellum resident profile decode failed\n");
     }
     ds4_session_free(session);
+    return ok ? 0 : 1;
+#endif
+}
+
+int ds4_engine_mellum_true_prefill_probe(ds4_engine *e, FILE *out) {
+#ifdef DS4_NO_GPU
+    (void)e;
+    (void)out;
+    fprintf(stderr, "ds4: Mellum true-prefill probe requires Metal support\n");
+    return 1;
+#else
+    static const int fixture_tokens[] = {
+        27, 1397, 233, 12998, 497, 2717, 669, 60, 783, 846, 42, 99, 46,
+        321, 800, 28, 233, 27, 8091, 233, 23, 233, 233, 24, 233, 233,
+    };
+    const uint32_t n_tokens = (uint32_t)(sizeof(fixture_tokens) /
+                                          sizeof(fixture_tokens[0]));
+    if (!e || !out || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
+        e->backend != DS4_BACKEND_METAL || !e->mellum_decode_contract_ready ||
+        !e->weights.output || e->weights.output->dim[1] == 0 ||
+        e->weights.output->dim[1] > SIZE_MAX / sizeof(float)) {
+        fprintf(stderr, "ds4: Mellum true-prefill probe requires an inspect-loaded Q8 Metal engine\n");
+        return 1;
+    }
+    const uint64_t vocab_dim = e->weights.output->dim[1];
+    const size_t logits_bytes = (size_t)vocab_dim * sizeof(float);
+    float *decode_logits = xmalloc(logits_bytes);
+    float *prefill_logits = xmalloc(logits_bytes);
+    float *decode_hidden = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *prefill_hidden = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    ds4_mellum_decode_state *decode = ds4_mellum_decode_state_create(e, n_tokens);
+    ds4_mellum_decode_state *prefill = ds4_mellum_decode_state_create(e, n_tokens);
+    ds4_mellum_prefill_scratch scratch = {0};
+    bool ok = decode && prefill &&
+              ds4_mellum_decode_output_prepare(e, decode) &&
+              ds4_mellum_decode_output_prepare(e, prefill) &&
+              ds4_mellum_prefill_scratch_create(&scratch, n_tokens);
+    for (uint32_t pos = 0; ok && pos < n_tokens; pos++) {
+        ok = ds4_mellum_decode_token(e, decode, fixture_tokens[pos], NULL,
+                                     NULL, NULL, NULL,
+                                     pos + 1u == n_tokens ? decode_logits : NULL,
+                                     false, false);
+    }
+    if (ok && ds4_gpu_tensor_read(decode->hidden, 0, decode_hidden,
+                                  (uint64_t)DS4_N_EMBD * sizeof(float)) == 0) {
+        fprintf(stderr, "ds4: Mellum true-prefill probe could not read sequential hidden state\n");
+        ok = false;
+    }
+    if (ok && !ds4_mellum_prefill_tokens(e, prefill, &scratch, fixture_tokens,
+                                          n_tokens, true)) {
+        fprintf(stderr, "ds4: Mellum true-prefill probe batch layer stack failed\n");
+        ok = false;
+    }
+    if (ok && ds4_gpu_tensor_read(prefill->logits, 0, prefill_logits,
+                                  logits_bytes) == 0) {
+        fprintf(stderr, "ds4: Mellum true-prefill probe could not read batch logits\n");
+        ok = false;
+    }
+    ds4_gpu_tensor *prefill_last = NULL;
+    if (ok) {
+        ds4_gpu_tensor *last_rows = (DS4_N_LAYER & 1u) ?
+            scratch.layer_out : scratch.hidden;
+        prefill_last = ds4_gpu_tensor_view(
+            last_rows, (uint64_t)(n_tokens - 1u) * DS4_N_EMBD * sizeof(float),
+            (uint64_t)DS4_N_EMBD * sizeof(float));
+        if (!prefill_last) {
+            fprintf(stderr, "ds4: Mellum true-prefill probe could not view batch hidden state\n");
+            ok = false;
+        } else if (ds4_gpu_tensor_read(prefill_last, 0, prefill_hidden,
+                                        (uint64_t)DS4_N_EMBD * sizeof(float)) == 0) {
+            fprintf(stderr, "ds4: Mellum true-prefill probe could not read batch hidden state\n");
+            ok = false;
+        }
+    }
+    ds4_gpu_tensor_free(prefill_last);
+    float logit_max_abs = 0.0f, hidden_max_abs = 0.0f;
+    double logit_sum_sq = 0.0, hidden_sum_sq = 0.0;
+    if (ok) {
+        for (uint64_t i = 0; i < vocab_dim; i++) {
+            if (!isfinite(decode_logits[i]) || !isfinite(prefill_logits[i])) {
+                ok = false;
+                break;
+            }
+            const float delta = prefill_logits[i] - decode_logits[i];
+            logit_max_abs = fmaxf(logit_max_abs, fabsf(delta));
+            logit_sum_sq += (double)delta * delta;
+        }
+    }
+    for (uint32_t i = 0; ok && i < DS4_N_EMBD; i++) {
+        if (!isfinite(decode_hidden[i]) || !isfinite(prefill_hidden[i])) {
+            ok = false;
+            break;
+        }
+        const float delta = prefill_hidden[i] - decode_hidden[i];
+        hidden_max_abs = fmaxf(hidden_max_abs, fabsf(delta));
+        hidden_sum_sq += (double)delta * delta;
+    }
+    const double logit_rms = ok ? sqrt(logit_sum_sq / (double)vocab_dim) : 0.0;
+    const double hidden_rms = ok ? sqrt(hidden_sum_sq / (double)DS4_N_EMBD) : 0.0;
+    if (!ok) {
+        fprintf(stderr, "ds4: Mellum true-prefill probe execution failed\n");
+    } else {
+        fprintf(out,
+                "Mellum true-prefill probe tokens=%u layers=%u hidden max_abs=%g rms=%g logits max_abs=%g rms=%g\n",
+                n_tokens, DS4_N_LAYER, hidden_max_abs, hidden_rms,
+                logit_max_abs, logit_rms);
+    }
+    ds4_mellum_prefill_scratch_free(&scratch);
+    ds4_mellum_decode_state_free(prefill);
+    ds4_mellum_decode_state_free(decode);
+    free(prefill_hidden);
+    free(decode_hidden);
+    free(prefill_logits);
+    free(decode_logits);
     return ok ? 0 : 1;
 #endif
 }

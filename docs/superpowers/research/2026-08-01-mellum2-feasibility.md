@@ -1280,6 +1280,17 @@ same resident-versus-streamed A/B gate used for Laguna XS.
   attention regression remains the attention numerical oracle. The next gate
   is an authentic-model multi-token layer/logit comparison before session sync
   may select true prefill.
+- Added that authentic-model comparison as the inspect-only
+  `--mellum-true-prefill-probe`. It embeds the fixed 26-token ChatML fixture
+  once, runs all 28 layers as a layer-major batch, and compares its final row
+  with an independently allocated sequential resident decode state. On the
+  pinned Q8 GGUF/M5 Max, batch-versus-decode drift is `1.44885` maximum /
+  `0.0734592` RMS at final layer 27 and `0.0345203` maximum / `0.0202315` RMS
+  in the 98,304 final logits. This is an evidence-gathering parity probe, not
+  a session-sync change or a prefill speed result; the next work must localize
+  the layer where the batch schedule exceeds the tokenwise envelope, then set
+  a measured acceptance envelope before wiring this graph into interactive
+  sessions.
 
 ### 2026-08-01 M5 prefill/decode target research
 
