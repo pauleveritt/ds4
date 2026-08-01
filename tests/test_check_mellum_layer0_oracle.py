@@ -13,11 +13,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CHECKER = ROOT / "tests" / "check_mellum_layer0_oracle.py"
 REFERENCE = ROOT / "tests" / "test-vectors" / "mellum-llama-cpp" / "l-out-27-tokenwise.f32"
+LOGITS_REFERENCE = ROOT / "tests" / "test-vectors" / "mellum-llama-cpp" / "result-output-tokenwise.f32"
 
 
-def run_checker(actual: Path, cwd: Path) -> subprocess.CompletedProcess[str]:
+def run_checker(
+    actual: Path, cwd: Path, layer: str = "27-tokenwise"
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(CHECKER), "--layer", "27-tokenwise", str(actual)],
+        [sys.executable, str(CHECKER), "--layer", layer, str(actual)],
         cwd=cwd,
         check=False,
         capture_output=True,
@@ -43,6 +46,11 @@ def main() -> int:
         result = run_checker(actual, scratch)
         if result.returncode != 0:
             raise AssertionError(f"valid oracle failed outside the repository: {result.stderr!r}")
+        logits = scratch / "valid-logits.f32"
+        shutil.copyfile(LOGITS_REFERENCE, logits)
+        result = run_checker(logits, scratch, "logits-tokenwise")
+        if result.returncode != 0:
+            raise AssertionError(f"valid logits oracle failed outside the repository: {result.stderr!r}")
         assert_rejected(math.nan, "nan", scratch)
         assert_rejected(math.inf, "inf", scratch)
     print("Mellum oracle checker: valid, NaN, and Inf cases passed")

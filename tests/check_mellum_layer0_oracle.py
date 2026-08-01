@@ -32,6 +32,13 @@ ORACLES = {
         "max_abs_limit": 1.5,
         "rms_limit": 6.0e-2,
     },
+    "logits-tokenwise": {
+        "values": 98304,
+        "reference": VECTOR_DIR / "result-output-tokenwise.f32",
+        "sha256": "4ec7f9c838058fc267ec0a2f117aa4db523950df1621f61d25afcf63e3be2b1c",
+        "max_abs_limit": 2.5e-2,
+        "rms_limit": 1.2e-2,
+    },
 }
 
 
@@ -47,7 +54,7 @@ def main() -> int:
     parser.add_argument("actual", type=Path, help="F32 output from a Mellum diagnostic probe")
     parser.add_argument(
         "--layer",
-        choices=("0", "27", "27-tokenwise"),
+        choices=("0", "27", "27-tokenwise", "logits-tokenwise"),
         default="0",
         help="checkpoint family (default: 0)",
     )
@@ -60,7 +67,7 @@ def main() -> int:
     layer = int(args.layer) if args.layer.isdecimal() else args.layer
     oracle = ORACLES[layer]
     reference_path = args.reference or oracle["reference"]
-    values = oracle["rows"] * HIDDEN
+    values = oracle["values"] if "values" in oracle else oracle["rows"] * HIDDEN
     expected_bytes = values * 4
 
     try:
@@ -101,11 +108,14 @@ def main() -> int:
         sum_sq += delta * delta
     rms = math.sqrt(sum_sq / len(reference))
     mae = sum_abs / len(reference)
-    token, channel = divmod(max_index, HIDDEN)
+    if values % HIDDEN == 0:
+        max_location = str(divmod(max_index, HIDDEN))
+    else:
+        max_location = str(max_index)
     print(
         f"Mellum layer-{args.layer} oracle "
         f"values={len(reference)} max_abs={max_abs:.9g} rms={rms:.9g} "
-        f"mae={mae:.9g} max_at=({token},{channel})"
+        f"mae={mae:.9g} max_at={max_location}"
     )
     max_abs_limit = oracle.get("max_abs_limit")
     rms_limit = oracle.get("rms_limit")

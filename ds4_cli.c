@@ -98,6 +98,11 @@ typedef struct {
     const char *mellum_all_layers_trace_out;
     const char *mellum_all_layers_attention_trace_out;
     const char *mellum_all_layers_qk_trace_out;
+    bool mellum_kv_layout_probe;
+    bool mellum_session_lifecycle_probe;
+    bool mellum_logits_probe;
+    const char *mellum_logits_probe_out;
+    int mellum_logits_probe_top_k;
 } cli_generation_options;
 
 typedef struct {
@@ -2054,6 +2059,29 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.mellum_all_layers_qk_trace_out = need_arg(&i, argc, argv, arg);
             c.inspect = true;
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-kv-layout-probe")) {
+            c.gen.mellum_kv_layout_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-session-lifecycle-probe")) {
+            c.gen.mellum_session_lifecycle_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-logits-probe")) {
+            c.gen.mellum_logits_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-logits-probe-out")) {
+            c.gen.mellum_logits_probe = true;
+            c.gen.mellum_logits_probe_out = need_arg(&i, argc, argv, arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-logits-probe-top-k")) {
+            c.gen.mellum_logits_probe = true;
+            c.gen.mellum_logits_probe_top_k =
+                parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--metal-graph-generate")) {
             fprintf(stderr, "ds4: --metal-graph-generate was removed; --metal is the graph path\n");
             exit(2);
@@ -2193,6 +2221,31 @@ int main(int argc, char **argv) {
             cfg.gen.mellum_all_layers_trace_out,
             cfg.gen.mellum_all_layers_attention_trace_out,
             cfg.gen.mellum_all_layers_qk_trace_out);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_kv_layout_probe) {
+        int rc = ds4_engine_mellum_kv_layout_probe(
+            engine, stdout, cfg.gen.ctx_size);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_session_lifecycle_probe) {
+        int rc = ds4_engine_mellum_session_lifecycle_probe(
+            engine, stdout, cfg.gen.ctx_size);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_logits_probe) {
+        int rc = ds4_engine_mellum_logits_probe(
+            engine, stdout, cfg.gen.mellum_logits_probe_out,
+            (uint32_t)cfg.gen.mellum_logits_probe_top_k);
         ds4_engine_close(engine);
         ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);

@@ -766,9 +766,86 @@ retains both layer-27 checkpoints so the schedule distinction remains visible.
 
 **Stopping boundary:** resident output-head integration, ordinary sessions,
 greedy generation, and SSD streaming are deliberately not started. The next
-authorized work after this research boundary is to decide whether the
-tokenwise whole-layer composition should become the engine graph, then add the
-final RMSNorm/output head and validate the existing greedy fixtures.
+authorized work after this research boundary is ordinary-session design only;
+it does not authorize implementation. Greedy generation, resident prefill, and
+SSD streaming remain out of scope.
+
+**Engine-graph promotion:** the accepted 28-layer tokenwise composition is now
+held in a reusable private `ds4_engine` Mellum decode state. It owns the Q8
+layer descriptors, shared activation/router scratch, F16 KV tensors for every
+layer, and a resettable token position; sliding layers retain their 1,024-row
+rings while full-attention layers use the requested diagnostic context. The
+inspect-only whole-model probe resets and reuses that state rather than
+reallocating its graph per invocation. Re-running the pinned 26-token fixture
+through this engine-owned state preserves the tokenwise layer-27 gate exactly:
+maximum absolute error `1.18908691`, RMS `0.0437416537`. This state is not a
+`ds4_session`, does not share the global KV-cache directory/store, and remains
+reachable only through the inspect probe. At this stage it had no final
+RMSNorm/output projection; token emission, greedy generation, resident prefill,
+and SSD streaming remain excluded.
+
+**Output-head promotion:** the same inspect-only engine state now owns F32
+output-norm and raw-logit tensors. The new `--mellum-logits-probe[-out FILE]`
+replays the pinned fixture through all 28 layers, final RMSNorm, and the Q8_0
+output matrix, then writes or displays raw logits only. It neither computes an
+argmax for an execution path nor emits a token. A matching tokenwise llama.cpp `result_output`
+checkpoint is pinned as `result-output-tokenwise.f32` (98,304 F32 values;
+SHA-256 `4ec7f9c838058fc267ec0a2f117aa4db523950df1621f61d25afcf63e3be2b1c`).
+The initial ds4 comparison is maximum absolute error `0.0175094604`, RMS
+`0.009415312`, and MAE `0.00922990179`; the explicit output-head gate is
+maximum `<= 0.025` and RMS `<= 0.012`. The error is expected to include the
+accepted tokenwise layer-stack drift; no token-quality inference or generation
+claim follows from this raw-logit gate.
+
+**Inspect-only ranking:** `--mellum-logits-probe-top-k N` ranks the raw logits
+from that same fixed probe and reports the IDs and values without passing them
+to a sampler, session, or token emitter. On the pinned fixture, the top 16 IDs
+exactly preserve the llama.cpp order: `910, 2116, 889, 629, 3756, 45742, 2591,
+2190, 1017, 433, 4697, 75, 3969, 20320, 21177, 7846`. This establishes only a
+diagnostic ranking seam; it does not authorize generation.
+
+**Next-phase session design (not implemented):** the first session-capable
+Mellum change should be a separate state type, rather than widening the fixed
+probe state. It needs one F16 key/value pair per layer, with a 1,024-row ring
+for each sliding layer and a caller-chosen full-context capacity for layers 3,
+7, 11, 15, 19, 23, and 27. The private probe's hard-coded fixture position and
+its CPU activation round-trips must not become session behavior. Before any
+decode or prefill is enabled, the design review must specify: (1) allocation
+and teardown ownership under `ds4_session`; (2) reset, context-limit, and
+sliding-ring semantics; (3) an explicit no-output/no-emission seam; and (4)
+the persistent-cache isolation rule: run anything that creates KV state as
+`HOME=/tmp/mellum2 ./ds4 ...`, because ds4's KV cache directory is shared
+across models. The first implementation gate is session create/close and KV
+layout inspection only—no prompt evaluation, prefill, token selection, or
+generation.
+
+**KV-layout allocation gate:** `--mellum-kv-layout-probe --ctx N` now
+allocates and releases the intended per-layer F16 key/value tensors under
+inspect mode, but does not create a `ds4_session` or evaluate a token. At
+`--ctx 4096`, it validates 21 sliding layers at 1,024 rows and seven full
+layers at 4,096 rows, with a KV dimension of 512 and a total allocation of
+102,760,448 bytes (98 MiB). This establishes the storage contract without
+reusing the generic session graph, which is structurally wrong for Mellum.
+
+**Layout-only session lifecycle gate:**
+`--mellum-session-lifecycle-probe --ctx N` now creates and releases a
+dedicated `ds4_session` carrying that Mellum KV layout. The generic Metal graph
+is deliberately not marked ready or allocated for this family. Every public
+token-execution entry point used by the gate rejects the session before any
+kernel work, and the probe verifies that rejection before teardown. At
+`--ctx 4096` the lifecycle completes with 21 sliding and seven full layers.
+This is a creation/teardown contract only: no prompt, prefill, logits, token
+selection, or generation has been enabled.
+
+**Boundary hardening review:** layout-only sessions intentionally allocate no
+generic graph, output buffer, or sampling workspace. The review found that a
+public argmax helper could otherwise dereference that absent logits buffer.
+It now returns the normal invalid-token result (`-1`), alongside the other
+selection and log-probability APIs. Payload, snapshot, and staged-payload APIs
+also reject this session state before they can touch an unrelated graph layout.
+The lifecycle probe now exercises token evaluation, eval-and-argmax, argmax,
+sampling, top-logprobs, and token-logprob rejection before releasing its KV
+tensors. This remains a safety boundary, not generation work.
 
 **Review hardening:** Sol's post-commit review found that the initial oracle
 checker could accidentally accept a NaN because comparisons with NaN are false,

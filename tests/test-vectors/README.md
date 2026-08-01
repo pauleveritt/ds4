@@ -91,6 +91,26 @@ wrong byte count, fixture hash mismatch, and every non-finite reference,
 actual, or delta value. Its dependency-free regression test is part of
 `make test`; run it alone with `make test-mellum-oracle-checker`.
 
+`mellum-llama-cpp/result-output-tokenwise.f32` is the matching final raw-logit
+checkpoint: one 98,304-value F32 row captured as llama.cpp's `result_output`
+after final RMSNorm and the Q8_0 output matrix. Its SHA-256 is
+`4ec7f9c838058fc267ec0a2f117aa4db523950df1621f61d25afcf63e3be2b1c`. The
+inspect-only ds4 probe does not select a token:
+
+```sh
+HOME=/tmp/mellum2 ./ds4 --mellum-logits-probe-out /tmp/mellum2-ds4-result-output.f32 --model MODEL
+python3 tests/check_mellum_layer0_oracle.py --layer logits-tokenwise /tmp/mellum2-ds4-result-output.f32
+```
+
+The raw-logit gate is maximum absolute error no greater than `0.025` and RMS
+no greater than `0.012`.
+
+For an inspect-only ranking report that neither samples nor emits a token:
+
+```sh
+HOME=/tmp/mellum2 ./ds4 --mellum-logits-probe-top-k 16 --model MODEL
+```
+
 ### llama.cpp capture provenance
 
 `capture-layer-output.patch` is the minimal callback patch used to create all
@@ -124,7 +144,8 @@ The command must emit exactly 9,216 bytes and SHA-256
 replaces the pinned fixture. Omit `MELLUM_TOKENWISE=1` to make the batched
 `l-out-27-last.f32` capture; set `MELLUM_DUMP_TENSOR=l_out-0` without it to
 make the 26-row layer-0 capture. The fixed prompt renders the 26 IDs printed by
-the callback, so tokenization is part of the recapture check.
+the callback, so tokenization is part of the recapture check. Set
+`MELLUM_DUMP_TENSOR=result_output` to recapture the one-row raw-logit oracle.
 
 The Metal SSD-streaming cache-pressure repro for issue #384 is a focused
 variant of the official-vector check. It forces a 16GiB routed-expert cache and

@@ -292,6 +292,25 @@ int ds4_engine_mellum_all_layers_probe(ds4_engine *engine,
                                        const char *attention_trace_output_path,
                                        const char *qk_trace_output_path);
 
+/* Inspect-only Mellum KV allocation gate. Allocates and frees the exact
+ * per-layer F16 layout without creating a session or evaluating a token. */
+int ds4_engine_mellum_kv_layout_probe(ds4_engine *engine,
+                                      FILE       *out,
+                                      int         ctx_size);
+
+/* Inspect-only Mellum session gate. Creates and releases a layout-only
+ * ds4_session; all token execution APIs reject that session. */
+int ds4_engine_mellum_session_lifecycle_probe(ds4_engine *engine,
+                                              FILE       *out,
+                                              int         ctx_size);
+
+/* Diagnostic-only Mellum output-head oracle. Replays the fixed fixture through
+ * final RMSNorm and the Q8 output projection, but does not select a token. */
+int ds4_engine_mellum_logits_probe(ds4_engine *engine,
+                                   FILE       *out,
+                                   const char *raw_output_path,
+                                   uint32_t    report_top_k);
+
 /* Multi-GPU pipeline-parallel entry point (wave 2).
  *
  * Accepts an optional ds4_gpu_config (defined in ds4_gpu_mgpu.h) that

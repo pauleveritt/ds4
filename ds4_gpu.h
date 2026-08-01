@@ -2393,8 +2393,8 @@ int ds4_gpu_mellum_attention_decode_tensor(
 
 /* One complete pre-norm Mellum decode layer for the pinned all-Q8_0 oracle.
  * It composes attention+residual, FFN RMSNorm, bias-free routing, routed MoE,
- * and the FFN residual. This is deliberately a diagnostic composition: it is
- * not an engine graph or an authorization to enable Mellum generation. */
+ * and the FFN residual. The inspect-only Mellum engine graph composes this
+ * primitive; it is not an authorization to enable normal Mellum generation. */
 typedef struct {
     ds4_gpu_mellum_attention_desc attention;
     uint64_t ffn_norm_offset;
