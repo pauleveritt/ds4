@@ -1,0 +1,13 @@
+=== GREEDY GENERATION: accurate build (HEAD) 2026-08-01T21:36:54Z ===
+--- PROMPT: Answer with one word: the capital of France is
+
+
+<think>
+1.  **Analyze the user's request:** The user wants a one-word answer to--- PROMPT: Complete this Python function: def add(a, b):
+ return a + b
+
+This is a simple function that takes two numbers as input and returns their sum.--- PROMPT: Count upward from one, placing a space after every integer.
+
+Input
+
+The input consists of a single integer $n$ ($1 \le n \le 

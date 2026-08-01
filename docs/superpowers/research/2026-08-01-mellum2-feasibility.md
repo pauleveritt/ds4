@@ -1545,6 +1545,91 @@ table is exactly the indirection a bounded cache needs. The code is kept behind
 its flag for that reason, with its resident-performance result recorded honestly
 as neutral.
 
+### 2026-08-01 Overnight run: results and the one decision left open
+
+Branch `mellum-2.1-overnight`, three commits, all gates green at HEAD. Logs in
+`logs/overnight-*.log`.
+
+**Measurement protocol correction (Phase 0).** Cross-session throughput
+comparison against numbers recorded in this document is **invalid**. A baseline
+re-run in the same session moved 187.3 to 179.9 t/s (-4%), and decode moved
+114.4 / 109.3 / 108.5 / 113.4 non-monotonically across four consecutive runs.
+Run-to-run variance is ~5%. Every A/B must be same-session and interleaved, and
+any delta under ~6% is noise. Several deltas recorded earlier in this document
+sit inside that band and should not be read as signal.
+
+**Envelopes re-tightened (Phase 1).** layer-27 tokenwise 1.5/6.0e-2 to
+0.55/4.5e-2; logits 2.5e-2/1.2e-2 to 1.3e-2/2.4e-3. Layer-0 was already at
+1.2-1.3x and is unchanged. This immediately paid for itself — see Phase 3.
+
+**Grouped MoE hardened (Phase 2).** Four review findings fixed: the grouped
+kernel used an unclamped bucket count as a loop bound while the build kernel
+increments its atomic past `bucket_cap`, which would index past the expert's
+bucket and past the buffer for the last expert (unreachable while a token's
+top-k experts are distinct, but unenforced); `n_expert` is now capped at 32 in
+the three routed-MoE entry points, since the down kernels size threadgroup
+scratch as `n_expert * 256` floats and 64 would request 64 KiB; the staged
+threadgroup length is rounded to 16 bytes; and a scratch resize while a
+caller-owned batch is open is refused. `make test` now also runs the Metal
+kernel suite with `DS4_MELLUM_GROUPED_MOE=1` — the grouped path had **no**
+automated coverage at all before this.
+
+**Down-kernel discriminator (Phase 3).** Eliding only the `mid` loads from the
+batch down kernel gives 4,564 ms against a same-session baseline of ~5,578 ms.
+So `mid` re-reads are ~1,014 ms — **38% of the down kernel, not the bulk of
+it.** The remaining ~62% is weight loads, scalar arithmetic, and the reduction
+tree. This bounds order-preserving row-tiling of the down kernel at roughly
++22% and corrects the previous section's claim that the MoE is activation-
+re-read bound: it is *partly* that, and more so per-element overhead.
+
+#### The open decision: dot4 vectorization
+
+Routing all five Mellum MoE kernels through a shared helper that consumes four
+elements per step — converting the `block_q8_0` scale once per four values
+instead of once per value — was implemented, measured, and **reverted**. It is
+preserved as `logs/moe.metal.dot4` with the idempotent transform in
+`logs/apply-dot4.py` (a `git diff` capture was discarded: the `rtk` proxy
+summarises diffs rather than emitting applicable patches).
+
+Applied symmetrically to decode, batch, and grouped, so bitwise
+batch-equals-decode survives:
+
+| Measure | Accurate (HEAD) | dot4 | Tightened gate | Original gate |
+| --- | ---: | ---: | ---: | ---: |
+| Prefill @1,024 | ~183 t/s | **265.2 t/s** | — | — |
+| Decode with head | 114.4 t/s | **143.8 t/s** | — | — |
+| layer-27 max | 0.404175 | 1.23608 | 0.55 | 1.5 |
+| logits max | 0.00976753 | 0.0177469 | 0.013 | 0.025 |
+| logits RMS | 0.00178922 | 0.00911324 | 0.0024 | 0.012 |
+
++45% prefill and +26% decode, against a 5.1x logit-RMS regression. Two things
+make this a judgement call rather than an obvious reject:
+
+1. dot4 **passes the original envelopes**. It is not below the bar the project
+   held all day; it gives back only the windfall from this session's
+   down-accumulation change.
+2. Top-16 logit ranking is **identical** to both the accurate build and the
+   pinned llama.cpp order (`910, 2116, 889, 629, 3756, 45742, 2591, 2190, 1017,
+   433, 4697, 75, 3969, 20320, 21177, 7846`), with logit values differing ~0.03%
+   relative.
+
+But it does change behaviour. Greedy generation on three prompts
+(`logs/overnight-gen-*.log`) is character-identical on two and **diverges on the
+third**: dot4 continues "For example, the output for the input 5 should be: 1 2
+3 4" where HEAD continues "Input The input consists of a single integer $n$".
+Neither is obviously better — a 12B model on an underspecified prompt with two
+near-tied candidates — but the outputs are not interchangeable.
+
+The mechanism is understood and the trade is structural, not a bug: scale
+hoisting requires reading four *contiguous* elements per thread, while the
+accuracy gain comes from the *strided* order. They cannot both be had in this
+kernel shape. A simdgroup rewrite might dominate both, but it is a different
+kernel, not a tweak of this one.
+
+**Left for the user**, because it trades measured accuracy for measured speed
+with no dominant option: adopt dot4, keep HEAD, or spend the next block on the
+simdgroup reduction that could moot the choice.
+
 ### Revised next steps
 
 0. **Row-tile both MoE kernels.** This supersedes step 1 as the performance
