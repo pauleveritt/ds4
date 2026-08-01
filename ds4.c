@@ -680,6 +680,40 @@ const ds4_shape DS4_SHAPE_LAGUNA_XS21 = {
     .rope_orig_ctx = 8192,
 };
 
+/* Loader-only in this step. Mellum's graph deliberately does not reuse the
+ * Laguna path: its all-sparse layers have no attention gate, router bias,
+ * leading dense block, or shared expert. */
+const ds4_shape DS4_SHAPE_MELLUM2 = {
+    .name = "Mellum 2",
+    .family = DS4_MODEL_FAMILY_MELLUM,
+    .variant = DS4_VARIANT_MELLUM2,
+    .n_layer = 28,
+    .n_embd = 2304,
+    .n_vocab = 98304,
+    .n_head = 32,
+    .n_head_global = 32,
+    .n_head_swa = 32,
+    .n_head_kv = 4,
+    .n_head_dim = 128,
+    .n_value_dim = 128,
+    .n_rot = 128,
+    .n_expert = 64,
+    .n_expert_used = 8,
+    .n_ff_dense = 7168,
+    .n_ff_exp = 896,
+    .n_swa = 1024,
+    .rms_eps = 1.0e-6f,
+    .expert_weight_scale = 1.0f,
+    .rope_freq_base = 500000.0f,
+    .rope_scale_factor = 16.0f,
+    .rope_yarn_beta_fast = 32.0f,
+    .rope_yarn_beta_slow = 1.0f,
+    .rope_yarn_attn_factor = 1.2772589f,
+    .rope_freq_base_swa = 500000.0f,
+    .context_length = 131072,
+    .rope_orig_ctx = 8192,
+};
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -2773,6 +2807,16 @@ static void model_summary(const ds4_model *m) {
     if (!model_get_u32(m, "deepseek4.expert_group_used_count", &n_group_used)) {
         model_get_u32(m, "glm-dsa.expert_group_used_count", &n_group_used);
     }
+    if (ds4_streq(arch, "mellum")) {
+        model_get_u32(m, "mellum.block_count", &layers);
+        model_get_u64_compat(m, "mellum.context_length", &ctx_train);
+        model_get_u32(m, "mellum.attention.head_count", &n_head);
+        model_get_u32(m, "mellum.attention.head_count_kv", &n_head_kv);
+        model_get_u32(m, "mellum.attention.key_length", &head_dim);
+        model_get_u32(m, "mellum.attention.sliding_window", &n_swa);
+        model_get_u32(m, "mellum.expert_count", &n_expert);
+        model_get_u32(m, "mellum.expert_used_count", &n_expert_used);
+    }
 
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         tensor_bytes += m->tensors[i].bytes;
@@ -4749,7 +4793,8 @@ static void tensor_expect_routed_expert(
 
 static bool weights_have_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
         return w && w->output_norm && w->output;
     }
     return w &&
@@ -4762,7 +4807,8 @@ static bool weights_have_output_head(const ds4_weights *w) {
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
         return w && (w->output_norm || w->output);
     }
     return w &&
@@ -4850,6 +4896,22 @@ static bool weights_laguna_layer_has_required(const ds4_layer_weights *l, uint32
            l->ffn_down_shexp;
 }
 
+static bool weights_mellum_layer_has_required(const ds4_layer_weights *l) {
+    return l &&
+           l->attn_norm &&
+           l->attn_q &&
+           l->attn_q_norm &&
+           l->attn_k &&
+           l->attn_k_norm &&
+           l->attn_v &&
+           l->attn_output &&
+           l->ffn_norm &&
+           l->ffn_gate_inp &&
+           l->ffn_gate_exps &&
+           l->ffn_up_exps &&
+           l->ffn_down_exps;
+}
+
 static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
     if (!l) return false;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -4857,6 +4919,9 @@ static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) 
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
         return weights_laguna_layer_has_required(l, il);
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        return weights_mellum_layer_has_required(l);
     }
     if (!l->hc_attn_fn ||
         !l->hc_attn_scale ||
@@ -5184,6 +5249,70 @@ static void weights_validate_laguna_layout(
     }
 }
 
+static void weights_validate_mellum_layout(
+        const ds4_weights *w,
+        uint32_t           layer_start,
+        uint32_t           layer_end,
+        bool               require_token_embd,
+        bool               require_output) {
+    if (!w) ds4_die("internal error: missing weights while validating Mellum layout");
+    if (layer_start >= DS4_N_LAYER) ds4_die("invalid first layer in Mellum weight layout validation");
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) {
+        ds4_die("invalid layer range in Mellum weight layout validation");
+    }
+
+    if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
+    if (w->token_embd) {
+        tensor_expect_layout(w->token_embd, DS4_TENSOR_Q8_0,
+                             2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+
+    const bool have_output = weights_have_output_head(w);
+    if (require_output && !have_output) ds4_die("required output head tensors are missing");
+    if (weights_have_partial_output_head(w) && !have_output) ds4_die("partial output head in GGUF");
+    if (have_output) {
+        tensor_expect_layout(w->output_norm, DS4_TENSOR_F32,
+                             1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(w->output, DS4_TENSOR_Q8_0,
+                             2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!weights_mellum_layer_has_required(l)) {
+            fprintf(stderr, "ds4: required Mellum tensors for layer %u are missing\n", il);
+            exit(1);
+        }
+        tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32,
+                             1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(l->attn_q, DS4_TENSOR_Q8_0,
+                             2, DS4_N_EMBD, q_dim, 0);
+        tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32,
+                             1, DS4_N_HEAD_DIM, 0, 0);
+        tensor_expect_layout(l->attn_k, DS4_TENSOR_Q8_0,
+                             2, DS4_N_EMBD, kv_dim, 0);
+        tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32,
+                             1, DS4_N_HEAD_DIM, 0, 0);
+        tensor_expect_layout(l->attn_v, DS4_TENSOR_Q8_0,
+                             2, DS4_N_EMBD, kv_dim, 0);
+        tensor_expect_layout(l->attn_output, DS4_TENSOR_Q8_0,
+                             2, q_dim, DS4_N_EMBD, 0);
+        tensor_expect_layout(l->ffn_norm, DS4_TENSOR_F32,
+                             1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32,
+                             2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+        tensor_expect_layout(l->ffn_gate_exps, DS4_TENSOR_Q8_0,
+                             3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_layout(l->ffn_up_exps, DS4_TENSOR_Q8_0,
+                             3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_layout(l->ffn_down_exps, DS4_TENSOR_Q8_0,
+                             3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+    }
+}
+
 static void weights_validate_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
@@ -5200,6 +5329,14 @@ static void weights_validate_layout(
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
         weights_validate_laguna_layout(w,
+                                       layer_start,
+                                       layer_end,
+                                       require_token_embd,
+                                       require_output);
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        weights_validate_mellum_layout(w,
                                        layer_start,
                                        layer_end,
                                        require_token_embd,
@@ -6106,6 +6243,91 @@ static void config_validate_laguna_model(const ds4_model *m) {
                        true);
 }
 
+static void config_validate_mellum_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_MELLUM2;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+    memset(g_ds4_head_counts, 0, sizeof(g_ds4_head_counts));
+
+    config_expect_u32("block_count",
+                      required_u32(m, "mellum.block_count"), DS4_N_LAYER);
+    config_expect_u64("context_length",
+                      required_u64_compat(m, "mellum.context_length"),
+                      DS4_CONTEXT_LENGTH);
+    config_expect_u32("embedding_length",
+                      required_u32(m, "mellum.embedding_length"), DS4_N_EMBD);
+    config_expect_u32("feed_forward_length",
+                      required_u32(m, "mellum.feed_forward_length"), DS4_N_FF_DENSE);
+    config_expect_u32("attention.head_count",
+                      required_u32(m, "mellum.attention.head_count"), DS4_N_HEAD);
+    config_expect_u32("attention.head_count_kv",
+                      required_u32(m, "mellum.attention.head_count_kv"), DS4_N_HEAD_KV);
+    config_expect_u32("attention.key_length",
+                      required_u32(m, "mellum.attention.key_length"), DS4_N_HEAD_DIM);
+    config_expect_u32("attention.value_length",
+                      required_u32(m, "mellum.attention.value_length"), DS4_N_VALUE_DIM);
+    config_expect_u32("expert_count",
+                      required_u32(m, "mellum.expert_count"), DS4_N_EXPERT);
+    config_expect_u32("expert_used_count",
+                      required_u32(m, "mellum.expert_used_count"), DS4_N_EXPERT_USED);
+    config_expect_u32("expert_feed_forward_length",
+                      required_u32(m, "mellum.expert_feed_forward_length"), DS4_N_FF_EXP);
+    config_expect_u32("attention.sliding_window",
+                      required_u32(m, "mellum.attention.sliding_window"), DS4_N_SWA);
+
+    ds4_array_ref sliding_pattern = {0};
+    if (!model_get_array(m, "mellum.attention.sliding_window_pattern", &sliding_pattern) ||
+        sliding_pattern.type != GGUF_VALUE_BOOL ||
+        sliding_pattern.len != DS4_N_LAYER) {
+        ds4_die("mellum.attention.sliding_window_pattern must be a bool array with one entry per layer");
+    }
+    ds4_cursor pattern_cursor = cursor_at(m, sliding_pattern.data_pos);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        bool is_sliding = false;
+        if (!cursor_read(&pattern_cursor, &is_sliding, sizeof(is_sliding))) {
+            ds4_die(pattern_cursor.error);
+        }
+        const bool expected_sliding = (il & 3u) != 3u;
+        if (is_sliding != expected_sliding) {
+            fprintf(stderr,
+                    "ds4: unexpected Mellum sliding-window value at layer %u: got %s, expected %s\n",
+                    il, is_sliding ? "true" : "false",
+                    expected_sliding ? "true" : "false");
+            exit(1);
+        }
+    }
+
+    ds4_str rope_type = {0};
+    if (!model_get_string(m, "mellum.rope.scaling.type", &rope_type) ||
+        !ds4_streq(rope_type, "yarn")) {
+        ds4_die("Mellum requires rope.scaling.type=yarn");
+    }
+    config_expect_u64("rope.scaling.original_context_length",
+                      required_u64_compat(m,
+                                          "mellum.rope.scaling.original_context_length"),
+                      DS4_ROPE_ORIG_CTX);
+    config_expect_f32("rope.scaling.factor",
+                      required_f32(m, "mellum.rope.scaling.factor"),
+                      DS4_ROPE_SCALE_FACTOR);
+    config_expect_f32("rope.scaling.yarn_attn_factor",
+                      required_f32(m, "mellum.rope.scaling.yarn_attn_factor"),
+                      DS4_ROPE_YARN_ATTN_FACTOR);
+    config_expect_f32("rope.scaling.yarn_beta_fast",
+                      required_f32(m, "mellum.rope.scaling.yarn_beta_fast"),
+                      DS4_ROPE_YARN_BETA_FAST);
+    config_expect_f32("rope.scaling.yarn_beta_slow",
+                      required_f32(m, "mellum.rope.scaling.yarn_beta_slow"),
+                      DS4_ROPE_YARN_BETA_SLOW);
+    config_expect_f32("rope.freq_base",
+                      required_f32(m, "mellum.rope.freq_base"),
+                      DS4_ROPE_FREQ_BASE);
+    config_expect_f32("rope.freq_base_swa",
+                      required_f32(m, "mellum.rope.freq_base_swa"),
+                      DS4_ROPE_FREQ_BASE_SWA);
+    config_expect_f32("attention.layer_norm_rms_epsilon",
+                      required_f32(m, "mellum.attention.layer_norm_rms_epsilon"),
+                      DS4_RMS_EPS);
+}
+
 static void config_validate_model(const ds4_model *m) {
     ds4_str arch = {0};
     if (model_get_string(m, "general.architecture", &arch) && ds4_streq(arch, "glm-dsa")) {
@@ -6116,12 +6338,17 @@ static void config_validate_model(const ds4_model *m) {
         config_validate_laguna_model(m);
         return;
     }
+    if (arch.ptr && ds4_streq(arch, "mellum")) {
+        config_validate_mellum_model(m);
+        return;
+    }
     config_validate_deepseek4_model(m);
 }
 
 static void weights_bind_output(ds4_weights *w, const ds4_model *m, bool required) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
         if (required) {
             w->output_norm = required_tensor(m, "output_norm.weight");
             w->output      = required_tensor(m, "output.weight");
@@ -6164,6 +6391,21 @@ static void weights_bind_laguna_layer(ds4_layer_weights *l, const ds4_model *m, 
     l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
     l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
     l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+}
+
+static void weights_bind_mellum_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    l->attn_norm     = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->attn_q        = required_tensorf(m, "blk.%u.attn_q.weight", il);
+    l->attn_q_norm   = required_tensorf(m, "blk.%u.attn_q_norm.weight", il);
+    l->attn_k        = required_tensorf(m, "blk.%u.attn_k.weight", il);
+    l->attn_k_norm   = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
+    l->attn_v        = required_tensorf(m, "blk.%u.attn_v.weight", il);
+    l->attn_output   = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    l->ffn_norm      = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+    l->ffn_gate_inp  = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+    l->ffn_gate_exps = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+    l->ffn_up_exps   = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+    l->ffn_down_exps = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
 }
 
 static void weights_bind_glm_dsa_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
@@ -6215,6 +6457,10 @@ static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
         weights_bind_laguna_layer(l, m, il);
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        weights_bind_mellum_layer(l, m, il);
         return;
     }
 
@@ -57710,6 +57956,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
     }
 #endif
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        if (opt->inspect_only) {
+            *out = e;
+            return 0;
+        }
+        fprintf(stderr,
+                "ds4: Mellum 2 loader support is inspect-only; "
+                "Metal graph execution lands in the next step\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
         if (opt->inspect_only) {
             *out = e;

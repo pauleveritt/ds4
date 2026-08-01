@@ -404,3 +404,7 @@ same resident-versus-streamed A/B gate used for Laguna XS.
 - Downloaded, checksummed, and inspected the pinned public Q8_0 GGUF.
 - Captured its metadata, chat-template tokenization, deterministic greedy
   continuations, first-token IDs, and explicit EOS behavior.
+- Added Mellum loader-only support: `--inspect` validates the public Q8_0
+  metadata, 28-layer SWA schedule, and all 339 tensor bindings without
+  building a Metal graph. Ordinary execution remains explicitly rejected until
+  the Mellum decode graph lands.

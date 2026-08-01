@@ -26,6 +26,7 @@ typedef enum {
     DS4_MODEL_FAMILY_DEEPSEEK4 = 0,
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
     DS4_MODEL_FAMILY_LAGUNA    = 2,
+    DS4_MODEL_FAMILY_MELLUM    = 3,
 } ds4_model_family;
 
 typedef enum {
@@ -34,6 +35,7 @@ typedef enum {
     DS4_VARIANT_GLM52 = 2,
     DS4_VARIANT_LAGUNA_S21 = 3,
     DS4_VARIANT_LAGUNA_XS21 = 4,
+    DS4_VARIANT_MELLUM2 = 5,
 } ds4_variant;
 
 /* Per-model-shape constants. Most of ds4.c's shape table stays private
@@ -93,6 +95,7 @@ typedef struct {
 
 extern const ds4_shape DS4_SHAPE_LAGUNA_S21;
 extern const ds4_shape DS4_SHAPE_LAGUNA_XS21;
+extern const ds4_shape DS4_SHAPE_MELLUM2;
 
 typedef enum {
     DS4_THINK_NONE,
