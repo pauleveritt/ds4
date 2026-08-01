@@ -770,6 +770,19 @@ authorized work after this research boundary is to decide whether the
 tokenwise whole-layer composition should become the engine graph, then add the
 final RMSNorm/output head and validate the existing greedy fixtures.
 
+**Review hardening:** Sol's post-commit review found that the initial oracle
+checker could accidentally accept a NaN because comparisons with NaN are false,
+and its fixture paths depended on the caller's current directory. The checker
+now rejects non-finite reference, actual, and delta values before accumulation,
+resolves fixtures from its own location, catches fixture-read failures, and is
+regression-tested for valid, NaN, and infinity output from outside the repo.
+The documented command explicitly uses `python3`, avoiding an executable-bit
+assumption. The exact callback patch, Metal build configuration, full fixed
+prompt/token sequence, batch-size-one tokenwise schedule, model identity, and
+expected SHA-256 now live alongside the F32 fixtures in
+`tests/test-vectors/mellum-llama-cpp/capture-layer-output.patch` and its README
+section. This closes fixture provenance without expanding runtime scope.
+
 **Gate:** the first greedy token matches llama.cpp on several prompts, and any
 logit or intermediate drift is measured and explained rather than hidden by a
 sampling comparison.

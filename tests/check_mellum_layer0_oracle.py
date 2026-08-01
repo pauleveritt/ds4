@@ -10,22 +10,24 @@ from pathlib import Path
 
 
 HIDDEN = 2304
+TESTS_DIR = Path(__file__).resolve().parent
+VECTOR_DIR = TESTS_DIR / "test-vectors" / "mellum-llama-cpp"
 ORACLES = {
     0: {
         "rows": 26,
-        "reference": Path("tests/test-vectors/mellum-llama-cpp/l-out-0.f32"),
+        "reference": VECTOR_DIR / "l-out-0.f32",
         "sha256": "5a99d699c83a1a5417f9175f46e30c343026767372546001a112aef34ce49243",
         "max_abs_limit": 6.0e-3,
         "rms_limit": 1.25e-4,
     },
     27: {
         "rows": 1,
-        "reference": Path("tests/test-vectors/mellum-llama-cpp/l-out-27-last.f32"),
+        "reference": VECTOR_DIR / "l-out-27-last.f32",
         "sha256": "050436ca257f8ebe36656f32785b9649ddf8b8ad75a08ec47f005ea588b72ebb",
     },
     "27-tokenwise": {
         "rows": 1,
-        "reference": Path("tests/test-vectors/mellum-llama-cpp/l-out-27-tokenwise.f32"),
+        "reference": VECTOR_DIR / "l-out-27-tokenwise.f32",
         "sha256": "4ae7a46e409d6e3bf760ef8f7c671f32ff16d0798b8cd3dd25fe5fcbb3f086fe",
         "max_abs_limit": 1.5,
         "rms_limit": 6.0e-2,
@@ -61,19 +63,18 @@ def main() -> int:
     values = oracle["rows"] * HIDDEN
     expected_bytes = values * 4
 
-    reference_bytes = reference_path.read_bytes()
-    reference_sha256 = hashlib.sha256(reference_bytes).hexdigest()
-    if reference_sha256 != oracle["sha256"]:
-        print(
-            f"reference SHA-256 mismatch: {reference_sha256} != {oracle['sha256']}",
-            file=sys.stderr,
-        )
-        return 1
-
     try:
+        reference_bytes = reference_path.read_bytes()
+        reference_sha256 = hashlib.sha256(reference_bytes).hexdigest()
+        if reference_sha256 != oracle["sha256"]:
+            print(
+                f"reference SHA-256 mismatch: {reference_sha256} != {oracle['sha256']}",
+                file=sys.stderr,
+            )
+            return 1
         reference = read_f32(reference_path, expected_bytes, values)
         actual = read_f32(args.actual, expected_bytes, values)
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         print(f"oracle check failed: {exc}", file=sys.stderr)
         return 1
 
@@ -82,7 +83,16 @@ def main() -> int:
     sum_abs = 0.0
     sum_sq = 0.0
     for index, (expected, observed) in enumerate(zip(reference, actual, strict=True)):
+        if not math.isfinite(expected):
+            print(f"oracle check failed: non-finite reference value at index {index}", file=sys.stderr)
+            return 1
+        if not math.isfinite(observed):
+            print(f"oracle check failed: non-finite actual value at index {index}", file=sys.stderr)
+            return 1
         delta = observed - expected
+        if not math.isfinite(delta):
+            print(f"oracle check failed: non-finite delta at index {index}", file=sys.stderr)
+            return 1
         absolute = abs(delta)
         if absolute > max_abs:
             max_abs = absolute

@@ -60,8 +60,8 @@ GGUF and the `python_add` ChatML fixture. Its SHA-256 is
 After writing ds4's diagnostic output, check the durable intermediate gate:
 
 ```sh
-./ds4 --mellum-layer0-probe-out /tmp/mellum2-ds4-l-out-0.f32 --model MODEL
-./tests/check_mellum_layer0_oracle.py /tmp/mellum2-ds4-l-out-0.f32
+HOME=/tmp/mellum2 ./ds4 --mellum-layer0-probe-out /tmp/mellum2-ds4-l-out-0.f32 --model MODEL
+python3 tests/check_mellum_layer0_oracle.py /tmp/mellum2-ds4-l-out-0.f32
 ```
 
 The checker verifies the fixture hash and exact byte counts, then requires
@@ -81,9 +81,50 @@ the all-layer acceptance oracle, with maximum absolute error no greater than
 `1.5` and RMS error no greater than `0.06`:
 
 ```sh
-./ds4 --mellum-all-layers-probe-out /tmp/mellum2-ds4-l-out-27.f32 --model MODEL
-./tests/check_mellum_layer0_oracle.py --layer 27-tokenwise /tmp/mellum2-ds4-l-out-27.f32
+HOME=/tmp/mellum2 ./ds4 --mellum-all-layers-probe-out /tmp/mellum2-ds4-l-out-27.f32 --model MODEL
+python3 tests/check_mellum_layer0_oracle.py --layer 27-tokenwise /tmp/mellum2-ds4-l-out-27.f32
 ```
+
+The checker resolves its pinned fixtures relative to its own source file, so
+these commands also work when invoked outside the repository. It rejects a
+wrong byte count, fixture hash mismatch, and every non-finite reference,
+actual, or delta value. Its dependency-free regression test is part of
+`make test`; run it alone with `make test-mellum-oracle-checker`.
+
+### llama.cpp capture provenance
+
+`capture-layer-output.patch` is the minimal callback patch used to create all
+three F32 checkpoints. It applies to the exact llama.cpp revision
+`0e4a0362239713ea95a6864a17a8de4b0ad90d62`; use a detached worktree so the
+reference checkout remains clean. `MODEL` must be the pinned public Q8_0 GGUF
+at revision `6f5b0031c9ea37740f630362d3c06c54933fc2f4`, with SHA-256
+`d4049c2599796d18245523818c0534e8f8605166fc58c60dd0753547facdb3a2`.
+The following recaptures the matching schedule layer-27 oracle on the original
+Apple Metal setup:
+
+```sh
+DS4_ROOT=$PWD
+LLAMA_SRC=/path/to/llama.cpp
+LLAMA_WORKTREE=/tmp/mellum2-llama-callback-src
+LLAMA_BUILD=/tmp/mellum2-llama-callback-build
+MODEL=/path/to/Mellum2-12B-A2.5B-Thinking-Q8_0.gguf
+
+git -C "$LLAMA_SRC" worktree add --detach "$LLAMA_WORKTREE" 0e4a0362239713ea95a6864a17a8de4b0ad90d62
+git -C "$LLAMA_WORKTREE" apply "$DS4_ROOT/tests/test-vectors/mellum-llama-cpp/capture-layer-output.patch"
+cmake -S "$LLAMA_WORKTREE" -B "$LLAMA_BUILD" -DGGML_METAL=ON -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF
+cmake --build "$LLAMA_BUILD" --target llama-eval-callback -j 8
+MELLUM_DUMP_TENSOR=l_out-27 MELLUM_DUMP_PATH=/tmp/l-out-27-tokenwise.f32 MELLUM_TOKENWISE=1 \
+  "$LLAMA_BUILD/bin/llama-eval-callback" -m "$MODEL" -ngl all -b 1 --escape \
+  -p $'<|im_start|>user\nComplete this Python function: def add(a, b):<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n'
+shasum -a 256 /tmp/l-out-27-tokenwise.f32
+```
+
+The command must emit exactly 9,216 bytes and SHA-256
+`4ae7a46e409d6e3bf760ef8f7c671f32ff16d0798b8cd3dd25fe5fcbb3f086fe` before it
+replaces the pinned fixture. Omit `MELLUM_TOKENWISE=1` to make the batched
+`l-out-27-last.f32` capture; set `MELLUM_DUMP_TENSOR=l_out-0` without it to
+make the 26-row layer-0 capture. The fixed prompt renders the 26 IDs printed by
+the callback, so tokenization is part of the recapture check.
 
 The Metal SSD-streaming cache-pressure repro for issue #384 is a focused
 variant of the official-vector check. It forces a 16GiB routed-expert cache and
