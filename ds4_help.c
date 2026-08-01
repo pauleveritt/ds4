@@ -300,6 +300,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--mellum-session-lifecycle-probe", "Create and release a Mellum layout-only session; token evaluation stays disabled.");
     opt(fp, c, "--mellum-session-decode-probe", "Replay the fixed fixture through a session-local Mellum decode path; selection stays disabled.");
     opt(fp, c, "--mellum-session-decode-probe-out FILE", "Write its raw F32 logits for oracle comparison without sampling or emitting a token.");
+    opt(fp, c, "--mellum-session-isolation-probe", "Interleave two Mellum decode sessions and require isolated, identical raw logits.");
     fputc('\n', fp);
 }
 

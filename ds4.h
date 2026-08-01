@@ -311,6 +311,12 @@ int ds4_engine_mellum_session_decode_probe(ds4_engine *engine,
                                            int         ctx_size,
                                            const char *raw_output_path);
 
+/* Inspect-only Mellum session isolation gate. Interleaves two independent
+ * decode sessions over the fixed fixture and requires bit-identical logits. */
+int ds4_engine_mellum_session_isolation_probe(ds4_engine *engine,
+                                              FILE       *out,
+                                              int         ctx_size);
+
 /* Diagnostic-only Mellum output-head oracle. Replays the fixed fixture through
  * final RMSNorm and the Q8 output projection, but does not select a token. */
 int ds4_engine_mellum_logits_probe(ds4_engine *engine,

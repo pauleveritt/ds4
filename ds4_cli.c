@@ -102,6 +102,7 @@ typedef struct {
     bool mellum_session_lifecycle_probe;
     bool mellum_session_decode_probe;
     const char *mellum_session_decode_probe_out;
+    bool mellum_session_isolation_probe;
     bool mellum_logits_probe;
     const char *mellum_logits_probe_out;
     int mellum_logits_probe_top_k;
@@ -2079,6 +2080,10 @@ static cli_config parse_options(int argc, char **argv) {
                 need_arg(&i, argc, argv, arg);
             c.inspect = true;
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-session-isolation-probe")) {
+            c.gen.mellum_session_isolation_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--mellum-logits-probe")) {
             c.gen.mellum_logits_probe = true;
             c.inspect = true;
@@ -2258,6 +2263,14 @@ int main(int argc, char **argv) {
         int rc = ds4_engine_mellum_session_decode_probe(
             engine, stdout, cfg.gen.ctx_size,
             cfg.gen.mellum_session_decode_probe_out);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_session_isolation_probe) {
+        int rc = ds4_engine_mellum_session_isolation_probe(
+            engine, stdout, cfg.gen.ctx_size);
         ds4_engine_close(engine);
         ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);

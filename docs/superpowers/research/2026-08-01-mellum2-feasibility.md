@@ -871,6 +871,14 @@ emission, generation, or SSD streaming. At `--ctx 4096`, the session gate's
 26-token final row matches the pinned oracle with maximum absolute error
 `0.0175094604` and RMS `0.009415312`, identical to the engine-owned diagnostic.
 
+**Session-isolation gate:** `--mellum-session-isolation-probe --ctx 4096`
+creates two inspect-only decode sessions on one engine and interleaves every
+fixture token. Their 98,304 raw logits are F32 bit-identical, while both
+sessions continue to reject token selection. This catches accidental sharing of
+KV tensors, activation scratch, or token position between sessions. It is a
+correctness-isolation check only; it does not claim multi-session memory
+efficiency and does not enable batching, prefill, generation, or SSD streaming.
+
 **Review hardening:** Sol's post-commit review found that the initial oracle
 checker could accidentally accept a NaN because comparisons with NaN are false,
 and its fixture paths depended on the caller's current directory. The checker

@@ -60838,6 +60838,75 @@ int ds4_engine_mellum_session_decode_probe(ds4_engine *e,
 #endif
 }
 
+int ds4_engine_mellum_session_isolation_probe(ds4_engine *e,
+                                              FILE       *out,
+                                              int         ctx_size) {
+#ifdef DS4_NO_GPU
+    (void)e;
+    (void)out;
+    (void)ctx_size;
+    fprintf(stderr, "ds4: Mellum session isolation probe requires Metal support\n");
+    return 1;
+#else
+    static const int fixture_tokens[] = {
+        27, 1397, 233, 12998, 497, 2717, 669, 60, 783, 846, 42, 99, 46,
+        321, 800, 28, 233, 27, 8091, 233, 23, 233, 233, 24, 233, 233,
+    };
+    const uint32_t n_tokens = (uint32_t)(sizeof(fixture_tokens) /
+                                          sizeof(fixture_tokens[0]));
+    if (!e || !out || ctx_size < (int)n_tokens ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
+        e->backend != DS4_BACKEND_METAL || !e->mellum_decode_contract_ready) {
+        fprintf(stderr, "ds4: Mellum session isolation probe requires an inspect-loaded Metal engine\n");
+        return 1;
+    }
+    ds4_session *a = NULL, *b = NULL;
+    int ok = ds4_mellum_session_create(&a, e, ctx_size, true) == 0 &&
+             ds4_mellum_session_create(&b, e, ctx_size, true) == 0;
+    if (!ok) {
+        fprintf(stderr, "ds4: Mellum session isolation allocation failed\n");
+        ds4_session_free(b);
+        ds4_session_free(a);
+        return 1;
+    }
+    char err[128] = "";
+    for (uint32_t pos = 0; ok && pos < n_tokens; pos++) {
+        ok = ds4_session_eval(a, fixture_tokens[pos], err, sizeof(err)) == 0 &&
+             ds4_session_eval(b, fixture_tokens[pos], err, sizeof(err)) == 0;
+        if (!ok) {
+            fprintf(stderr, "ds4: Mellum session isolation decode failed at token %u: %s\n",
+                    pos, err[0] ? err : "unknown error");
+        }
+    }
+    const uint64_t vocab_dim = e->weights.output->dim[1];
+    const size_t logit_bytes = (size_t)vocab_dim * sizeof(float);
+    float *a_logits = ok ? xmalloc(logit_bytes) : NULL;
+    float *b_logits = ok ? xmalloc(logit_bytes) : NULL;
+    if (ok && (ds4_session_copy_logits(a, a_logits, (int)vocab_dim) !=
+                   (int)vocab_dim ||
+               ds4_session_copy_logits(b, b_logits, (int)vocab_dim) !=
+                   (int)vocab_dim ||
+               memcmp(a_logits, b_logits, logit_bytes) != 0)) {
+        fprintf(stderr, "ds4: Mellum session isolation logits diverged\n");
+        ok = 0;
+    }
+    if (ok && (ds4_session_argmax(a) != -1 || ds4_session_argmax(b) != -1)) {
+        fprintf(stderr, "ds4: Mellum session isolation exposed token selection\n");
+        ok = 0;
+    }
+    if (ok) {
+        fprintf(out,
+                "Mellum session isolation probe sessions=2 tokens=%u ctx=%d logits=f32-exact selection=rejected\n",
+                n_tokens, ctx_size);
+    }
+    free(b_logits);
+    free(a_logits);
+    ds4_session_free(b);
+    ds4_session_free(a);
+    return ok ? 0 : 1;
+#endif
+}
+
 int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen) {
     if (!s || !s->distributed) {
         if (errlen) snprintf(err, errlen, "session is not a distributed coordinator");
