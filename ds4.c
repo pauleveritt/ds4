@@ -61826,6 +61826,277 @@ int ds4_engine_mellum_true_prefill_probe(ds4_engine *e, FILE *out) {
 #endif
 }
 
+#ifndef DS4_NO_GPU
+static bool ds4_mellum_prefill_chunks(const ds4_engine           *e,
+                                      ds4_mellum_decode_state    *state,
+                                      ds4_mellum_prefill_scratch *scratch,
+                                      const int                  *tokens,
+                                      uint32_t                    n_tokens,
+                                      uint32_t                    max_chunk) {
+    if (!e || !state || !scratch || !tokens || n_tokens == 0 ||
+        max_chunk == 0 || max_chunk > scratch->cap) return false;
+    for (uint32_t offset = 0; offset < n_tokens;) {
+        uint32_t chunk = n_tokens - offset;
+        if (chunk > max_chunk) chunk = max_chunk;
+        const bool last = offset + chunk == n_tokens;
+        if (!ds4_mellum_prefill_tokens(e, state, scratch, tokens + offset,
+                                       chunk, NULL, NULL, last)) return false;
+        offset += chunk;
+    }
+    return true;
+}
+#endif
+
+int ds4_engine_mellum_true_prefill_swa_probe(ds4_engine *e, FILE *out) {
+#ifdef DS4_NO_GPU
+    (void)e;
+    (void)out;
+    fprintf(stderr, "ds4: Mellum true-prefill SWA probe requires Metal support\n");
+    return 1;
+#else
+    const uint32_t tail_tokens = 6u;
+    if (DS4_N_SWA == 0 || DS4_N_SWA > UINT32_MAX - tail_tokens) {
+        fprintf(stderr, "ds4: Mellum true-prefill SWA probe has an invalid sliding window\n");
+        return 1;
+    }
+    const uint32_t first_chunk = DS4_N_SWA;
+    const uint32_t n_tokens = first_chunk + tail_tokens;
+    enum { small_chunk = 32 };
+    if (!e || !out || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
+        e->backend != DS4_BACKEND_METAL || !e->mellum_decode_contract_ready ||
+        !e->weights.output || e->weights.output->dim[1] == 0 ||
+        e->weights.output->dim[1] > SIZE_MAX / sizeof(float)) {
+        fprintf(stderr, "ds4: Mellum true-prefill SWA probe requires an inspect-loaded Q8 Metal engine\n");
+        return 1;
+    }
+    int *tokens = xmalloc((size_t)n_tokens * sizeof(*tokens));
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        tokens[i] = (int)(((uint64_t)i * 7919u + 27u) % DS4_N_VOCAB);
+    }
+    const uint64_t vocab_dim = e->weights.output->dim[1];
+    const size_t logits_bytes = (size_t)vocab_dim * sizeof(float);
+    const uint64_t hidden_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    float *decode_logits = xmalloc(logits_bytes);
+    float *prefill_logits = xmalloc(logits_bytes);
+    float *decode_window_logits = xmalloc(logits_bytes);
+    float *prefill_window_logits = xmalloc(logits_bytes);
+    float *decode_hidden = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *prefill_hidden = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *decode_window_hidden = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *prefill_window_hidden = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *small_logits = xmalloc(logits_bytes);
+    float *small_hidden = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    ds4_mellum_decode_state *decode = ds4_mellum_decode_state_create(e, n_tokens);
+    ds4_mellum_decode_state *prefill = ds4_mellum_decode_state_create(e, n_tokens);
+    ds4_mellum_decode_state *small = ds4_mellum_decode_state_create(e, n_tokens);
+    ds4_mellum_prefill_scratch scratch = {0};
+    ds4_mellum_prefill_scratch small_scratch = {0};
+    bool ok = tokens && decode_logits && prefill_logits && decode_window_logits &&
+              prefill_window_logits && decode_hidden && prefill_hidden &&
+              decode_window_hidden && prefill_window_hidden && small_logits &&
+              small_hidden && decode && prefill && small &&
+              ds4_mellum_decode_output_prepare(e, decode) &&
+              ds4_mellum_decode_output_prepare(e, prefill) &&
+              ds4_mellum_decode_output_prepare(e, small) &&
+              ds4_mellum_prefill_scratch_create(&scratch, first_chunk) &&
+              ds4_mellum_prefill_scratch_create(&small_scratch, small_chunk);
+    for (uint32_t pos = 0; ok && pos < n_tokens; pos++) {
+        const bool window_last = pos + 1u == first_chunk;
+        const bool final_last = pos + 1u == n_tokens;
+        ok = ds4_mellum_decode_token(e, decode, tokens[pos], NULL, NULL,
+                                     NULL, NULL, NULL, NULL,
+                                     window_last ? decode_window_logits :
+                                     (final_last ? decode_logits : NULL),
+                                     false, false);
+        if (ok && window_last && ds4_gpu_tensor_read(
+                decode->hidden, 0, decode_window_hidden, hidden_bytes) == 0) {
+            fprintf(stderr, "ds4: Mellum true-prefill SWA probe could not read sequential window hidden state\n");
+            ok = false;
+        }
+    }
+    if (ok && ds4_gpu_tensor_read(decode->hidden, 0, decode_hidden,
+                                  hidden_bytes) == 0) {
+        fprintf(stderr, "ds4: Mellum true-prefill SWA probe could not read sequential hidden state\n");
+        ok = false;
+    }
+    if (ok && !ds4_mellum_prefill_tokens(e, prefill, &scratch, tokens,
+                                          first_chunk, NULL, NULL, true)) {
+        fprintf(stderr, "ds4: Mellum true-prefill SWA probe first chunk failed\n");
+        ok = false;
+    }
+    if (ok && ds4_gpu_tensor_read(prefill->logits, 0, prefill_window_logits,
+                                  logits_bytes) == 0) {
+        fprintf(stderr, "ds4: Mellum true-prefill SWA probe could not read batch window logits\n");
+        ok = false;
+    }
+    ds4_gpu_tensor *prefill_window_last = NULL;
+    if (ok) {
+        ds4_gpu_tensor *last_rows = (DS4_N_LAYER & 1u) ?
+            scratch.layer_out : scratch.hidden;
+        prefill_window_last = ds4_gpu_tensor_view(
+            last_rows, (uint64_t)(first_chunk - 1u) * hidden_bytes, hidden_bytes);
+        if (!prefill_window_last || ds4_gpu_tensor_read(
+                prefill_window_last, 0, prefill_window_hidden, hidden_bytes) == 0) {
+            fprintf(stderr, "ds4: Mellum true-prefill SWA probe could not read batch window hidden state\n");
+            ok = false;
+        }
+    }
+    ds4_gpu_tensor_free(prefill_window_last);
+    if (ok && !ds4_mellum_prefill_tokens(e, prefill, &scratch,
+                                          tokens + first_chunk, tail_tokens,
+                                          NULL, NULL, true)) {
+        fprintf(stderr, "ds4: Mellum true-prefill SWA probe tail chunk failed\n");
+        ok = false;
+    }
+    if (ok && ds4_gpu_tensor_read(prefill->logits, 0, prefill_logits,
+                                  logits_bytes) == 0) {
+        fprintf(stderr, "ds4: Mellum true-prefill SWA probe could not read batch logits\n");
+        ok = false;
+    }
+    ds4_gpu_tensor *prefill_last = NULL;
+    if (ok) {
+        ds4_gpu_tensor *last_rows = (DS4_N_LAYER & 1u) ?
+            scratch.layer_out : scratch.hidden;
+        prefill_last = ds4_gpu_tensor_view(
+            last_rows, (uint64_t)(tail_tokens - 1u) * DS4_N_EMBD * sizeof(float),
+            (uint64_t)DS4_N_EMBD * sizeof(float));
+        if (!prefill_last || ds4_gpu_tensor_read(
+                prefill_last, 0, prefill_hidden,
+                (uint64_t)DS4_N_EMBD * sizeof(float)) == 0) {
+            fprintf(stderr, "ds4: Mellum true-prefill SWA probe could not read batch hidden state\n");
+            ok = false;
+        }
+    }
+    ds4_gpu_tensor_free(prefill_last);
+    if (ok && !ds4_mellum_prefill_chunks(e, small, &small_scratch, tokens,
+                                          n_tokens, small_chunk)) {
+        fprintf(stderr, "ds4: Mellum true-prefill SWA probe 32-token chunks failed\n");
+        ok = false;
+    }
+    if (ok && ds4_gpu_tensor_read(small->logits, 0, small_logits,
+                                  logits_bytes) == 0) {
+        fprintf(stderr, "ds4: Mellum true-prefill SWA probe could not read 32-token logits\n");
+        ok = false;
+    }
+    ds4_gpu_tensor *small_last = NULL;
+    if (ok) {
+        const uint32_t small_last_tokens = n_tokens % small_chunk ?
+            n_tokens % small_chunk : small_chunk;
+        ds4_gpu_tensor *last_rows = (DS4_N_LAYER & 1u) ?
+            small_scratch.layer_out : small_scratch.hidden;
+        small_last = ds4_gpu_tensor_view(
+            last_rows, (uint64_t)(small_last_tokens - 1u) * hidden_bytes,
+            hidden_bytes);
+        if (!small_last || ds4_gpu_tensor_read(
+                small_last, 0, small_hidden, hidden_bytes) == 0) {
+            fprintf(stderr, "ds4: Mellum true-prefill SWA probe could not read 32-token hidden state\n");
+            ok = false;
+        }
+    }
+    ds4_gpu_tensor_free(small_last);
+    float window_hidden_max_abs = 0.0f, window_logit_max_abs = 0.0f;
+    double window_hidden_sum_sq = 0.0, window_logit_sum_sq = 0.0;
+    for (uint32_t i = 0; ok && i < DS4_N_EMBD; i++) {
+        if (!isfinite(decode_window_hidden[i]) ||
+            !isfinite(prefill_window_hidden[i])) {
+            ok = false;
+            break;
+        }
+        const float delta = prefill_window_hidden[i] - decode_window_hidden[i];
+        window_hidden_max_abs = fmaxf(window_hidden_max_abs, fabsf(delta));
+        window_hidden_sum_sq += (double)delta * delta;
+    }
+    for (uint64_t i = 0; ok && i < vocab_dim; i++) {
+        if (!isfinite(decode_window_logits[i]) ||
+            !isfinite(prefill_window_logits[i])) {
+            ok = false;
+            break;
+        }
+        const float delta = prefill_window_logits[i] - decode_window_logits[i];
+        window_logit_max_abs = fmaxf(window_logit_max_abs, fabsf(delta));
+        window_logit_sum_sq += (double)delta * delta;
+    }
+    float hidden_max_abs = 0.0f, logit_max_abs = 0.0f;
+    double hidden_sum_sq = 0.0, logit_sum_sq = 0.0;
+    float small_hidden_max_abs = 0.0f, small_logit_max_abs = 0.0f;
+    double small_hidden_sum_sq = 0.0, small_logit_sum_sq = 0.0;
+    for (uint32_t i = 0; ok && i < DS4_N_EMBD; i++) {
+        if (!isfinite(decode_hidden[i]) || !isfinite(prefill_hidden[i])) {
+            ok = false;
+            break;
+        }
+        const float delta = prefill_hidden[i] - decode_hidden[i];
+        hidden_max_abs = fmaxf(hidden_max_abs, fabsf(delta));
+        hidden_sum_sq += (double)delta * delta;
+    }
+    for (uint64_t i = 0; ok && i < vocab_dim; i++) {
+        if (!isfinite(decode_logits[i]) || !isfinite(prefill_logits[i])) {
+            ok = false;
+            break;
+        }
+        const float delta = prefill_logits[i] - decode_logits[i];
+        logit_max_abs = fmaxf(logit_max_abs, fabsf(delta));
+        logit_sum_sq += (double)delta * delta;
+    }
+    for (uint32_t i = 0; ok && i < DS4_N_EMBD; i++) {
+        if (!isfinite(decode_hidden[i]) || !isfinite(small_hidden[i])) {
+            ok = false;
+            break;
+        }
+        const float delta = small_hidden[i] - decode_hidden[i];
+        small_hidden_max_abs = fmaxf(small_hidden_max_abs, fabsf(delta));
+        small_hidden_sum_sq += (double)delta * delta;
+    }
+    for (uint64_t i = 0; ok && i < vocab_dim; i++) {
+        if (!isfinite(decode_logits[i]) || !isfinite(small_logits[i])) {
+            ok = false;
+            break;
+        }
+        const float delta = small_logits[i] - decode_logits[i];
+        small_logit_max_abs = fmaxf(small_logit_max_abs, fabsf(delta));
+        small_logit_sum_sq += (double)delta * delta;
+    }
+    if (ok) {
+        fprintf(out,
+                "Mellum true-prefill SWA probe window=%u hidden max_abs=%g rms=%g logits max_abs=%g rms=%g\n",
+                first_chunk, window_hidden_max_abs,
+                sqrt(window_hidden_sum_sq / (double)DS4_N_EMBD),
+                window_logit_max_abs,
+                sqrt(window_logit_sum_sq / (double)vocab_dim));
+        fprintf(out,
+                "Mellum true-prefill SWA probe tokens=%u chunks=%u+%u hidden max_abs=%g rms=%g logits max_abs=%g rms=%g\n",
+                n_tokens, first_chunk, tail_tokens, hidden_max_abs,
+                sqrt(hidden_sum_sq / (double)DS4_N_EMBD), logit_max_abs,
+                sqrt(logit_sum_sq / (double)vocab_dim));
+        fprintf(out,
+                "Mellum true-prefill SWA probe tokens=%u chunks=%u hidden max_abs=%g rms=%g logits max_abs=%g rms=%g\n",
+                n_tokens, small_chunk, small_hidden_max_abs,
+                sqrt(small_hidden_sum_sq / (double)DS4_N_EMBD),
+                small_logit_max_abs,
+                sqrt(small_logit_sum_sq / (double)vocab_dim));
+    } else {
+        fprintf(stderr, "ds4: Mellum true-prefill SWA probe execution failed\n");
+    }
+    ds4_mellum_prefill_scratch_free(&scratch);
+    ds4_mellum_prefill_scratch_free(&small_scratch);
+    ds4_mellum_decode_state_free(small);
+    ds4_mellum_decode_state_free(prefill);
+    ds4_mellum_decode_state_free(decode);
+    free(prefill_window_hidden);
+    free(decode_window_hidden);
+    free(small_hidden);
+    free(prefill_hidden);
+    free(decode_hidden);
+    free(prefill_window_logits);
+    free(decode_window_logits);
+    free(small_logits);
+    free(prefill_logits);
+    free(decode_logits);
+    free(tokens);
+    return ok ? 0 : 1;
+#endif
+}
+
 int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen) {
     if (!s || !s->distributed) {
         if (errlen) snprintf(err, errlen, "session is not a distributed coordinator");

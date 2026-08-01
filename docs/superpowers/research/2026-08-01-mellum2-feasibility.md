@@ -1302,6 +1302,17 @@ same resident-versus-streamed A/B gate used for Laguna XS.
   comparison on a chunk that crosses the 1,024-token sliding-window boundary,
   then choose an envelope covering both short and wrapped-ring cases before
   promoting true prefill into session sync.
+- The boundary probe now reports both the 1,024-token pre-wrap baseline and
+  the result after six wrapped tokens, and is explicitly evidence-only rather
+  than an acceptance gate. On a deterministic 1,030-token sequence, the
+  pre-wrap batch has hidden RMS `3.9305` and logit RMS `0.0908209`; after six
+  wrapped tokens these are `2.47979` and `0.371089`. Repeating the exact same
+  prompt as 32-token batches yields bit-identical final hidden state and
+  logits to the `1024 + 6` schedule. Thus neither batch size nor the SWA ring
+  transition introduces an additional discrepancy in ds4; the large
+  long-sequence drift is a sequence-length/numerical-accumulation issue. Do
+  not set an acceptance envelope or promote true prefill until this has an
+  independent long-context reference or a tighter primitive-level diagnosis.
 
 ### 2026-08-01 M5 prefill/decode target research
 

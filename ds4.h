@@ -343,6 +343,11 @@ int ds4_engine_mellum_resident_profile(ds4_engine *engine, FILE *out,
  * layer-major batch and compares its raw final logits with sequential decode. */
 int ds4_engine_mellum_true_prefill_probe(ds4_engine *engine, FILE *out);
 
+/* Inspect-only Mellum true-prefill ring evidence probe. Compares an
+ * SWA-window+6 chunk schedule with sequential decode across the boundary;
+ * it does not currently define an acceptance envelope. */
+int ds4_engine_mellum_true_prefill_swa_probe(ds4_engine *engine, FILE *out);
+
 /* Diagnostic-only Mellum output-head oracle. Replays the fixed fixture through
  * final RMSNorm and the Q8 output projection, but does not select a token. */
 int ds4_engine_mellum_logits_probe(ds4_engine *engine,
