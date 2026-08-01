@@ -1254,3 +1254,13 @@ same resident-versus-streamed A/B gate used for Laguna XS.
   views. This unblocks the next component: a token-major Q8 selected-expert
   SwiGLU/down path and batch layer composition; it is not yet connected to
   session sync.
+- Added the companion token-major all-Q8_0 selected-expert MoE primitive. Its
+  SwiGLU and down-projection kernels retain the decode reduction order while
+  indexing activations, selections, weights, intermediate rows, and output by
+  token. A three-token regression with distinct noncontiguous expert choices
+  and weights is bitwise-identical to repeating the proven one-token Q8 path.
+  Activation-size and stride overflow validation is explicit. The remaining
+  implementation step is a complete batch-layer composition that joins
+  attention, F32 router projection/selection, this MoE, and the final residual;
+  then use a real model to compare that layer and logits against sequential
+  decode.

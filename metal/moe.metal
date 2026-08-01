@@ -615,6 +615,56 @@ kernel void kernel_mellum_q8_0_pair_swiglu_f32(
     }
 }
 
+// Token-major companion to the decode kernel above.  Keep the reduction and
+// per-row arithmetic unchanged so a batch row is reproducible as one decode.
+kernel void kernel_mellum_q8_0_pair_swiglu_batch_f32(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *gate, device const char *up, device const float *x,
+        device const int32_t *selected, device const float *weights,
+        device float *mid, threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    const uint ntg = 256u, row = tgpig.x, slot = tgpig.y, token = tgpig.z;
+    if (row >= args.mid_dim || slot >= args.n_expert_used || token >= args.n_tokens)
+        return;
+    const uint64_t selected_base = (uint64_t)token * args.n_expert_used;
+    const uint64_t mid_off = (uint64_t)token * args.mid_token_stride +
+                             (uint64_t)slot * args.mid_dim + row;
+    const int expert = selected[selected_base + slot];
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tid == 0u) mid[mid_off] = 0.0f;
+        return;
+    }
+    device const block_q8_0 *gate_row = (device const block_q8_0 *)(gate +
+        (uint64_t)(uint)expert * args.gate_expert_bytes +
+        (uint64_t)row * args.gate_row_bytes);
+    device const block_q8_0 *up_row = (device const block_q8_0 *)(up +
+        (uint64_t)(uint)expert * args.up_expert_bytes +
+        (uint64_t)row * args.up_row_bytes);
+    device const float *token_x = x + (uint64_t)token * args.in_dim;
+    float acc_gate = 0.0f, acc_up = 0.0f;
+    for (uint k = tid; k < args.in_dim; k += ntg) {
+        const uint block = k / QK8_0, element = k - block * QK8_0;
+        const float xv = token_x[k];
+        acc_gate += (float)gate_row[block].d * (float)gate_row[block].qs[element] * xv;
+        acc_up += (float)up_row[block].d * (float)up_row[block].qs[element] * xv;
+    }
+    scratch[tid] = acc_gate; scratch[ntg + tid] = acc_up;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+            scratch[ntg + tid] += scratch[ntg + tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        const float g = scratch[0];
+        mid[mid_off] = g / (1.0f + exp(-g)) * scratch[ntg] *
+            weights[selected_base + slot];
+    }
+}
+
 template <short N_R0>
 static inline void glm_q2_K_pair_swiglu_simd_f32_impl(
         ds4_metal_glm_routed_moe_args args,
@@ -2763,6 +2813,40 @@ kernel void kernel_mellum_q8_0_down_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (tid == 0u) out[row] = scratch[0];
+}
+
+kernel void kernel_mellum_q8_0_down_batch_f32(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *down, device const int32_t *selected,
+        device const float *mid, device float *out,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    const uint ntg = 256u, row = tgpig.x, token = tgpig.y;
+    if (row >= args.out_dim || token >= args.n_tokens) return;
+    const uint64_t selected_base = (uint64_t)token * args.n_expert_used;
+    const uint64_t mid_base = (uint64_t)token * args.mid_token_stride;
+    float acc = 0.0f;
+    for (uint slot = 0; slot < args.n_expert_used; slot++) {
+        const int expert = selected[selected_base + slot];
+        if (expert < 0 || (uint)expert >= args.n_total_expert) continue;
+        device const block_q8_0 *down_row = (device const block_q8_0 *)(down +
+            (uint64_t)(uint)expert * args.down_expert_bytes +
+            (uint64_t)row * args.down_row_bytes);
+        device const float *slot_mid = mid + mid_base + (uint64_t)slot * args.mid_dim;
+        for (uint k = tid; k < args.mid_dim; k += ntg) {
+            const uint block = k / QK8_0, element = k - block * QK8_0;
+            acc += (float)down_row[block].d * (float)down_row[block].qs[element] *
+                slot_mid[k];
+        }
+    }
+    scratch[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) out[(uint64_t)token * args.out_dim + row] = scratch[0];
 }
 
 kernel void kernel_glm_q4_K_addr_down_f32(

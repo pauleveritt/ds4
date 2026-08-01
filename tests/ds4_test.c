@@ -2226,6 +2226,97 @@ static void test_metal_mellum_q8_q8_routed_moe(void) {
                 mid_max, out_max);
         TEST_ASSERT(mid_max < 3.0e-5f);
         TEST_ASSERT(out_max < 3.0e-4f);
+
+        /* The batch primitive must reproduce independent selected-expert
+         * execution, including token-major route ids and weights. */
+        enum { batch_tokens = 3 };
+        const uint64_t batch_x_bytes = batch_tokens * x_bytes;
+        const uint64_t batch_mid_bytes = batch_tokens * mid_bytes;
+        const uint64_t batch_out_bytes = batch_tokens * out_bytes;
+        const uint64_t batch_route_bytes = batch_tokens * sizeof(selected_host);
+        ds4_gpu_tensor *batch_x = ds4_gpu_tensor_alloc(batch_x_bytes);
+        ds4_gpu_tensor *batch_mid = ds4_gpu_tensor_alloc(batch_mid_bytes);
+        ds4_gpu_tensor *batch_out = ds4_gpu_tensor_alloc(batch_out_bytes);
+        ds4_gpu_tensor *batch_selected = ds4_gpu_tensor_alloc(batch_route_bytes);
+        ds4_gpu_tensor *batch_weights = ds4_gpu_tensor_alloc(batch_route_bytes);
+        float *batch_x_host = malloc((size_t)batch_x_bytes);
+        float *batch_mid_host = malloc((size_t)batch_mid_bytes);
+        float *batch_out_host = malloc((size_t)batch_out_bytes);
+        int32_t batch_selected_host[3][3] = {
+            {3, 0, 2}, {1, 3, 0}, {2, 1, 3},
+        };
+        float batch_weights_host[3][3] = {
+            {0.45f, 0.70f, 0.30f}, {0.25f, 0.60f, 0.90f},
+            {0.80f, 0.15f, 0.55f},
+        };
+        const bool batch_allocated = batch_x && batch_mid && batch_out &&
+            batch_selected && batch_weights && batch_x_host && batch_mid_host &&
+            batch_out_host;
+        TEST_ASSERT(batch_allocated);
+        if (batch_allocated) {
+            for (uint32_t token = 0; token < batch_tokens; token++) {
+                for (uint32_t i = 0; i < in_dim; i++) {
+                    batch_x_host[(uint64_t)token * in_dim + i] = x_host[i] +
+                        (float)(token + 1u) / 97.0f;
+                }
+            }
+            TEST_ASSERT(ds4_gpu_tensor_write(batch_x, 0, batch_x_host,
+                                              batch_x_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(batch_selected, 0, batch_selected_host,
+                                              batch_route_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(batch_weights, 0, batch_weights_host,
+                                              batch_route_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
+                batch_out, batch_mid, model, model_bytes, gate_offset, up_offset,
+                down_offset, gate_expert, gate_row, down_expert, down_row, in_dim,
+                mid_dim, out_dim, batch_selected, batch_weights, n_total,
+                n_selected, batch_x, batch_tokens) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(batch_mid, 0, batch_mid_host,
+                                             batch_mid_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(batch_out, 0, batch_out_host,
+                                             batch_out_bytes) != 0);
+            for (uint32_t token = 0; token < batch_tokens; token++) {
+                ds4_gpu_tensor *one_x = ds4_gpu_tensor_view(
+                    batch_x, (uint64_t)token * x_bytes, x_bytes);
+                ds4_gpu_tensor *one_mid = ds4_gpu_tensor_view(
+                    batch_mid, (uint64_t)token * mid_bytes, mid_bytes);
+                ds4_gpu_tensor *one_out = ds4_gpu_tensor_view(
+                    batch_out, (uint64_t)token * out_bytes, out_bytes);
+                ds4_gpu_tensor *one_selected = ds4_gpu_tensor_view(
+                    batch_selected, (uint64_t)token * sizeof(selected_host),
+                    sizeof(selected_host));
+                ds4_gpu_tensor *one_weights = ds4_gpu_tensor_view(
+                    batch_weights, (uint64_t)token * sizeof(route_weights),
+                    sizeof(route_weights));
+                TEST_ASSERT(one_x && one_mid && one_out && one_selected && one_weights);
+                if (one_x && one_mid && one_out && one_selected && one_weights) {
+                    TEST_ASSERT(ds4_gpu_mellum_q8_0_routed_moe_one_tensor(
+                        one_out, one_mid, model, model_bytes, gate_offset, up_offset,
+                        down_offset, gate_expert, gate_row, down_expert, down_row,
+                        in_dim, mid_dim, out_dim, one_selected, one_weights, n_total,
+                        n_selected, one_x) != 0);
+                    TEST_ASSERT(ds4_gpu_tensor_read(one_mid, 0, mid_host,
+                                                    mid_bytes) != 0);
+                    TEST_ASSERT(ds4_gpu_tensor_read(one_out, 0, out_host,
+                                                    out_bytes) != 0);
+                    TEST_ASSERT(test_mellum_max_abs(
+                        mid_host, batch_mid_host + (uint64_t)token * n_selected * mid_dim,
+                        n_selected * mid_dim) == 0.0f);
+                    TEST_ASSERT(test_mellum_max_abs(
+                        out_host, batch_out_host + (uint64_t)token * out_dim,
+                        out_dim) == 0.0f);
+                }
+                ds4_gpu_tensor_free(one_weights); ds4_gpu_tensor_free(one_selected);
+                ds4_gpu_tensor_free(one_out); ds4_gpu_tensor_free(one_mid);
+                ds4_gpu_tensor_free(one_x);
+            }
+            fprintf(stderr, "ds4-test: Mellum Q8_0 batch routed MoE exact rows=%u\n",
+                    batch_tokens);
+        }
+        free(batch_out_host); free(batch_mid_host); free(batch_x_host);
+        ds4_gpu_tensor_free(batch_weights); ds4_gpu_tensor_free(batch_selected);
+        ds4_gpu_tensor_free(batch_out); ds4_gpu_tensor_free(batch_mid);
+        ds4_gpu_tensor_free(batch_x);
     }
     free(out_ref); free(mid_ref); free(out_host); free(mid_host); free(x_host);
     ds4_gpu_tensor_free(weights); ds4_gpu_tensor_free(selected);

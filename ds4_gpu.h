@@ -2308,6 +2308,30 @@ int ds4_gpu_mellum_q8_0_routed_moe_one_tensor(
         uint32_t                n_expert,
         const ds4_gpu_tensor *x);
 
+/* Token-major Q8_0 Mellum selected-expert MoE.  `mid` is
+ * n_tokens * n_expert * expert_mid_dim floats and `out` is token-major. */
+int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_tokens);
+
 /* Mellum's bias-free softmax router. `probs` exposes the full softmax for
  * diagnostics; `selected` and `weights` are the deterministic top-k result
  * with the selected probabilities renormalized to sum to one. */
