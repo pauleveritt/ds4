@@ -1271,3 +1271,29 @@ same resident-versus-streamed A/B gate used for Laguna XS.
   gate is intentionally narrower than generation: a multi-row layer result and
   cache comparison against repeated decode, followed by the equivalent
   authentic-model layer/logit oracle.
+
+### 2026-08-01 M5 prefill/decode target research
+
+The clearest recent public comparison is the [BaseRT M5 study](https://arxiv.org/abs/2607.19438),
+measured on an M5 **Pro**, not our higher-bandwidth M5 Max. It confirms the
+important architectural distinction for this port: decode is a memory-bound
+single-row GEMV workload, whereas prefill has enough rows to become GEMM/MoE
+and attention compute-bound. Its matched llama.cpp Q4 MoE data for
+Qwen3-30B-A3B reports 96.7 tok/s decode and 1,740--2,086 tok/s prefill from
+128--2,048 tokens; BaseRT reaches 105.1 tok/s decode and 2,478--3,907 tok/s
+prefill through M5 tensor-core prefill/MoE kernels. The paper reports the
+same pattern across families: decode uplift is bounded (up to 1.75x over
+llama.cpp), while prefill uplift can be several-fold.
+
+This is directionally relevant rather than a direct Mellum comparison: Mellum
+is Q8_0 (13 GB resident) and has 28 layers with 8-of-64 experts, so its exact
+balance differs. Our M5 Max resident measurement is already 111.6 tok/s decode
+with the output head, consistent with the paper's MoE decode range. The first
+true-prefill target should therefore be **at least 500 tok/s at a 1,024-token
+prompt**, a roughly 5x improvement over the current sequential-decode sync,
+with **800--1,200 tok/s** as a credible optimisation target once the batch Q8
+matmul/MoE path uses Metal 4 tensor operations. Treat a result below 250 tok/s
+as a structural failure (likely tokenwise work or excess command boundaries),
+not a tuning result. Decode should remain near 100--120 tok/s; a tensor-core
+project is primarily a prefill project and should not be judged by decode
+speedup.
