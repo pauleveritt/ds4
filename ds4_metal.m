@@ -232,6 +232,9 @@ static id<MTLComputePipelineState> g_mellum_q8_0_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_down_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_pair_swiglu_batch_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_down_batch_f32_pipeline;
+static id<MTLComputePipelineState> g_mellum_q8_0_pair_swiglu_grouped_f32_pipeline;
+static id<MTLComputePipelineState> g_mellum_moe_bucket_reset_pipeline;
+static id<MTLComputePipelineState> g_mellum_moe_bucket_build_pipeline;
 static id<MTLComputePipelineState> g_mellum_router_select_one_pipeline;
 static id<MTLComputePipelineState> g_mellum_router_select_batch_pipeline;
 static id<MTLComputePipelineState> g_mellum_gqa_decode_pipeline;
@@ -34309,6 +34312,48 @@ int ds4_gpu_mellum_attention_decode_tensor(
            ds4_gpu_add_tensor(out, projected, hidden, desc->n_embd) != 0;
 }
 
+/*
+ * Diagnostic: ds4_gpu_matmul_q8_0_legacy_tensor picks its kernel by token
+ * count.  One row uses the F32-accumulating matvec, 17..31 rows use a generic
+ * GEMM instantiated on half weights *and* half activations, and >=32 rows use
+ * the tensor-op path that dequantizes weight tiles to half.  A Q8_0 weight is
+ * d(F16) * q(int8) and needs ~18 mantissa bits, so batched prefill projections
+ * carry a relative weight error that decode does not.  This switch forces the
+ * row-exact decode kernel for every Mellum prefill projection so that
+ * batch-versus-decode drift can be attributed to kernel precision rather than
+ * graph semantics.  It validates the single release path and is not a second
+ * semantic variant.
+ */
+static bool ds4_gpu_mellum_prefill_exact_projections(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_MELLUM_PREFILL_EXACT");
+        cached = env && *env && strcmp(env, "0") != 0;
+    }
+    return cached != 0;
+}
+
+int ds4_gpu_mellum_prefill_exact_projections_enabled(void) {
+    return ds4_gpu_mellum_prefill_exact_projections() ? 1 : 0;
+}
+
+static int ds4_gpu_mellum_prefill_matmul_q8_0(ds4_gpu_tensor       *out,
+                                              const void           *model_map,
+                                              uint64_t              model_size,
+                                              uint64_t              weight_offset,
+                                              uint64_t              in_dim,
+                                              uint64_t              out_dim,
+                                              const ds4_gpu_tensor *x,
+                                              uint32_t              n_tokens) {
+    if (ds4_gpu_mellum_prefill_exact_projections()) {
+        return ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+            out, model_map, model_size, weight_offset, in_dim, out_dim, x,
+            n_tokens);
+    }
+    return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size, weight_offset,
+                                      in_dim, out_dim, x, n_tokens);
+}
+
 int ds4_gpu_mellum_attention_prefill_tensor(
         ds4_gpu_tensor                     *out,
         ds4_gpu_tensor                     *norm,
@@ -34362,12 +34407,15 @@ int ds4_gpu_mellum_attention_prefill_tensor(
     return ds4_gpu_rms_norm_weight_rows_tensor(
                norm, hidden, model_map, model_size, desc->attn_norm_offset,
                desc->n_embd, n_tokens, desc->rms_eps) != 0 &&
-           ds4_gpu_matmul_q8_0_tensor(q, model_map, model_size, desc->q_offset,
-                                       desc->n_embd, q_dim, norm, n_tokens) != 0 &&
-           ds4_gpu_matmul_q8_0_tensor(k, model_map, model_size, desc->k_offset,
-                                       desc->n_embd, kv_dim, norm, n_tokens) != 0 &&
-           ds4_gpu_matmul_q8_0_tensor(v, model_map, model_size, desc->v_offset,
-                                       desc->n_embd, kv_dim, norm, n_tokens) != 0 &&
+           ds4_gpu_mellum_prefill_matmul_q8_0(q, model_map, model_size,
+                                              desc->q_offset, desc->n_embd,
+                                              q_dim, norm, n_tokens) != 0 &&
+           ds4_gpu_mellum_prefill_matmul_q8_0(k, model_map, model_size,
+                                              desc->k_offset, desc->n_embd,
+                                              kv_dim, norm, n_tokens) != 0 &&
+           ds4_gpu_mellum_prefill_matmul_q8_0(v, model_map, model_size,
+                                              desc->v_offset, desc->n_embd,
+                                              kv_dim, norm, n_tokens) != 0 &&
            ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
                q, k, model_map, model_size, desc->q_norm_offset,
                desc->k_norm_offset, n_tokens, desc->n_head, desc->n_head_kv,
@@ -34379,9 +34427,10 @@ int ds4_gpu_mellum_attention_prefill_tensor(
                heads, key_cache, value_cache, staged_key, staged_value, q, k,
                v, pos0, n_tokens, cache_cap, desc->n_head, desc->n_head_kv,
                desc->head_dim, attention_scale) != 0 &&
-           ds4_gpu_matmul_q8_0_tensor(projected, model_map, model_size,
-                                       desc->output_offset, q_dim, desc->n_embd,
-                                       heads, n_tokens) != 0 &&
+           ds4_gpu_mellum_prefill_matmul_q8_0(projected, model_map, model_size,
+                                              desc->output_offset, q_dim,
+                                              desc->n_embd, heads,
+                                              n_tokens) != 0 &&
            ds4_gpu_add_tensor(out, projected, hidden,
                               (uint32_t)hidden_values) != 0;
 }
@@ -34790,7 +34839,7 @@ int ds4_gpu_mellum_routed_moe_one_tensor(
         [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:3];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
         [enc useResource:downbuf usage:MTLResourceUsageRead];
-        [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
+        [enc setThreadgroupMemoryLength:(NSUInteger)n_expert * 256u * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -34938,7 +34987,7 @@ int ds4_gpu_mellum_q8_0_routed_moe_one_tensor(
         [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:3];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
         [enc useResource:downbuf usage:MTLResourceUsageRead];
-        [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
+        [enc setThreadgroupMemoryLength:(NSUInteger)n_expert * 256u * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -34948,6 +34997,142 @@ int ds4_gpu_mellum_q8_0_routed_moe_one_tensor(
         }
     }
     return 1;
+}
+
+/*
+ * Expert-major grouping scratch for Mellum prefill.
+ *
+ * Mirrors ds4_metal_mellum_moe_group_args in metal/moe.metal.  The buffers are
+ * a few hundred KiB and are reused across layers and calls: allocating them per
+ * call would either be freed while the command buffer still referenced them or
+ * force a synchronization inside the batch.
+ */
+typedef struct {
+    uint32_t n_tokens;
+    uint32_t n_expert_used;
+    uint32_t n_total_expert;
+    uint32_t bucket_cap;
+} ds4_gpu_mellum_moe_group_args;
+
+typedef struct {
+    ds4_gpu_mellum_moe_group_args args;
+    ds4_gpu_tensor *counts;
+    ds4_gpu_tensor *pairs;
+    ds4_gpu_tensor *gate_offsets;
+    ds4_gpu_tensor *up_offsets;
+} ds4_gpu_mellum_moe_group;
+
+static int ds4_gpu_mellum_grouped_moe_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_MELLUM_GROUPED_MOE");
+        cached = env && *env && strcmp(env, "0") != 0;
+    }
+    return cached;
+}
+
+/*
+ * Bucket the chunk's (token, slot) pairs by selected expert, then hand the
+ * caller the buffers its grouped kernel needs.  Expert weights are addressed
+ * through an offset table so the same kernel can later be pointed at streamed
+ * cache slots instead of model offsets.
+ */
+static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
+                                           id<MTLCommandBuffer> cb,
+                                           uint32_t n_total_expert,
+                                           uint32_t n_expert_used,
+                                           uint32_t n_tokens,
+                                           uint64_t gate_expert_bytes,
+                                           id<MTLBuffer> selectedbuf,
+                                           uint64_t selected_offset) {
+    static ds4_gpu_tensor *s_counts, *s_pairs, *s_gate_off, *s_up_off;
+    static uint32_t s_experts, s_cap, s_pairs_experts;
+    static uint64_t s_expert_bytes;
+
+    if (!g || !cb || !selectedbuf || n_total_expert == 0 || n_tokens == 0 ||
+        n_expert_used == 0 || n_expert_used > n_total_expert) return false;
+    /* One token contributes at most one pair per expert. */
+    const uint32_t cap = n_tokens;
+    if (cap > UINT32_MAX / n_total_expert) return false;
+
+    if (!s_counts || s_experts != n_total_expert) {
+        ds4_gpu_tensor_free(s_counts);
+        ds4_gpu_tensor_free(s_gate_off);
+        ds4_gpu_tensor_free(s_up_off);
+        s_counts = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * sizeof(uint32_t));
+        s_gate_off = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * sizeof(uint64_t));
+        s_up_off = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * sizeof(uint64_t));
+        s_experts = n_total_expert;
+        s_expert_bytes = 0;
+    }
+    if (!s_pairs || s_cap < cap || s_pairs_experts != n_total_expert) {
+        ds4_gpu_tensor_free(s_pairs);
+        s_pairs = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * cap *
+                                       sizeof(uint32_t));
+        s_cap = cap;
+        s_pairs_experts = n_total_expert;
+    }
+    if (!s_counts || !s_pairs || !s_gate_off || !s_up_off) return false;
+
+    if (s_expert_bytes != gate_expert_bytes) {
+        uint64_t *off = malloc((size_t)n_total_expert * sizeof(*off));
+        if (!off) return false;
+        for (uint32_t e = 0; e < n_total_expert; e++) {
+            off[e] = (uint64_t)e * gate_expert_bytes;
+        }
+        const uint64_t bytes = (uint64_t)n_total_expert * sizeof(*off);
+        const bool ok = ds4_gpu_tensor_write(s_gate_off, 0, off, bytes) != 0 &&
+                        ds4_gpu_tensor_write(s_up_off, 0, off, bytes) != 0;
+        free(off);
+        if (!ok) return false;
+        s_expert_bytes = gate_expert_bytes;
+    }
+
+    if (!g_mellum_moe_bucket_reset_pipeline) {
+        g_mellum_moe_bucket_reset_pipeline =
+            ds4_gpu_get_pipeline("kernel_mellum_moe_bucket_reset");
+    }
+    if (!g_mellum_moe_bucket_build_pipeline) {
+        g_mellum_moe_bucket_build_pipeline =
+            ds4_gpu_get_pipeline("kernel_mellum_moe_bucket_build");
+    }
+    if (!g_mellum_moe_bucket_reset_pipeline ||
+        !g_mellum_moe_bucket_build_pipeline) return false;
+
+    g->args = (ds4_gpu_mellum_moe_group_args){
+        .n_tokens = n_tokens,
+        .n_expert_used = n_expert_used,
+        .n_total_expert = n_total_expert,
+        .bucket_cap = s_cap,
+    };
+    g->counts = s_counts;
+    g->pairs = s_pairs;
+    g->gate_offsets = s_gate_off;
+    g->up_offsets = s_up_off;
+
+    /* Reset and build are separate encoders: the build must observe the reset. */
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:g_mellum_moe_bucket_reset_pipeline];
+    [enc setBytes:&g->args length:sizeof(g->args) atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(s_counts)
+            offset:ds4_gpu_tensor_offset(s_counts) atIndex:1];
+    [enc dispatchThreadgroups:MTLSizeMake((n_total_expert + 63u) / 64u, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+
+    const uint32_t pair_total = n_tokens * n_expert_used;
+    enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:g_mellum_moe_bucket_build_pipeline];
+    [enc setBytes:&g->args length:sizeof(g->args) atIndex:0];
+    [enc setBuffer:selectedbuf offset:(NSUInteger)selected_offset atIndex:1];
+    [enc setBuffer:ds4_gpu_tensor_buffer(s_counts)
+            offset:ds4_gpu_tensor_offset(s_counts) atIndex:2];
+    [enc setBuffer:ds4_gpu_tensor_buffer(s_pairs)
+            offset:ds4_gpu_tensor_offset(s_pairs) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake((pair_total + 255u) / 256u, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return true;
 }
 
 int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
@@ -35017,6 +35202,16 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
             g_mellum_q8_0_down_batch_f32_pipeline,
             "kernel_mellum_q8_0_down_batch_f32");
         if (!pair_pipeline || !down_pipeline) return 0;
+        id<MTLComputePipelineState> grouped_pipeline = nil;
+        if (ds4_gpu_mellum_grouped_moe_enabled()) {
+            if (!g_mellum_q8_0_pair_swiglu_grouped_f32_pipeline)
+                g_mellum_q8_0_pair_swiglu_grouped_f32_pipeline =
+                    ds4_gpu_get_pipeline(
+                        "kernel_mellum_q8_0_pair_swiglu_grouped_f32");
+            grouped_pipeline = ds4_gpu_hot_pipeline(
+                g_mellum_q8_0_pair_swiglu_grouped_f32_pipeline,
+                "kernel_mellum_q8_0_pair_swiglu_grouped_f32");
+        }
         ds4_gpu_glm_routed_moe_args args = {
             .in_dim = expert_in_dim, .mid_dim = expert_mid_dim, .out_dim = out_dim,
             .n_total_expert = n_total_expert, .n_expert_used = n_expert,
@@ -35034,20 +35229,52 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
         id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
         id<MTLBuffer> weightsbuf = ds4_gpu_tensor_buffer(weights);
+        ds4_gpu_mellum_moe_group ggroup = {0};
+        const bool grouped = ds4_gpu_mellum_grouped_moe_enabled() &&
+            grouped_pipeline &&
+            ds4_gpu_mellum_moe_group_begin(&ggroup, cb, n_total_expert, n_expert,
+                                            n_tokens, gate_expert_bytes,
+                                            selectedbuf,
+                                            ds4_gpu_tensor_offset(selected));
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:pair_pipeline];
-        [enc setBytes:&args length:sizeof(args) atIndex:0];
-        [enc setBuffer:gatebuf offset:(NSUInteger)gate_inner atIndex:1];
-        [enc setBuffer:upbuf offset:(NSUInteger)up_inner atIndex:2];
-        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
-        [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:4];
-        [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:5];
-        [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:6];
-        [enc useResource:gatebuf usage:MTLResourceUsageRead];
-        [enc useResource:upbuf usage:MTLResourceUsageRead];
-        [enc setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(expert_mid_dim, n_expert, n_tokens)
-             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        if (grouped) {
+            [enc setComputePipelineState:grouped_pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBytes:&ggroup.args length:sizeof(ggroup.args) atIndex:1];
+            [enc setBuffer:gatebuf offset:(NSUInteger)gate_inner atIndex:2];
+            [enc setBuffer:upbuf offset:(NSUInteger)up_inner atIndex:3];
+            [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.gate_offsets)
+                    offset:ds4_gpu_tensor_offset(ggroup.gate_offsets) atIndex:4];
+            [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.up_offsets)
+                    offset:ds4_gpu_tensor_offset(ggroup.up_offsets) atIndex:5];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:6];
+            [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:7];
+            [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.counts)
+                    offset:ds4_gpu_tensor_offset(ggroup.counts) atIndex:8];
+            [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.pairs)
+                    offset:ds4_gpu_tensor_offset(ggroup.pairs) atIndex:9];
+            [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:10];
+            [enc useResource:gatebuf usage:MTLResourceUsageRead];
+            [enc useResource:upbuf usage:MTLResourceUsageRead];
+            [enc setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
+            [enc setThreadgroupMemoryLength:(NSUInteger)gate_row_bytes * 2u atIndex:1];
+            [enc dispatchThreadgroups:MTLSizeMake(expert_mid_dim, n_total_expert, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            [enc setComputePipelineState:pair_pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:gatebuf offset:(NSUInteger)gate_inner atIndex:1];
+            [enc setBuffer:upbuf offset:(NSUInteger)up_inner atIndex:2];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
+            [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:4];
+            [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:5];
+            [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:6];
+            [enc useResource:gatebuf usage:MTLResourceUsageRead];
+            [enc useResource:upbuf usage:MTLResourceUsageRead];
+            [enc setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(expert_mid_dim, n_expert, n_tokens)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
         ds4_gpu_end_compute_encoder(cb, enc);
         enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:down_pipeline];
@@ -35057,7 +35284,7 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
         [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:3];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
         [enc useResource:downbuf usage:MTLResourceUsageRead];
-        [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
+        [enc setThreadgroupMemoryLength:(NSUInteger)n_expert * 256u * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(out_dim, n_tokens, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);

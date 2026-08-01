@@ -2449,6 +2449,10 @@ int ds4_gpu_mellum_attention_decode_tensor(
 
 /* Layer-major batched counterpart of Mellum attention decode. The caller owns
  * row-major scratch tensors sized for n_tokens and the staged F16 K/V chunk. */
+/* Diagnostic: whether Mellum prefill projections use the row-exact decode
+ * kernel.  Reported by the profile so a measurement is self-describing. */
+int ds4_gpu_mellum_prefill_exact_projections_enabled(void);
+
 int ds4_gpu_mellum_attention_prefill_tensor(
         ds4_gpu_tensor                     *out,
         ds4_gpu_tensor                     *norm,

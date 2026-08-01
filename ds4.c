@@ -61552,6 +61552,28 @@ int ds4_engine_mellum_swa_boundary_probe(ds4_engine *e,
 }
 
 #ifndef DS4_NO_GPU
+static bool ds4_mellum_prefill_chunks(const ds4_engine           *e,
+                                      ds4_mellum_decode_state    *state,
+                                      ds4_mellum_prefill_scratch *scratch,
+                                      const int                  *tokens,
+                                      uint32_t                    n_tokens,
+                                      uint32_t                    max_chunk,
+                                      ds4_gpu_tensor             *layer_trace_gpu,
+                                      ds4_gpu_tensor             *attention_trace_gpu);
+static uint32_t ds4_mellum_probe_chunk(uint32_t fallback, uint32_t max_chunk);
+
+static bool ds4_mellum_resident_prefill_pass(
+        const ds4_engine *e, ds4_mellum_decode_state *state,
+        ds4_mellum_prefill_scratch *scratch, const int *tokens,
+        uint32_t n_tokens, uint32_t chunk, double *elapsed) {
+    ds4_mellum_decode_state_reset(state);
+    const double t0 = now_sec();
+    if (!ds4_mellum_prefill_chunks(e, state, scratch, tokens, n_tokens, chunk,
+                                   NULL, NULL)) return false;
+    *elapsed = now_sec() - t0;
+    return true;
+}
+
 static bool ds4_mellum_resident_profile_pass(
         const ds4_engine *e, ds4_mellum_decode_state *state,
         const int *tokens, int n_tokens, bool compute_logits, double *elapsed) {
@@ -61577,7 +61599,8 @@ int ds4_engine_mellum_resident_profile(ds4_engine *e, FILE *out,
     fprintf(stderr, "ds4: Mellum resident profile requires Metal support\n");
     return 1;
 #else
-    enum { warmup_tokens = 8, measured_tokens = 64, repeats = 3 };
+    enum { warmup_tokens = 8, measured_tokens = 64, repeats = 3,
+           prefill_tokens = 1024 };
     if (!e || !out || ctx_size <= measured_tokens ||
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
         e->backend != DS4_BACKEND_METAL || !e->mellum_decode_contract_ready ||
@@ -61612,6 +61635,34 @@ int ds4_engine_mellum_resident_profile(ds4_engine *e, FILE *out,
                        true, &pass_sec);
         logits_sec += pass_sec;
     }
+    /*
+     * Layer-major prefill at the sliding-window cap.  This is the throughput
+     * number sequential sync cannot reach; it is measured here so the
+     * projection-precision choice can be judged against its real cost.
+     */
+    double prefill_sec = 0.0;
+    bool prefill_ok = false;
+    uint32_t prefill_chunk = prefill_tokens;
+    ds4_mellum_prefill_scratch prefill_scratch = {0};
+    int *prefill_toks = NULL;
+    if (ok && ctx_size >= prefill_tokens) {
+        prefill_toks = xmalloc((size_t)prefill_tokens * sizeof(*prefill_toks));
+        for (int i = 0; i < prefill_tokens; i++) {
+            prefill_toks[i] = (int)(((uint32_t)i * 7919u + 27u) % DS4_N_VOCAB);
+        }
+        prefill_chunk = ds4_mellum_probe_chunk(prefill_tokens, prefill_tokens);
+        prefill_ok = ds4_mellum_prefill_scratch_create(&prefill_scratch,
+                                                       prefill_chunk) &&
+                     ds4_mellum_resident_prefill_pass(
+                         e, session->mellum->decode, &prefill_scratch,
+                         prefill_toks, prefill_tokens, prefill_chunk, &pass_sec);
+        for (int i = 0; prefill_ok && i < repeats; i++) {
+            prefill_ok = ds4_mellum_resident_prefill_pass(
+                e, session->mellum->decode, &prefill_scratch, prefill_toks,
+                prefill_tokens, prefill_chunk, &pass_sec);
+            prefill_sec += pass_sec;
+        }
+    }
     if (ok) {
         const double no_head_ms = layers_sec * 1000.0 / (repeats * measured_tokens);
         const double logits_ms = logits_sec * 1000.0 / (repeats * measured_tokens);
@@ -61619,13 +61670,69 @@ int ds4_engine_mellum_resident_profile(ds4_engine *e, FILE *out,
                 "Mellum resident profile tokens=%d repeats=%d no-head=%.3fms %.1ft/s with-head=%.3fms %.1ft/s output-head-delta=%.3fms\n",
                 measured_tokens, repeats, no_head_ms, 1000.0 / no_head_ms,
                 logits_ms, 1000.0 / logits_ms, logits_ms - no_head_ms);
+        if (prefill_ok) {
+            const double prefill_ms =
+                prefill_sec * 1000.0 / (double)repeats;
+            fprintf(out,
+                    "Mellum resident prefill tokens=%d chunk=%u exact=%d repeats=%d batch=%.1fms %.1ft/s\n",
+                    prefill_tokens, prefill_chunk,
+                    ds4_gpu_mellum_prefill_exact_projections_enabled(),
+                    repeats, prefill_ms,
+                    (double)prefill_tokens * 1000.0 / prefill_ms);
+        }
     } else {
         fprintf(stderr, "ds4: Mellum resident profile decode failed\n");
     }
+    ds4_mellum_prefill_scratch_free(&prefill_scratch);
+    free(prefill_toks);
     ds4_session_free(session);
     return ok ? 0 : 1;
 #endif
 }
+
+#ifndef DS4_NO_GPU
+/*
+ * Split one prefill into fixed-size chunks.  Traces are captured on the final
+ * chunk only: they describe the last token, which is the row every Mellum
+ * oracle compares.
+ */
+static bool ds4_mellum_prefill_chunks(const ds4_engine           *e,
+                                      ds4_mellum_decode_state    *state,
+                                      ds4_mellum_prefill_scratch *scratch,
+                                      const int                  *tokens,
+                                      uint32_t                    n_tokens,
+                                      uint32_t                    max_chunk,
+                                      ds4_gpu_tensor             *layer_trace_gpu,
+                                      ds4_gpu_tensor             *attention_trace_gpu) {
+    if (!e || !state || !scratch || !tokens || n_tokens == 0 ||
+        max_chunk == 0 || max_chunk > scratch->cap) return false;
+    for (uint32_t offset = 0; offset < n_tokens;) {
+        uint32_t chunk = n_tokens - offset;
+        if (chunk > max_chunk) chunk = max_chunk;
+        const bool last = offset + chunk == n_tokens;
+        if (!ds4_mellum_prefill_tokens(e, state, scratch, tokens + offset,
+                                       chunk, last ? layer_trace_gpu : NULL,
+                                       last ? attention_trace_gpu : NULL,
+                                       last)) return false;
+        offset += chunk;
+    }
+    return true;
+}
+
+/*
+ * Diagnostic chunk size for the prefill probes.  Unset keeps the historical
+ * single-batch behaviour; 1 makes every projection use the decode matvec, which
+ * separates layer-major graph semantics from batched-kernel precision.
+ */
+static uint32_t ds4_mellum_probe_chunk(uint32_t fallback, uint32_t max_chunk) {
+    const char *env = getenv("DS4_MELLUM_PREFILL_CHUNK");
+    if (!env || !*env) return fallback;
+    char *end = NULL;
+    const unsigned long value = strtoul(env, &end, 10);
+    if (end == env || value == 0 || value > max_chunk) return fallback;
+    return (uint32_t)value;
+}
+#endif
 
 int ds4_engine_mellum_true_prefill_probe(ds4_engine *e, FILE *out) {
 #ifdef DS4_NO_GPU
@@ -61687,9 +61794,11 @@ int ds4_engine_mellum_true_prefill_probe(ds4_engine *e, FILE *out) {
         fprintf(stderr, "ds4: Mellum true-prefill probe could not read sequential hidden state\n");
         ok = false;
     }
-    if (ok && !ds4_mellum_prefill_tokens(e, prefill, &scratch, fixture_tokens,
-                                          n_tokens, prefill_trace_gpu,
-                                          prefill_attention_trace_gpu, true)) {
+    const uint32_t probe_chunk = ds4_mellum_probe_chunk(n_tokens, n_tokens);
+    if (ok && !ds4_mellum_prefill_chunks(e, prefill, &scratch, fixture_tokens,
+                                          n_tokens, probe_chunk,
+                                          prefill_trace_gpu,
+                                          prefill_attention_trace_gpu)) {
         fprintf(stderr, "ds4: Mellum true-prefill probe batch layer stack failed\n");
         ok = false;
     }
@@ -61711,10 +61820,15 @@ int ds4_engine_mellum_true_prefill_probe(ds4_engine *e, FILE *out) {
     }
     ds4_gpu_tensor *prefill_last = NULL;
     if (ok) {
+        /* The scratch rows hold only the final chunk, so the last token sits at
+         * that chunk's last row rather than at n_tokens - 1. */
+        const uint32_t last_chunk_tokens = n_tokens % probe_chunk ?
+            n_tokens % probe_chunk : probe_chunk;
         ds4_gpu_tensor *last_rows = (DS4_N_LAYER & 1u) ?
             scratch.layer_out : scratch.hidden;
         prefill_last = ds4_gpu_tensor_view(
-            last_rows, (uint64_t)(n_tokens - 1u) * DS4_N_EMBD * sizeof(float),
+            last_rows,
+            (uint64_t)(last_chunk_tokens - 1u) * DS4_N_EMBD * sizeof(float),
             (uint64_t)DS4_N_EMBD * sizeof(float));
         if (!prefill_last) {
             fprintf(stderr, "ds4: Mellum true-prefill probe could not view batch hidden state\n");
@@ -61799,8 +61913,8 @@ int ds4_engine_mellum_true_prefill_probe(ds4_engine *e, FILE *out) {
         fprintf(stderr, "ds4: Mellum true-prefill probe execution failed\n");
     } else {
         fprintf(out,
-                "Mellum true-prefill probe tokens=%u layers=%u hidden max_abs=%g rms=%g logits max_abs=%g rms=%g\n",
-                n_tokens, DS4_N_LAYER, hidden_max_abs, hidden_rms,
+                "Mellum true-prefill probe tokens=%u chunk=%u layers=%u hidden max_abs=%g rms=%g logits max_abs=%g rms=%g\n",
+                n_tokens, probe_chunk, DS4_N_LAYER, hidden_max_abs, hidden_rms,
                 logit_max_abs, logit_rms);
         fprintf(out, "Mellum true-prefill worst-layer=%u max_abs=%g rms=%g\n",
                 worst_layer, worst_layer_max_abs, worst_layer_rms);
@@ -61826,27 +61940,6 @@ int ds4_engine_mellum_true_prefill_probe(ds4_engine *e, FILE *out) {
 #endif
 }
 
-#ifndef DS4_NO_GPU
-static bool ds4_mellum_prefill_chunks(const ds4_engine           *e,
-                                      ds4_mellum_decode_state    *state,
-                                      ds4_mellum_prefill_scratch *scratch,
-                                      const int                  *tokens,
-                                      uint32_t                    n_tokens,
-                                      uint32_t                    max_chunk) {
-    if (!e || !state || !scratch || !tokens || n_tokens == 0 ||
-        max_chunk == 0 || max_chunk > scratch->cap) return false;
-    for (uint32_t offset = 0; offset < n_tokens;) {
-        uint32_t chunk = n_tokens - offset;
-        if (chunk > max_chunk) chunk = max_chunk;
-        const bool last = offset + chunk == n_tokens;
-        if (!ds4_mellum_prefill_tokens(e, state, scratch, tokens + offset,
-                                       chunk, NULL, NULL, last)) return false;
-        offset += chunk;
-    }
-    return true;
-}
-#endif
-
 int ds4_engine_mellum_true_prefill_swa_probe(ds4_engine *e, FILE *out) {
 #ifdef DS4_NO_GPU
     (void)e;
@@ -61861,7 +61954,7 @@ int ds4_engine_mellum_true_prefill_swa_probe(ds4_engine *e, FILE *out) {
     }
     const uint32_t first_chunk = DS4_N_SWA;
     const uint32_t n_tokens = first_chunk + tail_tokens;
-    enum { small_chunk = 32 };
+    const uint32_t small_chunk = ds4_mellum_probe_chunk(32u, n_tokens);
     if (!e || !out || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
         e->backend != DS4_BACKEND_METAL || !e->mellum_decode_contract_ready ||
         !e->weights.output || e->weights.output->dim[1] == 0 ||
@@ -61969,13 +62062,13 @@ int ds4_engine_mellum_true_prefill_swa_probe(ds4_engine *e, FILE *out) {
     }
     ds4_gpu_tensor_free(prefill_last);
     if (ok && !ds4_mellum_prefill_chunks(e, small, &small_scratch, tokens,
-                                          n_tokens, small_chunk)) {
-        fprintf(stderr, "ds4: Mellum true-prefill SWA probe 32-token chunks failed\n");
+                                          n_tokens, small_chunk, NULL, NULL)) {
+        fprintf(stderr, "ds4: Mellum true-prefill SWA probe chunked schedule failed\n");
         ok = false;
     }
     if (ok && ds4_gpu_tensor_read(small->logits, 0, small_logits,
                                   logits_bytes) == 0) {
-        fprintf(stderr, "ds4: Mellum true-prefill SWA probe could not read 32-token logits\n");
+        fprintf(stderr, "ds4: Mellum true-prefill SWA probe could not read chunked logits\n");
         ok = false;
     }
     ds4_gpu_tensor *small_last = NULL;
@@ -61989,7 +62082,7 @@ int ds4_engine_mellum_true_prefill_swa_probe(ds4_engine *e, FILE *out) {
             hidden_bytes);
         if (!small_last || ds4_gpu_tensor_read(
                 small_last, 0, small_hidden, hidden_bytes) == 0) {
-            fprintf(stderr, "ds4: Mellum true-prefill SWA probe could not read 32-token hidden state\n");
+            fprintf(stderr, "ds4: Mellum true-prefill SWA probe could not read chunked hidden state\n");
             ok = false;
         }
     }

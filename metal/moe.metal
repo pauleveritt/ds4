@@ -665,6 +665,135 @@ kernel void kernel_mellum_q8_0_pair_swiglu_batch_f32(
     }
 }
 
+/*
+ * Expert-major (grouped) Mellum prefill.
+ *
+ * The token-major kernels above re-read an expert's weight row once per token
+ * that selected it, so a chunk reads n_tokens * n_expert_used expert rows per
+ * layer and batching buys no weight reuse.  Grouping inverts the loop: tokens
+ * are bucketed by selected expert, and each (expert, row) threadgroup stages
+ * its weight row into threadgroup memory once and then serves every token in
+ * that bucket.
+ *
+ * Two properties are deliberate.  The per-token inner loop and tree reduction
+ * are byte-for-byte the token-major ones, so grouped output is bitwise equal to
+ * both the batch and decode paths.  And expert weights are addressed through an
+ * offset table rather than `base + expert * bytes`, so the same kernel serves a
+ * resident mmap and, later, a bounded SSD expert cache whose slots are not at
+ * model offsets.
+ */
+struct ds4_metal_mellum_moe_group_args {
+    uint32_t n_tokens;
+    uint32_t n_expert_used;
+    uint32_t n_total_expert;
+    uint32_t bucket_cap;
+};
+
+kernel void kernel_mellum_moe_bucket_reset(
+        constant ds4_metal_mellum_moe_group_args &gargs,
+        device atomic_uint *counts,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid < gargs.n_total_expert) {
+        atomic_store_explicit(&counts[gid], 0u, memory_order_relaxed);
+    }
+}
+
+/*
+ * Append each (token, slot) pair to its expert's bucket.  The atomic makes
+ * within-bucket order run-dependent, which is harmless: a pair's position in
+ * the bucket selects only which thread handles it, never any arithmetic, and
+ * every result is written to an address derived from the pair itself.
+ */
+kernel void kernel_mellum_moe_bucket_build(
+        constant ds4_metal_mellum_moe_group_args &gargs,
+        device const int32_t *selected,
+        device atomic_uint *counts,
+        device uint32_t *pairs,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= gargs.n_tokens * gargs.n_expert_used) return;
+    const int expert = selected[gid];
+    if (expert < 0 || (uint)expert >= gargs.n_total_expert) return;
+    const uint idx = atomic_fetch_add_explicit(&counts[(uint)expert], 1u,
+                                               memory_order_relaxed);
+    if (idx < gargs.bucket_cap) {
+        pairs[(uint)expert * gargs.bucket_cap + idx] = gid;
+    }
+}
+
+kernel void kernel_mellum_q8_0_pair_swiglu_grouped_f32(
+        constant ds4_metal_glm_routed_moe_args &args,
+        constant ds4_metal_mellum_moe_group_args &gargs,
+        device const char *gate,
+        device const char *up,
+        device const uint64_t *gate_offsets,
+        device const uint64_t *up_offsets,
+        device const float *x,
+        device const float *weights,
+        device const uint32_t *counts,
+        device const uint32_t *pairs,
+        device float *mid,
+        threadgroup float *scratch [[threadgroup(0)]],
+        threadgroup char *staged [[threadgroup(1)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    const uint ntg = 256u;
+    const uint row = tgpig.x;
+    const uint expert = tgpig.y;
+    if (row >= args.mid_dim || expert >= gargs.n_total_expert) return;
+    const uint count = counts[expert];
+    if (count == 0u) return;
+
+    const uint row_bytes = (uint)args.gate_row_bytes;
+    device const char *gsrc =
+        gate + gate_offsets[expert] + (uint64_t)row * args.gate_row_bytes;
+    device const char *usrc =
+        up + up_offsets[expert] + (uint64_t)row * args.up_row_bytes;
+    for (uint b = tid; b < row_bytes; b += ntg) {
+        staged[b] = gsrc[b];
+        staged[row_bytes + b] = usrc[b];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup const block_q8_0 *gate_row =
+        (threadgroup const block_q8_0 *)staged;
+    threadgroup const block_q8_0 *up_row =
+        (threadgroup const block_q8_0 *)(staged + row_bytes);
+
+    for (uint p = 0; p < count; p++) {
+        const uint pair = pairs[expert * gargs.bucket_cap + p];
+        const uint token = pair / args.n_expert_used;
+        const uint slot = pair - token * args.n_expert_used;
+        device const float *token_x = x + (uint64_t)token * args.in_dim;
+        float acc_gate = 0.0f, acc_up = 0.0f;
+        for (uint k = tid; k < args.in_dim; k += ntg) {
+            const uint block = k / QK8_0, element = k - block * QK8_0;
+            const float xv = token_x[k];
+            acc_gate += (float)gate_row[block].d *
+                (float)gate_row[block].qs[element] * xv;
+            acc_up += (float)up_row[block].d *
+                (float)up_row[block].qs[element] * xv;
+        }
+        scratch[tid] = acc_gate;
+        scratch[ntg + tid] = acc_up;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                scratch[tid] += scratch[tid + stride];
+                scratch[ntg + tid] += scratch[ntg + tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0u) {
+            const float g = scratch[0];
+            mid[(uint64_t)token * args.mid_token_stride +
+                (uint64_t)slot * args.mid_dim + row] =
+                g / (1.0f + exp(-g)) * scratch[ntg] * weights[pair];
+        }
+        /* The next pair overwrites scratch; make sure every lane is done. */
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 template <short N_R0>
 static inline void glm_q2_K_pair_swiglu_simd_f32_impl(
         ds4_metal_glm_routed_moe_args args,
@@ -2789,30 +2918,49 @@ kernel void kernel_mellum_q8_0_down_f32(
     const uint row = tgpig.x;
     if (row >= args.out_dim) return;
 
-    float acc = 0.0f;
+    /*
+     * Each selected expert keeps its own complete dot product, and the finished
+     * per-slot scalars are summed in slot order.  Folding all slots into one
+     * accumulator would be marginally cheaper but makes the result inseparable
+     * per expert, which an expert-major (grouped) schedule cannot reproduce.
+     * This ordering is the contract that lets grouped prefill stay bit-exact
+     * against decode.  Scratch therefore holds one reduction lane per slot.
+     */
     for (uint slot = 0; slot < args.n_expert_used; slot++) {
         const int expert = selected[slot];
-        if (expert < 0 || (uint)expert >= args.n_total_expert) continue;
-        device const block_q8_0 *down_row =
-            (device const block_q8_0 *)(down +
-                (uint64_t)(uint)expert * args.down_expert_bytes +
-                (uint64_t)row * args.down_row_bytes);
-        device const float *slot_mid = mid + (uint64_t)slot * args.mid_dim;
-        for (uint k = tid; k < args.mid_dim; k += ntg) {
-            const uint block = k / QK8_0;
-            const uint element = k - block * QK8_0;
-            acc += (float)down_row[block].d *
-                   (float)down_row[block].qs[element] * slot_mid[k];
+        float acc = 0.0f;
+        if (expert >= 0 && (uint)expert < args.n_total_expert) {
+            device const block_q8_0 *down_row =
+                (device const block_q8_0 *)(down +
+                    (uint64_t)(uint)expert * args.down_expert_bytes +
+                    (uint64_t)row * args.down_row_bytes);
+            device const float *slot_mid = mid + (uint64_t)slot * args.mid_dim;
+            for (uint k = tid; k < args.mid_dim; k += ntg) {
+                const uint block = k / QK8_0;
+                const uint element = k - block * QK8_0;
+                acc += (float)down_row[block].d *
+                       (float)down_row[block].qs[element] * slot_mid[k];
+            }
         }
+        scratch[slot * ntg + tid] = acc;
     }
 
-    scratch[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        if (tid < stride) {
+            for (uint slot = 0; slot < args.n_expert_used; slot++) {
+                scratch[slot * ntg + tid] += scratch[slot * ntg + tid + stride];
+            }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (tid == 0u) out[row] = scratch[0];
+    if (tid == 0u) {
+        float total = 0.0f;
+        for (uint slot = 0; slot < args.n_expert_used; slot++) {
+            total += scratch[slot * ntg];
+        }
+        out[row] = total;
+    }
 }
 
 kernel void kernel_mellum_q8_0_down_batch_f32(
@@ -2826,27 +2974,41 @@ kernel void kernel_mellum_q8_0_down_batch_f32(
     if (row >= args.out_dim || token >= args.n_tokens) return;
     const uint64_t selected_base = (uint64_t)token * args.n_expert_used;
     const uint64_t mid_base = (uint64_t)token * args.mid_token_stride;
-    float acc = 0.0f;
+    /* Per-slot reduction lanes: see the decode kernel for why the slots stay
+     * separable rather than sharing one accumulator. */
     for (uint slot = 0; slot < args.n_expert_used; slot++) {
         const int expert = selected[selected_base + slot];
-        if (expert < 0 || (uint)expert >= args.n_total_expert) continue;
-        device const block_q8_0 *down_row = (device const block_q8_0 *)(down +
-            (uint64_t)(uint)expert * args.down_expert_bytes +
-            (uint64_t)row * args.down_row_bytes);
-        device const float *slot_mid = mid + mid_base + (uint64_t)slot * args.mid_dim;
-        for (uint k = tid; k < args.mid_dim; k += ntg) {
-            const uint block = k / QK8_0, element = k - block * QK8_0;
-            acc += (float)down_row[block].d * (float)down_row[block].qs[element] *
-                slot_mid[k];
+        float acc = 0.0f;
+        if (expert >= 0 && (uint)expert < args.n_total_expert) {
+            device const block_q8_0 *down_row = (device const block_q8_0 *)(down +
+                (uint64_t)(uint)expert * args.down_expert_bytes +
+                (uint64_t)row * args.down_row_bytes);
+            device const float *slot_mid =
+                mid + mid_base + (uint64_t)slot * args.mid_dim;
+            for (uint k = tid; k < args.mid_dim; k += ntg) {
+                const uint block = k / QK8_0, element = k - block * QK8_0;
+                acc += (float)down_row[block].d *
+                    (float)down_row[block].qs[element] * slot_mid[k];
+            }
         }
+        scratch[slot * ntg + tid] = acc;
     }
-    scratch[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        if (tid < stride) {
+            for (uint slot = 0; slot < args.n_expert_used; slot++) {
+                scratch[slot * ntg + tid] += scratch[slot * ntg + tid + stride];
+            }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (tid == 0u) out[(uint64_t)token * args.out_dim + row] = scratch[0];
+    if (tid == 0u) {
+        float total = 0.0f;
+        for (uint slot = 0; slot < args.n_expert_used; slot++) {
+            total += scratch[slot * ntg];
+        }
+        out[(uint64_t)token * args.out_dim + row] = total;
+    }
 }
 
 kernel void kernel_glm_q4_K_addr_down_f32(

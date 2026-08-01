@@ -1314,6 +1314,324 @@ same resident-versus-streamed A/B gate used for Laguna XS.
   not set an acceptance envelope or promote true prefill until this has an
   independent long-context reference or a tighter primitive-level diagnosis.
 
+### Current true-prefill status and replanned gate
+
+**Superseded 2026-08-01 by the resolution below.** The reference-first plan
+recorded here assumed the batch-versus-tokenwise drift was unexplained. It was
+not: it was projection-kernel precision, and the long-context llama.cpp capture
+this section proposed would not have discriminated the cause. The section is
+kept because the reasoning that led to it is part of the record.
+
+~~True prefill remains inspect-only … the next steps are deliberately
+reference-first: capture independent long-context checkpoints at 1,023/1,029,
+compare, localize, set thresholds, then wire into session sync.~~
+
+### 2026-08-01 Drift resolved: batched projections, not accumulation
+
+The drift is fully explained and fully removable. It was never sequence-length
+accumulation.
+
+`ds4_gpu_matmul_q8_0_legacy_tensor` (`ds4_metal.m`) selects its Q8_0 kernel by
+token count:
+
+| Tokens | Kernel | Precision |
+| --- | --- | --- |
+| 1 (decode) | `kernel_mul_mv_q8_0_f32` | int8 x F32, F32 accumulate |
+| 2-16 | `mul_mv_ext` | F32 dequant, reordered reduction |
+| 17-31 | generic `kernel_mul_mm_q8_0_f32` | half weights **and** half activations |
+| >=32, %32 | NAX tensor-op path | weight tiles dequantized to half |
+
+A Q8_0 weight is `d(F16) * q(int8)` and needs about 18 mantissa bits, so it is
+not exactly representable in half. Every batched prefill projection therefore
+carried a relative weight error that decode did not. The 26-token probe sits in
+the 17-31 band; the 1,024- and 32-token chunk schedules both sit in the NAX
+band, which is why they agreed with each other and looked like a
+schedule-independent result.
+
+Two ablations settle it. Both are inert by default:
+`DS4_MELLUM_PREFILL_CHUNK=N` splits a probe prefill into N-token chunks, and
+`DS4_MELLUM_PREFILL_EXACT=1` routes Mellum prefill projections through the
+existing `ds4_gpu_matmul_q8_0_decode_rows_exact_tensor`, which preserves the
+one-row reduction order.
+
+| Probe | Baseline | Chunk 1 | Exact projections |
+| --- | ---: | ---: | ---: |
+| 26-token hidden RMS | 0.0734592 | **0** | **0** |
+| 26-token logit RMS | 0.0202315 | **0** | **0** |
+| 1,024-token pre-wrap hidden RMS | 3.9305 | — | **0** |
+| 1,024-token pre-wrap logit RMS | 0.0908209 | — | **0** |
+| 1,030-token post-wrap hidden RMS | 2.47979 | — | 0.00365508 |
+| 1,030-token post-wrap logit RMS | 0.371089 | — | 0.000177075 |
+
+At chunk 1 every projection falls back to the decode matvec and the layer-major
+graph is **bit-identical** to sequential decode: zero drift in all 28 layer
+traces, all attention traces, the hidden state, and all 98,304 logits. That
+proves the graph semantics — staged GQA, rows-RMSNorm, batched router, batched
+MoE — are exactly right, and isolates 100% of the drift to batched kernels.
+
+With exact projections at full batch width, the 26-token probe and the
+1,024-token pre-wrap batch are likewise **bit-identical** to decode. Post-wrap
+drift falls about 680x (hidden) and 2,100x (logits).
+
+The residual `0.00365508` / `0.000177075` after six SWA-wrapped tokens is real
+but new: it appears only once the sliding ring wraps, and is identical for the
+`1024+6` and 32-token schedules, so it is a reduction-order difference in the
+wrapped-ring read rather than a chunking artifact. It was previously masked by
+noise 2,100x larger. This is now small enough to gate on.
+
+Two corrections to earlier claims follow. First, the recorded assertion that a
+32-token schedule is "bit-identical" to `1024+6` was never demonstrated by the
+code: the SWA probe compares each schedule against decode, never against the
+other, and prints only six significant digits. Both schedules do agree, but the
+evidence was a printed summary, not a bitwise check. Second, all drift figures
+in this document are absolute. The reference layer-27 hidden state has RMS
+63.36 and channels reaching 1,492.8, so the accepted 1.19 max-abs tokenwise
+tolerance is under 0.1% relative. Track relative error.
+
+For context on what any envelope can mean: llama.cpp's own batched and
+tokenwise layer-27 checkpoints (`l-out-27-last.f32` vs `l-out-27-tokenwise.f32`)
+differ by RMS 2.199, about 3.5% relative, at only 26 tokens. "Batch must match
+decode" is unattainable in any implementation of this model — except, as it
+turns out, in ds4 with exact projections, where it is currently exact.
+
+### 2026-08-01 First trustworthy prefill throughput, and where it goes
+
+`--mellum-resident-profile` now also measures layer-major prefill at the
+1,024-token sliding-window cap, warmed, three repeats. On the M5 Max with the
+pinned Q8 artifact:
+
+| Path | Decode | Prefill @1,024 |
+| --- | ---: | ---: |
+| Baseline projections | 121.1 t/s | 206.6 t/s |
+| Exact projections | 121.0 t/s | 170.0 t/s |
+
+Exactness costs about 18% of prefill and nothing measurable on decode.
+
+But prefill is only 1.7x decode, far under the 500 t/s floor, and throughput is
+**flat to declining** in batch size — 207.6 t/s at chunk 32, 208.2 at 128,
+198.0 at 512, 189.5 at 1,024. Batching buys nothing, which is the signature of
+work with no weight reuse across tokens.
+
+A short-circuit measurement attributes it precisely. With the routed MoE removed
+from the prefill layer (timing only, output invalid), prefill runs at **5,946
+t/s** at chunk 1,024 and 3,609 t/s at chunk 128. So:
+
+- the routed MoE is **96.8%** of prefill time (5,231 ms of 5,403 ms);
+- attention, projections, router, and norms are 3.2%, and they *do* scale with
+  batch width, 3,609 to 5,946 t/s from chunk 128 to 1,024.
+
+The cause is that the batched MoE is **token-major**: for each token it reads
+its 8 selected experts' weights, so per-layer expert traffic is
+`n_tokens * 8 * 6.19 MiB` and no expert weight is reused across the tokens that
+selected it. Decode does exactly the same work per token, which is why prefill
+barely beats it.
+
+The fix is expert-major grouping: sort the chunk's token/expert assignments by
+expert, then run one dense GEMM per expert over its assigned rows. At 1,024
+tokens and 64 experts with top-8, each expert serves about 128 tokens on
+average, so per-layer expert weight traffic drops from about 50 GiB to about
+396 MiB — roughly 128x less — and the MoE becomes compute-bound rather than
+bandwidth-bound. If MoE time fell even to the 300-600 ms range, total prefill
+would land near 1,200-1,500 t/s, which is the aspiration band this document
+already recorded from the BaseRT analogy.
+
+This single change is also the prerequisite for the SSD-streaming
+differentiator: expert-major grouping is exactly the access pattern a bounded
+expert cache needs, because it touches each expert once per chunk instead of
+once per token. Resident prefill speed and streamed prefill feasibility are the
+same refactor.
+
+### 2026-08-01 Down-accumulation contract, and an accuracy win
+
+Review found that expert-major grouping could not have preserved the new
+bitwise batch-equals-decode oracle, no matter how carefully written. The decode
+down kernel (`kernel_mellum_q8_0_down_f32`) folded **all eight selected experts
+into one per-thread accumulator** and then did a single tree reduction. An
+expert-major schedule necessarily finishes each `(token, slot)` dot product
+separately and sums eight scalars: same values, different summation tree,
+different bits. The contract had to change before the grouped kernel existed,
+not after.
+
+Both down kernels now keep one reduction lane per slot, reduce all lanes in a
+single fused tree, and sum the finished per-slot scalars **in slot order**.
+Threadgroup scratch grows from `256` to `n_expert_used * 256` floats. The
+arithmetic per slot is unchanged.
+
+This was expected to be neutral. It is not — it is a substantial accuracy
+improvement against llama.cpp, because llama.cpp also computes each expert's
+contribution separately and sums them, so per-slot accumulation matches the
+reference's summation structure. The old fused accumulator was itself a source
+of drift:
+
+| Oracle | Before | After | Gate |
+| --- | ---: | ---: | ---: |
+| layer-0 RMS | 9.80462e-05 | 9.80449e-05 | 1.25e-4 |
+| layer-27 tokenwise max | 1.18909 | **0.404175** | 1.5 |
+| layer-27 tokenwise RMS | 0.0437417 | **0.0347506** | 0.06 |
+| logits max | 0.0175095 | **0.00976753** | 0.025 |
+| logits RMS | 0.00941531 | **0.00178922** | 0.012 |
+
+Logit RMS improved 5.3x. Batch-versus-decode drift on the fast projection path
+also improved (hidden RMS 0.0734592 to 0.0532544; logit RMS 0.0202315 to
+0.00755411), and bit-identity under exact projections is preserved.
+
+Cost: decode fell from 121.1 to 114.7 t/s with the output head, about 5%,
+because the reduction tree now carries eight lanes. That is recoverable —
+`simd_sum` for the intra-warp stage, or reducing only populated lanes — and
+should be revisited rather than accepted permanently.
+
+`./ds4_test --metal-kernels` passes, including the bitwise batch-equals-decode
+MoE regressions. The pinned envelopes were **not** relaxed; every gate now has
+more margin than before.
+
+**Envelope note:** the layer-27 and logits envelopes were set at roughly 1.3x
+their measured values and are now far looser than the implementation warrants.
+They should be re-tightened around the new measurements, or they will silently
+absorb a future regression of exactly the size this change just removed.
+
+### 2026-08-01 Grouped MoE built and measured: correct, but the wrong axis
+
+Expert-major grouping is implemented and **bit-identical** to sequential
+decode, which is the strongest correctness result available. It is also **not a
+resident speed win**: 191.9 t/s token-major versus 188.3 t/s grouped at 1,024
+tokens. The weight-traffic hypothesis that motivated it is refuted.
+
+What was built (`DS4_MELLUM_GROUPED_MOE=1`, inert by default):
+`kernel_mellum_moe_bucket_reset` / `_build` bucket the chunk's `(token, slot)`
+pairs by selected expert with an atomic append, and
+`kernel_mellum_q8_0_pair_swiglu_grouped_f32` gives each `(expert, row)`
+threadgroup one staged copy of that expert's gate/up row, then serves every
+token in the bucket. The per-token inner loop and tree reduction are unchanged,
+which is why the output is bitwise equal. Expert weights are addressed through
+an **offset table** rather than `base + expert * bytes`.
+
+The refutation is informative. A ~128x cut in expert weight traffic produced
+nothing, so the MoE was never weight-bandwidth bound. Stubbing kernels apart
+locates the real cost:
+
+| Configuration | Time @1,024 tokens | Derived |
+| --- | ---: | --- |
+| No MoE | 172 ms | non-MoE path, 3% |
+| gate/up only (down stubbed) | 1,883 ms | gate/up ~1,711 ms, 37% |
+| Full MoE | 4,560 ms | **down ~2,677 ms, 59%** |
+
+The down projection costs 1.6x gate+up while doing **half** their FLOPs — about
+3x worse per FLOP. Its grid is `(out_dim=2304, n_tokens)` and every one of the
+2,304 output-row threadgroups re-reads the whole `mid` vector for its token
+(8 slots x 896 floats = 28 KiB). That is ~66 MiB per token per layer and ~1.9
+TiB per chunk, which at M5 Max bandwidth is the observed ~2.7 s. The gate/up
+kernel has the same defect against `x[token]`: 896 row-threadgroups each re-read
+the full 2,304-float activation.
+
+**Both MoE kernels are bound by re-reading activations once per output row.**
+Grouping fixes weight reuse, which was not the problem. Row-tiling — stage the
+activation vector once per threadgroup and compute R output rows against it —
+is the fix, and it applies to both kernels. R=8 should cut the dominant traffic
+about 8x.
+
+A second, independent inefficiency: the inner loops reload the `block_q8_0`
+scale on **every element** (32x redundant per block) and are scalar throughout,
+while the non-MoE path that runs 30x faster uses the vectorized simdgroup
+kernels in `dense.metal`. A throwaway patch hoisting the scale and processing
+four elements per iteration measured **224.6 t/s, +17%** on gate/up alone. It
+was reverted: regrouping the per-thread summation changes reduction order and
+forfeits bitwise identity, and it could not be validated properly in the time
+available. Treat +17% as a measured floor on that opportunity, not a result.
+
+**Grouping is still wanted — for streaming, not speed.** With the deployment
+plan now Q8-resident-plus-SSD-streamed experts, expert-major access is what lets
+a chunk load each expert **once** instead of once per token, and the offset
+table is exactly the indirection a bounded cache needs. The code is kept behind
+its flag for that reason, with its resident-performance result recorded honestly
+as neutral.
+
+### Revised next steps
+
+0. **Row-tile both MoE kernels.** This supersedes step 1 as the performance
+   task. Stage the activation vector once per threadgroup and compute R output
+   rows against it, for the down kernel first (59% of MoE time, ~1.9 TiB of
+   `mid` re-reads per chunk) and then gate/up. Combine with hoisting the
+   `block_q8_0` scale out of the element loop and vectorizing the load; that
+   alone measured +17% on gate/up. Expect the reduction order to change, so
+   re-gate against the llama.cpp envelopes rather than bitwise identity, and
+   tighten those envelopes first (see the note above) so they can actually
+   catch a regression.
+
+1. Expert-major grouped MoE — **built, bit-identical, neutral for resident
+   speed.** Retain it as SSD-streaming infrastructure rather than a performance
+   item; the offset-table seam is the indirection a bounded expert cache needs.
+   The constraints below still apply to any further work on it:
+   - **Order-preserving F32 only for the first version.** Keep the existing
+     exact per-row dot order and take the 8-16x traffic cut from staging each
+     expert's weight row once per threadgroup. The full ~128x needs M-tiles of
+     ~128, which forces reordered reductions and forfeits the oracle. Take the
+     16x first; that alone plausibly reaches the 300-600 ms MoE target, i.e.
+     roughly 1,200 t/s. Tensor ops and half tiles are a later, separately
+     gated step, and are the wrong instinct here anyway: the MoE is 96.8%
+     bandwidth-bound, so the win is traffic, not FLOPs.
+   - **Grouping must run on the GPU.** `router_selected` lives in device
+     memory; reading 8,192 expert IDs back per layer per chunk would insert 28
+     GPU-to-CPU syncs per chunk, which is the exact command-boundary disease
+     the 14.8-to-111 t/s work already cured once. Use a fixed-capacity 64-bucket
+     atomic append (worst case one expert takes every token: 64 x n_tokens x 4 B
+     = 256 KiB of indices). Atomics are safe for bucket construction because
+     within-expert order affects only the output address, not any arithmetic.
+   - **Never atomically accumulate floats into `moe_out`.** Scatter to
+     per-`(token, slot)` staging, then reduce the eight slots in fixed slot
+     order — the same order the down kernels now use.
+   - **Gather rows into contiguous per-expert buffers** rather than
+     index-indirect loads. The copy is ~100 MiB/layer against ~50 GiB
+     eliminated, and contiguity keeps a later tensor-op version open.
+   - Write the grouping once and quant-parametrically, swapping only the inner
+     dot. Note 896 is structurally Q8_0 forever on the down projection (a
+     896-wide K cannot form Q4_K superblocks), so the seam must handle K=2304
+     Q4_K and K=896/2304 Q8_0.
+
+   Precedent: `layer_routed_moe_batch` (`ds4.c:11704`) is the CPU reference and
+   already does this grouping by counting sort. The SSD streaming path
+   (`ds4_metal.m` ~15109) computes unique per-chunk expert *sets* — the set
+   half of the problem, not row grouping or per-expert GEMM. Do not over-credit
+   it as an existing GPU implementation.
+
+   Benchmark on a **real-text** 1,024-token fixture, not the synthetic
+   `(i*7919+27) % vocab` stream: grouped-MoE performance is a story about
+   expert load distribution, and synthetic tokens route unlike real text.
+2. Decide the projection-precision policy — and note this is really the same
+   kernel problem as step 1. What it must produce is an F32,
+   reduction-order-controlled Q8_0 matmul with weight reuse across rows, which
+   is exactly the inner loop the grouped MoE needs for its per-expert work.
+   `rows_exact` is a batched *GEMV*: it dispatches one threadgroup per
+   `(row-tile, row)` and re-reads the weights for every row, so it is
+   bandwidth-bound and will not scale. Today exact costs only ~18% of prefill
+   because the MoE dwarfs it; after step 1 the same ~619 ms sits on a ~670 ms
+   total, i.e. roughly 2x. Do not settle for choosing between fast-and-drifting
+   and exact-and-slow.
+
+   **`DS4_MELLUM_PREFILL_EXACT` must be retired before true prefill is wired
+   into `ds4_session_sync`.** It is acceptable now as a diagnostic that
+   validates the one release path, which is what `AGENT.md` permits. It would
+   not be acceptable as a numerics *policy* selected by an environment
+   variable, cached in a process-wide static and invisible in `--help`. One
+   path must be chosen in code at that point.
+
+   Caveat on the causal claim: the exact-projection ablation swaps precision,
+   tiling, and reduction order together. The magnitude argument is strong —
+   observed ~1.2e-3 relative drift at 26 tokens matches a ~2^-11 weight error,
+   not ~2^-23 F32 reordering noise — but what the experiment strictly
+   establishes is *locus* (100% of drift lives in the batched projection
+   kernels), not *mechanism*. So if an F32-accumulating GEMM turns out not to
+   be bit-identical, that is expected reduction-reorder behaviour, not a
+   refutation.
+3. Characterize the post-wrap ring residual and set short- and long-context
+   relative envelopes.
+4. Only then wire bounded true prefill into `ds4_session_sync`.
+
+The long-context llama.cpp capture is downgraded from blocker to optional
+cross-check: ds4 batch now equals ds4 decode exactly, and decode is already
+gated against llama.cpp. An HF Transformers FP32 forward from the pinned
+safetensors remains the more valuable reference, because it is the only
+available check that is not downstream of llama.cpp's own graph.
+
 ### 2026-08-01 M5 prefill/decode target research
 
 The clearest recent public comparison is the [BaseRT M5 study](https://arxiv.org/abs/2607.19438),
@@ -1330,12 +1648,14 @@ llama.cpp), while prefill uplift can be several-fold.
 This is directionally relevant rather than a direct Mellum comparison: Mellum
 is Q8_0 (13 GB resident) and has 28 layers with 8-of-64 experts, so its exact
 balance differs. Our M5 Max resident measurement is already 111.6 tok/s decode
-with the output head, consistent with the paper's MoE decode range. The first
-true-prefill target should therefore be **at least 500 tok/s at a 1,024-token
-prompt**, a roughly 5x improvement over the current sequential-decode sync,
-with **800--1,200 tok/s** as a credible optimisation target once the batch Q8
-matmul/MoE path uses Metal 4 tensor operations. Treat a result below 250 tok/s
-as a structural failure (likely tokenwise work or excess command boundaries),
-not a tuning result. Decode should remain near 100--120 tok/s; a tensor-core
-project is primarily a prefill project and should not be judged by decode
-speedup.
+with the output head, consistent with the paper's MoE decode range. For a
+1,024-token prompt, **at least 500 tok/s** is the first true-prefill acceptance
+floor, a roughly 5x improvement over sequential-decode sync. The Q8 M5 Max
+aspiration is **1,200--1,500 tok/s** once batch Q8 matmul/MoE uses Metal 4
+tensor operations; 800--1,200 tok/s remains a credible nearer-term optimisation
+band. Treat a result below 250 tok/s as a structural failure (likely tokenwise
+work or excess command boundaries), not a tuning result. Decode should remain
+near 100--120 tok/s; a tensor-core project is principally a prefill project and
+should not be judged by decode speedup. These are targets, not present
+measurements: no trustworthy true-prefill throughput has been recorded while
+the correctness gate remains blocked.
