@@ -1,0 +1,7 @@
+=== PHASE 6 SOAK 2026-08-01T21:38:11Z ===
+chunk=32 exact=0: Mellum true-prefill SWA probe tokens=1030 chunks=32 hidden max_abs=38.9707 rms=2.40653 logits max_abs=0.891979 rms=0.388538
+chunk=32 exact=1: Mellum true-prefill SWA probe tokens=1030 chunks=32 hidden max_abs=0.0334473 rms=0.00402957 logits max_abs=0.00109291 rms=0.000327317
+chunk=128 exact=0: Mellum true-prefill SWA probe tokens=1030 chunks=1024+6 hidden max_abs=38.9707 rms=2.40653 logits max_abs=0.891979 rms=0.388538
+chunk=128 exact=1: Mellum true-prefill SWA probe tokens=1030 chunks=1024+6 hidden max_abs=0.0334473 rms=0.00402957 logits max_abs=0.00109291 rms=0.000327317
+chunk=1024 exact=0: Mellum true-prefill SWA probe tokens=1030 chunks=1024+6 hidden max_abs=38.9707 rms=2.40653 logits max_abs=0.891979 rms=0.388538
+chunk=1024 exact=1: Mellum true-prefill SWA probe tokens=1030 chunks=1024+6 hidden max_abs=0.0334473 rms=0.00402957 logits max_abs=0.00109291 rms=0.000327317

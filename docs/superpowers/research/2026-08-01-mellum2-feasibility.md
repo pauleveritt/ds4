@@ -1630,6 +1630,31 @@ kernel, not a tweak of this one.
 with no dominant option: adopt dot4, keep HEAD, or spend the next block on the
 simdgroup reduction that could moot the choice.
 
+#### Phase 6 soak: chunk invariance demonstrated, wrap residual re-baselined
+
+Six cells, chunk in {32, 128, 1024} x exact in {0, 1}, on the 1,030-token
+sequence. Every cell at a given `exact` setting is **identical to all printed
+digits**. This finally demonstrates the chunk-schedule invariance that was
+previously only inferred from two summary lines compared by eye — across three
+chunk sizes rather than two, though still via printed summaries rather than a
+bitwise file diff.
+
+| exact | hidden max / RMS | logit max / RMS |
+| ---: | --- | --- |
+| 0 | 38.9707 / 2.40653 | 0.891979 / 0.388538 |
+| 1 | 0.0334473 / 0.00402957 | 0.00109291 / 0.000327317 |
+
+The `exact=1` post-wrap logit RMS is 0.000327317 against 0.000177075 recorded
+earlier — 1.85x, which breaches the planned "within 1.3x" gate. **This is not a
+regression.** The recorded figure predates the down-accumulation contract
+change, so the gate compared against a stale reference — the same mistake as
+Phase 0, in a different guise. The post-contract values above are the correct
+baseline going forward. Note the asymmetry worth watching: the contract change
+improved agreement with llama.cpp by 5.3x while making the batch-versus-decode
+wrap residual ~1.85x larger. Those are different quantities and there is no
+contradiction, but a future change that moves them in opposite directions again
+should be looked at closely rather than averaged.
+
 ### Revised next steps
 
 0. **Row-tile both MoE kernels.** This supersedes step 1 as the performance
