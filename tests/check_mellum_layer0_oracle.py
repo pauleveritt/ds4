@@ -29,15 +29,15 @@ ORACLES = {
         "rows": 1,
         "reference": VECTOR_DIR / "l-out-27-tokenwise.f32",
         "sha256": "4ae7a46e409d6e3bf760ef8f7c671f32ff16d0798b8cd3dd25fe5fcbb3f086fe",
-        "max_abs_limit": 1.5,
-        "rms_limit": 6.0e-2,
+        "max_abs_limit": 0.55,
+        "rms_limit": 4.5e-2,
     },
     "logits-tokenwise": {
         "values": 98304,
         "reference": VECTOR_DIR / "result-output-tokenwise.f32",
         "sha256": "4ec7f9c838058fc267ec0a2f117aa4db523950df1621f61d25afcf63e3be2b1c",
-        "max_abs_limit": 2.5e-2,
-        "rms_limit": 1.2e-2,
+        "max_abs_limit": 1.3e-2,
+        "rms_limit": 2.4e-3,
     },
 }
 

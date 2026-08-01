@@ -1,0 +1,5 @@
+=== PHASE 1 2026-08-01T21:28:56Z ===
+Mellum layer-0 oracle values=59904 max_abs=0.00493812561 rms=9.80449449e-05 mae=3.69403802e-05 max_at=(15, 1236)
+Mellum layer-27-tokenwise oracle values=2304 max_abs=0.404174805 rms=0.0347506243 mae=0.0264729854 max_at=(0, 368)
+Mellum layer-logits-tokenwise oracle values=98304 max_abs=0.00976753235 rms=0.00178921805 mae=0.00141903868 max_at=39546
+exit=0
