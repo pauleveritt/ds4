@@ -1507,6 +1507,149 @@ static void test_metal_mellum_attention_prelude(void) {
         fprintf(stderr, "ds4-test: Mellum one-row attention prefill out=%g\n",
                 prefill_out_error);
         TEST_ASSERT(prefill_out_error < 5.0e-4f);
+
+        /* Compare real multi-row batch layout with the established tokenwise
+         * attention primitive across a wrapped ring.  The descriptor enables
+         * YaRN so row-position handling is exercised too. */
+        enum { batch_tokens = 3 };
+        const uint32_t batch_pos = pos + 1u;
+        const uint64_t batch_embd_bytes = batch_tokens * embd_bytes;
+        const uint64_t batch_q_bytes = batch_tokens * q_bytes;
+        const uint64_t batch_kv_bytes = batch_tokens * kv_bytes;
+        ds4_gpu_tensor *batch_hidden_t = ds4_gpu_tensor_alloc(batch_embd_bytes);
+        ds4_gpu_tensor *batch_norm_t = ds4_gpu_tensor_alloc(batch_embd_bytes);
+        ds4_gpu_tensor *batch_q_t = ds4_gpu_tensor_alloc(batch_q_bytes);
+        ds4_gpu_tensor *batch_k_t = ds4_gpu_tensor_alloc(batch_kv_bytes);
+        ds4_gpu_tensor *batch_v_t = ds4_gpu_tensor_alloc(batch_kv_bytes);
+        ds4_gpu_tensor *batch_heads_t = ds4_gpu_tensor_alloc(batch_q_bytes);
+        ds4_gpu_tensor *batch_projected_t = ds4_gpu_tensor_alloc(batch_embd_bytes);
+        ds4_gpu_tensor *batch_out_t = ds4_gpu_tensor_alloc(batch_embd_bytes);
+        ds4_gpu_tensor *batch_staged_key_t = ds4_gpu_tensor_alloc(
+            batch_tokens * kv_dim * sizeof(uint16_t));
+        ds4_gpu_tensor *batch_staged_value_t = ds4_gpu_tensor_alloc(
+            batch_tokens * kv_dim * sizeof(uint16_t));
+        float *batch_hidden = malloc((size_t)batch_embd_bytes);
+        float *batch_out = malloc((size_t)batch_embd_bytes);
+        float *sequential_out = malloc((size_t)batch_embd_bytes);
+        uint16_t *cache_seed = malloc((size_t)cache_bytes);
+        uint16_t *value_seed = malloc((size_t)cache_bytes);
+        uint16_t *cache_batch = malloc((size_t)cache_bytes);
+        uint16_t *value_batch = malloc((size_t)cache_bytes);
+        const bool batch_allocated = batch_hidden_t && batch_norm_t && batch_q_t &&
+            batch_k_t && batch_v_t && batch_heads_t && batch_projected_t &&
+            batch_out_t && batch_staged_key_t && batch_staged_value_t &&
+            batch_hidden && batch_out && sequential_out && cache_seed &&
+            value_seed && cache_batch && value_batch;
+        TEST_ASSERT(batch_allocated);
+        if (batch_allocated) {
+            for (uint32_t token = 0; token < batch_tokens; token++) {
+                for (uint32_t i = 0; i < n_embd; i++) {
+                    batch_hidden[(uint64_t)token * n_embd + i] = hidden[i] +
+                        (float)(token + 1u) / 193.0f;
+                }
+            }
+            TEST_ASSERT(ds4_gpu_tensor_read(key_cache_t, 0, cache_seed,
+                                            cache_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(value_cache_t, 0, value_seed,
+                                            cache_bytes) != 0);
+            const ds4_gpu_mellum_attention_desc yarn_desc = {
+                .attn_norm_offset = desc.attn_norm_offset,
+                .q_offset = desc.q_offset,
+                .q_norm_offset = desc.q_norm_offset,
+                .k_offset = desc.k_offset,
+                .k_norm_offset = desc.k_norm_offset,
+                .v_offset = desc.v_offset,
+                .output_offset = desc.output_offset,
+                .n_embd = desc.n_embd, .n_head = desc.n_head,
+                .n_head_kv = desc.n_head_kv, .head_dim = desc.head_dim,
+                .n_rot = desc.n_rot, .n_ctx_orig = 8u,
+                .rms_eps = desc.rms_eps, .freq_base = desc.freq_base,
+                .freq_scale = 1.0f, .rope_ext_factor = 1.0f,
+                .rope_attn_factor = 1.0f, .yarn_beta_fast = 32.0f,
+                .yarn_beta_slow = 1.0f,
+            };
+            TEST_ASSERT(ds4_gpu_tensor_write(batch_hidden_t, 0, batch_hidden,
+                                              batch_embd_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_mellum_attention_prefill_tensor(
+                            batch_out_t, batch_norm_t, batch_q_t, batch_k_t,
+                            batch_v_t, batch_heads_t, batch_projected_t,
+                            key_cache_t, value_cache_t, batch_staged_key_t,
+                            batch_staged_value_t, model, model_bytes, &yarn_desc,
+                            batch_hidden_t, batch_pos, batch_tokens,
+                            cache_cap) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(batch_out_t, 0, batch_out,
+                                             batch_embd_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(key_cache_t, 0, cache_batch,
+                                             cache_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(value_cache_t, 0, value_batch,
+                                             cache_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(key_cache_t, 0, cache_seed,
+                                              cache_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(value_cache_t, 0, value_seed,
+                                              cache_bytes) != 0);
+            for (uint32_t token = 0; token < batch_tokens; token++) {
+                const uint32_t token_pos = batch_pos + token;
+                const uint32_t token_keys = token_pos + 1u < cache_cap ?
+                    token_pos + 1u : cache_cap;
+                TEST_ASSERT(ds4_gpu_tensor_write(hidden_t, 0,
+                            batch_hidden + (uint64_t)token * n_embd,
+                            embd_bytes) != 0);
+                TEST_ASSERT(ds4_gpu_mellum_attention_decode_tensor(
+                                out_t, norm_t, q_t, k_t, v_t, heads_t,
+                                projected_t, key_cache_t, value_cache_t, model,
+                                model_bytes, &yarn_desc, hidden_t, token_pos,
+                                cache_cap, token_pos + 1u - token_keys,
+                                token_keys) != 0);
+                TEST_ASSERT(ds4_gpu_tensor_read(out_t, 0,
+                            sequential_out + (uint64_t)token * n_embd,
+                            embd_bytes) != 0);
+            }
+            float batch_error = test_mellum_max_abs(batch_out, sequential_out,
+                                                     batch_tokens * n_embd);
+            TEST_ASSERT(ds4_gpu_tensor_read(key_cache_t, 0, key_cache,
+                                             cache_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(value_cache_t, 0, value_cache,
+                                             cache_bytes) != 0);
+            float kv_max_abs = 0.0f;
+            uint32_t kv_mismatch = 0;
+            for (uint32_t i = 0; i < cache_cap * kv_dim; i++) {
+                const float kd = fabsf(test_f16_to_f32(cache_batch[i]) -
+                                       test_f16_to_f32(key_cache[i]));
+                const float vd = fabsf(test_f16_to_f32(value_batch[i]) -
+                                       test_f16_to_f32(value_cache[i]));
+                kv_max_abs = fmaxf(kv_max_abs, fmaxf(kd, vd));
+                kv_mismatch += cache_batch[i] != key_cache[i] ||
+                    value_batch[i] != value_cache[i];
+            }
+            fprintf(stderr,
+                    "ds4-test: Mellum multi-row YaRN prefill out=%g kv=%u/%u max_abs=%g\n",
+                    batch_error, kv_mismatch, cache_cap * kv_dim, kv_max_abs);
+            TEST_ASSERT(batch_error < 5.0e-4f);
+            TEST_ASSERT(kv_max_abs < 2.0e-3f);
+            TEST_ASSERT(ds4_gpu_tensor_write(key_cache_t, 0, cache_seed,
+                                              cache_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(value_cache_t, 0, value_seed,
+                                              cache_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_begin_commands() != 0);
+            TEST_ASSERT(ds4_gpu_mellum_attention_prefill_tensor(
+                            batch_out_t, batch_norm_t, batch_q_t, batch_k_t,
+                            batch_v_t, batch_heads_t, batch_projected_t,
+                            key_cache_t, value_cache_t, batch_staged_key_t,
+                            batch_staged_value_t, model, model_bytes, &yarn_desc,
+                            batch_hidden_t, batch_pos, batch_tokens,
+                            cache_cap) != 0);
+            TEST_ASSERT(ds4_gpu_commands_active());
+            TEST_ASSERT(ds4_gpu_end_commands() != 0);
+        }
+        free(value_batch); free(cache_batch); free(value_seed); free(cache_seed);
+        free(sequential_out); free(batch_out); free(batch_hidden);
+        ds4_gpu_tensor_free(batch_staged_value_t);
+        ds4_gpu_tensor_free(batch_staged_key_t);
+        ds4_gpu_tensor_free(batch_out_t);
+        ds4_gpu_tensor_free(batch_projected_t);
+        ds4_gpu_tensor_free(batch_heads_t); ds4_gpu_tensor_free(batch_v_t);
+        ds4_gpu_tensor_free(batch_k_t); ds4_gpu_tensor_free(batch_q_t);
+        ds4_gpu_tensor_free(batch_norm_t); ds4_gpu_tensor_free(batch_hidden_t);
     }
     free(value_cache); free(key_cache); free(out_actual); free(heads_actual);
     free(v_actual); free(k_actual); free(q_actual); free(out_ref); free(heads_ref);
