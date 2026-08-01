@@ -2335,6 +2335,26 @@ int ds4_gpu_mellum_gqa_decode_tensor(
         uint32_t                head_dim,
         float                   scale);
 
+/* Batched causal Mellum GQA. K/V are staged as F16 before all queries run,
+ * then committed to the ring, so a chunk crossing the ring boundary cannot
+ * overwrite history still needed by an earlier query in that same chunk. */
+int ds4_gpu_mellum_gqa_prefill_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        ds4_gpu_tensor       *staged_key,
+        ds4_gpu_tensor       *staged_value,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              head_dim,
+        float                 scale);
+
 /* Store the current Mellum K/V vectors in the F16 ring consumed by GQA. */
 int ds4_gpu_mellum_store_kv_tensor(
         ds4_gpu_tensor       *key_cache,

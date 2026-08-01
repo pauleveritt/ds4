@@ -1207,3 +1207,11 @@ same resident-versus-streamed A/B gate used for Laguna XS.
   replan: optimize the 28-layer attention/routed-MoE stack, not the output
   head. The inspect-only `--mellum-resident-profile` command keeps this result
   reproducible without widening generation scope.
+- Began genuine layer-major prefill with the smallest safe primitive: ungated
+  Mellum GQA over a token batch. It stages each chunk's F16 K/V, evaluates each
+  query causally against the staged rows or pre-existing ring, then commits the
+  ring after all queries. The isolated Metal regression crosses a wrapped
+  17-row cache and agrees with an independent scalar reference at
+  `4.47e-08` maximum absolute error. This is a foundation only: batched Q8
+  projections, Q/K norm/RoPE, routing, and sparse-MoE remain before it can
+  replace sequential session sync.

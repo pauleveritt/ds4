@@ -232,6 +232,7 @@ static id<MTLComputePipelineState> g_mellum_q8_0_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_down_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_router_select_one_pipeline;
 static id<MTLComputePipelineState> g_mellum_gqa_decode_pipeline;
+static id<MTLComputePipelineState> g_mellum_gqa_prefill_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_addr_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_addr_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q5_k_pair_swiglu_f32_pipeline;
@@ -9755,6 +9756,7 @@ void ds4_gpu_cleanup(void) {
         g_mellum_q8_0_down_f32_pipeline = nil;
         g_mellum_router_select_one_pipeline = nil;
         g_mellum_gqa_decode_pipeline = nil;
+        g_mellum_gqa_prefill_pipeline = nil;
         g_glm_q2_k_addr_down_f32_pipeline = nil;
         g_glm_q4_k_addr_down_f32_pipeline = nil;
         g_glm_q5_k_pair_swiglu_f32_pipeline = nil;
@@ -34056,6 +34058,112 @@ int ds4_gpu_mellum_gqa_decode_tensor(
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Mellum GQA decode")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_mellum_gqa_prefill_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        ds4_gpu_tensor       *staged_key,
+        ds4_gpu_tensor       *staged_value,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              head_dim,
+        float                 scale) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !key_cache || !value_cache || !staged_key || !staged_value ||
+        !q || !k || !v || n_tokens == 0 || pos0 > UINT32_MAX - n_tokens ||
+        cache_cap == 0 || n_head == 0 || n_head_kv == 0 ||
+        n_head % n_head_kv != 0 || head_dim != 128u ||
+        !isfinite(scale) || scale <= 0.0f) return 0;
+    @autoreleasepool {
+        const uint64_t q_values = (uint64_t)n_tokens * n_head * head_dim;
+        const uint64_t kv_values = (uint64_t)n_tokens * n_head_kv * head_dim;
+        const uint64_t cache_values =
+            (uint64_t)cache_cap * n_head_kv * head_dim;
+        if (q_values > NSUIntegerMax / sizeof(float) ||
+            kv_values > NSUIntegerMax / sizeof(uint16_t) ||
+            ds4_gpu_tensor_bytes(q) < q_values * sizeof(float) ||
+            ds4_gpu_tensor_bytes(k) < kv_values * sizeof(float) ||
+            ds4_gpu_tensor_bytes(v) < kv_values * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out) < q_values * sizeof(float) ||
+            ds4_gpu_tensor_bytes(staged_key) < kv_values * sizeof(uint16_t) ||
+            ds4_gpu_tensor_bytes(staged_value) < kv_values * sizeof(uint16_t) ||
+            ds4_gpu_tensor_bytes(key_cache) < cache_values * sizeof(uint16_t) ||
+            ds4_gpu_tensor_bytes(value_cache) < cache_values * sizeof(uint16_t)) {
+            fprintf(stderr, "ds4: Metal Mellum prefill GQA received undersized buffers\n");
+            return 0;
+        }
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        id<MTLBuffer> keybuf = ds4_gpu_tensor_buffer(key_cache);
+        id<MTLBuffer> valuebuf = ds4_gpu_tensor_buffer(value_cache);
+        id<MTLBuffer> stagedkeybuf = ds4_gpu_tensor_buffer(staged_key);
+        id<MTLBuffer> stagedvaluebuf = ds4_gpu_tensor_buffer(staged_value);
+        id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
+        id<MTLBuffer> kbuf = ds4_gpu_tensor_buffer(k);
+        id<MTLBuffer> vbuf = ds4_gpu_tensor_buffer(v);
+        if (!g_mellum_gqa_prefill_pipeline) {
+            g_mellum_gqa_prefill_pipeline = ds4_gpu_get_pipeline(
+                "kernel_mellum_attention_prefill_gqa_f16");
+        }
+        id<MTLComputePipelineState> attention_pipeline = ds4_gpu_hot_pipeline(
+            g_mellum_gqa_prefill_pipeline,
+            "kernel_mellum_attention_prefill_gqa_f16");
+        if (!outbuf || !keybuf || !valuebuf || !stagedkeybuf ||
+            !stagedvaluebuf || !qbuf || !kbuf || !vbuf || !attention_pipeline ||
+            !g_laguna_stage_kv_pipeline || !g_laguna_commit_kv_pipeline) return 0;
+
+        const ds4_gpu_laguna_prefill_attention_args args = {
+            .n_tokens = n_tokens, .pos0 = pos0, .cache_cap = cache_cap,
+            .n_head = n_head, .n_head_kv = n_head_kv, .head_dim = head_dim,
+            .scale = scale, .pad0 = 0,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_laguna_stage_kv_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:kbuf offset:ds4_gpu_tensor_offset(k) atIndex:1];
+        [enc setBuffer:vbuf offset:ds4_gpu_tensor_offset(v) atIndex:2];
+        [enc setBuffer:stagedkeybuf offset:ds4_gpu_tensor_offset(staged_key) atIndex:3];
+        [enc setBuffer:stagedvaluebuf offset:ds4_gpu_tensor_offset(staged_value) atIndex:4];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)kv_values, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:attention_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
+        [enc setBuffer:keybuf offset:ds4_gpu_tensor_offset(key_cache) atIndex:2];
+        [enc setBuffer:valuebuf offset:ds4_gpu_tensor_offset(value_cache) atIndex:3];
+        [enc setBuffer:stagedkeybuf offset:ds4_gpu_tensor_offset(staged_key) atIndex:4];
+        [enc setBuffer:stagedvaluebuf offset:ds4_gpu_tensor_offset(staged_value) atIndex:5];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(n_head, n_tokens, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_laguna_commit_kv_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:stagedkeybuf offset:ds4_gpu_tensor_offset(staged_key) atIndex:1];
+        [enc setBuffer:stagedvaluebuf offset:ds4_gpu_tensor_offset(staged_value) atIndex:2];
+        [enc setBuffer:keybuf offset:ds4_gpu_tensor_offset(key_cache) atIndex:3];
+        [enc setBuffer:valuebuf offset:ds4_gpu_tensor_offset(value_cache) atIndex:4];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)kv_values, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Mellum prefill GQA")) return 0;
     }
     return 1;
 }

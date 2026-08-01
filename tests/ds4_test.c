@@ -1018,6 +1018,145 @@ static void test_metal_mellum_gqa_decode(void) {
     ds4_gpu_tensor_free(key_cache); ds4_gpu_tensor_free(q);
 }
 
+static void test_metal_mellum_gqa_prefill(void) {
+    const uint32_t n_head = 32u, n_head_kv = 4u, head_dim = 128u;
+    const uint32_t cache_cap = 17u, pos0 = 15u, n_tokens = 4u;
+    const uint32_t cache_width = n_head_kv * head_dim;
+    const uint64_t q_values = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t kv_values = (uint64_t)n_tokens * cache_width;
+    const uint64_t q_bytes = q_values * sizeof(float);
+    const uint64_t kv_f32_bytes = kv_values * sizeof(float);
+    const uint64_t kv_f16_bytes = kv_values * sizeof(uint16_t);
+    const uint64_t cache_bytes =
+        (uint64_t)cache_cap * cache_width * sizeof(uint16_t);
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *k = ds4_gpu_tensor_alloc(kv_f32_bytes);
+    ds4_gpu_tensor *v = ds4_gpu_tensor_alloc(kv_f32_bytes);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(q_bytes);
+    ds4_gpu_tensor *key_cache = ds4_gpu_tensor_alloc(cache_bytes);
+    ds4_gpu_tensor *value_cache = ds4_gpu_tensor_alloc(cache_bytes);
+    ds4_gpu_tensor *staged_key = ds4_gpu_tensor_alloc(kv_f16_bytes);
+    ds4_gpu_tensor *staged_value = ds4_gpu_tensor_alloc(kv_f16_bytes);
+    float *q_host = malloc((size_t)q_bytes);
+    float *k_host = malloc((size_t)kv_f32_bytes);
+    float *v_host = malloc((size_t)kv_f32_bytes);
+    float *out_host = malloc((size_t)q_bytes);
+    float *out_ref = malloc((size_t)q_bytes);
+    uint16_t *key_host = malloc((size_t)cache_bytes);
+    uint16_t *value_host = malloc((size_t)cache_bytes);
+    const bool allocated = q && k && v && out && key_cache && value_cache &&
+        staged_key && staged_value && q_host && k_host && v_host && out_host &&
+        out_ref && key_host && value_host;
+    TEST_ASSERT(allocated);
+    if (allocated) {
+        for (uint64_t i = 0; i < q_values; i++) {
+            q_host[i] = (float)((int)((i * 37u + 11u) % 211u) - 105) / 176.0f;
+        }
+        for (uint64_t i = 0; i < kv_values; i++) {
+            k_host[i] = (float)((int)((i * 41u + 17u) % 199u) - 99) / 168.0f;
+            v_host[i] = (float)((int)((i * 43u + 23u) % 197u) - 98) / 152.0f;
+        }
+        for (uint64_t i = 0; i < (uint64_t)cache_cap * cache_width; i++) {
+            key_host[i] = test_float_to_f16(
+                (float)((int)((i * 29u + 7u) % 193u) - 96) / 160.0f);
+            value_host[i] = test_float_to_f16(
+                (float)((int)((i * 31u + 3u) % 181u) - 90) / 144.0f);
+        }
+        const float scale = 1.0f / sqrtf((float)head_dim);
+        for (uint32_t token = 0; token < n_tokens; token++) {
+            const uint32_t query_pos = pos0 + token;
+            const uint32_t key_count = query_pos + 1u < cache_cap ?
+                query_pos + 1u : cache_cap;
+            const uint32_t key_start = query_pos + 1u - key_count;
+            for (uint32_t head = 0; head < n_head; head++) {
+                const uint32_t kv_head = head / (n_head / n_head_kv);
+                float scores[cache_cap];
+                float max_score = -FLT_MAX, sum = 0.0f;
+                for (uint32_t i = 0; i < key_count; i++) {
+                    const uint32_t key_pos = key_start + i;
+                    const bool current = key_pos >= pos0;
+                    const uint64_t base = current ?
+                        (uint64_t)(key_pos - pos0) * cache_width +
+                            (uint64_t)kv_head * head_dim :
+                        (uint64_t)(key_pos % cache_cap) * cache_width +
+                            (uint64_t)kv_head * head_dim;
+                    float dot = 0.0f;
+                    for (uint32_t d = 0; d < head_dim; d++) {
+                        const float key_value = current ?
+                            test_f16_to_f32(test_float_to_f16(k_host[base + d])) :
+                            test_f16_to_f32(key_host[base + d]);
+                        dot += q_host[((uint64_t)token * n_head + head) *
+                                      head_dim + d] * key_value;
+                    }
+                    scores[i] = dot * scale;
+                    max_score = fmaxf(max_score, scores[i]);
+                }
+                for (uint32_t i = 0; i < key_count; i++) {
+                    scores[i] = expf(scores[i] - max_score);
+                    sum += scores[i];
+                }
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    float value = 0.0f;
+                    for (uint32_t i = 0; i < key_count; i++) {
+                        const uint32_t key_pos = key_start + i;
+                        const bool current = key_pos >= pos0;
+                        const uint64_t base = current ?
+                            (uint64_t)(key_pos - pos0) * cache_width +
+                                (uint64_t)kv_head * head_dim :
+                            (uint64_t)(key_pos % cache_cap) * cache_width +
+                                (uint64_t)kv_head * head_dim;
+                        const float value_value = current ?
+                            test_f16_to_f32(test_float_to_f16(v_host[base + d])) :
+                            test_f16_to_f32(value_host[base + d]);
+                        value += scores[i] * value_value;
+                    }
+                    out_ref[((uint64_t)token * n_head + head) * head_dim + d] =
+                        value / sum;
+                }
+            }
+        }
+        TEST_ASSERT(ds4_gpu_tensor_write(q, 0, q_host, q_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(k, 0, k_host, kv_f32_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(v, 0, v_host, kv_f32_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(key_cache, 0, key_host, cache_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(value_cache, 0, value_host, cache_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_mellum_gqa_prefill_tensor(
+                        out, key_cache, value_cache, staged_key, staged_value,
+                        q, k, v, pos0, n_tokens, cache_cap, n_head, n_head_kv,
+                        head_dim, scale) != 0);
+        TEST_ASSERT(ds4_gpu_mellum_gqa_prefill_tensor(
+                        out, key_cache, value_cache, staged_key, staged_value,
+                        q, k, v, pos0, 0, cache_cap, n_head, n_head_kv,
+                        head_dim, scale) == 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, q_bytes) != 0);
+        float max_abs = 0.0f;
+        for (uint64_t i = 0; i < q_values; i++) {
+            TEST_ASSERT(isfinite(out_host[i]));
+            max_abs = fmaxf(max_abs, fabsf(out_host[i] - out_ref[i]));
+        }
+        TEST_ASSERT(ds4_gpu_tensor_read(key_cache, 0, key_host, cache_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(value_cache, 0, value_host, cache_bytes) != 0);
+        for (uint32_t token = 0; token < n_tokens; token++) {
+            const uint32_t row = (pos0 + token) % cache_cap;
+            for (uint32_t col = 0; col < cache_width; col++) {
+                const uint64_t dst = (uint64_t)row * cache_width + col;
+                const uint64_t src = (uint64_t)token * cache_width + col;
+                TEST_ASSERT(key_host[dst] == test_float_to_f16(k_host[src]));
+                TEST_ASSERT(value_host[dst] == test_float_to_f16(v_host[src]));
+            }
+        }
+        fprintf(stderr, "ds4-test: Mellum batched GQA prefill max_abs=%g ring=wrapped\n",
+                max_abs);
+        TEST_ASSERT(max_abs < 2.0e-5f);
+    }
+    free(value_host); free(key_host); free(out_ref); free(out_host);
+    free(v_host); free(k_host); free(q_host);
+    ds4_gpu_tensor_free(staged_value); ds4_gpu_tensor_free(staged_key);
+    ds4_gpu_tensor_free(value_cache); ds4_gpu_tensor_free(key_cache);
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(v); ds4_gpu_tensor_free(k);
+    ds4_gpu_tensor_free(q);
+}
+
 typedef struct {
     uint16_t d;
     uint16_t dmin;
@@ -6218,6 +6357,7 @@ static void test_metal_kernel_group(void) {
     TEST_ASSERT(ds4_gpu_test_glm_q3_down_slots8_bound_equivalence() != 0);
     test_metal_mellum_router();
     test_metal_mellum_gqa_decode();
+    test_metal_mellum_gqa_prefill();
     test_metal_mellum_attention_prelude();
     test_metal_mellum_q8_layer();
     test_metal_mellum_q4_q8_routed_moe();

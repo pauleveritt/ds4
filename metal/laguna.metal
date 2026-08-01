@@ -700,6 +700,80 @@ kernel void kernel_mellum_attention_decode_gqa_f16(
     oh[lane + 96u] = acc.w * inv_sum;
 }
 
+// Mellum's layer-major prefill counterpart. The staged K/V buffers make all
+// current-chunk rows visible without writing the ring until every causal query
+// has consumed the history it needs. Unlike Laguna, Mellum has no gate.
+kernel void kernel_mellum_attention_prefill_gqa_f16(
+        constant ds4_metal_args_laguna_prefill_attention &args,
+        device const float *q,
+        device const half  *key_cache,
+        device const half  *value_cache,
+        device const half  *staged_key,
+        device const half  *staged_value,
+        device float       *out,
+        ushort lane [[thread_index_in_simdgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    const uint head = tgpig.x;
+    const uint token = tgpig.y;
+    if (head >= args.n_head || token >= args.n_tokens ||
+        args.n_head_kv == 0u || args.n_head % args.n_head_kv != 0u ||
+        args.head_dim != 128u || args.cache_cap == 0u) return;
+    const uint heads_per_kv = args.n_head / args.n_head_kv;
+    const uint kv_head = head / heads_per_kv;
+    const uint cache_width = args.n_head_kv * args.head_dim;
+    const uint query_pos = args.pos0 + token;
+    const uint key_count = min(query_pos + 1u, args.cache_cap);
+    const uint key_start = query_pos + 1u - key_count;
+    device const float *qh = q +
+        ((uint64_t)token * args.n_head + head) * args.head_dim;
+    float4 acc = float4(0.0f);
+    float max_score = -INFINITY;
+    float score_sum = 0.0f;
+    for (uint key_pos = key_start; key_pos <= query_pos; key_pos++) {
+        const bool current = key_pos >= args.pos0;
+        const uint row = current ? key_pos - args.pos0 :
+            key_pos % args.cache_cap;
+        const uint64_t kv_base = (uint64_t)row * cache_width +
+            (uint64_t)kv_head * args.head_dim;
+        const uint d0 = lane;
+        const float4 key = current ?
+            float4((float)staged_key[kv_base + d0],
+                   (float)staged_key[kv_base + d0 + 32u],
+                   (float)staged_key[kv_base + d0 + 64u],
+                   (float)staged_key[kv_base + d0 + 96u]) :
+            float4((float)key_cache[kv_base + d0],
+                   (float)key_cache[kv_base + d0 + 32u],
+                   (float)key_cache[kv_base + d0 + 64u],
+                   (float)key_cache[kv_base + d0 + 96u]);
+        const float4 query = float4(qh[d0], qh[d0 + 32u],
+                                    qh[d0 + 64u], qh[d0 + 96u]);
+        const float score = simd_sum(dot(query, key)) * args.scale;
+        const float next_max = max(max_score, score);
+        const float old_scale = max_score == -INFINITY ? 0.0f :
+            exp(max_score - next_max);
+        const float value_scale = exp(score - next_max);
+        score_sum = score_sum * old_scale + value_scale;
+        const float4 value = current ?
+            float4((float)staged_value[kv_base + d0],
+                   (float)staged_value[kv_base + d0 + 32u],
+                   (float)staged_value[kv_base + d0 + 64u],
+                   (float)staged_value[kv_base + d0 + 96u]) :
+            float4((float)value_cache[kv_base + d0],
+                   (float)value_cache[kv_base + d0 + 32u],
+                   (float)value_cache[kv_base + d0 + 64u],
+                   (float)value_cache[kv_base + d0 + 96u]);
+        acc = acc * old_scale + value * value_scale;
+        max_score = next_max;
+    }
+    const float inv_sum = score_sum > 0.0f ? 1.0f / score_sum : 0.0f;
+    device float *oh = out +
+        ((uint64_t)token * args.n_head + head) * args.head_dim;
+    oh[lane] = acc.x * inv_sum;
+    oh[lane + 32u] = acc.y * inv_sum;
+    oh[lane + 64u] = acc.z * inv_sum;
+    oh[lane + 96u] = acc.w * inv_sum;
+}
+
 // Global layers split keys across 32 workgroups. Evaluate three query heads
 // sharing one KV head together so each K/V row is loaded once instead of three
 // times; the established gated reducer still merges the resulting partials.
