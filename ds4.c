@@ -36769,6 +36769,68 @@ static bool ds4_mellum_decode_token(const ds4_engine       *e,
     const uint32_t q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint32_t qk_trace_stride = q_dim + DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     embed_token_any(&e->model, &e->weights, token, state->hidden_cpu);
+
+    /* The fixed oracle captures per-layer tensors, so it intentionally keeps
+     * the old synchronous readback schedule below.  Normal session decode has
+     * no need to expose an intermediate activation: keep it on the GPU and
+     * submit the whole layer stack plus output head as one command batch. */
+    const bool capture_intermediate = final_cpu || layer_trace ||
+                                      attention_trace || qk_trace;
+    if (!capture_intermediate) {
+        ds4_gpu_tensor *current = state->hidden;
+        ds4_gpu_tensor *next = state->layer_out;
+        bool batch_started = false;
+        bool ok = ds4_gpu_tensor_write(current, 0, state->hidden_cpu,
+                                       embd_bytes) != 0;
+        if (ok) {
+            batch_started = ds4_gpu_begin_commands() != 0;
+            ok = batch_started;
+        }
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            const uint32_t cache_cap = state->cache_cap[il];
+            const bool sliding = e->mellum_layer[il].sliding_attention;
+            const uint32_t key_start = sliding && pos + 1u > cache_cap
+                ? pos + 1u - cache_cap : 0u;
+            const uint32_t key_count = pos - key_start + 1u;
+            ok = ds4_gpu_mellum_q8_0_layer_decode_tensor(
+                next, state->attention_out, state->attention_norm,
+                state->q, state->k, state->v, state->heads, state->projected,
+                state->key_cache[il], state->value_cache[il], state->ffn_norm,
+                state->router_logits, state->router_selected, state->router_weights,
+                state->router_probs, state->moe_mid, state->moe_out, e->model.map,
+                e->model.size, &state->desc[il], current, pos, cache_cap,
+                key_start, key_count) != 0;
+            ds4_gpu_tensor *tmp = current;
+            current = next;
+            next = tmp;
+        }
+        if (ok && logits_cpu) {
+            if (!state->output_norm || !state->logits) {
+                ok = false;
+            } else {
+                const uint64_t vocab_dim = e->weights.output->dim[1];
+                ok = ds4_gpu_rms_norm_weight_tensor(
+                         state->output_norm, current, e->model.map,
+                         e->model.size, e->weights.output_norm->abs_offset,
+                         DS4_N_EMBD, DS4_RMS_EPS) != 0 &&
+                     ds4_gpu_matmul_q8_0_tensor(
+                         state->logits, e->model.map, e->model.size,
+                         e->weights.output->abs_offset, DS4_N_EMBD, vocab_dim,
+                         state->output_norm, 1) != 0;
+            }
+        }
+        /* End even after an encoder failure: it releases the batch command
+         * buffer and makes any already encoded work safe to reclaim. */
+        const bool batch_ok = !batch_started || ds4_gpu_end_commands() != 0;
+        ok = ok && batch_ok;
+        if (ok && logits_cpu) {
+            ok = ds4_gpu_tensor_read(state->logits, 0, logits_cpu,
+                                     e->weights.output->dim[1] * sizeof(float)) != 0;
+        }
+        if (ok) state->position++;
+        return ok;
+    }
+
     bool ok = ds4_gpu_tensor_write(state->hidden, 0, state->hidden_cpu, embd_bytes) != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const uint32_t cache_cap = state->cache_cap[il];

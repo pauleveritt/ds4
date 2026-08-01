@@ -942,6 +942,32 @@ resumed final logits are F32-bit-identical to independent baselines. Ordinary
 `ds4` opening of the same model is separately rejected before it can enter the
 incompatible generic graph.
 
+**GPU-resident decode experiment:** the first 14.8 t/s agent trace was not a
+model limit. Its normal decode loop submitted the composed Metal helpers as
+many individually owned command buffers and copied the 2,304-F32 hidden state
+from GPU to CPU and back between every Mellum layer. The improved normal path
+keeps two activation buffers on GPU, ping-pongs them through the 28 layers,
+and surrounds the complete layer stack plus output head with one existing
+Metal command batch. The layer-trace/oracle mode deliberately retains its
+synchronous readbacks, so diagnostic semantics are unchanged.
+
+On the identical 13-token raw prompt and 32-token greedy cap, the trace from
+the first generated token to the 32nd covers 31 completed decode evaluations.
+It fell from 2.164 s (**14.3 t/s**) to 278 ms (**111.5 t/s**): a **7.8x**
+steady-decode improvement. The initial 13-token sync remained about 1.2 s,
+which is expected to include first-use pipeline work and is not yet a prefill
+result. The pre- and post-change session raw-logit files compare byte-for-byte
+identically; the session-logit oracle remains at `0.0175094604` maximum
+absolute / `0.009415312` RMS drift, and the all-layer tokenwise oracle remains
+at `1.18908691` maximum absolute / `0.0437416537` RMS drift. Interactive and
+two-session isolation probes still pass.
+
+The next measurement should use three to five warmed repetitions and record
+wall time, sync time, and generation time separately; a Metal System Trace (or
+the existing GPU-busy profiler) should confirm the command-buffer collapse.
+Only then should work move to GPU token embedding or true resident batched
+prefill. SSD work remains out of scope.
+
 **Review hardening:** Sol's post-commit review found that the initial oracle
 checker could accidentally accept a NaN because comparisons with NaN are false,
 and its fixture paths depended on the caller's current directory. The checker
