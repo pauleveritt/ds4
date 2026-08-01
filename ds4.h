@@ -304,6 +304,13 @@ int ds4_engine_mellum_session_lifecycle_probe(ds4_engine *engine,
                                               FILE       *out,
                                               int         ctx_size);
 
+/* Inspect-only Mellum session decode gate. Replays the fixed fixture through
+ * session-owned KV/scratch and raw logits, while token selection stays off. */
+int ds4_engine_mellum_session_decode_probe(ds4_engine *engine,
+                                           FILE       *out,
+                                           int         ctx_size,
+                                           const char *raw_output_path);
+
 /* Diagnostic-only Mellum output-head oracle. Replays the fixed fixture through
  * final RMSNorm and the Q8 output projection, but does not select a token. */
 int ds4_engine_mellum_logits_probe(ds4_engine *engine,

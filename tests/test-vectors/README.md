@@ -105,6 +105,14 @@ python3 tests/check_mellum_layer0_oracle.py --layer logits-tokenwise /tmp/mellum
 The raw-logit gate is maximum absolute error no greater than `0.025` and RMS
 no greater than `0.012`.
 
+The first session-owned decode gate replays the same fixture through its own
+F16 KV layout and scratch, without sampling or emitting a token:
+
+```sh
+HOME=/tmp/mellum2 ./ds4 --mellum-session-decode-probe-out /tmp/mellum2-session-result-output.f32 --ctx 4096 --model MODEL
+python3 tests/check_mellum_layer0_oracle.py --layer logits-tokenwise /tmp/mellum2-session-result-output.f32
+```
+
 For an inspect-only ranking report that neither samples nor emits a token:
 
 ```sh

@@ -847,6 +847,30 @@ The lifecycle probe now exercises token evaluation, eval-and-argmax, argmax,
 sampling, top-logprobs, and token-logprob rejection before releasing its KV
 tensors. This remains a safety boundary, not generation work.
 
+**Decode-session contract:** the next inspect-only gate is one-token decode,
+not a promotion of the reusable fixed-fixture probe. A decode session owns its
+own activation/router scratch, F16 K/V tensors, absolute position, final-norm
+scratch, and raw-logit tensor. It uses the same 21 sliding 1,024-row rings and
+seven full-context tensors as the layout contract. Its position must equal the
+session checkpoint length before each decode; a successful decode appends the
+input token and produces only the resulting raw logits. Invalidating this
+inspect session resets its checkpoint and decode position to zero; partial
+rewind is deliberately reduced to that reset rather than exposing replay
+semantics. The engine-owned probe state is deliberately not shared across
+sessions.
+
+The allowed entry point is an inspect-only fixture gate,
+`--mellum-session-decode-probe[-out FILE]`. It drives the public one-token
+session-evaluation API over the pinned 26 tokens and can write the final raw
+logit row for the existing oracle checker. `ds4_session_sync` and all prefill,
+batch, layer-slice, snapshot, payload, argmax, sampling, and log-probability
+paths continue to reject Mellum sessions. The ordinary Mellum loader remains
+inspect-only, and no CLI prompt path reaches this state. This makes the raw
+logit oracle the acceptance criterion without authorizing token selection,
+emission, generation, or SSD streaming. At `--ctx 4096`, the session gate's
+26-token final row matches the pinned oracle with maximum absolute error
+`0.0175094604` and RMS `0.009415312`, identical to the engine-owned diagnostic.
+
 **Review hardening:** Sol's post-commit review found that the initial oracle
 checker could accidentally accept a NaN because comparisons with NaN are false,
 and its fixture paths depended on the caller's current directory. The checker

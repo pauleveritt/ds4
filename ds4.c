@@ -36548,26 +36548,10 @@ static bool ds4_mellum_kv_layout_alloc(const ds4_engine *e,
 
 struct ds4_mellum_session_state {
     ds4_mellum_kv_layout kv;
+    ds4_mellum_decode_state *decode;
     uint32_t ctx_size;
+    bool decode_enabled;
 };
-
-static ds4_mellum_session_state *ds4_mellum_session_state_create(
-        const ds4_engine *e,
-        uint32_t          ctx_size) {
-    ds4_mellum_session_state *state = xcalloc(1, sizeof(*state));
-    if (!ds4_mellum_kv_layout_alloc(e, &state->kv, ctx_size, NULL)) {
-        free(state);
-        return NULL;
-    }
-    state->ctx_size = ctx_size;
-    return state;
-}
-
-static void ds4_mellum_session_state_free(ds4_mellum_session_state *state) {
-    if (!state) return;
-    ds4_mellum_kv_layout_free(&state->kv);
-    free(state);
-}
 
 typedef struct {
     uint32_t id;
@@ -36658,15 +36642,11 @@ static void ds4_mellum_decode_state_free(ds4_mellum_decode_state *state) {
     free(state);
 }
 
-static bool ds4_engine_mellum_decode_state_prepare(ds4_engine *e,
-                                                    uint32_t    full_cache_cap) {
+static ds4_mellum_decode_state *ds4_mellum_decode_state_create(
+        const ds4_engine *e,
+        uint32_t          full_cache_cap) {
     if (!e || full_cache_cap == 0) return false;
-    ds4_mellum_decode_state *state = e->mellum_decode_state;
-    if (state && state->full_cache_cap == full_cache_cap) return true;
-    ds4_mellum_decode_state_free(state);
-    e->mellum_decode_state = NULL;
-
-    state = xcalloc(1, sizeof(*state));
+    ds4_mellum_decode_state *state = xcalloc(1, sizeof(*state));
     const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint64_t q_bytes = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
@@ -36712,14 +36692,24 @@ static bool ds4_engine_mellum_decode_state_prepare(ds4_engine *e,
     if (!ok) {
         fprintf(stderr, "ds4: Mellum inspect graph allocation failed\n");
         ds4_mellum_decode_state_free(state);
-        return false;
+        return NULL;
     }
-    e->mellum_decode_state = state;
-    return true;
+    return state;
 }
 
-static bool ds4_engine_mellum_decode_output_prepare(ds4_engine *e) {
-    ds4_mellum_decode_state *state = e ? e->mellum_decode_state : NULL;
+static bool ds4_engine_mellum_decode_state_prepare(ds4_engine *e,
+                                                    uint32_t    full_cache_cap) {
+    if (!e || full_cache_cap == 0) return false;
+    ds4_mellum_decode_state *state = e->mellum_decode_state;
+    if (state && state->full_cache_cap == full_cache_cap) return true;
+    ds4_mellum_decode_state_free(state);
+    e->mellum_decode_state = ds4_mellum_decode_state_create(e, full_cache_cap);
+    return e->mellum_decode_state != NULL;
+}
+
+static bool ds4_mellum_decode_output_prepare(
+        const ds4_engine       *e,
+        ds4_mellum_decode_state *state) {
     if (!state || !e->weights.output_norm || !e->weights.output ||
         e->weights.output_norm->type != DS4_TENSOR_F32 ||
         e->weights.output_norm->ndim != 1 ||
@@ -36748,18 +36738,18 @@ static bool ds4_engine_mellum_decode_output_prepare(ds4_engine *e) {
     return false;
 }
 
-static void ds4_engine_mellum_decode_state_reset(ds4_engine *e) {
-    if (e && e->mellum_decode_state) e->mellum_decode_state->position = 0;
+static void ds4_mellum_decode_state_reset(ds4_mellum_decode_state *state) {
+    if (state) state->position = 0;
 }
 
-static bool ds4_engine_mellum_decode_token(ds4_engine *e,
-                                            int         token,
-                                            float      *final_cpu,
-                                            float      *layer_trace,
-                                            float      *attention_trace,
-                                            float      *qk_trace,
-                                            float      *logits_cpu) {
-    ds4_mellum_decode_state *state = e ? e->mellum_decode_state : NULL;
+static bool ds4_mellum_decode_token(const ds4_engine       *e,
+                                    ds4_mellum_decode_state *state,
+                                    int                     token,
+                                    float                  *final_cpu,
+                                    float                  *layer_trace,
+                                    float                  *attention_trace,
+                                    float                  *qk_trace,
+                                    float                  *logits_cpu) {
     if (!state || state->position >= state->full_cache_cap) return false;
     const uint32_t pos = state->position;
     const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
@@ -36824,6 +36814,37 @@ static bool ds4_engine_mellum_decode_token(ds4_engine *e,
     if (ok) state->position++;
     return ok;
 }
+
+static ds4_mellum_session_state *ds4_mellum_session_state_create(
+        const ds4_engine *e,
+        uint32_t          ctx_size,
+        bool              decode_enabled) {
+    ds4_mellum_session_state *state = xcalloc(1, sizeof(*state));
+    state->ctx_size = ctx_size;
+    state->decode_enabled = decode_enabled;
+    if (decode_enabled) {
+        state->decode = ds4_mellum_decode_state_create(e, ctx_size);
+        if (!state->decode ||
+            !ds4_mellum_decode_output_prepare(e, state->decode)) {
+            ds4_mellum_decode_state_free(state->decode);
+            free(state);
+            return NULL;
+        }
+        return state;
+    }
+    if (!ds4_mellum_kv_layout_alloc(e, &state->kv, ctx_size, NULL)) {
+        free(state);
+        return NULL;
+    }
+    return state;
+}
+
+static void ds4_mellum_session_state_free(ds4_mellum_session_state *state) {
+    if (!state) return;
+    ds4_mellum_decode_state_free(state->decode);
+    ds4_mellum_kv_layout_free(&state->kv);
+    free(state);
+}
 #endif
 
 int ds4_engine_mellum_all_layers_probe(ds4_engine *e,
@@ -36868,12 +36889,13 @@ int ds4_engine_mellum_all_layers_probe(ds4_engine *e,
     const uint32_t qk_trace_stride = q_dim + kv_dim;
     float *qk_trace = xmalloc((size_t)DS4_N_LAYER * qk_trace_stride * sizeof(float));
     int ok = ds4_engine_mellum_decode_state_prepare(e, n_tokens);
-    if (ok) ds4_engine_mellum_decode_state_reset(e);
+    if (ok) ds4_mellum_decode_state_reset(e->mellum_decode_state);
 
     for (uint32_t pos = 0; ok && pos < n_tokens; pos++) {
         const bool capture_trace = pos + 1u == n_tokens;
-        ok = ds4_engine_mellum_decode_token(
-            e, fixture_tokens[pos], capture_trace ? final_cpu : NULL,
+        ok = ds4_mellum_decode_token(
+            e, e->mellum_decode_state, fixture_tokens[pos],
+            capture_trace ? final_cpu : NULL,
             capture_trace ? layer_trace : NULL,
             capture_trace ? attention_trace : NULL,
             capture_trace ? qk_trace : NULL, NULL);
@@ -36992,11 +37014,12 @@ int ds4_engine_mellum_logits_probe(ds4_engine *e,
     const uint64_t vocab_dim = e->weights.output->dim[1];
     float *logits_cpu = xmalloc((size_t)vocab_dim * sizeof(float));
     int ok = ds4_engine_mellum_decode_state_prepare(e, n_tokens);
-    if (ok) ok = ds4_engine_mellum_decode_output_prepare(e);
-    if (ok) ds4_engine_mellum_decode_state_reset(e);
+    if (ok) ok = ds4_mellum_decode_output_prepare(e, e->mellum_decode_state);
+    if (ok) ds4_mellum_decode_state_reset(e->mellum_decode_state);
     for (uint32_t pos = 0; ok && pos < n_tokens; pos++) {
-        ok = ds4_engine_mellum_decode_token(
-            e, fixture_tokens[pos], NULL, NULL, NULL, NULL,
+        ok = ds4_mellum_decode_token(
+            e, e->mellum_decode_state, fixture_tokens[pos],
+            NULL, NULL, NULL, NULL,
             pos + 1u == n_tokens ? logits_cpu : NULL);
         if (!ok) fprintf(stderr, "ds4: Mellum logits probe failed at token %u\n", pos);
     }
@@ -51633,8 +51656,26 @@ static bool ds4_session_is_cpu(const ds4_session *s) {
     return s && s->engine && s->engine->backend == DS4_BACKEND_CPU;
 }
 
-static bool ds4_session_is_mellum_layout_only(const ds4_session *s) {
+static bool ds4_session_is_mellum(const ds4_session *s) {
     return s && s->mellum != NULL;
+}
+
+static bool ds4_session_is_mellum_layout_only(const ds4_session *s) {
+#ifndef DS4_NO_GPU
+    return ds4_session_is_mellum(s) && !s->mellum->decode_enabled;
+#else
+    (void)s;
+    return false;
+#endif
+}
+
+static bool ds4_session_is_mellum_decode_only(const ds4_session *s) {
+#ifndef DS4_NO_GPU
+    return ds4_session_is_mellum(s) && s->mellum->decode_enabled;
+#else
+    (void)s;
+    return false;
+#endif
 }
 
 static bool ds4_session_reject_mellum_layout_only(const ds4_session *s,
@@ -51644,6 +51685,17 @@ static bool ds4_session_reject_mellum_layout_only(const ds4_session *s,
     if (err && errlen) {
         snprintf(err, errlen,
                  "Mellum session is layout-only; token evaluation is not enabled");
+    }
+    return true;
+}
+
+static bool ds4_session_reject_mellum_unsupported(const ds4_session *s,
+                                                   char              *err,
+                                                   size_t             errlen) {
+    if (!ds4_session_is_mellum(s)) return false;
+    if (err && errlen) {
+        snprintf(err, errlen,
+                 "Mellum session does not support this operation in inspect mode");
     }
     return true;
 }
@@ -51781,7 +51833,7 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
     if (!s || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end))
         return 0;
-    if (ds4_session_is_mellum_layout_only(s)) return 0;
+    if (ds4_session_is_mellum(s)) return 0;
     if (ds4_session_is_cpu(s)) return 0;
     if (ds4_session_is_laguna(s)) return 0;
     if (ds4_session_is_glm(s)) {
@@ -51851,7 +51903,7 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
 int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen) {
-    if (ds4_session_reject_mellum_layout_only(s, err, errlen)) return 1;
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     if (!s || !fp || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload save");
@@ -52094,7 +52146,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    const int *tokens, uint32_t n_tokens,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen) {
-    if (ds4_session_reject_mellum_layout_only(s, err, errlen)) return 1;
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     if (!s || !fp || !tokens ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload load");
@@ -52718,7 +52770,7 @@ static void session_greedy_splitkv_reset(ds4_session *s) {
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
-    if (ds4_session_is_mellum_layout_only(s)) return 0;
+    if (ds4_session_is_mellum(s)) return 0;
     if (s->distributed) return 0;
     if (ds4_session_is_laguna(s)) {
 #ifdef DS4_NO_GPU
@@ -52808,7 +52860,7 @@ void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
 
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen) {
-    if (ds4_session_reject_mellum_layout_only(s, err, errlen)) return 1;
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     if (!out) {
         payload_set_err(err, errlen, "invalid session payload staging request");
         return 1;
@@ -52862,7 +52914,7 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
 }
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
-    if (ds4_session_reject_mellum_layout_only(s, err, errlen)) return 1;
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
@@ -53255,7 +53307,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
-    if (ds4_session_reject_mellum_layout_only(s, err, errlen)) return 1;
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -53945,7 +53997,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 }
 
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen) {
-    if (ds4_session_reject_mellum_layout_only(s, err, errlen)) return 1;
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     if (!s || !snap) {
         payload_set_err(err, errlen, "invalid session snapshot save");
         return 1;
@@ -53989,7 +54041,7 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
 }
 
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
-    if (ds4_session_reject_mellum_layout_only(s, err, errlen)) return 1;
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     if (!s || !snap || !snap->ptr || snap->len == 0) {
         payload_set_err(err, errlen, "invalid session snapshot load");
         return 1;
@@ -54449,7 +54501,7 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
-    if (ds4_session_reject_mellum_layout_only(s, err, errlen)) return -1;
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return -1;
     if (ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
@@ -60239,6 +60291,28 @@ static int ds4_session_tp_register(ds4_session *s) {
     return 1;
 }
 
+static int ds4_mellum_session_create(ds4_session **out, ds4_engine *e,
+                                     int ctx_size, bool decode_enabled) {
+    if (!out || !e || ctx_size <= 0 ||
+        !e->mellum_decode_contract_ready ||
+        !ds4_backend_uses_graph(e->backend)) return 1;
+    ds4_session *s = xcalloc(1, sizeof(*s));
+    s->engine = e;
+    s->ctx_size = ctx_size;
+    s->mellum = ds4_mellum_session_state_create(
+        e, (uint32_t)ctx_size, decode_enabled);
+    if (!s->mellum) {
+        fprintf(stderr, "ds4: Mellum session allocation failed\n");
+        free(s);
+        return 1;
+    }
+    if (decode_enabled) {
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    }
+    *out = s;
+    return 0;
+}
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
@@ -60273,18 +60347,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     return 1;
 #else
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
-        if (!ds4_backend_uses_graph(e->backend)) return 1;
-        ds4_session *s = xcalloc(1, sizeof(*s));
-        s->engine = e;
-        s->ctx_size = ctx_size;
-        s->mellum = ds4_mellum_session_state_create(e, (uint32_t)ctx_size);
-        if (!s->mellum) {
-            fprintf(stderr, "ds4: Mellum layout-only session KV allocation failed\n");
-            free(s);
-            return 1;
-        }
-        *out = s;
-        return 0;
+        return ds4_mellum_session_create(out, e, ctx_size, false);
     }
     if (!ds4_backend_uses_graph(e->backend) || !e->metal_ready) return 1;
 
@@ -60594,7 +60657,7 @@ void ds4_session_free(ds4_session *s) {
 #endif
     ds4_dist_session_free(s->distributed);
 #ifndef DS4_NO_GPU
-    if (ds4_session_is_mellum_layout_only(s)) {
+    if (ds4_session_is_mellum(s)) {
         ds4_mellum_session_state_free(s->mellum);
         s->mellum = NULL;
     } else
@@ -60665,6 +60728,30 @@ int ds4_engine_mellum_session_lifecycle_probe(ds4_engine *e,
         ds4_session_free(session);
         return 1;
     }
+    ds4_session_payload_file staged = {0};
+    ds4_session_snapshot snapshot = {0};
+    if (ds4_session_payload_bytes(session) != 0 ||
+        ds4_session_layer_payload_bytes(session, 0, 0) != 0 ||
+        ds4_session_stage_payload(session, &staged, reject_err,
+                                  sizeof(reject_err)) != 1 ||
+        ds4_session_save_payload(session, NULL, reject_err,
+                                 sizeof(reject_err)) != 1 ||
+        ds4_session_load_payload(session, NULL, 0, reject_err,
+                                 sizeof(reject_err)) != 1 ||
+        ds4_session_save_layer_payload(session, NULL, 0, 0, reject_err,
+                                       sizeof(reject_err)) != 1 ||
+        ds4_session_load_layer_payload(session, NULL, 0, NULL, 0, 0, 0,
+                                       reject_err, sizeof(reject_err)) != 1 ||
+        ds4_session_save_snapshot(session, &snapshot, reject_err,
+                                  sizeof(reject_err)) != 1 ||
+        ds4_session_load_snapshot(session, NULL, reject_err,
+                                  sizeof(reject_err)) != 1) {
+        fprintf(stderr, "ds4: Mellum layout-only session unexpectedly exposed payload state\n");
+        ds4_session_payload_file_free(&staged);
+        ds4_session_snapshot_free(&snapshot);
+        ds4_session_free(session);
+        return 1;
+    }
     const uint32_t full_layers = DS4_N_LAYER / 4u;
     const uint32_t sliding_layers = DS4_N_LAYER - full_layers;
     fprintf(out,
@@ -60672,6 +60759,83 @@ int ds4_engine_mellum_session_lifecycle_probe(ds4_engine *e,
             ctx_size, sliding_layers, full_layers);
     ds4_session_free(session);
     return 0;
+}
+
+int ds4_engine_mellum_session_decode_probe(ds4_engine *e,
+                                           FILE       *out,
+                                           int         ctx_size,
+                                           const char *raw_output_path) {
+#ifdef DS4_NO_GPU
+    (void)e;
+    (void)out;
+    (void)ctx_size;
+    (void)raw_output_path;
+    fprintf(stderr, "ds4: Mellum session decode probe requires Metal support\n");
+    return 1;
+#else
+    static const int fixture_tokens[] = {
+        27, 1397, 233, 12998, 497, 2717, 669, 60, 783, 846, 42, 99, 46,
+        321, 800, 28, 233, 27, 8091, 233, 23, 233, 233, 24, 233, 233,
+    };
+    const uint32_t n_tokens = (uint32_t)(sizeof(fixture_tokens) /
+                                          sizeof(fixture_tokens[0]));
+    if (!e || !out || ctx_size < (int)n_tokens ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
+        e->backend != DS4_BACKEND_METAL || !e->mellum_decode_contract_ready) {
+        fprintf(stderr, "ds4: Mellum session decode probe requires an inspect-loaded Metal engine\n");
+        return 1;
+    }
+    ds4_session *session = NULL;
+    if (ds4_mellum_session_create(&session, e, ctx_size, true) != 0 ||
+        !session || !ds4_session_is_mellum_decode_only(session)) {
+        fprintf(stderr, "ds4: Mellum inspect decode session creation failed\n");
+        ds4_session_free(session);
+        return 1;
+    }
+    char err[128] = "";
+    int ok = 1;
+    for (uint32_t pos = 0; ok && pos < n_tokens; pos++) {
+        if (ds4_session_eval(session, fixture_tokens[pos], err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4: Mellum session decode probe failed at token %u: %s\n",
+                    pos, err[0] ? err : "unknown error");
+            ok = 0;
+        }
+    }
+    const uint64_t vocab_dim = e->weights.output->dim[1];
+    float *logits = ok ? xmalloc((size_t)vocab_dim * sizeof(*logits)) : NULL;
+    if (ok && (ds4_session_copy_logits(session, logits, (int)vocab_dim) !=
+                   (int)vocab_dim ||
+               ds4_session_argmax(session) != -1 ||
+               ds4_session_eval_argmax(session, 0, err, sizeof(err)) != -1 ||
+               ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, NULL) != -1 ||
+               ds4_session_top_logprobs(session, &(ds4_token_score){0}, 1) != 0 ||
+               ds4_session_payload_bytes(session) != 0 ||
+               ds4_session_sync(session, NULL, err, sizeof(err)) != 1)) {
+        fprintf(stderr, "ds4: Mellum session decode probe exposed an unsupported operation\n");
+        ok = 0;
+    }
+    if (ok && raw_output_path && raw_output_path[0] &&
+        !ds4_mellum_write_atomic(raw_output_path, logits,
+                                 vocab_dim * sizeof(*logits))) {
+        fprintf(stderr, "ds4: could not write Mellum session decode output\n");
+        ok = 0;
+    }
+    if (ok) {
+        float sum = 0.0f;
+        for (uint64_t i = 0; i < vocab_dim; i++) sum += logits[i];
+        fprintf(out,
+                "Mellum session decode probe tokens=%u ctx=%d vocab=%llu sum=%.6f selection=rejected\n",
+                n_tokens, ctx_size, (unsigned long long)vocab_dim, sum);
+    }
+    ds4_session_rewind(session, (int)n_tokens - 1);
+    if (ok && ds4_session_pos(session) != 0) {
+        fprintf(stderr, "ds4: Mellum inspect rewind did not reset session state\n");
+        ok = 0;
+    }
+    free(logits);
+    ds4_session_free(session);
+    return ok ? 0 : 1;
+#endif
 }
 
 int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen) {
@@ -60693,6 +60857,7 @@ bool ds4_session_is_distributed(ds4_session *s) {
 
 int ds4_session_set_power(ds4_session *s, int power_percent) {
     if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
+    if (ds4_session_is_mellum(s)) return 1;
 #ifndef DS4_NO_GPU
     if ((ds4_session_is_glm(s) || ds4_session_is_laguna(s)) &&
         power_percent != 100) {
@@ -60748,7 +60913,7 @@ int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
     }
-    if (ds4_session_reject_mellum_layout_only(s, err, errlen)) return 1;
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     ds4_session_invalidate(s);
     if (ds4_session_is_cpu(s)) {
         session_cpu_reset_cache(s);
@@ -60791,7 +60956,7 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
         if (errlen) snprintf(err, errlen, "invalid output-head hidden-state input");
         return 1;
     }
-    if (ds4_session_reject_mellum_layout_only(s, err, errlen)) return 1;
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
 
     ds4_engine *e = s->engine;
     if (!weights_have_output_head(&e->weights)) {
@@ -61090,7 +61255,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
     }
-    if (ds4_session_reject_mellum_layout_only(s, err, errlen)) return 1;
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     const uint32_t executable_layers = ds4_model_normal_layer_count();
     if (executable_layers == 0 ||
         layer_start > layer_end ||
@@ -61604,7 +61769,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
-    if (ds4_session_reject_mellum_layout_only(s, err, errlen)) return 1;
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     const bool mirror = ds4_session_tp_leader(s);
     if (mirror && prompt && prompt->len > 0) {
         if (!ds4_tp_send_sync(s->engine->tp.ctx, s->tp_session_id,
@@ -62621,12 +62786,12 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 }
 
 int ds4_session_argmax(ds4_session *s) {
-    if (!s || ds4_session_is_mellum_layout_only(s) || !s->logits) return -1;
+    if (!s || ds4_session_is_mellum(s) || !s->logits) return -1;
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
-    if (!s || ds4_session_is_mellum_layout_only(s) || !s->logits) return -1;
+    if (!s || ds4_session_is_mellum(s) || !s->logits) return -1;
     int best = -1;
     float best_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -62652,14 +62817,14 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
-    if (!s || ds4_session_is_mellum_layout_only(s) || !s->logits ||
+    if (!s || ds4_session_is_mellum(s) || !s->logits ||
         !s->sample_probs) return -1;
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
-    if (!s || ds4_session_is_mellum_layout_only(s) || !s->logits ||
+    if (!s || ds4_session_is_mellum(s) || !s->logits ||
         !out || k <= 0) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
     for (int i = 0; i < k; i++) {
@@ -62697,7 +62862,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 }
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
-    if (!s || ds4_session_is_mellum_layout_only(s) || !s->logits ||
+    if (!s || ds4_session_is_mellum(s) || !s->logits ||
         !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
 
     float max_logit = DS4_NEG_INF;
@@ -62727,7 +62892,7 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
 }
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
-    if (!s || ds4_session_is_mellum_layout_only(s) || !s->logits ||
+    if (!s || ds4_session_is_mellum(s) || !s->logits ||
         !logits || n != (int)DS4_N_VOCAB) return 1;
     memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     return 0;
@@ -63601,7 +63766,42 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
     return rc;
 }
 
+#ifndef DS4_NO_GPU
+static int ds4_session_eval_mellum_decode(ds4_session *s, int token,
+                                          char *err, size_t errlen) {
+    if (!s || !s->engine || !s->mellum || !s->mellum->decode || !s->logits ||
+        token < 0 || (uint32_t)token >= DS4_N_VOCAB) {
+        if (err && errlen) snprintf(err, errlen, "invalid Mellum decode session or token");
+        return 1;
+    }
+    ds4_mellum_decode_state *state = s->mellum->decode;
+    if (s->checkpoint.len < 0 || (uint32_t)s->checkpoint.len >= (uint32_t)s->ctx_size ||
+        state->position != (uint32_t)s->checkpoint.len) {
+        if (err && errlen) snprintf(err, errlen, "Mellum decode session position is invalid");
+        return 1;
+    }
+    if (!ds4_mellum_decode_token(s->engine, state, token, NULL, NULL, NULL,
+                                 NULL, s->logits)) {
+        if (err && errlen) snprintf(err, errlen, "Mellum inspect decode failed");
+        ds4_session_invalidate(s);
+        return 1;
+    }
+    token_vec_push(&s->checkpoint, token);
+    s->checkpoint_valid = true;
+    return 0;
+}
+#endif
+
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+    if (ds4_session_is_mellum_decode_only(s)) {
+#ifdef DS4_NO_GPU
+        (void)token;
+        if (err && errlen) snprintf(err, errlen, "Mellum decode requires Metal support");
+        return 1;
+#else
+        return ds4_session_eval_mellum_decode(s, token, err, errlen);
+#endif
+    }
     if (ds4_session_reject_mellum_layout_only(s, err, errlen)) return 1;
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
@@ -64400,6 +64600,11 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
             }
             return 1;
         }
+        if (count > 1 && ds4_session_is_mellum(s)) {
+            if (err && errlen) snprintf(err, errlen,
+                                        "Mellum inspect sessions support only one-token eval");
+            return 1;
+        }
         if (items[i].token < 0 || items[i].token >= (int)DS4_N_VOCAB) {
             if (err && errlen) {
                 snprintf(err, errlen, "decode batch item %d has an invalid token", i);
@@ -64459,6 +64664,11 @@ int ds4_sessions_eval_batch_with_prefill(
     if (!items || count <= 0 || !prefill_session || !prefill_prompt ||
         !prefill_session->engine) {
         if (err && errlen) snprintf(err, errlen, "invalid mixed model batch");
+        return 1;
+    }
+    if (ds4_session_is_mellum(prefill_session)) {
+        if (err && errlen) snprintf(err, errlen,
+                                    "Mellum inspect sessions do not support prefill");
         return 1;
     }
     if (!prefill_session->checkpoint_valid ||
@@ -67800,6 +68010,11 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
+    if (ds4_session_is_mellum(s)) {
+        if (err && errlen) snprintf(err, errlen,
+                                    "Mellum inspect sessions do not support token selection");
+        return -1;
+    }
     if (s->distributed) {
         if (!accepted) return 0;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
@@ -68526,6 +68741,11 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+#ifndef DS4_NO_GPU
+    if (ds4_session_is_mellum_decode_only(s)) {
+        ds4_mellum_decode_state_reset(s->mellum->decode);
+    }
+#endif
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
     ds4_session_glm_reset_dense_cache(s);
@@ -68533,6 +68753,12 @@ void ds4_session_invalidate(ds4_session *s) {
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
+    if (ds4_session_is_mellum(s)) {
+        /* Partial replay is intentionally outside the inspect-only decode
+         * contract. Resetting preserves the position/KV invariant instead. */
+        ds4_session_invalidate(s);
+        return;
+    }
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
         (void)ds4_tp_send_rewind(s->engine->tp.ctx, s->tp_session_id, pos);

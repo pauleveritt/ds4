@@ -298,6 +298,8 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--mellum-all-layers-qk-trace-out FILE", "Write all 28 final-token post-RoPE Q/K states for diagnosis.");
     opt(fp, c, "--mellum-kv-layout-probe", "Allocate and release Mellum's per-layer F16 KV layout without evaluation.");
     opt(fp, c, "--mellum-session-lifecycle-probe", "Create and release a Mellum layout-only session; token evaluation stays disabled.");
+    opt(fp, c, "--mellum-session-decode-probe", "Replay the fixed fixture through a session-local Mellum decode path; selection stays disabled.");
+    opt(fp, c, "--mellum-session-decode-probe-out FILE", "Write its raw F32 logits for oracle comparison without sampling or emitting a token.");
     fputc('\n', fp);
 }
 
