@@ -104,6 +104,7 @@ typedef struct {
     const char *mellum_session_decode_probe_out;
     bool mellum_session_isolation_probe;
     bool mellum_interactive_session_probe;
+    bool mellum_swa_boundary_probe;
     bool mellum_logits_probe;
     const char *mellum_logits_probe_out;
     int mellum_logits_probe_top_k;
@@ -2089,6 +2090,10 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.mellum_interactive_session_probe = true;
             c.inspect = true;
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-swa-boundary-probe")) {
+            c.gen.mellum_swa_boundary_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--mellum-logits-probe")) {
             c.gen.mellum_logits_probe = true;
             c.inspect = true;
@@ -2283,6 +2288,14 @@ int main(int argc, char **argv) {
     }
     if (cfg.gen.mellum_interactive_session_probe) {
         int rc = ds4_engine_mellum_interactive_session_probe(
+            engine, stdout, cfg.gen.ctx_size);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_swa_boundary_probe) {
+        int rc = ds4_engine_mellum_swa_boundary_probe(
             engine, stdout, cfg.gen.ctx_size);
         ds4_engine_close(engine);
         ds4_dist_options_free(cfg.dist);

@@ -1167,3 +1167,15 @@ same resident-versus-streamed A/B gate used for Laguna XS.
   to be schedule-specific: the pinned matching tokenwise layer-27 reference
   passes at `0.0437417` RMS and `1.18909` maximum absolute error. Stop here
   before output-head, generation, or SSD-streaming work.
+- Moved Q8 token embedding into the resident Metal command batch. It removes
+  the final CPU embedding/readback handoff and is byte-identical to the prior
+  resident decode output; steady decode remains about 111 t/s, confirming that
+  the layer compute rather than the 9 KiB embedding upload dominates.
+- Added bounded (32-token) command-batched sequential session sync. This is
+  deliberately not described as true multi-token prefill: it preserves one
+  autoregressive decode graph per token and merely amortizes command submission.
+  The existing interactive/session-isolation checks and pinned logits/all-layer
+  oracles remain unchanged. The dedicated 1,030-token probe now compares this
+  schedule bit-for-bit with per-token decode across the 1,024-token SWA ring
+  boundary (21 sliding layers and 7 full layers). This clears the long-context
+  correctness gate before a layer-major prefill graph is attempted.

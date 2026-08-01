@@ -328,6 +328,12 @@ int ds4_engine_mellum_interactive_session_probe(ds4_engine *engine,
                                                 FILE       *out,
                                                 int         ctx_size);
 
+/* Inspect-only Mellum long-context gate. Compares the ordinary decode schedule
+ * with command-batched sequential sync across the 1,024-token SWA boundary. */
+int ds4_engine_mellum_swa_boundary_probe(ds4_engine *engine,
+                                         FILE       *out,
+                                         int         ctx_size);
+
 /* Diagnostic-only Mellum output-head oracle. Replays the fixed fixture through
  * final RMSNorm and the Q8 output projection, but does not select a token. */
 int ds4_engine_mellum_logits_probe(ds4_engine *engine,

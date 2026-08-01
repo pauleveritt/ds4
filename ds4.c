@@ -36760,7 +36760,9 @@ static bool ds4_mellum_decode_token(const ds4_engine       *e,
                                     float                  *layer_trace,
                                     float                  *attention_trace,
                                     float                  *qk_trace,
-                                    float                  *logits_cpu) {
+                                    float                  *logits_cpu,
+                                    bool                    compute_logits,
+                                    bool                    allow_existing_batch) {
     if (!state || state->position >= state->full_cache_cap) return false;
     const uint32_t pos = state->position;
     const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
@@ -36768,7 +36770,7 @@ static bool ds4_mellum_decode_token(const ds4_engine       *e,
     const uint64_t kv_bytes = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
     const uint32_t q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint32_t qk_trace_stride = q_dim + DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
-    embed_token_any(&e->model, &e->weights, token, state->hidden_cpu);
+    if (token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
 
     /* The fixed oracle captures per-layer tensors, so it intentionally keeps
      * the old synchronous readback schedule below.  Normal session decode has
@@ -36779,13 +36781,19 @@ static bool ds4_mellum_decode_token(const ds4_engine       *e,
     if (!capture_intermediate) {
         ds4_gpu_tensor *current = state->hidden;
         ds4_gpu_tensor *next = state->layer_out;
+        const bool use_existing_batch =
+            allow_existing_batch && ds4_gpu_commands_active();
+        if (use_existing_batch && logits_cpu) return false;
         bool batch_started = false;
-        bool ok = ds4_gpu_tensor_write(current, 0, state->hidden_cpu,
-                                       embd_bytes) != 0;
-        if (ok) {
-            batch_started = ds4_gpu_begin_commands() != 0;
-            ok = batch_started;
-        }
+        bool ok = e->weights.token_embd &&
+                  e->weights.token_embd->type == DS4_TENSOR_Q8_0;
+        if (ok && !use_existing_batch) batch_started = ds4_gpu_begin_commands() != 0;
+        if (use_existing_batch) batch_started = true;
+        ok = ok && batch_started;
+        if (ok) ok = ds4_gpu_embed_token_q8_0_tensor(
+            current, e->model.map, e->model.size,
+            e->weights.token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)token,
+            DS4_N_EMBD) != 0;
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
             const uint32_t cache_cap = state->cache_cap[il];
             const bool sliding = e->mellum_layer[il].sliding_attention;
@@ -36804,7 +36812,7 @@ static bool ds4_mellum_decode_token(const ds4_engine       *e,
             current = next;
             next = tmp;
         }
-        if (ok && logits_cpu) {
+        if (ok && (logits_cpu || compute_logits)) {
             if (!state->output_norm || !state->logits) {
                 ok = false;
             } else {
@@ -36821,7 +36829,8 @@ static bool ds4_mellum_decode_token(const ds4_engine       *e,
         }
         /* End even after an encoder failure: it releases the batch command
          * buffer and makes any already encoded work safe to reclaim. */
-        const bool batch_ok = !batch_started || ds4_gpu_end_commands() != 0;
+        const bool batch_ok = use_existing_batch ||
+                              (!batch_started || ds4_gpu_end_commands() != 0);
         ok = ok && batch_ok;
         if (ok && logits_cpu) {
             ok = ds4_gpu_tensor_read(state->logits, 0, logits_cpu,
@@ -36831,6 +36840,7 @@ static bool ds4_mellum_decode_token(const ds4_engine       *e,
         return ok;
     }
 
+    embed_token_any(&e->model, &e->weights, token, state->hidden_cpu);
     bool ok = ds4_gpu_tensor_write(state->hidden, 0, state->hidden_cpu, embd_bytes) != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const uint32_t cache_cap = state->cache_cap[il];
@@ -36973,7 +36983,7 @@ int ds4_engine_mellum_all_layers_probe(ds4_engine *e,
             capture_trace ? final_cpu : NULL,
             capture_trace ? layer_trace : NULL,
             capture_trace ? attention_trace : NULL,
-            capture_trace ? qk_trace : NULL, NULL);
+            capture_trace ? qk_trace : NULL, NULL, false, false);
         if (!ok) {
             fprintf(stderr, "ds4: Mellum inspect graph failed at token %u\n", pos);
         }
@@ -37096,7 +37106,7 @@ int ds4_engine_mellum_logits_probe(ds4_engine *e,
         ok = ds4_mellum_decode_token(
             e, e->mellum_decode_state, fixture_tokens[pos],
             NULL, NULL, NULL, NULL,
-            pos + 1u == n_tokens ? logits_cpu : NULL);
+            pos + 1u == n_tokens ? logits_cpu : NULL, false, false);
         if (!ok) fprintf(stderr, "ds4: Mellum logits probe failed at token %u\n", pos);
     }
     if (ok && raw_output_path && raw_output_path[0] &&
@@ -61286,6 +61296,73 @@ int ds4_engine_mellum_interactive_session_probe(ds4_engine *e,
 #endif
 }
 
+int ds4_engine_mellum_swa_boundary_probe(ds4_engine *e,
+                                         FILE       *out,
+                                         int         ctx_size) {
+#ifdef DS4_NO_GPU
+    (void)e;
+    (void)out;
+    (void)ctx_size;
+    fprintf(stderr, "ds4: Mellum SWA boundary probe requires Metal support\n");
+    return 1;
+#else
+    enum { n_tokens = 1030 };
+    if (!e || !out || ctx_size <= n_tokens ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
+        e->backend != DS4_BACKEND_METAL || !e->mellum_decode_contract_ready ||
+        e->mellum_interactive_sessions) {
+        fprintf(stderr,
+                "ds4: Mellum SWA boundary probe requires an inspect-loaded Metal engine and ctx > %d\n",
+                n_tokens);
+        return 1;
+    }
+    int *tokens = xmalloc((size_t)n_tokens * sizeof(*tokens));
+    for (int i = 0; i < n_tokens; i++) {
+        /* Valid, varied IDs; the deterministic sequence avoids tokenizer state. */
+        tokens[i] = (int)(((uint32_t)i * 7919u + 27u) % DS4_N_VOCAB);
+    }
+    ds4_tokens prompt = {.v = tokens, .len = n_tokens, .cap = n_tokens};
+    const uint64_t vocab_dim = e->weights.output->dim[1];
+    const size_t logit_bytes = (size_t)vocab_dim * sizeof(float);
+    float *reference = xmalloc(logit_bytes);
+    float *actual = xmalloc(logit_bytes);
+    ds4_session *baseline = NULL;
+    ds4_session *batched = NULL;
+    char err[160] = "";
+    bool ok = ds4_mellum_session_create(&baseline, e, ctx_size, true, true) == 0 &&
+              baseline != NULL &&
+              ds4_mellum_session_decode_fixture(baseline, tokens, n_tokens,
+                                                err, sizeof(err)) &&
+              ds4_session_copy_logits(baseline, reference, (int)vocab_dim) ==
+                  (int)vocab_dim;
+    if (ok) {
+        ok = ds4_mellum_session_create(&batched, e, ctx_size, true, true) == 0 &&
+             batched != NULL &&
+             ds4_session_sync(batched, &prompt, err, sizeof(err)) == 0 &&
+             ds4_session_pos(batched) == n_tokens &&
+             ds4_session_copy_logits(batched, actual, (int)vocab_dim) ==
+                 (int)vocab_dim &&
+             ds4_mellum_logits_are_finite(reference, vocab_dim) &&
+             ds4_mellum_logits_are_finite(actual, vocab_dim) &&
+             memcmp(reference, actual, logit_bytes) == 0;
+    }
+    if (!ok) {
+        fprintf(stderr, "ds4: Mellum SWA boundary schedules diverged: %s\n",
+                err[0] ? err : "allocation, execution, or F32 comparison failure");
+    } else {
+        fprintf(out,
+                "Mellum SWA boundary probe tokens=%d boundary=1024 sliding=21 full=7 ctx=%d logits=f32-exact\n",
+                n_tokens, ctx_size);
+    }
+    ds4_session_free(batched);
+    ds4_session_free(baseline);
+    free(actual);
+    free(reference);
+    free(tokens);
+    return ok ? 0 : 1;
+#endif
+}
+
 int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen) {
     if (!s || !s->distributed) {
         if (errlen) snprintf(err, errlen, "session is not a distributed coordinator");
@@ -62306,6 +62383,10 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                      errlen);
     }
     if (ds4_session_is_mellum(s)) {
+#ifdef DS4_NO_GPU
+        snprintf(err, errlen, "Mellum decode requires Metal support");
+        return 1;
+#else
         int start = 0;
         if (s->checkpoint_valid && prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint)) {
@@ -62313,22 +62394,58 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         } else {
             ds4_session_invalidate(s);
         }
-        for (int i = start; i < prompt->len; i++) {
-            if (ds4_session_cancelled(s)) {
+        /* This is still tokenwise autoregressive prefill, not the later
+         * multi-token graph. Batching bounded runs removes host submission
+         * waits while retaining the established decode arithmetic and KV
+         * update order. Keep the cap modest until long-context watchdog and
+         * cancellation measurements are available. */
+        static const int sync_batch_tokens = 32;
+        ds4_mellum_decode_state *state = s->mellum->decode;
+        for (int i = start; i < prompt->len;) {
+            const int end = prompt->len - i > sync_batch_tokens ?
+                i + sync_batch_tokens : prompt->len;
+            const bool batch_started = ds4_gpu_begin_commands() != 0;
+            bool ok = batch_started;
+            bool interrupted = false;
+            for (; ok && i < end; i++) {
+                if (ds4_session_cancelled(s)) {
+                    interrupted = true;
+                    break;
+                }
+                const bool last = i + 1 == prompt->len;
+                ok = ds4_mellum_decode_token(
+                    s->engine, state, prompt->v[i], NULL, NULL, NULL, NULL,
+                    NULL, last, true);
+                if (!ok) break;
+                token_vec_push(&s->checkpoint, prompt->v[i]);
+                if (s->progress) {
+                    s->progress(s->progress_ud, "prefill_chunk", i + 1,
+                                prompt->len);
+                }
+            }
+            const bool batch_ok = !batch_started || ds4_gpu_end_commands() != 0;
+            if (!ok || !batch_ok) {
+                snprintf(err, errlen, "Mellum sequential prefill batch failed");
+                ds4_session_invalidate(s);
+                return 1;
+            }
+            if (interrupted) {
                 snprintf(err, errlen, "interrupted");
                 s->checkpoint_valid = s->checkpoint.len != 0;
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
-            if (ds4_session_eval(s, prompt->v[i], err, errlen) != 0) {
-                return 1;
-            }
-            if (s->progress) {
-                s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
-            }
+        }
+        if (start < prompt->len &&
+            ds4_gpu_tensor_read(state->logits, 0, s->logits,
+                                s->engine->weights.output->dim[1] * sizeof(float)) == 0) {
+            snprintf(err, errlen, "Mellum sequential prefill logits read failed");
+            ds4_session_invalidate(s);
+            return 1;
         }
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
         return 0;
+#endif
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
@@ -64260,7 +64377,7 @@ static int ds4_session_eval_mellum_decode(ds4_session *s, int token,
         return 1;
     }
     if (!ds4_mellum_decode_token(s->engine, state, token, NULL, NULL, NULL,
-                                 NULL, s->logits)) {
+                                 NULL, s->logits, false, false)) {
         if (err && errlen) snprintf(err, errlen, "Mellum inspect decode failed");
         ds4_session_invalidate(s);
         return 1;
