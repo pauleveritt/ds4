@@ -36595,6 +36595,15 @@ static bool ds4_mellum_print_logits_top_k(FILE         *out,
     return true;
 }
 
+static bool ds4_mellum_logits_are_finite(const float *logits,
+                                         uint64_t     vocab_dim) {
+    if (!logits) return false;
+    for (uint64_t id = 0; id < vocab_dim; id++) {
+        if (!isfinite(logits[id])) return false;
+    }
+    return true;
+}
+
 struct ds4_mellum_decode_state {
     ds4_gpu_mellum_q8_0_layer_desc desc[DS4_MAX_LAYER];
     uint32_t cache_cap[DS4_MAX_LAYER];
@@ -60838,6 +60847,17 @@ int ds4_engine_mellum_session_decode_probe(ds4_engine *e,
 #endif
 }
 
+static bool ds4_mellum_session_decode_fixture(ds4_session *session,
+                                              const int   *tokens,
+                                              uint32_t     n_tokens,
+                                              char        *err,
+                                              size_t       errlen) {
+    for (uint32_t pos = 0; pos < n_tokens; pos++) {
+        if (ds4_session_eval(session, tokens[pos], err, errlen) != 0) return false;
+    }
+    return true;
+}
+
 int ds4_engine_mellum_session_isolation_probe(ds4_engine *e,
                                               FILE       *out,
                                               int         ctx_size) {
@@ -60848,46 +60868,69 @@ int ds4_engine_mellum_session_isolation_probe(ds4_engine *e,
     fprintf(stderr, "ds4: Mellum session isolation probe requires Metal support\n");
     return 1;
 #else
-    static const int fixture_tokens[] = {
+    static const int fixture_a[] = {
         27, 1397, 233, 12998, 497, 2717, 669, 60, 783, 846, 42, 99, 46,
         321, 800, 28, 233, 27, 8091, 233, 23, 233, 233, 24, 233, 233,
     };
-    const uint32_t n_tokens = (uint32_t)(sizeof(fixture_tokens) /
-                                          sizeof(fixture_tokens[0]));
+    static const int fixture_b[] = {
+        28, 1397, 233, 12998, 497, 2717, 669, 60, 783, 846, 42, 99, 46,
+        321, 800, 28, 233, 27, 8091, 233, 23, 233, 233, 24, 233, 233,
+    };
+    const uint32_t n_tokens = (uint32_t)(sizeof(fixture_a) /
+                                          sizeof(fixture_a[0]));
     if (!e || !out || ctx_size < (int)n_tokens ||
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
         e->backend != DS4_BACKEND_METAL || !e->mellum_decode_contract_ready) {
         fprintf(stderr, "ds4: Mellum session isolation probe requires an inspect-loaded Metal engine\n");
         return 1;
     }
-    ds4_session *a = NULL, *b = NULL;
-    int ok = ds4_mellum_session_create(&a, e, ctx_size, true) == 0 &&
-             ds4_mellum_session_create(&b, e, ctx_size, true) == 0;
-    if (!ok) {
-        fprintf(stderr, "ds4: Mellum session isolation allocation failed\n");
-        ds4_session_free(b);
-        ds4_session_free(a);
-        return 1;
-    }
     char err[128] = "";
-    for (uint32_t pos = 0; ok && pos < n_tokens; pos++) {
-        ok = ds4_session_eval(a, fixture_tokens[pos], err, sizeof(err)) == 0 &&
-             ds4_session_eval(b, fixture_tokens[pos], err, sizeof(err)) == 0;
-        if (!ok) {
-            fprintf(stderr, "ds4: Mellum session isolation decode failed at token %u: %s\n",
-                    pos, err[0] ? err : "unknown error");
-        }
-    }
     const uint64_t vocab_dim = e->weights.output->dim[1];
     const size_t logit_bytes = (size_t)vocab_dim * sizeof(float);
-    float *a_logits = ok ? xmalloc(logit_bytes) : NULL;
-    float *b_logits = ok ? xmalloc(logit_bytes) : NULL;
+    float *a_reference = xmalloc(logit_bytes);
+    float *b_reference = xmalloc(logit_bytes);
+    float *a_logits = xmalloc(logit_bytes);
+    float *b_logits = xmalloc(logit_bytes);
+    ds4_session *baseline = NULL, *a = NULL, *b = NULL;
+    int ok = ds4_mellum_session_create(&baseline, e, ctx_size, true) == 0 &&
+             ds4_mellum_session_decode_fixture(baseline, fixture_a, n_tokens,
+                                               err, sizeof(err)) &&
+             ds4_session_copy_logits(baseline, a_reference, (int)vocab_dim) ==
+                 (int)vocab_dim;
+    ds4_session_free(baseline);
+    baseline = NULL;
+    if (ok) {
+        ok = ds4_mellum_session_create(&baseline, e, ctx_size, true) == 0 &&
+             ds4_mellum_session_decode_fixture(baseline, fixture_b, n_tokens,
+                                               err, sizeof(err)) &&
+             ds4_session_copy_logits(baseline, b_reference, (int)vocab_dim) ==
+                 (int)vocab_dim;
+    }
+    ds4_session_free(baseline);
+    baseline = NULL;
+    if (ok) {
+        ok = ds4_mellum_session_create(&a, e, ctx_size, true) == 0 &&
+             ds4_mellum_session_create(&b, e, ctx_size, true) == 0;
+    }
+    for (uint32_t pos = 0; ok && pos < n_tokens; pos++) {
+        ok = ds4_session_eval(a, fixture_a[pos], err, sizeof(err)) == 0 &&
+             ds4_session_eval(b, fixture_b[pos], err, sizeof(err)) == 0;
+    }
+    if (!ok) {
+        fprintf(stderr, "ds4: Mellum session isolation decode failed: %s\n",
+                err[0] ? err : "allocation or copy failure");
+    }
     if (ok && (ds4_session_copy_logits(a, a_logits, (int)vocab_dim) !=
                    (int)vocab_dim ||
                ds4_session_copy_logits(b, b_logits, (int)vocab_dim) !=
                    (int)vocab_dim ||
-               memcmp(a_logits, b_logits, logit_bytes) != 0)) {
-        fprintf(stderr, "ds4: Mellum session isolation logits diverged\n");
+               !ds4_mellum_logits_are_finite(a_reference, vocab_dim) ||
+               !ds4_mellum_logits_are_finite(b_reference, vocab_dim) ||
+               !ds4_mellum_logits_are_finite(a_logits, vocab_dim) ||
+               !ds4_mellum_logits_are_finite(b_logits, vocab_dim) ||
+               memcmp(a_reference, a_logits, logit_bytes) != 0 ||
+               memcmp(b_reference, b_logits, logit_bytes) != 0)) {
+        fprintf(stderr, "ds4: Mellum session isolation logits diverged or were non-finite\n");
         ok = 0;
     }
     if (ok && (ds4_session_argmax(a) != -1 || ds4_session_argmax(b) != -1)) {
@@ -60899,8 +60942,11 @@ int ds4_engine_mellum_session_isolation_probe(ds4_engine *e,
                 "Mellum session isolation probe sessions=2 tokens=%u ctx=%d logits=f32-exact selection=rejected\n",
                 n_tokens, ctx_size);
     }
+    ds4_session_free(baseline);
     free(b_logits);
     free(a_logits);
+    free(b_reference);
+    free(a_reference);
     ds4_session_free(b);
     ds4_session_free(a);
     return ok ? 0 : 1;

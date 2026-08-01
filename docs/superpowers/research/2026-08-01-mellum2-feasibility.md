@@ -872,12 +872,13 @@ emission, generation, or SSD streaming. At `--ctx 4096`, the session gate's
 `0.0175094604` and RMS `0.009415312`, identical to the engine-owned diagnostic.
 
 **Session-isolation gate:** `--mellum-session-isolation-probe --ctx 4096`
-creates two inspect-only decode sessions on one engine and interleaves every
-fixture token. Their 98,304 raw logits are F32 bit-identical, while both
-sessions continue to reject token selection. This catches accidental sharing of
-KV tensors, activation scratch, or token position between sessions. It is a
-correctness-isolation check only; it does not claim multi-session memory
-efficiency and does not enable batching, prefill, generation, or SSD streaming.
+first records independent baselines for two fixture streams that differ at
+their first token, then interleaves those streams in two sessions on one engine.
+Each final 98,304-logit row must be finite and F32-bit-identical to its own
+baseline, while both sessions continue to reject token selection. The divergent
+schedule catches aliased KV rows or token positions; it does not claim to test
+concurrent scratch safety or multi-session memory efficiency. It does not enable
+batching, prefill, generation, or SSD streaming.
 
 **Review hardening:** Sol's post-commit review found that the initial oracle
 checker could accidentally accept a NaN because comparisons with NaN are false,
