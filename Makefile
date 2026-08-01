@@ -380,6 +380,10 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test \
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
+	# The Mellum grouped (expert-major) MoE is env-gated, so the default run
+	# never reaches it.  Re-run the Metal kernel suite with it enabled: its
+	# batch-equals-decode checks are what hold grouped output bit-exact.
+	DS4_MELLUM_GROUPED_MOE=1 ./ds4_test --metal-kernels
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args

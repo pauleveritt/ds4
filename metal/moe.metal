@@ -740,9 +740,18 @@ kernel void kernel_mellum_q8_0_pair_swiglu_grouped_f32(
     const uint row = tgpig.x;
     const uint expert = tgpig.y;
     if (row >= args.mid_dim || expert >= gargs.n_total_expert) return;
-    const uint count = counts[expert];
+    /*
+     * The build kernel increments its atomic even when the bucket is full, so
+     * a stored count can exceed bucket_cap.  Clamp before it is used as a loop
+     * bound: an unclamped count would index past this expert's bucket, and past
+     * the buffer entirely for the last expert.  Overflow is unreachable while a
+     * token's top-k experts are distinct (bucket_cap == n_tokens), but nothing
+     * in the router contract enforces that here.
+     */
+    const uint count = min(counts[expert], gargs.bucket_cap);
     if (count == 0u) return;
 
+    /* Staging assumes up rows match gate rows in stride; the host enforces it. */
     const uint row_bytes = (uint)args.gate_row_bytes;
     device const char *gsrc =
         gate + gate_offsets[expert] + (uint64_t)row * args.gate_row_bytes;

@@ -34728,6 +34728,8 @@ int ds4_gpu_mellum_routed_moe_one_tensor(
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !mid || !model_map || !selected || !weights || !x ||
         n_total_expert == 0 || n_expert == 0 || n_expert > n_total_expert ||
+        /* Down scratch is n_expert * 256 floats; keep it inside 32 KiB. */
+        n_expert > 32u ||
         expert_in_dim == 0 || expert_mid_dim == 0 || out_dim == 0 ||
         (expert_in_dim % 256u) != 0 || (expert_mid_dim % 32u) != 0 ||
         gate_row_bytes != (uint64_t)(expert_in_dim / 256u) * 144u ||
@@ -34872,6 +34874,8 @@ int ds4_gpu_mellum_q8_0_routed_moe_one_tensor(
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !mid || !model_map || !selected || !weights || !x ||
         n_total_expert == 0 || n_expert == 0 || n_expert > n_total_expert ||
+        /* Down scratch is n_expert * 256 floats; keep it inside 32 KiB. */
+        n_expert > 32u ||
         expert_in_dim == 0 || expert_mid_dim == 0 || out_dim == 0 ||
         (expert_in_dim % 32u) != 0 || (expert_mid_dim % 32u) != 0 ||
         gate_row_bytes != (uint64_t)(expert_in_dim / 32u) * 34u ||
@@ -35056,6 +35060,7 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
     if (cap > UINT32_MAX / n_total_expert) return false;
 
     if (!s_counts || s_experts != n_total_expert) {
+        if (s_counts && ds4_gpu_commands_active()) return false;
         ds4_gpu_tensor_free(s_counts);
         ds4_gpu_tensor_free(s_gate_off);
         ds4_gpu_tensor_free(s_up_off);
@@ -35066,6 +35071,13 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
         s_expert_bytes = 0;
     }
     if (!s_pairs || s_cap < cap || s_pairs_experts != n_total_expert) {
+        /*
+         * Freeing here while a caller-owned batch is open could release a
+         * buffer the queued command buffer still references.  Callers keep the
+         * shape fixed for a whole chunk, so this only guards a future one that
+         * does not.
+         */
+        if (s_pairs && ds4_gpu_commands_active()) return false;
         ds4_gpu_tensor_free(s_pairs);
         s_pairs = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * cap *
                                        sizeof(uint32_t));
@@ -35148,6 +35160,8 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !mid || !model_map || !selected || !weights || !x ||
         n_total_expert == 0 || n_expert == 0 || n_expert > n_total_expert ||
+        /* Down scratch is n_expert * 256 floats; keep it inside 32 KiB. */
+        n_expert > 32u ||
         expert_in_dim == 0 || expert_mid_dim == 0 || out_dim == 0 || n_tokens == 0 ||
         n_expert > UINT32_MAX / expert_mid_dim ||
         (expert_in_dim % 32u) != 0 || (expert_mid_dim % 32u) != 0 ||
@@ -35257,7 +35271,7 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
             [enc useResource:gatebuf usage:MTLResourceUsageRead];
             [enc useResource:upbuf usage:MTLResourceUsageRead];
             [enc setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
-            [enc setThreadgroupMemoryLength:(NSUInteger)gate_row_bytes * 2u atIndex:1];
+            [enc setThreadgroupMemoryLength:(((NSUInteger)gate_row_bytes * 2u) + 15u) & ~(NSUInteger)15u atIndex:1];
             [enc dispatchThreadgroups:MTLSizeMake(expert_mid_dim, n_total_expert, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         } else {
