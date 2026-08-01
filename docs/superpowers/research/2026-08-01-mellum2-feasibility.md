@@ -1234,3 +1234,15 @@ same resident-versus-streamed A/B gate used for Laguna XS.
   and logits against sequential decode. Session sync remains sequential until
   those gates pass, and its eventual chunk cap is 1,024 to fit every Mellum
   sliding ring.
+- Strengthened the attention parity gate after a second Sol review. The
+  composed API now rejects an oversized batch before queueing RMSNorm/QKV/RoPE
+  work, matching its GQA primitive; the direct API rejection and active
+  caller-owned-command-batch result are both covered. The three-row YaRN
+  wrapped-ring comparison now starts from a deterministic seed, has measured
+  margins (`2e-5` output and `5e-5` F16-KV drift), and verifies the caller-owned
+  result/cache against a standalone submission. It measures `3.8147e-6`
+  output drift and two one-ULP F16 cache values (`7.62939e-6` max). Remaining
+  attention coverage before declaring the gate complete: multi-row ordinary
+  pre-wrap and non-wrapped full-cache YaRN cases. These are correctness tests,
+  not a reason to delay the next implementation dependency: the bias-free
+  batched router.

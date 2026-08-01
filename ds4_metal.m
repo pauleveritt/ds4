@@ -34336,7 +34336,7 @@ int ds4_gpu_mellum_attention_prefill_tensor(
         !isfinite(desc->rope_ext_factor) ||
         !isfinite(desc->rope_attn_factor) ||
         !isfinite(desc->yarn_beta_fast) || !isfinite(desc->yarn_beta_slow) ||
-        cache_cap == 0) return 0;
+        cache_cap == 0 || n_tokens > cache_cap) return 0;
     const uint64_t q_dim = (uint64_t)desc->n_head * desc->head_dim;
     const uint64_t kv_dim = (uint64_t)desc->n_head_kv * desc->head_dim;
     const uint64_t hidden_values = (uint64_t)n_tokens * desc->n_embd;

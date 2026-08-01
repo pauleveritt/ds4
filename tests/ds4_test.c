@@ -1548,10 +1548,18 @@ static void test_metal_mellum_attention_prelude(void) {
                         (float)(token + 1u) / 193.0f;
                 }
             }
-            TEST_ASSERT(ds4_gpu_tensor_read(key_cache_t, 0, cache_seed,
-                                            cache_bytes) != 0);
-            TEST_ASSERT(ds4_gpu_tensor_read(value_cache_t, 0, value_seed,
-                                            cache_bytes) != 0);
+            /* Seed independently of the preceding one-row decode checks: this
+             * isolates multi-row ring semantics from their implementation. */
+            for (uint32_t i = 0; i < cache_cap * kv_dim; i++) {
+                cache_seed[i] = test_float_to_f16(
+                    (float)((int)((i * 43u + 9u) % 127u) - 63) / 111.0f);
+                value_seed[i] = test_float_to_f16(
+                    (float)((int)((i * 47u + 11u) % 131u) - 65) / 107.0f);
+            }
+            TEST_ASSERT(ds4_gpu_tensor_write(key_cache_t, 0, cache_seed,
+                                              cache_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(value_cache_t, 0, value_seed,
+                                              cache_bytes) != 0);
             const ds4_gpu_mellum_attention_desc yarn_desc = {
                 .attn_norm_offset = desc.attn_norm_offset,
                 .q_offset = desc.q_offset,
@@ -1568,6 +1576,15 @@ static void test_metal_mellum_attention_prelude(void) {
                 .rope_attn_factor = 1.0f, .yarn_beta_fast = 32.0f,
                 .yarn_beta_slow = 1.0f,
             };
+            /* Reject before composing a batch whose post-attention ring commit
+             * would alias a cache row. */
+            TEST_ASSERT(ds4_gpu_mellum_attention_prefill_tensor(
+                            batch_out_t, batch_norm_t, batch_q_t, batch_k_t,
+                            batch_v_t, batch_heads_t, batch_projected_t,
+                            key_cache_t, value_cache_t, batch_staged_key_t,
+                            batch_staged_value_t, model, model_bytes, &yarn_desc,
+                            batch_hidden_t, batch_pos, cache_cap + 1u,
+                            cache_cap) == 0);
             TEST_ASSERT(ds4_gpu_tensor_write(batch_hidden_t, 0, batch_hidden,
                                               batch_embd_bytes) != 0);
             TEST_ASSERT(ds4_gpu_mellum_attention_prefill_tensor(
@@ -1624,8 +1641,8 @@ static void test_metal_mellum_attention_prelude(void) {
             fprintf(stderr,
                     "ds4-test: Mellum multi-row YaRN prefill out=%g kv=%u/%u max_abs=%g\n",
                     batch_error, kv_mismatch, cache_cap * kv_dim, kv_max_abs);
-            TEST_ASSERT(batch_error < 5.0e-4f);
-            TEST_ASSERT(kv_max_abs < 2.0e-3f);
+            TEST_ASSERT(batch_error < 2.0e-5f);
+            TEST_ASSERT(kv_max_abs < 5.0e-5f);
             TEST_ASSERT(ds4_gpu_tensor_write(key_cache_t, 0, cache_seed,
                                               cache_bytes) != 0);
             TEST_ASSERT(ds4_gpu_tensor_write(value_cache_t, 0, value_seed,
@@ -1640,6 +1657,16 @@ static void test_metal_mellum_attention_prelude(void) {
                             cache_cap) != 0);
             TEST_ASSERT(ds4_gpu_commands_active());
             TEST_ASSERT(ds4_gpu_end_commands() != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(batch_out_t, 0, sequential_out,
+                                             batch_embd_bytes) != 0);
+            TEST_ASSERT(test_mellum_max_abs(sequential_out, batch_out,
+                                            batch_tokens * n_embd) == 0.0f);
+            TEST_ASSERT(ds4_gpu_tensor_read(key_cache_t, 0, key_cache,
+                                             cache_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(value_cache_t, 0, value_cache,
+                                             cache_bytes) != 0);
+            TEST_ASSERT(memcmp(cache_batch, key_cache, (size_t)cache_bytes) == 0);
+            TEST_ASSERT(memcmp(value_batch, value_cache, (size_t)cache_bytes) == 0);
         }
         free(value_batch); free(cache_batch); free(value_seed); free(cache_seed);
         free(sequential_out); free(batch_out); free(batch_hidden);
