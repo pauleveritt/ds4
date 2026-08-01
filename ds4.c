@@ -36843,6 +36843,8 @@ static bool ds4_mellum_prefill_tokens(
         ds4_mellum_prefill_scratch        *scratch,
         const int                         *tokens,
         uint32_t                           n_tokens,
+        ds4_gpu_tensor                     *layer_trace_gpu,
+        ds4_gpu_tensor                     *attention_trace_gpu,
         bool                               compute_logits) {
     if (!e || !state || !scratch || !tokens || n_tokens == 0 ||
         n_tokens > scratch->cap || n_tokens > DS4_N_SWA ||
@@ -36852,6 +36854,10 @@ static bool ds4_mellum_prefill_tokens(
         e->weights.token_embd->type != DS4_TENSOR_Q8_0) {
         return false;
     }
+    if (layer_trace_gpu && ds4_gpu_tensor_bytes(layer_trace_gpu) <
+        (uint64_t)DS4_N_LAYER * DS4_N_EMBD * sizeof(float)) return false;
+    if (attention_trace_gpu && ds4_gpu_tensor_bytes(attention_trace_gpu) <
+        (uint64_t)DS4_N_LAYER * DS4_N_EMBD * sizeof(float)) return false;
     for (uint32_t i = 0; i < n_tokens; i++) {
         if (tokens[i] < 0 || (uint32_t)tokens[i] >= DS4_N_VOCAB) return false;
     }
@@ -36878,6 +36884,17 @@ static bool ds4_mellum_prefill_tokens(
             scratch->router_weights, scratch->router_probs, scratch->moe_mid,
             scratch->moe_out, e->model.map, e->model.size, &state->desc[il],
             current, pos0, n_tokens, state->cache_cap[il]) != 0;
+        if (ok && layer_trace_gpu) {
+            ok = ds4_gpu_tensor_copy(
+                layer_trace_gpu, (uint64_t)il * embd_bytes, next,
+                (uint64_t)(n_tokens - 1u) * embd_bytes, embd_bytes) != 0;
+        }
+        if (ok && attention_trace_gpu) {
+            ok = ds4_gpu_tensor_copy(
+                attention_trace_gpu, (uint64_t)il * embd_bytes,
+                scratch->attention_out, (uint64_t)(n_tokens - 1u) * embd_bytes,
+                embd_bytes) != 0;
+        }
         ds4_gpu_tensor *tmp = current;
         current = next;
         next = tmp;
@@ -36915,6 +36932,8 @@ static bool ds4_mellum_decode_token(const ds4_engine       *e,
                                     float                  *layer_trace,
                                     float                  *attention_trace,
                                     float                  *qk_trace,
+                                    ds4_gpu_tensor         *layer_trace_gpu,
+                                    ds4_gpu_tensor         *attention_trace_gpu,
                                     float                  *logits_cpu,
                                     bool                    compute_logits,
                                     bool                    allow_existing_batch) {
@@ -36933,6 +36952,10 @@ static bool ds4_mellum_decode_token(const ds4_engine       *e,
      * submit the whole layer stack plus output head as one command batch. */
     const bool capture_intermediate = final_cpu || layer_trace ||
                                       attention_trace || qk_trace;
+    if (layer_trace_gpu && ds4_gpu_tensor_bytes(layer_trace_gpu) <
+        (uint64_t)DS4_N_LAYER * embd_bytes) return false;
+    if (attention_trace_gpu && ds4_gpu_tensor_bytes(attention_trace_gpu) <
+        (uint64_t)DS4_N_LAYER * embd_bytes) return false;
     if (!capture_intermediate) {
         ds4_gpu_tensor *current = state->hidden;
         ds4_gpu_tensor *next = state->layer_out;
@@ -36963,6 +36986,16 @@ static bool ds4_mellum_decode_token(const ds4_engine       *e,
                 state->router_probs, state->moe_mid, state->moe_out, e->model.map,
                 e->model.size, &state->desc[il], current, pos, cache_cap,
                 key_start, key_count) != 0;
+            if (ok && layer_trace_gpu) {
+                ok = ds4_gpu_tensor_copy(
+                    layer_trace_gpu, (uint64_t)il * embd_bytes, next, 0,
+                    embd_bytes) != 0;
+            }
+            if (ok && attention_trace_gpu) {
+                ok = ds4_gpu_tensor_copy(
+                    attention_trace_gpu, (uint64_t)il * embd_bytes,
+                    state->attention_out, 0, embd_bytes) != 0;
+            }
             ds4_gpu_tensor *tmp = current;
             current = next;
             next = tmp;
@@ -37138,7 +37171,7 @@ int ds4_engine_mellum_all_layers_probe(ds4_engine *e,
             capture_trace ? final_cpu : NULL,
             capture_trace ? layer_trace : NULL,
             capture_trace ? attention_trace : NULL,
-            capture_trace ? qk_trace : NULL, NULL, false, false);
+            capture_trace ? qk_trace : NULL, NULL, NULL, NULL, false, false);
         if (!ok) {
             fprintf(stderr, "ds4: Mellum inspect graph failed at token %u\n", pos);
         }
@@ -37261,7 +37294,7 @@ int ds4_engine_mellum_logits_probe(ds4_engine *e,
         ok = ds4_mellum_decode_token(
             e, e->mellum_decode_state, fixture_tokens[pos],
             NULL, NULL, NULL, NULL,
-            pos + 1u == n_tokens ? logits_cpu : NULL, false, false);
+            NULL, NULL, pos + 1u == n_tokens ? logits_cpu : NULL, false, false);
         if (!ok) fprintf(stderr, "ds4: Mellum logits probe failed at token %u\n", pos);
     }
     if (ok && raw_output_path && raw_output_path[0] &&
@@ -61526,7 +61559,7 @@ static bool ds4_mellum_resident_profile_pass(
     const double t0 = now_sec();
     for (int i = 0; i < n_tokens; i++) {
         if (!ds4_mellum_decode_token(e, state, tokens[i], NULL, NULL, NULL,
-                                     NULL, NULL, compute_logits, false)) {
+                                     NULL, NULL, NULL, NULL, compute_logits, false)) {
             return false;
         }
     }
@@ -61620,16 +61653,32 @@ int ds4_engine_mellum_true_prefill_probe(ds4_engine *e, FILE *out) {
     float *prefill_logits = xmalloc(logits_bytes);
     float *decode_hidden = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
     float *prefill_hidden = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    const uint64_t layer_trace_bytes =
+        (uint64_t)DS4_N_LAYER * DS4_N_EMBD * sizeof(float);
+    float *decode_trace = xmalloc((size_t)layer_trace_bytes);
+    float *prefill_trace = xmalloc((size_t)layer_trace_bytes);
+    float *decode_attention_trace = xmalloc((size_t)layer_trace_bytes);
+    float *prefill_attention_trace = xmalloc((size_t)layer_trace_bytes);
+    ds4_gpu_tensor *decode_trace_gpu = ds4_gpu_tensor_alloc(layer_trace_bytes);
+    ds4_gpu_tensor *prefill_trace_gpu = ds4_gpu_tensor_alloc(layer_trace_bytes);
+    ds4_gpu_tensor *decode_attention_trace_gpu = ds4_gpu_tensor_alloc(layer_trace_bytes);
+    ds4_gpu_tensor *prefill_attention_trace_gpu = ds4_gpu_tensor_alloc(layer_trace_bytes);
     ds4_mellum_decode_state *decode = ds4_mellum_decode_state_create(e, n_tokens);
     ds4_mellum_decode_state *prefill = ds4_mellum_decode_state_create(e, n_tokens);
     ds4_mellum_prefill_scratch scratch = {0};
-    bool ok = decode && prefill &&
+    bool ok = decode_logits && prefill_logits && decode_hidden && prefill_hidden &&
+              decode_trace && prefill_trace && decode_attention_trace &&
+              prefill_attention_trace && decode_trace_gpu && prefill_trace_gpu &&
+              decode_attention_trace_gpu && prefill_attention_trace_gpu &&
+              decode && prefill &&
               ds4_mellum_decode_output_prepare(e, decode) &&
               ds4_mellum_decode_output_prepare(e, prefill) &&
               ds4_mellum_prefill_scratch_create(&scratch, n_tokens);
     for (uint32_t pos = 0; ok && pos < n_tokens; pos++) {
         ok = ds4_mellum_decode_token(e, decode, fixture_tokens[pos], NULL,
                                      NULL, NULL, NULL,
+                                     pos + 1u == n_tokens ? decode_trace_gpu : NULL,
+                                     pos + 1u == n_tokens ? decode_attention_trace_gpu : NULL,
                                      pos + 1u == n_tokens ? decode_logits : NULL,
                                      false, false);
     }
@@ -61639,13 +61688,25 @@ int ds4_engine_mellum_true_prefill_probe(ds4_engine *e, FILE *out) {
         ok = false;
     }
     if (ok && !ds4_mellum_prefill_tokens(e, prefill, &scratch, fixture_tokens,
-                                          n_tokens, true)) {
+                                          n_tokens, prefill_trace_gpu,
+                                          prefill_attention_trace_gpu, true)) {
         fprintf(stderr, "ds4: Mellum true-prefill probe batch layer stack failed\n");
         ok = false;
     }
     if (ok && ds4_gpu_tensor_read(prefill->logits, 0, prefill_logits,
                                   logits_bytes) == 0) {
         fprintf(stderr, "ds4: Mellum true-prefill probe could not read batch logits\n");
+        ok = false;
+    }
+    if (ok && (ds4_gpu_tensor_read(decode_trace_gpu, 0, decode_trace,
+                                   layer_trace_bytes) == 0 ||
+               ds4_gpu_tensor_read(prefill_trace_gpu, 0, prefill_trace,
+                                   layer_trace_bytes) == 0 ||
+               ds4_gpu_tensor_read(decode_attention_trace_gpu, 0,
+                                   decode_attention_trace, layer_trace_bytes) == 0 ||
+               ds4_gpu_tensor_read(prefill_attention_trace_gpu, 0,
+                                   prefill_attention_trace, layer_trace_bytes) == 0)) {
+        fprintf(stderr, "ds4: Mellum true-prefill probe could not read layer trace\n");
         ok = false;
     }
     ds4_gpu_tensor *prefill_last = NULL;
@@ -61667,6 +61728,11 @@ int ds4_engine_mellum_true_prefill_probe(ds4_engine *e, FILE *out) {
     ds4_gpu_tensor_free(prefill_last);
     float logit_max_abs = 0.0f, hidden_max_abs = 0.0f;
     double logit_sum_sq = 0.0, hidden_sum_sq = 0.0;
+    uint32_t worst_layer = 0;
+    float worst_layer_max_abs = 0.0f;
+    double worst_layer_rms = 0.0;
+    float worst_attention_max_abs = 0.0f;
+    double worst_attention_rms = 0.0;
     if (ok) {
         for (uint64_t i = 0; i < vocab_dim; i++) {
             if (!isfinite(decode_logits[i]) || !isfinite(prefill_logits[i])) {
@@ -61687,6 +61753,46 @@ int ds4_engine_mellum_true_prefill_probe(ds4_engine *e, FILE *out) {
         hidden_max_abs = fmaxf(hidden_max_abs, fabsf(delta));
         hidden_sum_sq += (double)delta * delta;
     }
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        float layer_max_abs = 0.0f;
+        float attention_max_abs = 0.0f;
+        double layer_sum_sq = 0.0;
+        double attention_sum_sq = 0.0;
+        for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
+            const float actual = prefill_trace[(uint64_t)il * DS4_N_EMBD + i];
+            const float reference = decode_trace[(uint64_t)il * DS4_N_EMBD + i];
+            const float attention_actual = prefill_attention_trace[
+                (uint64_t)il * DS4_N_EMBD + i];
+            const float attention_reference = decode_attention_trace[
+                (uint64_t)il * DS4_N_EMBD + i];
+            if (!isfinite(actual) || !isfinite(reference) ||
+                !isfinite(attention_actual) || !isfinite(attention_reference)) {
+                ok = false;
+                break;
+            }
+            const float delta = actual - reference;
+            const float attention_delta = attention_actual - attention_reference;
+            layer_max_abs = fmaxf(layer_max_abs, fabsf(delta));
+            layer_sum_sq += (double)delta * delta;
+            attention_max_abs = fmaxf(attention_max_abs, fabsf(attention_delta));
+            attention_sum_sq += (double)attention_delta * attention_delta;
+        }
+        const double layer_rms = sqrt(layer_sum_sq / (double)DS4_N_EMBD);
+        const double attention_rms = sqrt(attention_sum_sq / (double)DS4_N_EMBD);
+        if (layer_rms > worst_layer_rms) {
+            worst_layer = il;
+            worst_layer_max_abs = layer_max_abs;
+            worst_layer_rms = layer_rms;
+        }
+        if (attention_rms > worst_attention_rms) {
+            worst_attention_max_abs = attention_max_abs;
+            worst_attention_rms = attention_rms;
+        }
+        if (ok) fprintf(out,
+                        "Mellum true-prefill layer=%u attention_max=%g attention_rms=%g layer_max=%g layer_rms=%g\n",
+                        il, attention_max_abs, attention_rms,
+                        layer_max_abs, layer_rms);
+    }
     const double logit_rms = ok ? sqrt(logit_sum_sq / (double)vocab_dim) : 0.0;
     const double hidden_rms = ok ? sqrt(hidden_sum_sq / (double)DS4_N_EMBD) : 0.0;
     if (!ok) {
@@ -61696,10 +61802,22 @@ int ds4_engine_mellum_true_prefill_probe(ds4_engine *e, FILE *out) {
                 "Mellum true-prefill probe tokens=%u layers=%u hidden max_abs=%g rms=%g logits max_abs=%g rms=%g\n",
                 n_tokens, DS4_N_LAYER, hidden_max_abs, hidden_rms,
                 logit_max_abs, logit_rms);
+        fprintf(out, "Mellum true-prefill worst-layer=%u max_abs=%g rms=%g\n",
+                worst_layer, worst_layer_max_abs, worst_layer_rms);
+        fprintf(out, "Mellum true-prefill worst-attention max_abs=%g rms=%g\n",
+                worst_attention_max_abs, worst_attention_rms);
     }
     ds4_mellum_prefill_scratch_free(&scratch);
+    ds4_gpu_tensor_free(prefill_attention_trace_gpu);
+    ds4_gpu_tensor_free(decode_attention_trace_gpu);
+    ds4_gpu_tensor_free(prefill_trace_gpu);
+    ds4_gpu_tensor_free(decode_trace_gpu);
     ds4_mellum_decode_state_free(prefill);
     ds4_mellum_decode_state_free(decode);
+    free(prefill_trace);
+    free(decode_trace);
+    free(prefill_attention_trace);
+    free(decode_attention_trace);
     free(prefill_hidden);
     free(decode_hidden);
     free(prefill_logits);
@@ -62760,7 +62878,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 const bool last = i + 1 == prompt->len;
                 ok = ds4_mellum_decode_token(
                     s->engine, state, prompt->v[i], NULL, NULL, NULL, NULL,
-                    NULL, last, true);
+                    NULL, NULL, NULL, last, true);
                 if (!ok) break;
                 token_vec_push(&s->checkpoint, prompt->v[i]);
                 if (s->progress) {
@@ -64722,7 +64840,7 @@ static int ds4_session_eval_mellum_decode(ds4_session *s, int token,
         return 1;
     }
     if (!ds4_mellum_decode_token(s->engine, state, token, NULL, NULL, NULL,
-                                 NULL, s->logits, false, false)) {
+                                 NULL, NULL, NULL, s->logits, false, false)) {
         if (err && errlen) snprintf(err, errlen, "Mellum inspect decode failed");
         ds4_session_invalidate(s);
         return 1;

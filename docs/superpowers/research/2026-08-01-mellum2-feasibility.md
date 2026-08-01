@@ -1291,6 +1291,17 @@ same resident-versus-streamed A/B gate used for Laguna XS.
   the layer where the batch schedule exceeds the tokenwise envelope, then set
   a measured acceptance envelope before wiring this graph into interactive
   sessions.
+- Localized the first true-prefill measurement with final-token GPU traces for
+  both post-attention and post-layer activations. Drift accumulates smoothly,
+  rather than beginning at a single incorrect layer: layer 0 is `1.35e-5` RMS
+  post-layer, layer 15 is `4.80e-3`, layer 26 is `4.04e-2`, and layer 27 is
+  `7.35e-2`. Layer 27's post-attention drift is `4.65e-2` RMS and the MoE plus
+  residual raises it to `7.35e-2`; it is therefore amplification of the
+  existing batched-versus-tokenwise numerical path, not a distinct YaRN or
+  router failure. The next correctness task is to run the same measured
+  comparison on a chunk that crosses the 1,024-token sliding-window boundary,
+  then choose an envelope covering both short and wrapped-ring cases before
+  promoting true prefill into session sync.
 
 ### 2026-08-01 M5 prefill/decode target research
 
