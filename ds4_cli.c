@@ -75,6 +75,7 @@ typedef struct {
     bool min_p_set;
     uint64_t seed;
     bool dump_tokens;
+    bool dump_chat_tokens;
     const char *dump_logits_path;
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
@@ -90,6 +91,13 @@ typedef struct {
     bool metal_graph_test;
     bool metal_graph_full_test;
     bool metal_graph_prompt_test;
+    bool mellum_layer0_probe;
+    const char *mellum_layer0_probe_out;
+    bool mellum_all_layers_probe;
+    const char *mellum_all_layers_probe_out;
+    const char *mellum_all_layers_trace_out;
+    const char *mellum_all_layers_attention_trace_out;
+    const char *mellum_all_layers_qk_trace_out;
 } cli_generation_options;
 
 typedef struct {
@@ -1961,6 +1969,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.cuda_tensor_parallel = true;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
+        } else if (!strcmp(arg, "--dump-chat-tokens")) {
+            c.gen.dump_chat_tokens = true;
         } else if (!strcmp(arg, "--dump-logits")) {
             c.gen.dump_logits_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-logprobs")) {
@@ -2011,6 +2021,39 @@ static cli_config parse_options(int argc, char **argv) {
 #else
             c.engine.backend = DS4_BACKEND_METAL;
 #endif
+        } else if (!strcmp(arg, "--mellum-layer0-probe")) {
+            c.gen.mellum_layer0_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-layer0-probe-out")) {
+            c.gen.mellum_layer0_probe = true;
+            c.gen.mellum_layer0_probe_out = need_arg(&i, argc, argv, arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-all-layers-probe")) {
+            c.gen.mellum_all_layers_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-all-layers-probe-out")) {
+            c.gen.mellum_all_layers_probe = true;
+            c.gen.mellum_all_layers_probe_out = need_arg(&i, argc, argv, arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-all-layers-trace-out")) {
+            c.gen.mellum_all_layers_probe = true;
+            c.gen.mellum_all_layers_trace_out = need_arg(&i, argc, argv, arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-all-layers-attention-trace-out")) {
+            c.gen.mellum_all_layers_probe = true;
+            c.gen.mellum_all_layers_attention_trace_out = need_arg(&i, argc, argv, arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-all-layers-qk-trace-out")) {
+            c.gen.mellum_all_layers_probe = true;
+            c.gen.mellum_all_layers_qk_trace_out = need_arg(&i, argc, argv, arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--metal-graph-generate")) {
             fprintf(stderr, "ds4: --metal-graph-generate was removed; --metal is the graph path\n");
             exit(2);
@@ -2064,15 +2107,26 @@ static cli_config parse_options(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
-    if (cfg.gen.dump_tokens) {
+    if (cfg.gen.dump_tokens || cfg.gen.dump_chat_tokens) {
         if (cfg.gen.prompt == NULL) {
-            fprintf(stderr, "ds4: --dump-tokens requires -p or --prompt-file\n");
+            fprintf(stderr, "ds4: --dump-tokens and --dump-chat-tokens require -p or --prompt-file\n");
             free(cfg.prompt_owned);
             return 2;
         }
-        int rc = ds4_dump_text_tokenization(cfg.engine.model_path,
-                                            cfg.gen.prompt,
-                                            stdout);
+        if (cfg.gen.dump_tokens && cfg.gen.dump_chat_tokens) {
+            fprintf(stderr, "ds4: choose either --dump-tokens or --dump-chat-tokens\n");
+            free(cfg.prompt_owned);
+            return 2;
+        }
+        int rc = cfg.gen.dump_chat_tokens
+            ? ds4_dump_chat_tokenization(cfg.engine.model_path,
+                                         cfg.gen.system,
+                                         cfg.gen.prompt,
+                                         cli_effective_think_mode(&cfg.gen),
+                                         stdout)
+            : ds4_dump_text_tokenization(cfg.engine.model_path,
+                                         cfg.gen.prompt,
+                                         stdout);
         ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return rc;
@@ -2125,6 +2179,25 @@ int main(int argc, char **argv) {
         return 1;
     }
     cli_apply_model_sampling_defaults(engine, &cfg.gen);
+    if (cfg.gen.mellum_layer0_probe) {
+        int rc = ds4_engine_mellum_layer0_probe(engine, stdout,
+                                                 cfg.gen.mellum_layer0_probe_out);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_all_layers_probe) {
+        int rc = ds4_engine_mellum_all_layers_probe(
+            engine, stdout, cfg.gen.mellum_all_layers_probe_out,
+            cfg.gen.mellum_all_layers_trace_out,
+            cfg.gen.mellum_all_layers_attention_trace_out,
+            cfg.gen.mellum_all_layers_qk_trace_out);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
     if (!cfg.gen.system_set) {
         cfg.gen.system = ds4_engine_default_system_prompt(engine);
     }

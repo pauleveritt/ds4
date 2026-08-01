@@ -1,0 +1,85 @@
+{
+  "schema": "ds4-mellum-llama-cpp-first-token-logprobs-v1",
+  "source": {
+    "runtime": "llama.cpp",
+    "revision": "0e4a0362239713ea95a6864a17a8de4b0ad90d62",
+    "build_target": "llama-server",
+    "model": "JetBrains/Mellum2-12B-A2.5B-Thinking-GGUF-Q8_0",
+    "model_revision": "6f5b0031c9ea37740f630362d3c06c54933fc2f4",
+    "model_sha256": "d4049c2599796d18245523818c0534e8f8605166fc58c60dd0753547facdb3a2",
+    "server": [
+      "--ctx-size", "512",
+      "--gpu-layers", "all",
+      "--parallel", "1",
+      "--no-warmup",
+      "--reasoning", "off",
+      "--no-webui"
+    ],
+    "completion": {
+      "n_predict": 1,
+      "temperature": 0,
+      "top_k": 0,
+      "top_p": 1,
+      "min_p": 0,
+      "n_probs": 10,
+      "cache_prompt": false
+    }
+  },
+  "chat_prefix": "<|im_start|>user\\n{message}<|im_end|>\\n<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n",
+  "cases": [
+    {
+      "id": "python_add",
+      "message": "Complete this Python function: def add(a, b):",
+      "prompt_tokens": 26,
+      "selected": { "id": 910, "text": "def", "logprob": -0.29194939136505127 },
+      "top_logprobs": [
+        { "id": 910, "text": "def", "logprob": -0.29194939136505127 },
+        { "id": 2116, "text": "We", "logprob": -2.285548448562622 },
+        { "id": 889, "text": "```", "logprob": -2.937260866165161 },
+        { "id": 629, "text": "The", "logprob": -3.6091415882110596 },
+        { "id": 3756, "text": "Here", "logprob": -3.8750193119049072 },
+        { "id": 45742, "text": "Sure", "logprob": -4.280335426330566 },
+        { "id": 2591, "text": "You", "logprob": -4.493160247802734 },
+        { "id": 2190, "text": "Def", "logprob": -5.4801740646362305 },
+        { "id": 1017, "text": "To", "logprob": -5.48403263092041 },
+        { "id": 433, "text": "**", "logprob": -5.830436706542969 }
+      ]
+    },
+    {
+      "id": "javascript_square",
+      "message": "Write only the JavaScript body of function square(x).",
+      "prompt_tokens": 25,
+      "selected": { "id": 889, "text": "```", "logprob": -0.9222503304481506 },
+      "top_logprobs": [
+        { "id": 889, "text": "```", "logprob": -0.9222503304481506 },
+        { "id": 801, "text": "return", "logprob": -1.1168609857559204 },
+        { "id": 1035, "text": "function", "logprob": -1.5487381219863892 },
+        { "id": 4041, "text": "Return", "logprob": -4.414412975311279 },
+        { "id": 308, "text": "   ", "logprob": -4.444760799407959 },
+        { "id": 122, "text": "x", "logprob": -5.06647253036499 },
+        { "id": 435, "text": "//", "logprob": -5.109010219573975 },
+        { "id": 2591, "text": "You", "logprob": -5.385585308074951 },
+        { "id": 2698, "text": "/**", "logprob": -5.76767110824585 },
+        { "id": 10523, "text": "square", "logprob": -5.785924434661865 }
+      ]
+    },
+    {
+      "id": "france_capital",
+      "message": "Answer with one word: the capital of France is",
+      "prompt_tokens": 24,
+      "selected": { "id": 50195, "text": "Paris", "logprob": -0.029317080974578857 },
+      "top_logprobs": [
+        { "id": 50195, "text": "Paris", "logprob": -0.029317080974578857 },
+        { "id": 629, "text": "The", "logprob": -4.0669145584106445 },
+        { "id": 300, "text": "the", "logprob": -5.585541725158691 },
+        { "id": 1404, "text": "Par", "logprob": -5.731562614440918 },
+        { "id": 12330, "text": " Paris", "logprob": -7.104367256164551 },
+        { "id": 717, "text": "par", "logprob": -7.377907752990723 },
+        { "id": 82, "text": "P", "logprob": -8.017638206481934 },
+        { "id": 30953, "text": "London", "logprob": -8.203818321228027 },
+        { "id": 68807, "text": "巴", "logprob": -8.788153648376465 },
+        { "id": 8389, "text": "PAR", "logprob": -9.0418062210083 }
+      ]
+    }
+  ]
+}

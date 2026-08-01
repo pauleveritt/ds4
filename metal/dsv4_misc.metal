@@ -111,6 +111,11 @@ struct ds4_metal_args_glm_router_select_one {
     uint32_t pad0;
 };
 
+struct ds4_metal_args_mellum_router_select_one {
+    uint32_t n_expert;
+    uint32_t n_expert_used;
+};
+
 struct ds4_metal_args_glm_kv_lora_rms_norm {
     uint32_t n_tokens;
     uint32_t kv_raw_dim;
@@ -4633,6 +4638,70 @@ kernel void kernel_glm_router_select_one(
         }
         sum = max(sum, 6.103515625e-5f);
         token_weights[tid] = token_probs[(uint)token_selected[tid]] / sum * args.expert_weight_scale;
+    }
+}
+
+// Mellum router: bias-free softmax, deterministic descending top-k, then
+// normalization over the selected probabilities.  The lower expert id wins a
+// tie, matching the CPU/reference top-k convention used by ds4.
+kernel void kernel_mellum_router_select_one(
+        constant ds4_metal_args_mellum_router_select_one &args,
+        device const float *logits,
+        device int32_t *selected,
+        device float *weights,
+        device float *probs,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup float *scores = scratch;
+    threadgroup float *sums = scratch + 256;
+    threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + 512);
+    const uint n_expert = min(args.n_expert, 256u);
+    const bool active = tid < n_expert;
+
+    scores[tid] = active ? logits[tid] : -INFINITY;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) scores[tid] = max(scores[tid], scores[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float max_logit = scores[0];
+    const float e = active ? exp(logits[tid] - max_logit) : 0.0f;
+    sums[tid] = e;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) sums[tid] += sums[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float denom = max(sums[0], 6.103515625e-5f);
+    if (active) probs[tid] = e / denom;
+    scores[tid] = active ? e / denom : -INFINITY;
+    idx[tid] = (int32_t)tid;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint k = 2u; k <= 256u; k <<= 1u) {
+        for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+            const uint other = tid ^ j;
+            if (other > tid) {
+                const int32_t a = idx[tid], b = idx[other];
+                const bool descending = (tid & k) == 0u;
+                const bool better_b = ds4_glm_router_better(scores, b, a);
+                const bool better_a = ds4_glm_router_better(scores, a, b);
+                if (descending ? better_b : better_a) {
+                    idx[tid] = b;
+                    idx[other] = a;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    const uint k_used = min(args.n_expert_used, n_expert);
+    if (tid < k_used) selected[tid] = idx[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < k_used) {
+        float selected_sum = 0.0f;
+        for (uint i = 0; i < k_used; i++) selected_sum += probs[(uint)selected[i]];
+        weights[tid] = probs[(uint)selected[tid]] /
+            max(selected_sum, 6.103515625e-5f);
     }
 }
 

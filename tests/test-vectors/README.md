@@ -49,6 +49,42 @@ It also consumes the local golden fixture:
 ./ds4_test --local-golden-vectors
 ```
 
+## Mellum layer-0 numerical oracle
+
+`mellum-llama-cpp/l-out-0.f32` is the 26 x 2,304 little-endian F32 `l_out-0`
+checkpoint captured by the `llama-eval-callback` example at llama.cpp revision
+`0e4a0362239713ea95a6864a17a8de4b0ad90d62`. It uses the pinned Mellum Q8_0
+GGUF and the `python_add` ChatML fixture. Its SHA-256 is
+`5a99d699c83a1a5417f9175f46e30c343026767372546001a112aef34ce49243`.
+
+After writing ds4's diagnostic output, check the durable intermediate gate:
+
+```sh
+./ds4 --mellum-layer0-probe-out /tmp/mellum2-ds4-l-out-0.f32 --model MODEL
+./tests/check_mellum_layer0_oracle.py /tmp/mellum2-ds4-l-out-0.f32
+```
+
+The checker verifies the fixture hash and exact byte counts, then requires
+maximum absolute error no greater than `0.006` and RMS error no greater than
+`0.000125`. `--mellum-layer0-probe-out` stages output beside the requested path
+and atomically replaces it only after the complete checkpoint is written.
+
+`mellum-llama-cpp/l-out-27-last.f32` is the corresponding final-token,
+post-layer-27 F32 checkpoint (SHA-256
+`050436ca257f8ebe36656f32785b9649ddf8b8ad75a08ec47f005ea588b72ebb`). It
+is the batched-prefill diagnostic; it does not share ds4's tokenwise schedule.
+
+The matching tokenwise callback checkpoint is
+`mellum-llama-cpp/l-out-27-tokenwise.f32` (SHA-256
+`4ae7a46e409d6e3bf760ef8f7c671f32ff16d0798b8cd3dd25fe5fcbb3f086fe`). It is
+the all-layer acceptance oracle, with maximum absolute error no greater than
+`1.5` and RMS error no greater than `0.06`:
+
+```sh
+./ds4 --mellum-all-layers-probe-out /tmp/mellum2-ds4-l-out-27.f32 --model MODEL
+./tests/check_mellum_layer0_oracle.py --layer 27-tokenwise /tmp/mellum2-ds4-l-out-27.f32
+```
+
 The Metal SSD-streaming cache-pressure repro for issue #384 is a focused
 variant of the official-vector check. It forces a 16GiB routed-expert cache and
 runs only the `short_code_completion` case that exposes wrong logits when

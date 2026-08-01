@@ -97,6 +97,12 @@ extern const ds4_shape DS4_SHAPE_LAGUNA_S21;
 extern const ds4_shape DS4_SHAPE_LAGUNA_XS21;
 extern const ds4_shape DS4_SHAPE_MELLUM2;
 
+/* Mellum's 28 layers repeat [sliding, sliding, sliding, full]. Sliding
+ * layers use ordinary RoPE; full-attention layers use the model's YaRN RoPE
+ * parameters. Invalid layer indices return false from both helpers. */
+bool ds4_mellum_layer_uses_sliding_attention(uint32_t layer_index);
+bool ds4_mellum_layer_uses_yarn_rope(uint32_t layer_index);
+
 typedef enum {
     DS4_THINK_NONE,
     DS4_THINK_HIGH,
@@ -271,6 +277,21 @@ typedef struct {
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 
+/* Diagnostic-only Mellum oracle probe.  Replays the pinned 26-token fixture
+ * through layer 0 without creating a session or enabling generation. */
+int ds4_engine_mellum_layer0_probe(ds4_engine *engine,
+                                   FILE       *out,
+                                   const char *raw_output_path);
+
+/* Diagnostic-only Mellum whole-model oracle. Replays the same pinned fixture
+ * through all 28 layers without creating a session or enabling generation. */
+int ds4_engine_mellum_all_layers_probe(ds4_engine *engine,
+                                       FILE       *out,
+                                       const char *raw_output_path,
+                                       const char *trace_output_path,
+                                       const char *attention_trace_output_path,
+                                       const char *qk_trace_output_path);
+
 /* Multi-GPU pipeline-parallel entry point (wave 2).
  *
  * Accepts an optional ds4_gpu_config (defined in ds4_gpu_mgpu.h) that
@@ -362,6 +383,11 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                int max_tokens);
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
+int ds4_dump_chat_tokenization(const char *model_path,
+                               const char *system,
+                               const char *prompt,
+                               ds4_think_mode think_mode,
+                               FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);

@@ -270,6 +270,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     title(fp, c, "Diagnostics And Data Collection");
     opt(fp, c, "--inspect", "Load the model and print a summary only.");
     opt(fp, c, "--dump-tokens", "Tokenize the prompt exactly as written, then exit.");
+    opt(fp, c, "--dump-chat-tokens", "Render and tokenize the native chat prompt, then exit.");
     opt(fp, c, "--dump-logits FILE", "Write full next-token logits as JSON.");
     opt(fp, c, "--dump-logprobs FILE", "Write greedy continuation top-logprobs as JSON.");
     opt(fp, c, "--logprobs-top-k N", "Alternatives stored by --dump-logprobs. Default: 20");
@@ -285,6 +286,13 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--metal-graph-test", "Compare first GPU-resident graph stages with CPU.");
     opt(fp, c, "--metal-graph-full-test", "Run the GPU-resident self-token graph across all layers.");
     opt(fp, c, "--metal-graph-prompt-test", "Compare CPU and GPU graph logits for the full prompt.");
+    opt(fp, c, "--mellum-layer0-probe", "Mellum diagnostic: replay the pinned layer-0 oracle fixture.");
+    opt(fp, c, "--mellum-layer0-probe-out FILE", "Write its 26 F32 layer outputs for oracle comparison.");
+    opt(fp, c, "--mellum-all-layers-probe", "Mellum diagnostic: replay the fixture through all 28 layers.");
+    opt(fp, c, "--mellum-all-layers-probe-out FILE", "Write its final-token F32 output for oracle comparison.");
+    opt(fp, c, "--mellum-all-layers-trace-out FILE", "Write all 28 final-token F32 layer outputs for diagnosis.");
+    opt(fp, c, "--mellum-all-layers-attention-trace-out FILE", "Write all 28 final-token attention residuals for diagnosis.");
+    opt(fp, c, "--mellum-all-layers-qk-trace-out FILE", "Write all 28 final-token post-RoPE Q/K states for diagnosis.");
     fputc('\n', fp);
 }
 

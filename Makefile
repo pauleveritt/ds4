@@ -88,6 +88,19 @@ tests/test_metal_session_batch: tests/test_metal_session_batch.o $(CORE_OBJS)
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
 
+tests/test_mellum_tokenizer.o: tests/test_mellum_tokenizer.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_mellum_tokenizer.c
+
+tests/test_mellum_tokenizer: tests/test_mellum_tokenizer.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-mellum-tokenizer: tests/test_mellum_tokenizer
+	@if [ -z "$(strip $(DS4_TEST_MELLUM_MODEL))" ]; then \
+		echo "error: set DS4_TEST_MELLUM_MODEL to the Mellum Q8 GGUF"; \
+		exit 2; \
+	fi
+	DS4_TEST_MELLUM_MODEL="$(DS4_TEST_MELLUM_MODEL)" ./tests/test_mellum_tokenizer
+
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_help.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)

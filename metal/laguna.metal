@@ -139,15 +139,15 @@ kernel void kernel_laguna_qk_head_rms_norm_rope_neox(
         args, row, weight, scratch, tid, ntg_u.x, token);
 }
 
-struct ds4_metal_args_laguna_kv_store {
+struct ds4_metal_args_store_kv_f16 {
     uint32_t cache_cap;
     uint32_t cache_row;
     uint32_t n_head_kv;
     uint32_t head_dim;
 };
 
-kernel void kernel_laguna_store_kv_f16(
-        constant ds4_metal_args_laguna_kv_store &args,
+kernel void kernel_store_kv_f16(
+        constant ds4_metal_args_store_kv_f16 &args,
         device const float *k,
         device const float *v,
         device half *key_cache,
@@ -635,6 +635,70 @@ struct ds4_metal_args_laguna_gqa3_decode {
     uint32_t nwg;
     float    scale;
 };
+
+struct ds4_metal_args_mellum_gqa_decode {
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t cache_cap;
+    uint32_t key_start;
+    uint32_t key_count;
+    float    scale;
+};
+
+// Mellum has the same four-KV-head GQA layout as Laguna but no learned
+// attention gate. This correctness-first decode kernel keeps one SIMD group
+// per query head; a later split-K specialization can retain this interface.
+kernel void kernel_mellum_attention_decode_gqa_f16(
+        constant ds4_metal_args_mellum_gqa_decode &args,
+        device const float *q,
+        device const half  *key_cache,
+        device const half  *value_cache,
+        device float       *out,
+        ushort lane [[thread_index_in_simdgroup]],
+        uint head [[threadgroup_position_in_grid]]) {
+    if (head >= args.n_head || args.n_head_kv == 0u ||
+        args.n_head % args.n_head_kv != 0u || args.head_dim != 128u ||
+        args.cache_cap == 0u || args.key_count == 0u) return;
+    const uint heads_per_kv = args.n_head / args.n_head_kv;
+    const uint kv_head = head / heads_per_kv;
+    const uint cache_width = args.n_head_kv * args.head_dim;
+    device const float *qh = q + (uint64_t)head * args.head_dim;
+    float4 acc = float4(0.0f);
+    float max_score = -INFINITY;
+    float score_sum = 0.0f;
+    for (uint i = 0; i < args.key_count; i++) {
+        const uint row = (uint)(((uint64_t)args.key_start + i) %
+                                args.cache_cap);
+        const uint64_t kv_base = (uint64_t)row * cache_width +
+            (uint64_t)kv_head * args.head_dim;
+        const uint d0 = lane;
+        const float4 key = float4((float)key_cache[kv_base + d0],
+                                  (float)key_cache[kv_base + d0 + 32u],
+                                  (float)key_cache[kv_base + d0 + 64u],
+                                  (float)key_cache[kv_base + d0 + 96u]);
+        const float4 query = float4(qh[d0], qh[d0 + 32u],
+                                    qh[d0 + 64u], qh[d0 + 96u]);
+        const float score = simd_sum(dot(query, key)) * args.scale;
+        const float next_max = max(max_score, score);
+        const float old_scale = max_score == -INFINITY ? 0.0f :
+            exp(max_score - next_max);
+        const float value_scale = exp(score - next_max);
+        score_sum = score_sum * old_scale + value_scale;
+        const float4 value = float4((float)value_cache[kv_base + d0],
+                                    (float)value_cache[kv_base + d0 + 32u],
+                                    (float)value_cache[kv_base + d0 + 64u],
+                                    (float)value_cache[kv_base + d0 + 96u]);
+        acc = acc * old_scale + value * value_scale;
+        max_score = next_max;
+    }
+    const float inv_sum = score_sum > 0.0f ? 1.0f / score_sum : 0.0f;
+    device float *oh = out + (uint64_t)head * args.head_dim;
+    oh[lane] = acc.x * inv_sum;
+    oh[lane + 32u] = acc.y * inv_sum;
+    oh[lane + 64u] = acc.z * inv_sum;
+    oh[lane + 96u] = acc.w * inv_sum;
+}
 
 // Global layers split keys across 32 workgroups. Evaluate three query heads
 // sharing one KV head together so each K/V row is loaded once instead of three

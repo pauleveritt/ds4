@@ -1595,6 +1595,7 @@ first answer:
 
 ```sh
 ./ds4 --dump-tokens -p "..."
+./ds4 --dump-chat-tokens --nothink -p "..."
 ./ds4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
 ./ds4 --dump-logits /tmp/logits.json --metal --nothink --prompt-file prompt.txt
 ./ds4-server --trace /tmp/ds4-trace.txt ...
@@ -1604,6 +1605,8 @@ first answer:
   written, recognizes DS4 protocol specials, and then exits before inference
   starts. For example, the DSML tool close marker starts as two tokens: `</`
   and `｜DSML｜`.
+- `--dump-chat-tokens` applies ds4's native chat template before dumping
+  tokens, also without creating a session or running inference.
 - `--dump-logprobs` stores a greedy continuation with the top local
   alternatives at each step, which helps separate sampling choices from
   logit/model issues.
