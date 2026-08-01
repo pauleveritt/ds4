@@ -918,6 +918,87 @@ static void test_metal_mellum_router(void) {
     ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(logits);
 }
 
+static void test_metal_mellum_router_batch(void) {
+    enum { n_expert = 64, n_used = 8, n_tokens = 3 };
+    const uint64_t logits_bytes = (uint64_t)n_tokens * n_expert * sizeof(float);
+    const uint64_t selected_bytes = (uint64_t)n_tokens * n_used * sizeof(int32_t);
+    const uint64_t weights_bytes = (uint64_t)n_tokens * n_used * sizeof(float);
+    ds4_gpu_tensor *logits = ds4_gpu_tensor_alloc(logits_bytes);
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(selected_bytes);
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(weights_bytes);
+    ds4_gpu_tensor *probs = ds4_gpu_tensor_alloc(logits_bytes);
+    float *logits_host = malloc((size_t)logits_bytes);
+    float *probs_batch = malloc((size_t)logits_bytes);
+    float *weights_batch = malloc((size_t)weights_bytes);
+    int32_t *selected_batch = malloc((size_t)selected_bytes);
+    TEST_ASSERT(logits && selected && weights && probs && logits_host && probs_batch &&
+                weights_batch && selected_batch);
+    if (logits && selected && weights && probs && logits_host && probs_batch &&
+        weights_batch && selected_batch) {
+        for (uint32_t token = 0; token < n_tokens; token++) {
+            for (uint32_t i = 0; i < n_expert; i++) {
+                logits_host[(uint64_t)token * n_expert + i] = token == 0u ?
+                    (float)((int)((i * 23u + 17u) % 61u) - 30) / 7.0f :
+                    token == 1u ? (float)((int)(i % 9u) - 4) :
+                    (i == 7u ? 80.0f : i == 19u ? 79.5f : -80.0f - (float)i);
+            }
+        }
+        logits_host[n_expert + 3u] = logits_host[n_expert + 12u] = 6.0f;
+        TEST_ASSERT(ds4_gpu_tensor_write(logits, 0, logits_host, logits_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_mellum_router_select_batch_tensor(
+                        selected, weights, probs, logits, n_expert, n_used,
+                        n_tokens) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(selected, 0, selected_batch,
+                                        selected_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(weights, 0, weights_batch,
+                                        weights_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(probs, 0, probs_batch, logits_bytes) != 0);
+        for (uint32_t token = 0; token < n_tokens; token++) {
+            ds4_gpu_tensor *token_logits = ds4_gpu_tensor_view(
+                logits, (uint64_t)token * n_expert * sizeof(float),
+                n_expert * sizeof(float));
+            ds4_gpu_tensor *token_selected = ds4_gpu_tensor_view(
+                selected, (uint64_t)token * n_used * sizeof(int32_t),
+                n_used * sizeof(int32_t));
+            ds4_gpu_tensor *token_weights = ds4_gpu_tensor_view(
+                weights, (uint64_t)token * n_used * sizeof(float),
+                n_used * sizeof(float));
+            ds4_gpu_tensor *token_probs = ds4_gpu_tensor_view(
+                probs, (uint64_t)token * n_expert * sizeof(float),
+                n_expert * sizeof(float));
+            TEST_ASSERT(token_logits && token_selected && token_weights && token_probs);
+            if (token_logits && token_selected && token_weights && token_probs) {
+                TEST_ASSERT(ds4_gpu_mellum_router_select_tensor(
+                                token_selected, token_weights, token_probs,
+                                token_logits, n_expert, n_used) != 0);
+                int32_t selected_one[n_used];
+                float weights_one[n_used], probs_one[n_expert];
+                TEST_ASSERT(ds4_gpu_tensor_read(token_selected, 0, selected_one,
+                                                sizeof(selected_one)) != 0);
+                TEST_ASSERT(ds4_gpu_tensor_read(token_weights, 0, weights_one,
+                                                sizeof(weights_one)) != 0);
+                TEST_ASSERT(ds4_gpu_tensor_read(token_probs, 0, probs_one,
+                                                sizeof(probs_one)) != 0);
+                TEST_ASSERT(memcmp(selected_one,
+                                   selected_batch + (uint64_t)token * n_used,
+                                   sizeof(selected_one)) == 0);
+                TEST_ASSERT(memcmp(weights_one,
+                                   weights_batch + (uint64_t)token * n_used,
+                                   sizeof(weights_one)) == 0);
+                TEST_ASSERT(memcmp(probs_one,
+                                   probs_batch + (uint64_t)token * n_expert,
+                                   sizeof(probs_one)) == 0);
+            }
+            ds4_gpu_tensor_free(token_probs); ds4_gpu_tensor_free(token_weights);
+            ds4_gpu_tensor_free(token_selected); ds4_gpu_tensor_free(token_logits);
+        }
+        fprintf(stderr, "ds4-test: Mellum batch router exact rows=%u\n", n_tokens);
+    }
+    free(selected_batch); free(weights_batch); free(probs_batch); free(logits_host);
+    ds4_gpu_tensor_free(probs); ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(logits);
+}
+
 static void test_metal_mellum_gqa_decode(void) {
     const uint32_t n_head = 32u, n_head_kv = 4u, head_dim = 128u;
     const uint32_t cache_cap = 17u, key_start = 11u, key_count = 13u;
@@ -6555,6 +6636,7 @@ static void test_metal_kernel_group(void) {
     TEST_ASSERT(ds4_gpu_test_glm_q3_down_one_bound_equivalence() != 0);
     TEST_ASSERT(ds4_gpu_test_glm_q3_down_slots8_bound_equivalence() != 0);
     test_metal_mellum_router();
+    test_metal_mellum_router_batch();
     test_metal_mellum_gqa_decode();
     test_metal_mellum_gqa_prefill();
     test_metal_mellum_attention_prelude();

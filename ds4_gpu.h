@@ -2319,6 +2319,18 @@ int ds4_gpu_mellum_router_select_tensor(
         uint32_t                n_expert,
         uint32_t                n_expert_used);
 
+/* Token-major batch form of Mellum's bias-free router.  Each token uses the
+ * same deterministic softmax/top-k and selected-probability normalization as
+ * the one-token primitive. */
+int ds4_gpu_mellum_router_select_batch_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        uint32_t                n_tokens);
+
 /* One-token ungated GQA over F16 K/V cache rows. `key_start` is an absolute
  * position; cache addressing wraps at `cache_cap`, supporting both Mellum's
  * sliding layers and its full-attention layers. */

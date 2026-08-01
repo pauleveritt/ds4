@@ -231,6 +231,7 @@ static id<MTLComputePipelineState> g_glm_q4_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_down_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_router_select_one_pipeline;
+static id<MTLComputePipelineState> g_mellum_router_select_batch_pipeline;
 static id<MTLComputePipelineState> g_mellum_gqa_decode_pipeline;
 static id<MTLComputePipelineState> g_mellum_gqa_prefill_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_addr_down_f32_pipeline;
@@ -9755,6 +9756,7 @@ void ds4_gpu_cleanup(void) {
         g_mellum_q8_0_pair_swiglu_f32_pipeline = nil;
         g_mellum_q8_0_down_f32_pipeline = nil;
         g_mellum_router_select_one_pipeline = nil;
+        g_mellum_router_select_batch_pipeline = nil;
         g_mellum_gqa_decode_pipeline = nil;
         g_mellum_gqa_prefill_pipeline = nil;
         g_glm_q2_k_addr_down_f32_pipeline = nil;
@@ -34514,6 +34516,70 @@ int ds4_gpu_mellum_router_select_tensor(
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Mellum router select")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_mellum_router_select_batch_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        uint32_t                n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!selected || !weights || !probs || !logits || n_expert == 0 ||
+        n_expert > 256u || n_expert_used == 0 || n_expert_used > n_expert ||
+        n_tokens == 0) return 0;
+    const uint64_t logits_bytes = (uint64_t)n_tokens * n_expert * sizeof(float);
+    const uint64_t selected_bytes =
+        (uint64_t)n_tokens * n_expert_used * sizeof(int32_t);
+    const uint64_t weights_bytes =
+        (uint64_t)n_tokens * n_expert_used * sizeof(float);
+    const uint64_t probs_bytes = (uint64_t)n_tokens * n_expert * sizeof(float);
+    @autoreleasepool {
+        id<MTLBuffer> logitsbuf = ds4_gpu_tensor_buffer(logits);
+        id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
+        id<MTLBuffer> weightsbuf = ds4_gpu_tensor_buffer(weights);
+        id<MTLBuffer> probsbuf = ds4_gpu_tensor_buffer(probs);
+        if (!logitsbuf || !selectedbuf || !weightsbuf || !probsbuf ||
+            ds4_gpu_tensor_bytes(logits) < logits_bytes ||
+            ds4_gpu_tensor_bytes(selected) < selected_bytes ||
+            ds4_gpu_tensor_bytes(weights) < weights_bytes ||
+            ds4_gpu_tensor_bytes(probs) < probs_bytes) {
+            fprintf(stderr, "ds4: Metal Mellum batch router received undersized buffers\n");
+            return 0;
+        }
+        if (!g_mellum_router_select_batch_pipeline) {
+            g_mellum_router_select_batch_pipeline =
+                ds4_gpu_get_pipeline("kernel_mellum_router_select_batch");
+        }
+        id<MTLComputePipelineState> pipeline = ds4_gpu_hot_pipeline(
+            g_mellum_router_select_batch_pipeline,
+            "kernel_mellum_router_select_batch");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        ds4_gpu_mellum_router_select_one_args args = {
+            .n_expert = n_expert,
+            .n_expert_used = n_expert_used,
+        };
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:logitsbuf offset:ds4_gpu_tensor_offset(logits) atIndex:1];
+        [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+        [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:3];
+        [enc setBuffer:probsbuf offset:ds4_gpu_tensor_offset(probs) atIndex:4];
+        [enc setThreadgroupMemoryLength:512u * sizeof(float) +
+                                          256u * sizeof(int32_t) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Mellum batch router select"))
+            return 0;
     }
     return 1;
 }

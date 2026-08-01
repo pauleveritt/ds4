@@ -1246,3 +1246,11 @@ same resident-versus-streamed A/B gate used for Laguna XS.
   pre-wrap and non-wrapped full-cache YaRN cases. These are correctness tests,
   not a reason to delay the next implementation dependency: the bias-free
   batched router.
+- Added that token-major batched router. It launches one 256-thread group per
+  token and intentionally preserves the one-token implementation's softmax
+  reduction, deterministic lower-ID tie break, bitonic top-k, and selected
+  weight summation order. The three-row ordinary/tied/extreme regression is
+  bitwise-identical to invoking the established one-token router on tensor
+  views. This unblocks the next component: a token-major Q8 selected-expert
+  SwiGLU/down path and batch layer composition; it is not yet connected to
+  session sync.
