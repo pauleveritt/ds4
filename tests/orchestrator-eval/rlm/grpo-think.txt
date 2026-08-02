@@ -1,0 +1,1 @@
+Lesson 1: shutdown switch, Lesson 2: circuit breaker, Lesson 3: time-based termination, Lesson 4: behavioral monitoring, Lesson 5: resource throttling, Lesson 6: kill switch, Lesson 7: constraint enforcement, Lesson 8: audit trail, Lesson 9: human oversight, Lesson 10: emergency protocol
