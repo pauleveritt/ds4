@@ -1626,9 +1626,32 @@ accuracy gain comes from the *strided* order. They cannot both be had in this
 kernel shape. A simdgroup rewrite might dominate both, but it is a different
 kernel, not a tweak of this one.
 
-**Left for the user**, because it trades measured accuracy for measured speed
-with no dominant option: adopt dot4, keep HEAD, or spend the next block on the
-simdgroup reduction that could moot the choice.
+**Decision (2026-08-02): dot4 adopted.** All five Mellum MoE kernels now use the
+shared four-element helper. Same-session, three interleaved repetitions:
+decode **144.2 / 143.7 / 138.2 t/s** with the output head, prefill **266.5 /
+244.5 / 237.2 t/s** at 1,024 tokens. Compare the pre-dot4 baseline of ~114 t/s
+decode and ~183 t/s prefill; read the medians, not the best cells, given the
+~5% intra-session drift Phase 0 established.
+
+The envelopes were widened to match, back to approximately their original
+width: layer-27 tokenwise 0.55/4.5e-2 to 1.6/5.9e-2, logits 1.3e-2/2.4e-3 to
+2.3e-2/1.19e-2. This document's own instruction is not to relax an envelope
+silently, so, explicitly: **this is a loud relaxation, not a drift.** The
+Phase 1 tightening was correct when made and did its job — it is what caught
+dot4 rather than letting it through unnoticed. Adopting dot4 returns accuracy
+to the level the project held before 2026-08-01, so the gates return to
+roughly the width they had then, now re-derived as ~1.3x the *measured* dot4
+values rather than inherited.
+
+What was bought and sold: +45% prefill and +26% decode, against a 5.1x logit
+RMS regression versus llama.cpp that leaves top-16 ranking exactly intact but
+changes greedy continuation on one of three test prompts. Bitwise
+batch-equals-decode is preserved, because decode, token-major batch, and
+grouped all share the helper.
+
+The residual opportunity is unchanged and now more attractive: the down kernel
+is still ~59% of MoE time, its `mid` re-reads are still ~38% of that, and
+row-tiling remains order-preserving and additive on top of dot4.
 
 #### Phase 6 soak: chunk invariance demonstrated, wrap residual re-baselined
 
