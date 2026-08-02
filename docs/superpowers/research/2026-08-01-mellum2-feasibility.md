@@ -1574,6 +1574,32 @@ caller-owned batch is open is refused. `make test` now also runs the Metal
 kernel suite with `DS4_MELLUM_GROUPED_MOE=1` — the grouped path had **no**
 automated coverage at all before this.
 
+**Correction: `make test` does not pass in this worktree, and never did.** It
+was reported green during this session on the strength of an exit code read
+through a pipe — `make test 2>&1 | tail -25` returns *`tail`'s* status, not
+make's. The real failure is environmental and predates this work: the
+`long-context` suite requires `ds4flash.gguf`, which does not exist here, and
+`ds4_test` exits 1 on that. Nothing in the Mellum changes causes it.
+
+What is actually verified, with exit codes checked directly rather than through
+a pipe: `./ds4_test --metal-kernels` exits 0 under both the default and
+`DS4_MELLUM_GROUPED_MOE=1`; `tests/check_mellum_layer0_oracle.py` exits 0 on
+all three oracles; the batch-versus-decode probe under
+`DS4_MELLUM_PREFILL_EXACT=1` is bit-identical; and a rebuild produces zero
+warnings or errors. Those are the claims the kernel work rests on and they
+hold. The suite-wide claim did not.
+
+A related hazard was introduced and has been removed: a `ds4flash.gguf` symlink
+was created pointing at the Mellum Q8 GGUF so `--metal-kernels` could be run by
+name. That made `ds4_test` fail *differently* — ten `ds4_engine_open` assertion
+failures — because ordinary `ds4_engine_open` rejects Mellum by design, so every
+model-dependent test tried to open a model the non-agent path refuses. The
+symlink is gone; `--metal-kernels` does not need it.
+
+Two process lessons, both cheap: read the exit status of the command, not of
+the last stage of a pipe; and treat a suite that *skips* its model-dependent
+tests as untested rather than as passing.
+
 **Down-kernel discriminator (Phase 3).** Eliding only the `mid` loads from the
 batch down kernel gives 4,564 ms against a same-session baseline of ~5,578 ms.
 So `mid` re-reads are ~1,014 ms — **38% of the down kernel, not the bulk of
