@@ -1,0 +1,88 @@
+**Phase 2 Delegation Packet**
+
+---
+
+**NEW Files**
+
+- `app.py`  
+  - Add route `/complaints` → function `complaints_board()`  
+  - Function must return template `complaints.html` with context `complaints: list[Complaint]`  
+  - Import `datetime`, `timezone` from `datetime`  
+  - Import `Complaint` dataclass (defined below)  
+
+- `templates/complaints.html`  
+  - Inherits from `base.html`  
+  - Block title: "Complaints Board"  
+  - Heading: `<h1>Complaints Board</h1>`  
+  - For each `complaint` in `complaints`:  
+    - Display: `<p><strong>{{ complaint.agent_name }}</strong> — {{ complaint.timestamp.strftime("%Y-%m-%d") }}</p>`  
+    - Display: `<p>{{ complaint.text }}</p>`  
+  - Seed the list with 5 `Complaint` instances (see below)  
+
+- `dataclasses.py`  
+  - Define `@dataclass` `Complaint` with fields:  
+    - `agent_name: str`  
+    - `text: str`  
+    - `timestamp: datetime` (timezone-aware, e.g., `datetime.now(timezone.utc)`)  
+
+- `tests/test_app.py`  
+  - Add test: `def test_complaints_board_get() -> None:`  
+    - `response = client.get("/complaints")`  
+    - Assert `response.status_code == 200`  
+    - Assert response body contains "Complaints Board"  
+    - Assert response body contains "Scope creep never ends."  
+
+---
+
+**SHARED Files**
+
+- `app.py`  
+  - Route: `/` → `home()` → returns `templates/home.html`  
+  - Route: `/complaints` → `complaints_board()` → returns `templates/complaints.html`  
+  - Import: `from fastapi import FastAPI`  
+  - Import: `from starlette.testclient import TestClient` (in tests)  
+  - Variable: `app = FastAPI()`  
+
+- `templates/base.html`  
+  - Navbar brand: "AgentClinic"  
+  - Links: Home (`/`) and Complaints (`/complaints`)  
+  - Favicon: `https://www.python.org/static/favicon.ico`  
+  - Title block default: "AgentClinic"  
+  - Bootstrap 5 CSS: `<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">`  
+  - Bootstrap 5 JS: `<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>`  
+
+- `templates/home.html`  
+  - Hero tagline: "Come in. Sit down. Tell us about your human."  
+
+- `tests/test_app.py`  
+  - Smoke test: `def test_home_get() -> None:`  
+    - `response = client.get("/")`  
+    - Assert `response.status_code == 200`  
+    - Assert response body contains "Come in. Sit down. Tell us about your human."  
+
+---
+
+**Exact Literals**
+
+- "AgentClinic"  
+- "Complaints Board"  
+- "Come in. Sit down. Tell us about your human."  
+- "Scope creep never ends."  
+
+---
+
+**Validation Command**
+
+`.venv/bin/python -m pytest tests/`
+
+---
+
+**Framework Semantic Trap**
+
+- `timestamp` must be timezone-aware (e.g., `datetime.now(timezone.utc)`), not naive (e.g., `datetime.now()`).  
+- Do not use `str()` or `repr()` on `Complaint` instances in templates; access fields directly.  
+- Bootstrap 5 CDN links must be exact; no local build or npm step.  
+
+--- 
+
+**END PACKET**

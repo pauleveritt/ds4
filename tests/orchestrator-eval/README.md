@@ -27,7 +27,11 @@ inlines files and leaves the child transcribing.
   contradictions to be reported.
 - `prompt_p2.txt` — Phase 2 packet. More discriminating: it has shared files
   carried over from Phase 1, so it tests whether preservation requirements are
-  stated rather than only new work.
+  stated rather than only new work. This is the *extraction* shape: every
+  literal the packet needs is supplied.
+- `prompt_p3.txt` — the same Phase 2 written as user stories. The *inference*
+  shape: the file set must be inferred and behavioural requirements translated
+  into technical ones. Scored by `score_p3.py` (18 checks).
 
 ## Running
 
@@ -75,3 +79,11 @@ as a baseline to re-run, not a verdict.
 The thinking-length column is worth keeping: it is the cost side of a
 pass-rate-versus-thinking-length tradeoff that the model authors have said they
 want measured.
+
+## Thinking length
+
+`REPORT-thinking-length.md` holds the paired thinking-on/off results across
+both task shapes, written up as feedback for the model authors. Headline: on
+neither task shape did thinking improve the score, and the grpo checkpoint did
+not terminate on either — while thinking-off cut output 7-16x and scored
+higher. We predicted the opposite for the inference shape.

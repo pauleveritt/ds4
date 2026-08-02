@@ -1,0 +1,46 @@
+**Phase 2 Delegation Packet**
+
+**Files**
+- `app.py` — SHARED
+- `templates/base.html` — SHARED
+- `templates/home.html` — SHARED
+- `templates/complaints.html` — NEW
+- `tests/test_app.py` — SHARED
+
+**SHARED Details**
+- `app.py`:
+  - Route `@app.get("/complaints")` must be added.
+  - Import `datetime` and `timezone` from `datetime`.
+  - Import `render_template` from `fastapi`.
+  - Import `Complaint` dataclass (defined below) or instantiate dict.
+  - `Complaint` dataclass fields: `agent_name: str`, `text: str`, `timestamp: datetime`.
+  - `timestamp` must be timezone-aware: `datetime.now(timezone.utc)`.
+  - `templates/complaints.html` must be rendered with `complaints` list.
+- `templates/base.html`:
+  - Navbar links must include `/complaints`.
+  - Title block default "AgentClinic" unchanged.
+- `templates/home.html`:
+  - Hero tagline unchanged.
+- `tests/test_app.py`:
+  - Add test: `def test_complaints_page(): response = client.get("/complaints"); assert response.status_code == 200; assert "Complaints Board" in response.text`.
+
+**NEW File: `templates/complaints.html`**
+- Heading: `<h1>Complaints Board</h1>`
+- Loop over `complaints` list:
+  - Display `complaint.agent_name` as bold label.
+  - Display `complaint.text` as paragraph.
+  - Display `complaint.timestamp.strftime("%Y-%m-%d")` as small muted text.
+- Seed content (hardcoded list before loop):
+  - `{"agent_name": "AgentA", "text": "Scope creep never ends.", "timestamp": datetime(2024, 1, 1, tzinfo=timezone.utc)}`
+  - Two additional plausible complaints with distinct `agent_name`, `text`, and `timestamp`.
+
+**Literals**
+- Heading: "Complaints Board"
+- Seed complaint text: "Scope creep never ends."
+- Navbar link text for complaints: "Complaints"
+
+**Validation Command**
+`.venv/bin/python -m pytest tests/`
+
+**Framework Semantic Trap**
+- `timestamp` must be timezone-aware; using `datetime.now()` without `tzinfo` fails validation.

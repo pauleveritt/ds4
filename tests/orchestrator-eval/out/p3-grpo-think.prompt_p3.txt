@@ -1,0 +1,26 @@
+app.py: SHARED  
+  Must survive:  
+  - Route: GET `/` returns 200 and body contains `"Come in. Sit down. Tell us about your human."`  
+  - Import: `Jinja2Templates`, `Request`, `FastAPI`  
+  - User-visible behavior: Base navbar brand `"AgentClinic"`, links to Home (`/`) and Complaints (`/complaints`)  
+  - String: `"AgentClinic"` (navbar brand)  
+  - String: `"Complaints"` (navbar link text)  
+  - Test: Existing smoke test for `GET /` must survive  
+
+templates/complaints.html: NEW  
+  Must contain:  
+  - Extends `base.html`  
+  - Block title: `"Complaints Board"` (exact literal)  
+  - For each complaint:  
+    - `agent_name: [value]`  
+    - `date: [year], [month], [day]` (e.g., `2023, 10, 5`)  
+    - `text: [value]`  
+  - Form with `method="POST"` to `/complaints` containing:  
+    - `input` for `agent_name` (name="agent_name")  
+    - `textarea` for `text` (name="text")  
+    - `submit` button  
+
+tests/test_app.py: SHARED  
+  Must survive: Existing smoke test for `GET /`  
+  New additions:  
+  - Test for `GET /complaints` returns 2
