@@ -105,8 +105,14 @@ Download one main model. **Prefer the imatrix versions.**
 ./download_model.sh q2-imatrix   # 96/128 GB RAM machines, imatrix-tuned q2
 ./download_model.sh q2-q4-imatrix  # 96/128 GB RAM machines, q2 with last 6 layers q4
 ./download_model.sh q4-imatrix   # >= 256 GB RAM machines, imatrix-tuned q4
+./download_model.sh mxfp4        # native MXFP4 experts, about 156 GB
 ./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
 ```
+
+The MXFP4 GGUF preserves DeepSeek's released MXFP4 routed-expert weights rather
+than requantizing them. It runs on Metal and CUDA; Blackwell CUDA devices use
+native FP4 matrix instructions and FP4 activations for batched expert work.
+Decode and other CUDA devices use Q8 activations.
 
 For the full PRO Q4 distributed run, download one half on each machine:
 
@@ -222,7 +228,7 @@ Run it with greedy decoding:
 ```
 
 `--mtp` supplies the support GGUF, while `--dspark` selects the DSpark runtime.
-The default confidence threshold is `0.9`; it prunes suffixes that are unlikely
+The default confidence threshold is `0.7`; it prunes suffixes that are unlikely
 to repay their verification cost. `--dspark-confidence 0` forces fixed
 five-token blocks and is intended for diagnostics. Sampled decoding does not
 use DSpark proposals. `--quality` and `--dspark-strict` also keep target-only
@@ -984,9 +990,13 @@ request is never evicted. Choose `N` and `--ctx` so all resident KV allocations
 fit in GPU memory. Without this option, inference retains the original
 single-session behavior.
 
-Batching is exact: when a native batched kernel is unavailable, DwarfStar runs
-the affected rows in a fixed order and returns the same full logits as separate
-session evaluations. The current backend behavior is:
+While generation is active, prefill yields every 128 tokens by default.
+`--mixed-prefill-quantum N` changes that interval for testing; larger values
+reduce scheduling handoffs but can make active decoders wait longer.
+
+Decode batching is exact: when a native batched kernel is unavailable,
+DwarfStar runs the affected rows in a fixed order and returns the same full
+logits as separate session evaluations. The current backend behavior is:
 
 | Backend and model | Session execution |
 | --- | --- |
