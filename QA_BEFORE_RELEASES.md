@@ -158,14 +158,18 @@ model loading, and scheduler paths.  Run these whenever DSpark support,
 speculative verification, confidence/scheduler policy, target hidden capture,
 tiny routed-MoE verifier kernels, or shared `--mtp` support-model code changes:
 
+Use the 0731 DSpark support GGUF only with a Flash 0731 target. A support model
+from another checkpoint can have plausible acceptance statistics while
+producing a different greedy continuation.
+
 - Default greedy acceptance fixture:
-  `DS4_DSPARK_MODEL=/Users/antirez/ds4/ds4flash.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support.gguf make dspark-acceptance`.
+  `DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - 64-token guardrail:
-  `DS4_DSPARK_FIXTURE_TOKENS=64 DS4_DSPARK_MODEL=/Users/antirez/ds4/ds4flash.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support.gguf make dspark-acceptance`.
+  `DS4_DSPARK_FIXTURE_TOKENS=64 DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - Fixed-block partial-accept fallback:
-  `DS4_DSPARK_FIXTURE_CONFIDENCE=0 DS4_DSPARK_FIXTURE_TOKENS=8 DS4_DSPARK_FIXTURE_REQUIRE_PARTIAL=1 DS4_DSPARK_MODEL=/Users/antirez/ds4/ds4flash.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support.gguf make dspark-acceptance`.
+  `DS4_DSPARK_FIXTURE_CONFIDENCE=0 DS4_DSPARK_FIXTURE_TOKENS=8 DS4_DSPARK_FIXTURE_REQUIRE_PARTIAL=1 DS4_DSPARK_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-acceptance`.
 - DSpark verifier invariant smoke:
-  `DS4_TEST_MODEL=/Users/antirez/ds4/ds4flash.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support.gguf make dspark-verify-depth`.
+  `DS4_TEST_MODEL=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=/Users/antirez/ds4/gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf make dspark-verify-depth`.
 - If shared support-model or verifier structures changed, also run legacy MTP:
   `make mtp-verify-depth` with `DS4_TEST_MTP` set to a one-stage MTP support
   GGUF, or confirm the target skips only because the optional file is missing.
@@ -306,7 +310,7 @@ SSD streaming is a capacity path, so test both correctness and user experience.
   with boosted Q4 routed-expert layers and a prompt long enough to exercise the
   selected-address prefill path; it must not fail with "model range is not
   covered by mapped model views":
-  `./ds4 -m gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed.gguf --ssd-streaming --ssd-streaming-cache-experts 16GB --ctx 4096 --tokens 1 --nothink --prompt-file /tmp/ds4_600tok_prompt.txt`.
+  `./ds4 -m gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf --ssd-streaming --ssd-streaming-cache-experts 16GB --ctx 4096 --tokens 1 --nothink --prompt-file /tmp/ds4_600tok_prompt.txt`.
 - Cold streaming measurement:
   run once with `--ssd-streaming-cold` and verify no deadlock, missing expert,
   or impossible slowdown.
@@ -388,12 +392,17 @@ a substitute for CUDA or Metal release testing.
   `make clean && make strix-halo`.
 - Require the ROCm build to complete without compiler warnings.
 - Use the q2 Flash imatrix GGUF for release smoke tests:
-  `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf`.
+  `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf`.
 - Do not use the mixed q2-q4 or Q4 Flash GGUFs for routine Strix Halo QA yet.
   They are dangerous on this machine for now because the ROCm path can hit
   system OOM instead of failing cleanly.
 - Run a short CLI prompt:
-  `./ds4 -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf --ctx 4096 --nothink -p "Reply with exactly: OK"`.
+  `./ds4 -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf --ctx 4096 --nothink -p "Reply with exactly: OK"`.
+- For DeepSeek Flash decode, confirm the default path uses prequantized Q8
+  activations. Repeat the same greedy run with
+  `DS4_ROCM_DSV4_PREQUANT_DECODE=0` only as a diagnostic control. The default
+  must be materially faster and must still pass the continuation-quality gate.
+  GLM and `--quality` must stay on the full-FP32 activation path.
 - Run one longer prompt if ROCm kernels, backend hooks, tensor loading, model
   cache, KV cache, or graph prefill code changed.
 - Run the GLM Q2 release model through ROCm SSD streaming with at least four
@@ -508,7 +517,50 @@ The agent is the most stateful component.  Test it manually, not only by build.
 - Confirm context buffer size, raw KV rows, compressed KV rows, and mmap behavior
   match expectations for 32k, 100k, and any release-advertised context size.
 
-## 16. Release Sign-off
+## 16. Speed Regression
+
+Performance is a release gate. A correct result that is unexpectedly much
+slower still needs an explanation before release.
+
+Use the same commit, GGUF checksum, prompt, context frontier, generated-token
+count, power setting, and backend flags as the reference run. Let the machine
+become idle, discard the first warm-up run, then record the median of three
+runs. Do not compare different model checkpoints or quantizations. For batched
+tests, record aggregate and per-session decode speed.
+
+- A slowdown over 5% requires a clean rerun and investigation.
+- A repeatable slowdown over 10% in prefill, decode, or aggregate batched
+  decode is a release blocker unless the change and tradeoff are documented.
+- Keep the complete `ds4-bench` CSV. A single short-prompt average is not enough
+  to detect a context-dependent regression.
+- Compare startup time and peak memory as well as tokens per second when model
+  loading, caches, streaming, or temporary arenas changed.
+- Run the backend-specific batch tests in sections 4 and 8. Fast single-session
+  decode does not substitute for aggregate multi-session throughput.
+
+These are the last known good observations available when this gate was added.
+They are reference points for matching hardware and workloads, not performance
+claims across different models or contexts.
+
+| System and backend | Model and workload | Prefill | Decode |
+| --- | --- | ---: | ---: |
+| MacBook Pro M3 Max 128 GB, Metal | Flash q2, 11,709-token prompt | 250.11 t/s | 21.47 t/s |
+| MacBook Pro M5 Max 128 GB, Metal | Flash q2, 11,707-token prompt | 463.44 t/s | 25.90 t/s |
+| Mac Studio M3 Ultra 512 GB, Metal | Flash q2, 11,709-token prompt | 468.03 t/s | 27.39 t/s |
+| Mac Studio M3 Ultra 512 GB, Metal | Flash q4, 12,018-token prompt | 448.82 t/s | 26.62 t/s |
+| Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.2 IQ2_XXS, 4,096-token context | about 94 t/s | 15.4 t/s |
+| DGX Spark GB10, CUDA | Flash q2, 7,047-token prompt | 343.81 t/s | 13.75 t/s |
+| Strix Halo gfx1151, ROCm | Flash IQ2 resident, short section 9 smoke | - | 16.78 t/s; FP32 rollback 9.43 t/s |
+| Strix Halo gfx1151, ROCm | Flash IQ2 resident, 4,096-token context | - | 14.82 t/s; FP32 rollback 8.76 t/s |
+| 8x L40S, CUDA TP | Flash q4, 2,048-token prefill benchmark | 1,524.84 t/s | 46.93 t/s |
+| 8x L40S, CUDA TP | Flash q4, 16-row decode oracle | - | 126.0 aggregate t/s |
+
+The 8x L40S values are retained from the last recorded run on `192.168.60.250`.
+Do not interrupt a production server merely to refresh them. When that host is
+available for release QA, the existing hard floor remains 110 aggregate t/s for
+the 16-row decode oracle.
+
+## 17. Release Sign-off
 
 Do not sign off until:
 
@@ -525,7 +577,8 @@ Do not sign off until:
 - Disk KV cache was exercised.
 - Server API streaming was exercised.
 - Agent interruption and tool loops were exercised manually.
-- Speed is within expected variance for the same hardware and model.
+- The speed-regression gate passed on every validated backend, with any skipped
+  baseline or intentional slowdown documented.
 - Metal 2/4/8/16-session exactness and forced fallback gates passed.
 - Physical Metal TP batching and CUDA native decode/mixed batching passed when
   those backends are part of the release.
