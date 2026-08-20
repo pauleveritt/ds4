@@ -10934,6 +10934,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     int rc = 0;
     char last_status[256] = {0};
     double last_status_at = 0.0;
+    agent_worker_state last_state = (agent_worker_state)-1;  /* nothing emitted yet */
 
     if (!one_shot) {
         if (set_nonblock(STDIN_FILENO, true, &old_stdin_flags) != 0) {
@@ -11026,11 +11027,17 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             char cur[256];
             agent_format_status_line(&st, cur, sizeof(cur));
             double now = now_sec();
-            if (strcmp(cur, last_status) != 0 && now - last_status_at >= 0.200) {
+            bool state_changed = st.state != last_state;
+            /* A state change publishes immediately — the consumer's spinner keys off
+             * the phase, and at idle the loop blocks in poll() indefinitely, so a
+             * dropped transition is never retried. Within a state, throttle. */
+            if (strcmp(cur, last_status) != 0 &&
+                (state_changed || now - last_status_at >= 0.200)) {
                 write_all(STDERR_FILENO, cur, strlen(cur));
                 write_all(STDERR_FILENO, "\n", 1);
                 snprintf(last_status, sizeof(last_status), "%s", cur);
                 last_status_at = now;
+                last_state = st.state;
             }
         }
 
