@@ -311,6 +311,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
+    opt(fp, c, "--json-events", "Emit NDJSON events on stdout instead of formatted text.");
     fputc('\n', fp);
 }
 

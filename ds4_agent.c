@@ -74,6 +74,8 @@ typedef struct {
     const char *gpu_devices_arg;
     const char *chdir_path;
     bool non_interactive;
+    bool edit_upto;
+    bool json_events;
 } agent_config;
 
 typedef enum {
@@ -160,6 +162,17 @@ typedef struct {
 
 static unsigned agent_next_prefill_label(void);
 
+/* Growable byte buffer.  Defined here (rather than beside its helper
+ * functions further down) so agent_token_renderer can embed one by value for
+ * --json-events buffering, and so renderer_write() can append to it before
+ * the helper functions themselves are defined. */
+typedef struct {
+    char *ptr;
+    size_t len;
+    size_t cap;
+    bool truncated;
+} agent_buf;
+
 typedef struct agent_tail_capture {
     char *buf;
     size_t cap;
@@ -212,6 +225,8 @@ typedef struct {
     size_t utf8_pending_len;
     size_t utf8_pending_need;
     agent_tail_capture *capture;
+    agent_buf json_pending;      /* buffered bytes awaiting a text/think event */
+    bool      json_pending_think; /* which kind json_pending holds */
 } agent_token_renderer;
 
 typedef struct {
@@ -335,6 +350,12 @@ static agent_worker *agent_completion_worker;
 
 static void worker_apply_pending_power(agent_worker *w);
 static void agent_trace(agent_worker *w, const char *fmt, ...);
+/* json_events emitter (defined below agent_buf's helpers, near :4132) and
+ * the agent_buf helper it and renderer_write() both need, forward-declared
+ * here so the renderer hooks above their definitions can call them. */
+static void agent_buf_append(agent_buf *b, const char *s, size_t n);
+static void agent_emit_event_str(agent_worker *w, const char *kind,
+                                 const char *s, size_t n);
 static void agent_trace_text(agent_worker *w, const char *label,
                              const char *text, size_t len);
 static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr);
@@ -727,6 +748,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--json-events")) {
+            c.json_events = true;
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
@@ -2085,9 +2108,33 @@ static char *agent_tail_capture_take(agent_tail_capture *t, size_t *len) {
     return out;
 }
 
+/* Flush any bytes buffered for --json-events as one text/think NDJSON event.
+ * A no-op when nothing is pending, so it is always safe to call, including
+ * from the un-flagged path where json_pending never accumulates anything. */
+static void renderer_json_flush(agent_token_renderer *r) {
+    if (!r->json_pending.len) return;
+    agent_emit_event_str(r->worker,
+                         r->json_pending_think ? "think" : "text",
+                         r->json_pending.ptr, r->json_pending.len);
+    r->json_pending.len = 0;
+}
+
 static void renderer_write(agent_token_renderer *r, const char *s, size_t n) {
-    if (r->capture) agent_tail_capture_append(r->capture, s, n);
-    else agent_publish(r->worker, s, n);
+    if (r->capture) {
+        agent_tail_capture_append(r->capture, s, n);
+    } else if (r->worker->cfg->json_events) {
+        /* Buffer text/think bytes and flush only on a boundary: a think/text
+         * mode change, the 4096-byte threshold below, or turn finish (see the
+         * renderer_json_flush() call added to renderer_finish()).  Emitting
+         * one JSON line per character would make this feature unusable. */
+        if (r->json_pending.len && r->json_pending_think != r->in_think)
+            renderer_json_flush(r);
+        r->json_pending_think = r->in_think;
+        agent_buf_append(&r->json_pending, s, n);
+        if (r->json_pending.len >= 4096) renderer_json_flush(r);
+    } else {
+        agent_publish(r->worker, s, n);
+    }
 }
 
 static void renderer_set_grey(agent_token_renderer *r) {
@@ -3136,6 +3183,14 @@ static void renderer_finish(agent_token_renderer *r) {
         renderer_write(r, "\n", 1);
         r->last_output_newline = true;
     }
+    /* Flush whatever is left in the --json-events buffer (this is the
+     * "finish == true" flush point) and release its backing storage; a
+     * no-op in the un-flagged path since nothing ever writes to
+     * json_pending there. */
+    renderer_json_flush(r);
+    free(r->json_pending.ptr);
+    r->json_pending.ptr = NULL;
+    r->json_pending.cap = 0;
 }
 
 static void renderer_color(agent_token_renderer *r, const char *seq) {
@@ -4070,13 +4125,6 @@ static bool worker_cancel_session_cb(void *ud) {
     return worker_should_interrupt(ud);
 }
 
-typedef struct {
-    char *ptr;
-    size_t len;
-    size_t cap;
-    bool truncated;
-} agent_buf;
-
 static void agent_buf_append(agent_buf *b, const char *s, size_t n) {
     if (!n || b->truncated) return;
     const size_t max = 128 * 1024;
@@ -4105,6 +4153,51 @@ static char *agent_buf_take(agent_buf *b) {
     char *p = b->ptr;
     memset(b, 0, sizeof(*b));
     return p;
+}
+
+/* JSON string-body escaping.  Bytes >= 0x80 pass through untouched so UTF-8
+ * multi-byte sequences survive; only the characters JSON actually forbids in a
+ * string body are escaped.  Distinct from agent_trace_escaped(), which uses
+ * C-style \xNN escapes that are not valid JSON. */
+static void agent_json_escape(agent_buf *b, const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+        case '"':  agent_buf_puts(b, "\\\""); break;
+        case '\\': agent_buf_puts(b, "\\\\"); break;
+        case '\n': agent_buf_puts(b, "\\n"); break;
+        case '\r': agent_buf_puts(b, "\\r"); break;
+        case '\t': agent_buf_puts(b, "\\t"); break;
+        default:
+            if (c < 0x20) {
+                char esc[8];
+                snprintf(esc, sizeof(esc), "\\u%04x", c);
+                agent_buf_puts(b, esc);
+            } else {
+                char ch[2] = {(char)c, '\0'};
+                agent_buf_puts(b, ch);
+            }
+            break;
+        }
+    }
+}
+
+/* Emit one NDJSON event through the worker's normal publish path, so events
+ * reach stdout on the same channel and in the same order as everything else
+ * the worker produces. */
+static void agent_emit_event_str(agent_worker *w, const char *kind,
+                                 const char *s, size_t n) {
+    agent_buf b = {0};
+    agent_buf_puts(&b, "{\"t\":\"");
+    agent_buf_puts(&b, kind);
+    agent_buf_puts(&b, "\",\"s\":\"");
+    agent_json_escape(&b, s, n);
+    agent_buf_puts(&b, "\"}\n");
+    char *line = agent_buf_take(&b);
+    if (line) {
+        agent_publish(w, line, strlen(line));
+        free(line);
+    }
 }
 
 static bool agent_tokens_equal(const ds4_tokens *a, const ds4_tokens *b) {
@@ -8798,7 +8891,12 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         if (room <= 1) max_tokens = 0;
         else if (max_tokens > room - 1) max_tokens = room - 1;
 
-        bool use_color = isatty(STDOUT_FILENO) != 0;
+        /* --json-events output is machine-consumed, never a terminal: force
+         * the same use_color=false path a non-tty pipe already takes today,
+         * so no ANSI escape of any kind (grey think text, code-block/bold/
+         * italic highlighting) and no markdown-marker stripping happens
+         * ahead of the renderer_write() json_pending buffering below. */
+        bool use_color = isatty(STDOUT_FILENO) != 0 && !cfg->json_events;
         agent_token_renderer renderer = {
             .engine = w->engine,
             .worker = w,
