@@ -3412,6 +3412,14 @@ static void agent_tool_viz_read_value_byte(agent_stream_renderer *sr, char c) {
 static void agent_tool_viz_render_read(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->read_style || v->read_line_rendered) return;
+    /* This renders the "Reading <path> <range>..." ANSI summary line, which
+     * would leak as a duplicate/incorrect "text" event under --json-events:
+     * the structured tool/param_begin/param_value events already carry the
+     * path and range correctly, and (unlike ANSI mode) this function's
+     * inputs -- v->read_path/read_start/read_max -- are never populated in
+     * JSON mode, since agent_tool_viz_param_raw_byte's json_events branch
+     * returns before agent_tool_viz_read_value_byte would fill them in. */
+    if (agent_tool_viz_json_events(sr)) return;
 
     if (!v->read_prefix_rendered) {
         agent_tool_viz_line_prefix(sr);
@@ -7273,6 +7281,82 @@ static void test_agent_dsml_stream_tool_call_chunked(void) {
     agent_dsml_parser_free(&p);
 }
 
+static void test_agent_json_events_read_tool_omits_reading_summary(void) {
+    /* Regression test for a code-review finding on the --json-events tool
+     * events work: agent_tool_viz_render_read() (the ANSI "Reading <path>
+     * <range>..." summary) is called unconditionally from
+     * agent_stream_tool_events() whenever a read tool call closes, with no
+     * json_events gate.  Under the flag this leaked a spurious "text" event
+     * that both duplicated and contradicted the structured tool events --
+     * contradicted because read_path/read_start/read_max are never
+     * populated in JSON mode (agent_tool_viz_param_raw_byte's json_events
+     * branch returns before agent_tool_viz_read_value_byte would fill them
+     * in), so the leaked line rendered from empty state as
+     * "Reading <unknown> 1:500...".  Uses the same DSML sample as
+     * test_agent_dsml_stream_tool_call_chunked() above, which proves this
+     * exact input renders "Reading ds4_agent.c" on the un-flagged ANSI
+     * path -- here, with --json-events on, that text must not appear at
+     * all.  Unlike agent_test_stream_capture() (which sets .capture and so
+     * bypasses the json_events branch of renderer_write()/agent_publish()
+     * entirely), this builds a real agent_worker with json_events on so
+     * events actually flow through agent_publish() into w.out, mirroring
+     * test_agent_json_events_release_flushes_and_frees_pending() above.
+     * Feeds the DSML one byte at a time, since the leak is specifically
+     * about what agent_stream_tool_events()/agent_tool_viz_render_read() do
+     * as a tool call closes mid-stream, not about chunk boundaries. */
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    agent_token_renderer renderer = {
+        .worker = &w,
+        .format_thinking = true,
+        .format_markdown = false,
+        .last_output_newline = true,
+    };
+    agent_dsml_parser p = {
+        .syntax = AGENT_TOOL_SYNTAX_DSML,
+        .state = AGENT_DSML_SEARCH,
+    };
+    agent_stream_renderer stream = {
+        .renderer = &renderer,
+        .parser = &p,
+        .syntax = AGENT_TOOL_SYNTAX_DSML,
+    };
+
+    const char *text =
+        "<｜DSML｜tool_calls><｜DSML｜invoke name=\"read\">"
+        "<｜DSML｜parameter name=\"path\" string=\"true\">ds4_agent.c</｜DSML｜parameter>"
+        "</｜DSML｜invoke></｜DSML｜tool_calls>";
+    size_t len = strlen(text);
+    for (size_t i = 0; i < len; i++)
+        agent_stream_text(&stream, text + i, 1, false);
+    agent_stream_text(&stream, NULL, 0, true);
+    renderer_finish(&renderer);
+
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(p.calls.v[0].name && !strcmp(p.calls.v[0].name, "read"));
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"tool\",\"name\":\"read\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"param_begin\",\"kind\":\"path\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"param_value\",\"s\":\"ds4_agent.c\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"finish\"") != NULL);
+
+    /* The regression: no "Reading" summary anywhere in the event stream, and
+     * specifically no leaked "t":"text" event at all for this turn -- the
+     * read summary was the only thing that could have produced one here. */
+    AGENT_TEST_ASSERT(strstr(w.out, "Reading") == NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"text\"") == NULL);
+
+    agent_dsml_parser_free(&p);
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
 static void test_agent_glm_tool_parser_rejects_missing_value(void) {
     const char *text = "<tool_call>list<arg_key>path</arg_key></tool_call>";
     agent_dsml_parser p = {
@@ -7470,6 +7554,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_glm_stream_ignores_tool_inside_think();
     test_agent_glm_stream_greedy_sampling_boundaries();
     test_agent_dsml_stream_tool_call_chunked();
+    test_agent_json_events_read_tool_omits_reading_summary();
     test_agent_glm_tool_parser_rejects_missing_value();
     test_agent_tagged_structural_candidate_guard();
 }
