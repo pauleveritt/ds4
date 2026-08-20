@@ -3590,6 +3590,33 @@ static void agent_tool_viz_param_begin(agent_stream_renderer *sr, const char *na
     renderer_color(sr->renderer, agent_tool_param_color(v->param_kind));
 }
 
+/* Number of trailing bytes in buf[0..len) that are the start of an
+ * as-yet-incomplete UTF-8 sequence -- 0 if the buffer ends on a complete
+ * character (or plain ASCII).  A continuation byte matches (b & 0xC0) ==
+ * 0x80; a lead byte's high bits declare its own sequence length (0xC0..0xDF
+ * -> 2, 0xE0..0xEF -> 3, 0xF0..0xF7 -> 4).  The longest UTF-8 sequence is 4
+ * bytes, so at most 3 trailing bytes can ever be an incomplete tail: scan
+ * back at most 3 bytes looking for the lead byte.  If none of those 3 bytes
+ * is a lead byte, they are exactly the 3 continuation bytes of an already-
+ * complete 4-byte sequence (the only way 3 continuation bytes can appear
+ * consecutively at the very end of well-formed UTF-8), so the buffer is
+ * still safe to flush in full. */
+static size_t agent_utf8_incomplete_tail_len(const char *buf, size_t len) {
+    size_t max_back = len < 3 ? len : 3;
+    for (size_t back = 1; back <= max_back; back++) {
+        unsigned char b = (unsigned char)buf[len - back];
+        if ((b & 0xC0) == 0x80) continue; /* continuation byte; keep scanning back */
+        size_t seq_len;
+        if ((b & 0x80) == 0x00) seq_len = 1;      /* ASCII */
+        else if ((b & 0xE0) == 0xC0) seq_len = 2;
+        else if ((b & 0xF0) == 0xE0) seq_len = 3;
+        else if ((b & 0xF8) == 0xF0) seq_len = 4;
+        else seq_len = 1; /* not a valid UTF-8 lead byte; treat as standalone */
+        return seq_len > back ? back : 0;
+    }
+    return 0;
+}
+
 /* Flush the accumulated --json-events parameter-value buffer as one
  * "param_value" event.  A no-op when nothing is pending, so it is safe to
  * call both at the 4096-byte threshold in agent_tool_viz_param_raw_byte and
@@ -3600,6 +3627,28 @@ static void agent_tool_viz_json_param_flush(agent_stream_renderer *sr) {
     agent_emit_tool_event(sr->renderer->worker, "param_value", NULL, NULL,
                           v->json_param.ptr, v->json_param.len);
     v->json_param.len = 0;
+}
+
+/* Like agent_tool_viz_json_param_flush(), but for the 4096-byte threshold
+ * flush specifically: holds back any trailing incomplete UTF-8 sequence so a
+ * multi-byte character (a non-ASCII file path, a comment, an em dash -- any
+ * non-ASCII byte a tool parameter's raw value can legitimately contain)
+ * never gets split across two "param_value" events. Each half of a split
+ * character is invalid UTF-8 on its own once escaped into its own JSON
+ * string, so the Swift consumer would see replacement characters or lose the
+ * chunk. The held-back tail stays in v->json_param and is picked up by the
+ * next agent_buf_append(), so it appears whole in a later event. */
+static void agent_tool_viz_json_param_flush_safe(agent_stream_renderer *sr) {
+    agent_tool_visualizer *v = &sr->viz;
+    if (!v->json_param.len) return;
+    size_t hold = agent_utf8_incomplete_tail_len(v->json_param.ptr, v->json_param.len);
+    size_t flush_len = v->json_param.len - hold;
+    if (!flush_len) return; /* the whole buffer is still an incomplete tail */
+    agent_emit_tool_event(sr->renderer->worker, "param_value", NULL, NULL,
+                          v->json_param.ptr, flush_len);
+    if (hold) memmove(v->json_param.ptr, v->json_param.ptr + flush_len, hold);
+    v->json_param.len = hold;
+    if (v->json_param.ptr) v->json_param.ptr[hold] = '\0';
 }
 
 static void agent_tool_viz_param_end(agent_stream_renderer *sr) {
@@ -3622,7 +3671,7 @@ static void agent_tool_viz_param_raw_byte(agent_stream_renderer *sr, char c) {
     agent_tool_visualizer *v = &sr->viz;
     if (agent_tool_viz_json_events(sr)) {
         agent_buf_append(&v->json_param, &c, 1);
-        if (v->json_param.len >= 4096) agent_tool_viz_json_param_flush(sr);
+        if (v->json_param.len >= 4096) agent_tool_viz_json_param_flush_safe(sr);
         return;
     }
     if (v->read_style) {
@@ -4334,6 +4383,77 @@ static void agent_emit_tool_event(agent_worker *w, const char *phase,
         agent_buf_puts(&b, "\"");
     }
     agent_buf_puts(&b, "}\n");
+    char *line = agent_buf_take(&b);
+    if (line) { agent_publish(w, line, strlen(line)); free(line); }
+}
+
+/* Emit one NDJSON event with no payload: {"t":"<kind>"}.  Used for the
+ * --json-events replacements of the +DWARFSTAR_WAITING / +DWARFSTAR_QUEUED
+ * stderr markers -- "ready" and "queued" carry no fields, just the kind. */
+static void agent_emit_bare_event(agent_worker *w, const char *kind) {
+    agent_buf b = {0};
+    agent_buf_puts(&b, "{\"t\":\"");
+    agent_buf_puts(&b, kind);
+    agent_buf_puts(&b, "\"}\n");
+    char *line = agent_buf_take(&b);
+    if (line) { agent_publish(w, line, strlen(line)); free(line); }
+}
+
+/* agent_status.state -> lowercase wire name for the "status" event.  Unlike
+ * agent_format_status_line() (the +DWARFSTAR_STATUS stderr marker), this
+ * covers all eight agent_worker_state values distinctly: the stderr marker
+ * collapses DRAINING/SAVING/ERROR/STOPPED into "idle", which is a known
+ * defect the JSON event must not reproduce. */
+static const char *agent_status_state_name(agent_worker_state state) {
+    switch (state) {
+    case AGENT_WORKER_IDLE:       return "idle";
+    case AGENT_WORKER_PREFILL:    return "prefill";
+    case AGENT_WORKER_GENERATING: return "generating";
+    case AGENT_WORKER_COMPACTING: return "compacting";
+    case AGENT_WORKER_DRAINING:   return "draining";
+    case AGENT_WORKER_SAVING:     return "saving";
+    case AGENT_WORKER_ERROR:      return "error";
+    case AGENT_WORKER_STOPPED:    return "stopped";
+    }
+    return "idle";
+}
+
+/* Emit one NDJSON "status" event carrying every agent_status field, the
+ * --json-events replacement for the +DWARFSTAR_STATUS stderr marker.  Unlike
+ * that marker (whose "state" name collapses four of the eight states into
+ * "idle"), this emits the full state set via agent_status_state_name(). */
+static void agent_emit_status_event(agent_worker *w, const agent_status *st) {
+    agent_buf b = {0};
+    char num[64];
+    agent_buf_puts(&b, "{\"t\":\"status\",\"state\":\"");
+    agent_buf_puts(&b, agent_status_state_name(st->state));
+    agent_buf_puts(&b, "\",\"prefill_done\":");
+    snprintf(num, sizeof(num), "%d", st->prefill_done);
+    agent_buf_puts(&b, num);
+    agent_buf_puts(&b, ",\"prefill_total\":");
+    snprintf(num, sizeof(num), "%d", st->prefill_total);
+    agent_buf_puts(&b, num);
+    agent_buf_puts(&b, ",\"prefill_tps\":");
+    snprintf(num, sizeof(num), "%.1f", st->prefill_tps);
+    agent_buf_puts(&b, num);
+    agent_buf_puts(&b, ",\"generated\":");
+    snprintf(num, sizeof(num), "%d", st->generated);
+    agent_buf_puts(&b, num);
+    agent_buf_puts(&b, ",\"gen_tps\":");
+    snprintf(num, sizeof(num), "%.1f", st->gen_tps);
+    agent_buf_puts(&b, num);
+    agent_buf_puts(&b, ",\"ctx_used\":");
+    snprintf(num, sizeof(num), "%d", st->ctx_used);
+    agent_buf_puts(&b, num);
+    agent_buf_puts(&b, ",\"ctx_size\":");
+    snprintf(num, sizeof(num), "%d", st->ctx_size);
+    agent_buf_puts(&b, num);
+    agent_buf_puts(&b, ",\"power\":");
+    snprintf(num, sizeof(num), "%d", st->power_percent);
+    agent_buf_puts(&b, num);
+    agent_buf_puts(&b, ",\"error\":\"");
+    agent_json_escape(&b, st->error, strlen(st->error));
+    agent_buf_puts(&b, "\"}\n");
     char *line = agent_buf_take(&b);
     if (line) { agent_publish(w, line, strlen(line)); free(line); }
 }
@@ -6964,6 +7084,13 @@ static void agent_test_assert(bool cond, const char *expr,
 #define AGENT_TEST_ASSERT(expr) \
     agent_test_assert((expr), #expr, __FILE__, __LINE__)
 
+/* Forward-declared for the --json-events status/ready/queued/bash-observation
+ * tests below: both are defined much later in the file (agent_bash_job
+ * plumbing and tool dispatch live near the bottom), well after
+ * ds4_agent_unit_tests_run() registers its test list. */
+static void agent_bash_publish_observation(agent_worker *w, const char *obs);
+static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call);
+
 static void test_agent_edit_upto_tail_newline_is_not_part_of_anchor(void) {
     const char *data =
         "CFLAGS = -Wall -Wextra -g\n"
@@ -7538,6 +7665,319 @@ static void test_agent_json_events_release_flushes_and_frees_pending(void) {
     pthread_mutex_destroy(&w.mu);
 }
 
+/* Task 3 additional requirement: agent_bash_publish_observation() previously
+ * wrote its "[showing first/last output lines]" notice and the command's own
+ * output straight to agent_publish() with raw ANSI escapes, bypassing the
+ * --json-events emitter entirely. Since DS4 Control's Swift consumer ignores
+ * any stdout line that isn't valid JSON, that meant every bash tool's output
+ * would silently vanish from the app's transcript under --json-events. This
+ * covers the "<tail ...>" shape (the common progress-refresh case, which also
+ * carries the failure-color branch) and asserts the body text survives as one
+ * {"t":"tool","phase":"output",...} event with no ANSI bytes anywhere.
+ *
+ * This must be a "tool"/"output" event, not "text": bash output is not model
+ * prose. Task 5 folds "text" events into the trailing assistant message and
+ * Task 6 renders that through a markdown renderer, so shell output containing
+ * '#', '*', backticks, or '|' would render as headings/bullets/tables
+ * misattributed to the model instead of nesting inside the tool's own card
+ * the way the pre-migration scrape layer does today. */
+static void test_agent_json_events_bash_observation_tail_wraps_as_tool_output(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    const char *obs =
+        "bash job=3 pid=4242 status=done elapsed_sec=2.5 timed_out=0\n"
+        "exit_status=1\n"
+        "output_path=/tmp/x (500 bytes, 20 lines)\n"
+        "<tail -12 /tmp/x>\n"
+        "line one\nline two: boom\n"
+        "</tail>\n";
+    agent_bash_publish_observation(&w, obs);
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"tool\",\"phase\":\"output\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"text\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "showing last output lines") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "line one") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "line two: boom") != NULL);
+    /* No raw ANSI escape bytes anywhere -- \x1b must never appear on stdout
+     * under --json-events, since every line must parse as JSON. */
+    AGENT_TEST_ASSERT(memchr(w.out, '\x1b', w.out_len) == NULL);
+    /* Exactly one NDJSON line: the notice and body were combined into a
+     * single tool/output event, not split across multiple agent_publish()
+     * calls that could interleave with other output. */
+    size_t newline_count = 0;
+    for (size_t i = 0; i < w.out_len; i++) if (w.out[i] == '\n') newline_count++;
+    AGENT_TEST_ASSERT(newline_count == 1);
+
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* Same fix, the plain "<output>" shape (short command, no head/tail notice) --
+ * confirms the no-notice path also wraps cleanly with no leaked ANSI. */
+static void test_agent_json_events_bash_observation_plain_output_wraps_as_tool_output(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1;
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    const char *obs =
+        "bash job=1 pid=100 status=done elapsed_sec=0.1 timed_out=0\n"
+        "exit_status=0\n"
+        "<output>\n"
+        "hello from bash\n"
+        "</output>\n";
+    agent_bash_publish_observation(&w, obs);
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"tool\",\"phase\":\"output\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "hello from bash") != NULL);
+    AGENT_TEST_ASSERT(memchr(w.out, '\x1b', w.out_len) == NULL);
+    /* No notice line for the plain <output> shape. */
+    AGENT_TEST_ASSERT(strstr(w.out, "showing") == NULL);
+
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* Un-flagged path must stay byte-identical: same raw ANSI, same lack of any
+ * JSON wrapping. */
+static void test_agent_bash_observation_unflagged_path_unchanged(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1;
+    agent_config cfg = { .json_events = false };
+    w.cfg = &cfg;
+
+    const char *obs =
+        "bash job=1 pid=100 status=done elapsed_sec=0.1 timed_out=0\n"
+        "exit_status=0\n"
+        "<output>\n"
+        "hello from bash\n"
+        "</output>\n";
+    agent_bash_publish_observation(&w, obs);
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "hello from bash") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"text\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"tool\"") == NULL);
+
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* Second additional-requirement site: the "[tool:%s] unknown tool" header in
+ * agent_execute_tool_call()'s fallback branch was another raw agent_publish()
+ * call reachable while --json-events is on (any DSML tool call the model
+ * invents that isn't a real tool name). Same tool/output shape as the bash
+ * observation fix -- this is tool-associated diagnostic output, not prose. */
+static void test_agent_json_events_unknown_tool_header_wraps_as_tool_output(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1;
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    char name_buf[] = "not_a_real_tool";
+    agent_tool_call call = {0};
+    call.name = name_buf;
+
+    char *result = agent_execute_tool_call(&w, &call);
+    AGENT_TEST_ASSERT(result != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "unknown tool") != NULL);
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"tool\",\"phase\":\"output\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"text\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "not_a_real_tool") != NULL);
+    AGENT_TEST_ASSERT(memchr(w.out, '\x1b', w.out_len) == NULL);
+
+    free(result);
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* agent_emit_status_event() must emit all eight agent_status states, not the
+ * four the +DWARFSTAR_STATUS stderr marker's agent_format_status_line()
+ * collapses into "idle" (DRAINING/SAVING/ERROR/STOPPED). This is the specific
+ * defect the brief calls out that the JSON event must not reproduce. */
+static void test_agent_emit_status_event_covers_all_eight_states(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1;
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    struct { agent_worker_state state; const char *name; } cases[] = {
+        { AGENT_WORKER_IDLE,       "idle" },
+        { AGENT_WORKER_PREFILL,    "prefill" },
+        { AGENT_WORKER_GENERATING, "generating" },
+        { AGENT_WORKER_COMPACTING, "compacting" },
+        { AGENT_WORKER_DRAINING,   "draining" },
+        { AGENT_WORKER_SAVING,     "saving" },
+        { AGENT_WORKER_ERROR,      "error" },
+        { AGENT_WORKER_STOPPED,    "stopped" },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        agent_status st = {0};
+        st.state = cases[i].state;
+        st.prefill_done = 3;
+        st.prefill_total = 10;
+        st.prefill_tps = 12.5;
+        st.generated = 7;
+        st.gen_tps = 33.25;
+        st.ctx_used = 1028;
+        st.ctx_size = 8192;
+        st.power_percent = 100;
+        agent_emit_status_event(&w, &st);
+
+        char want[64];
+        snprintf(want, sizeof(want), "\"state\":\"%s\"", cases[i].name);
+        AGENT_TEST_ASSERT(w.out != NULL && strstr(w.out, want) != NULL);
+
+        free(w.out);
+        w.out = NULL;
+        w.out_len = 0;
+        w.out_cap = 0;
+    }
+
+    AGENT_TEST_ASSERT(w.out == NULL);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* agent_status.error must round-trip through the JSON escaper -- a quote or
+ * backslash in an error message must not break the event's JSON syntax. */
+static void test_agent_emit_status_event_escapes_error_field(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1;
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    agent_status st = {0};
+    st.state = AGENT_WORKER_ERROR;
+    snprintf(st.error, sizeof(st.error), "bad \"path\\name\"");
+    agent_emit_status_event(&w, &st);
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\\\"path\\\\name\\\"") != NULL);
+
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* agent_emit_bare_event() is the --json-events replacement for the
+ * +DWARFSTAR_WAITING / +DWARFSTAR_QUEUED stderr markers. */
+static void test_agent_emit_bare_event_ready_and_queued(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1;
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    agent_emit_bare_event(&w, "ready");
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(!strcmp(w.out, "{\"t\":\"ready\"}\n"));
+    free(w.out);
+    w.out = NULL; w.out_len = 0; w.out_cap = 0;
+
+    agent_emit_bare_event(&w, "queued");
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(!strcmp(w.out, "{\"t\":\"queued\"}\n"));
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* Regression test for a code-review finding on Task 2's --json-events tool
+ * events work: agent_tool_viz_param_raw_byte() appends one byte at a time
+ * into v->json_param and flushes as a "param_value" event as soon as its
+ * length reaches 4096, with no regard for whether that boundary lands mid
+ * multi-byte UTF-8 character. A tool parameter's raw value can legitimately
+ * contain non-ASCII bytes (a file path, a comment, an em dash in generated
+ * prose), and once a character is split, each half is invalid UTF-8 in its
+ * own JSON string -- the Swift consumer would see replacement characters or
+ * silently lose a chunk. This drives the flush function directly (not
+ * through the DSML parser) with an input crafted so a 3-byte UTF-8 character
+ * (an em dash, E2 80 94) straddles byte offset 4096, and asserts every
+ * emitted param_value payload is independently valid UTF-8 at both ends and
+ * that concatenating them reproduces the input exactly. */
+static void test_agent_json_events_param_value_utf8_boundary_no_tear(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    agent_token_renderer renderer = { .worker = &w };
+    agent_stream_renderer stream = { .renderer = &renderer };
+
+    /* 4095 ASCII bytes, then a 3-byte em dash at offsets 4095..4097 (so the
+     * 4096-byte threshold check trips exactly one byte into the character),
+     * then more ASCII so a second, ordinary flush happens afterward too. */
+    agent_buf input = {0};
+    for (int i = 0; i < 4095; i++) agent_buf_append(&input, "a", 1);
+    agent_buf_append(&input, "\xe2\x80\x94", 3); /* U+2014 EM DASH */
+    agent_buf_puts(&input, "trailing text after the boundary");
+
+    for (size_t i = 0; i < input.len; i++)
+        agent_tool_viz_param_raw_byte(&stream, input.ptr[i]);
+    agent_tool_viz_json_param_flush(&stream); /* final flush, as param_end does */
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+
+    /* Reconstruct the concatenation of every param_value event's "s" field.
+     * None of the input bytes need JSON escaping (no quotes/backslashes/
+     * control bytes), so each event is exactly `{"t":"tool","phase":
+     * "param_value","s":"<raw bytes>"}\n` -- slice out the bytes between
+     * the opening `"s":"` and the closing `"}`. */
+    agent_buf reconstructed = {0};
+    size_t pos = 0;
+    int event_count = 0;
+    while (pos < w.out_len) {
+        const char *line_start = w.out + pos;
+        const char *newline = memchr(line_start, '\n', w.out_len - pos);
+        size_t line_len = newline ? (size_t)(newline - line_start) : (w.out_len - pos);
+        const char *skey = agent_memmem(line_start, line_len, "\"s\":\"", 5);
+        AGENT_TEST_ASSERT(skey != NULL);
+        const char *sval = skey + 5;
+        const char *line_end = line_start + line_len;
+        AGENT_TEST_ASSERT((size_t)(line_end - sval) >= 2);
+        const char *send = line_end - 2; /* line ends with `"}`; drop it */
+        size_t chunk_len = (size_t)(send - sval);
+
+        /* Each individually-emitted chunk must be valid UTF-8 on its own:
+         * it must not open on a stray continuation byte, and it must not
+         * end on an incomplete multi-byte lead sequence. This is exactly
+         * the property the fix provides -- without it (flushing at a raw
+         * 4096-byte cut with no hold-back), one of these two assertions
+         * fails on this input, since the em dash's lead byte (E2) or its
+         * first continuation byte (80) lands as the last byte of the first
+         * chunk. */
+        if (chunk_len) {
+            AGENT_TEST_ASSERT(((unsigned char)sval[0] & 0xC0) != 0x80);
+            AGENT_TEST_ASSERT(agent_utf8_incomplete_tail_len(sval, chunk_len) == 0);
+        }
+        agent_buf_append(&reconstructed, sval, chunk_len);
+        event_count++;
+        pos += line_len + (newline ? 1 : 0);
+    }
+
+    AGENT_TEST_ASSERT(event_count >= 2); /* the threshold flush plus the final flush */
+    AGENT_TEST_ASSERT(reconstructed.len == input.len);
+    AGENT_TEST_ASSERT(reconstructed.len &&
+                      !memcmp(reconstructed.ptr, input.ptr, input.len));
+
+    free(reconstructed.ptr);
+    free(input.ptr);
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_json_events_release_flushes_and_frees_pending();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
@@ -7557,6 +7997,14 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_json_events_read_tool_omits_reading_summary();
     test_agent_glm_tool_parser_rejects_missing_value();
     test_agent_tagged_structural_candidate_guard();
+    test_agent_json_events_bash_observation_tail_wraps_as_tool_output();
+    test_agent_json_events_bash_observation_plain_output_wraps_as_tool_output();
+    test_agent_bash_observation_unflagged_path_unchanged();
+    test_agent_json_events_unknown_tool_header_wraps_as_tool_output();
+    test_agent_emit_status_event_covers_all_eight_states();
+    test_agent_emit_status_event_escapes_error_field();
+    test_agent_emit_bare_event_ready_and_queued();
+    test_agent_json_events_param_value_utf8_boundary_no_tear();
 }
 #endif
 
@@ -8404,6 +8852,7 @@ static char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
 static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
     if (!obs || !obs[0]) return;
     const char *body = NULL;
+    const char *notice = NULL;
     const char *label = strstr(obs, "\n<head ");
     const char *close = NULL;
     if (label) {
@@ -8415,14 +8864,8 @@ static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
     if (label) {
         const char *tag_end = strstr(label, ">\n");
         if (tag_end) {
-            agent_publish(w, "\x1b[90m", 5);
-            if (strstr(label, "\n<head ") == label)
-                agent_publish(w, "[showing first output lines]\n",
-                              strlen("[showing first output lines]\n"));
-            else
-                agent_publish(w, "[showing last output lines]\n",
-                              strlen("[showing last output lines]\n"));
-            agent_publish(w, "\x1b[0m", 4);
+            notice = (strstr(obs, "\n<head ") == label) ?
+                "[showing first output lines]\n" : "[showing last output lines]\n";
             body = tag_end + 2;
         }
     } else {
@@ -8437,9 +8880,40 @@ static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
     size_t n = end ? (size_t)(end - body) : strlen(body);
     if (n) {
         bool failed = strstr(obs, "status=done") && !strstr(obs, "exit_status=0\n");
+        bool trailing_newline = body[n - 1] != '\n';
+        if (w->cfg->json_events) {
+            /* Route the notice + body through the emitter as one
+             * {"t":"tool","phase":"output",...} event instead of the raw
+             * agent_publish() calls below, which would put non-JSON lines
+             * (and ANSI escapes) directly on stdout mid-NDJSON-stream. DS4
+             * Control runs bash tools constantly, so left unhandled, every
+             * shell command's output would silently vanish from the app's
+             * transcript (the Swift parser ignores non-JSON lines) -- a
+             * functional regression, not just a formatting nit.
+             *
+             * This is a "tool"/"output" event, not "text": bash output is
+             * not model prose. Task 5 folds "text" events into the trailing
+             * assistant message and Task 6 renders that through a markdown
+             * renderer, so shell output containing '#', '*', backticks, or
+             * '|' would render as headings/bullets/tables misattributed to
+             * the model instead of nesting inside the tool's own card. */
+            agent_buf combined = {0};
+            if (notice) agent_buf_puts(&combined, notice);
+            agent_buf_append(&combined, body, n);
+            if (trailing_newline) agent_buf_puts(&combined, "\n");
+            agent_emit_tool_event(w, "output", NULL, NULL,
+                                  combined.ptr ? combined.ptr : "", combined.len);
+            free(combined.ptr);
+            return;
+        }
+        if (notice) {
+            agent_publish(w, "\x1b[90m", 5);
+            agent_publish(w, notice, strlen(notice));
+            agent_publish(w, "\x1b[0m", 4);
+        }
         if (failed) agent_publish(w, "\x1b[38;5;208m", 11);
         agent_publish(w, body, n);
-        if (body[n - 1] != '\n') agent_publish(w, "\n", 1);
+        if (trailing_newline) agent_publish(w, "\n", 1);
         if (failed) agent_publish(w, "\x1b[0m", 4);
     }
 }
@@ -8552,7 +9026,10 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     {
         char header[256];
         snprintf(header, sizeof(header), "\n[tool:%s] unknown tool\n", call->name);
-        agent_publish(w, header, strlen(header));
+        if (w->cfg->json_events)
+            agent_emit_tool_event(w, "output", NULL, NULL, header, strlen(header));
+        else
+            agent_publish(w, header, strlen(header));
         agent_buf_puts(&result, "Tool error: unknown tool: ");
         agent_buf_puts(&result, call->name);
         agent_buf_puts(&result, "\n");
@@ -11411,7 +11888,8 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         if (!one_shot && initialized && idle && !queue.len &&
             input.len == 0 && !stdin_eof && !waiting_announced)
         {
-            agent_noninteractive_marker("+DWARFSTAR_WAITING");
+            if (cfg->json_events) agent_emit_bare_event(&worker, "ready");
+            else agent_noninteractive_marker("+DWARFSTAR_WAITING");
             waiting_announced = true;
         }
 
@@ -11481,8 +11959,16 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
              * dropped transition is never retried. Within a state, throttle. */
             if (strcmp(cur, last_status) != 0 &&
                 (state_changed || now - last_status_at >= 0.200)) {
-                write_all(STDERR_FILENO, cur, strlen(cur));
-                write_all(STDERR_FILENO, "\n", 1);
+                if (cfg->json_events) {
+                    /* Publish through the worker's normal out buffer (not a
+                     * direct stdout write) so this event lands in the same
+                     * FIFO as text/tool events instead of possibly jumping
+                     * ahead of output still sitting in that buffer. */
+                    agent_emit_status_event(&worker, &st);
+                } else {
+                    write_all(STDERR_FILENO, cur, strlen(cur));
+                    write_all(STDERR_FILENO, "\n", 1);
+                }
                 snprintf(last_status, sizeof(last_status), "%s", cur);
                 last_status_at = now;
                 last_state = st.state;
@@ -11508,11 +11994,13 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             if (worker_is_idle(&worker) && queue.len == 0) {
                 if (!worker_submit(&worker, prompt)) {
                     agent_prompt_queue_push(&queue, prompt);
-                    agent_noninteractive_marker("+DWARFSTAR_QUEUED");
+                    if (cfg->json_events) agent_emit_bare_event(&worker, "queued");
+                    else agent_noninteractive_marker("+DWARFSTAR_QUEUED");
                 }
             } else {
                 agent_prompt_queue_push(&queue, prompt);
-                agent_noninteractive_marker("+DWARFSTAR_QUEUED");
+                if (cfg->json_events) agent_emit_bare_event(&worker, "queued");
+                else agent_noninteractive_marker("+DWARFSTAR_QUEUED");
             }
             free(prompt);
             waiting_announced = false;
