@@ -2119,6 +2119,19 @@ static void renderer_json_flush(agent_token_renderer *r) {
     r->json_pending.len = 0;
 }
 
+/* Flush and release the --json-events buffer.  This is the single place that
+ * knows how to retire json_pending, so every exit from worker_run_turn's
+ * generation loop -- normal completion via renderer_finish(), or a hard
+ * error that bails out mid-generation -- calls this instead of duplicating
+ * flush+free.  A no-op in the un-flagged path (json_pending never
+ * accumulates anything there) and safe to call more than once. */
+static void renderer_json_release(agent_token_renderer *r) {
+    renderer_json_flush(r);
+    free(r->json_pending.ptr);
+    r->json_pending.ptr = NULL;
+    r->json_pending.cap = 0;
+}
+
 static void renderer_write(agent_token_renderer *r, const char *s, size_t n) {
     if (r->capture) {
         agent_tail_capture_append(r->capture, s, n);
@@ -3183,14 +3196,8 @@ static void renderer_finish(agent_token_renderer *r) {
         renderer_write(r, "\n", 1);
         r->last_output_newline = true;
     }
-    /* Flush whatever is left in the --json-events buffer (this is the
-     * "finish == true" flush point) and release its backing storage; a
-     * no-op in the un-flagged path since nothing ever writes to
-     * json_pending there. */
-    renderer_json_flush(r);
-    free(r->json_pending.ptr);
-    r->json_pending.ptr = NULL;
-    r->json_pending.cap = 0;
+    /* This is the "finish == true" flush point for the --json-events buffer. */
+    renderer_json_release(r);
 }
 
 static void renderer_color(agent_token_renderer *r, const char *seq) {
@@ -5441,7 +5448,13 @@ static void agent_history_render_assistant(agent_worker *w,
                                    AGENT_HISTORY_ASSISTANT_MAX_LINES,
                                    AGENT_HISTORY_ASSISTANT_MAX_BYTES,
                                    &source_truncated);
-    bool use_color = isatty(STDOUT_FILENO) != 0;
+    /* --json-events replay must produce the same "raw text, no ANSI" contract
+     * as the live-generation renderer (worker_run_turn): force use_color off
+     * (mirrors the fix there) and, since format_markdown is not already tied
+     * to use_color the way it is at the live site, also force it off so
+     * markdown markers survive into the text/think event body unstripped
+     * rather than being silently consumed by the markdown state machine. */
+    bool use_color = isatty(STDOUT_FILENO) != 0 && !w->cfg->json_events;
     agent_tail_capture tail = {
         .cap = source_truncated ? AGENT_HISTORY_ASSISTANT_MAX_BYTES : 0,
     };
@@ -5453,7 +5466,7 @@ static void agent_history_render_assistant(agent_worker *w,
          * switching back to a session, not reading a different transcript
          * format.  Tool calls are still dry-rendered below, so replay never
          * executes tools or mutates transcript state. */
-        .format_markdown = true,
+        .format_markdown = !w->cfg->json_events,
         .use_color = use_color && !source_truncated,
         .last_output_newline = true,
         .capture = source_truncated ? &tail : NULL,
@@ -5487,14 +5500,30 @@ static void agent_history_render_assistant(agent_worker *w,
                                      AGENT_HISTORY_ASSISTANT_MAX_LINES,
                                      AGENT_HISTORY_ASSISTANT_MAX_BYTES,
                                      &line_truncated);
-        if (use_color) agent_publish(w, "\x1b[90m", 5);
-        agent_publish(w,
-                      "\n... earlier assistant history truncated; showing tail ...\n",
-                      strlen("\n... earlier assistant history truncated; showing tail ...\n"));
         (void)rendered_truncated;
-        agent_publish(w, tail_start, (size_t)(tail_text + tail_len - tail_start));
-        if (tail_len && tail_text[tail_len - 1] != '\n') agent_publish(w, "\n", 1);
-        if (use_color) agent_publish(w, "\x1b[0m", 4);
+        size_t tail_show_len = (size_t)(tail_text + tail_len - tail_start);
+        bool trailing_newline = tail_len && tail_text[tail_len - 1] != '\n';
+        if (w->cfg->json_events) {
+            /* Route this notice + tail text through the emitter as one text
+             * event instead of the raw agent_publish() calls below, which
+             * would otherwise put non-JSON lines (and, were use_color still
+             * on, ANSI escapes) directly on stdout mid-NDJSON-stream. */
+            agent_buf b = {0};
+            agent_buf_puts(&b, "\n... earlier assistant history truncated; showing tail ...\n");
+            agent_buf_append(&b, tail_start, tail_show_len);
+            if (trailing_newline) agent_buf_puts(&b, "\n");
+            char *combined = agent_buf_take(&b);
+            agent_emit_event_str(w, "text", combined, strlen(combined));
+            free(combined);
+        } else {
+            if (use_color) agent_publish(w, "\x1b[90m", 5);
+            agent_publish(w,
+                          "\n... earlier assistant history truncated; showing tail ...\n",
+                          strlen("\n... earlier assistant history truncated; showing tail ...\n"));
+            agent_publish(w, tail_start, tail_show_len);
+            if (trailing_newline) agent_publish(w, "\n", 1);
+            if (use_color) agent_publish(w, "\x1b[0m", 4);
+        }
         free(tail_text);
     }
 }
@@ -7236,7 +7265,74 @@ static void test_agent_backend_name_matches_build(void) {
 #endif
 }
 
+static void test_agent_json_events_release_flushes_and_frees_pending(void) {
+    /* Regression test for a code-review finding on the --json-events work:
+     * renderer_write() buffers text/think bytes into agent_token_renderer's
+     * json_pending, and for a long time renderer_finish() was the ONLY site
+     * that flushed and freed it.  Three hard-error `return 1;` exits inside
+     * worker_run_turn's generation loop (worker_force_generated_text
+     * failure, the DFlash speculative decode failure, and
+     * worker_accept_generated_token failure) could all be reached with
+     * bytes already sitting in json_pending -- worker_publish_generated_token
+     * runs (and buffers via renderer_write) before the call that can then
+     * fail -- so on any of those three paths up to 4KB of already-buffered
+     * assistant text was silently dropped (never emitted as a text/think
+     * event) and its heap allocation leaked, since renderer_finish() was
+     * never reached.  The fix routes all three failure sites through a
+     * shared `goto turn_fail` that calls renderer_json_release() exactly
+     * once.  This test exercises that shared function directly: it cannot
+     * drive worker_run_turn itself (that needs a real ds4_engine/session),
+     * but it proves the primitive the fix relies on actually flushes
+     * buffered text instead of dropping it, and actually releases the
+     * allocation instead of leaking it. */
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    agent_token_renderer r = { .worker = &w };
+
+    /* Two writes, no think/text mode change, well under the 4096-byte
+     * threshold: renderer_write() must buffer, not publish -- this is the
+     * same "don't emit per character" contract, and it is also exactly the
+     * state a hard mid-generation error left json_pending in before this
+     * fix (data sitting in the buffer with no flush ever scheduled). */
+    renderer_write(&r, "hello ", 6);
+    renderer_write(&r, "world", 5);
+    AGENT_TEST_ASSERT(r.json_pending.len == 11);
+    AGENT_TEST_ASSERT(w.out_len == 0);
+
+    renderer_json_release(&r);
+
+    /* The buffered text must have reached stdout as one NDJSON text event --
+     * not been silently dropped. */
+    AGENT_TEST_ASSERT(w.out_len > 0);
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"text\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "hello world") != NULL);
+    size_t newline_count = 0;
+    for (size_t i = 0; i < w.out_len; i++) if (w.out[i] == '\n') newline_count++;
+    AGENT_TEST_ASSERT(newline_count == 1); /* one buffered chunk, one event line */
+
+    /* The buffer's backing allocation must be released, not just emptied,
+     * so a per-tool-round agent_token_renderer doesn't leak it. */
+    AGENT_TEST_ASSERT(r.json_pending.ptr == NULL);
+    AGENT_TEST_ASSERT(r.json_pending.cap == 0);
+
+    /* A second release (e.g. a path that reaches both turn_fail and, later,
+     * renderer_finish) must be a safe no-op: no double free, no duplicate
+     * event. */
+    size_t out_len_before = w.out_len;
+    renderer_json_release(&r);
+    AGENT_TEST_ASSERT(w.out_len == out_len_before);
+
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
 static void ds4_agent_unit_tests_run(void) {
+    test_agent_json_events_release_flushes_and_frees_pending();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_read_default_lines_follow_context();
@@ -8967,9 +9063,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 if (worker_force_generated_text(w, "[upto]\n", max_tokens,
                                                 &generated, t0, &stream,
                                                 err, sizeof(err)) != 0) {
-                    agent_dsml_parser_free(&dsml);
-                    agent_set_error(w, err);
-                    return 1;
+                    goto turn_fail;
                 }
             } else {
                 free(text);
@@ -8995,9 +9089,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                         err,
                         sizeof(err));
                     if (ntok < 0) {
-                        agent_dsml_parser_free(&dsml);
-                        agent_set_error(w, err[0] ? err : "DFlash decode failed");
-                        return 1;
+                        if (!err[0]) snprintf(err, sizeof(err), "DFlash decode failed");
+                        goto turn_fail;
                     }
 
                     bool consumed_all = true;
@@ -9033,9 +9126,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 } else if (worker_accept_generated_token(
                                w, token, &generated, t0,
                                &stream, err, sizeof(err)) != 0) {
-                    agent_dsml_parser_free(&dsml);
-                    agent_set_error(w, err);
-                    return 1;
+                    goto turn_fail;
                 }
             }
 
@@ -9186,6 +9277,24 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             pthread_mutex_unlock(&w->mu);
         }
         free(queued_user);
+        continue;
+
+        /* Shared bail-out for the hard-error paths inside the generation
+         * loop above (worker_force_generated_text(), the DFlash speculative
+         * decode, and worker_accept_generated_token() all `goto` here on
+         * failure).  Centralizing the cleanup means a future error path
+         * added to the loop can't forget to release the --json-events
+         * buffer the way three separate copy-pasted `return 1;` sites once
+         * did: renderer_write() may have already buffered up to 4096 bytes
+         * of assistant text into renderer.json_pending by the time any of
+         * these calls fail, and renderer_finish() -- the only other site
+         * that flushes/frees that buffer -- is never reached on this path. */
+    turn_fail: {
+        renderer_json_release(&renderer);
+        agent_dsml_parser_free(&dsml);
+        agent_set_error(w, err);
+        return 1;
+    }
     }
 }
 
