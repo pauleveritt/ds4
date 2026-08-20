@@ -10871,6 +10871,29 @@ static void agent_noninteractive_marker(const char *msg) {
     write_all(STDERR_FILENO, "\n", 1);
 }
 
+/* Machine-readable status for GUI front-ends.  The interactive footer already
+ * renders these numbers (build_status_text); headless callers previously had no
+ * way to see them, so a supervising GUI could show neither progress nor speed.
+ * Keys are space-separated and consumers must ignore unknown ones, so this can
+ * grow without breaking older parsers. */
+static void agent_format_status_line(const agent_status *st, char *buf, size_t len) {
+    const char *name;
+    switch (st->state) {
+    case AGENT_WORKER_PREFILL:    name = "prefill";    break;
+    case AGENT_WORKER_GENERATING: name = "generating"; break;
+    case AGENT_WORKER_COMPACTING: name = "compacting"; break;
+    default:                      name = "idle";       break;
+    }
+    const bool prefill = st->state == AGENT_WORKER_PREFILL;
+    snprintf(buf, len,
+             "+DWARFSTAR_STATUS state=%s done=%d total=%d tps=%.1f ctx=%d/%d",
+             name,
+             prefill ? st->prefill_done : st->generated,
+             prefill ? st->prefill_total : 0,
+             prefill ? st->prefill_tps : st->gen_tps,
+             st->ctx_used, st->ctx_size);
+}
+
 static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
     char buf[4096];
     for (;;) {
@@ -10909,6 +10932,8 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     agent_prompt_queue queue = {0};
     double quiet_deadline = 0.0;
     int rc = 0;
+    char last_status[256] = {0};
+    double last_status_at = 0.0;
 
     if (!one_shot) {
         if (set_nonblock(STDIN_FILENO, true, &old_stdin_flags) != 0) {
@@ -10992,6 +11017,22 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             fflush(stdout);
         }
         free(out);
+
+        /* Publish status at most every 200 ms.  Dedupe on the whole formatted line:
+         * while generating, the token count changes so this emits at the throttle
+         * rate, and at idle the numbers freeze so it emits once per transition
+         * instead of repeating forever. */
+        {
+            char cur[256];
+            agent_format_status_line(&st, cur, sizeof(cur));
+            double now = now_sec();
+            if (strcmp(cur, last_status) != 0 && now - last_status_at >= 0.200) {
+                write_all(STDERR_FILENO, cur, strlen(cur));
+                write_all(STDERR_FILENO, "\n", 1);
+                snprintf(last_status, sizeof(last_status), "%s", cur);
+                last_status_at = now;
+            }
+        }
 
         if (worker_take_queued_user_drain_request(&worker)) {
             char *queued = agent_prompt_queue_take_all(&queue);
