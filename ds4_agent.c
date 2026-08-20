@@ -445,6 +445,26 @@ static void agent_input_buf_append(agent_input_buf *b, const char *s, size_t n) 
     b->ptr[b->len] = '\0';
 }
 
+/* Non-interactive mode has no terminal, so it never receives SIGINT, and the
+ * interactive editor's own Ctrl+C handling (byte 3 / ETX, see
+ * editor_take_queued_byte(&editor, 3) in the interactive loop) lives entirely
+ * in code this mode never runs. DS4 Control's AgentSession.interrupt() writes
+ * a bare ETX byte to signal the same thing here; strip every occurrence out
+ * of the buffered input so it can never reach the model as literal prompt
+ * text, and report whether one was found. */
+static bool agent_input_buf_take_interrupt(agent_input_buf *b) {
+    bool found = false;
+    size_t w = 0;
+    for (size_t r = 0; r < b->len; r++) {
+        if (b->ptr[r] == 3) { found = true; continue; }
+        if (w != r) b->ptr[w] = b->ptr[r];
+        w++;
+    }
+    b->len = w;
+    if (b->ptr) b->ptr[b->len] = '\0';
+    return found;
+}
+
 static char *agent_input_buf_take(agent_input_buf *b) {
     if (!b->ptr) return xstrdup("");
     char *p = b->ptr;
@@ -11002,6 +11022,12 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             if (agent_read_stdin_available(&input, &stdin_eof) != 0) {
                 rc = 1;
                 break;
+            }
+            /* Strip before the length comparison below: a lone interrupt byte
+             * is a signal, not queued prompt text, so it must not restart the
+             * 200ms quiet-deadline debounce that decides when to submit. */
+            if (agent_input_buf_take_interrupt(&input) && !worker_is_idle(&worker)) {
+                worker_interrupt(&worker);
             }
             if (input.len != old_len) {
                 quiet_deadline = now_sec() + 0.200;
