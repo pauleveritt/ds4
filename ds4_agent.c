@@ -9440,6 +9440,13 @@ static bool worker_submit(agent_worker *w, const char *text) {
     bool ok = w->initialized && w->status.state == AGENT_WORKER_IDLE && !w->cmd_text;
     if (ok) {
         w->cmd_text = xstrdup(text);
+        /* A late interrupt can latch after the worker already observed idle
+         * (see the "stale interrupt" hazard noted near worker_clear_interrupt)
+         * and survive here unconsumed — the new turn's first
+         * worker_should_interrupt() check would then abort it instantly for
+         * no reason visible to the caller. Clear it along with the other
+         * per-turn state below. */
+        w->interrupt = false;
         /* A submitted turn is no longer idle, even if the worker thread has
          * not yet reached its real prefill accounting.  Non-interactive mode
          * depends on this to avoid exiting in the small handoff window between
