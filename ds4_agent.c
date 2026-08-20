@@ -311,6 +311,10 @@ typedef struct {
     char read_whole[8];
     char tool_path[512];
     bool code_param_active;
+    /* --json-events only: accumulates one parameter's raw value bytes so
+     * they can be flushed as a handful of "param_value" events instead of
+     * one event per byte (see agent_tool_viz_param_raw_byte). */
+    agent_buf json_param;
 } agent_tool_visualizer;
 
 typedef struct {
@@ -356,6 +360,12 @@ static void agent_trace(agent_worker *w, const char *fmt, ...);
 static void agent_buf_append(agent_buf *b, const char *s, size_t n);
 static void agent_emit_event_str(agent_worker *w, const char *kind,
                                  const char *s, size_t n);
+/* --json-events tool-event emitter (defined beside agent_emit_event_str,
+ * same placement rule as above): forward-declared here so the tool
+ * visualizer hooks further up the file can call it. */
+static void agent_emit_tool_event(agent_worker *w, const char *phase,
+                                  const char *key, const char *value,
+                                  const char *s, size_t n);
 static void agent_trace_text(agent_worker *w, const char *label,
                              const char *text, size_t len);
 static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr);
@@ -3264,6 +3274,31 @@ static const char *agent_tool_param_color(agent_tool_param_kind kind) {
     }
 }
 
+/* --json-events wire string for a param_kind, per the Swift consumer's
+ * expected vocabulary. */
+static const char *agent_tool_param_kind_str(agent_tool_param_kind kind) {
+    switch (kind) {
+    case AGENT_TOOL_PARAM_PATH: return "path";
+    case AGENT_TOOL_PARAM_OFFSET: return "offset";
+    case AGENT_TOOL_PARAM_CONTENT: return "content";
+    case AGENT_TOOL_PARAM_DIFF_OLD: return "diff_old";
+    case AGENT_TOOL_PARAM_DIFF_NEW: return "diff_new";
+    case AGENT_TOOL_PARAM_BASH_COMMAND: return "bash_command";
+    case AGENT_TOOL_PARAM_NORMAL: default: return "normal";
+    }
+}
+
+/* Whether this stream should emit --json-events tool events instead of ANSI
+ * output.  Some unit tests build an agent_stream_renderer whose
+ * agent_token_renderer has no worker (they capture bytes directly via
+ * renderer.capture rather than going through a worker at all) -- treat a
+ * missing worker/cfg the same as the flag being off instead of
+ * dereferencing NULL, mirroring how agent_trace() guards `!w`. */
+static bool agent_tool_viz_json_events(agent_stream_renderer *sr) {
+    return sr->renderer->worker && sr->renderer->worker->cfg &&
+           sr->renderer->worker->cfg->json_events;
+}
+
 static void agent_tool_viz_write(agent_stream_renderer *sr, const char *s, size_t n) {
     renderer_plain(sr->renderer, s, n);
     for (size_t i = 0; i < n; i++) sr->viz.last_output_newline = s[i] == '\n';
@@ -3276,10 +3311,19 @@ static void agent_tool_viz_puts(agent_stream_renderer *sr, const char *s) {
 static void agent_tool_viz_start(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     bool line_open = !sr->renderer->last_output_newline;
+    /* A prior tool-call block in this same stream may have left its
+     * --json-events param-value buffer allocated (agent_tool_viz_finish frees
+     * it, but be defensive): free before the memset below zeroes the
+     * pointer, or it leaks on every subsequent tool block in this turn. */
+    free(v->json_param.ptr);
     memset(v, 0, sizeof(*v));
     v->active = true;
     v->at_line_start = true;
     v->last_output_newline = true;
+    if (agent_tool_viz_json_events(sr)) {
+        agent_emit_tool_event(sr->renderer->worker, "start", NULL, NULL, NULL, 0);
+        return;
+    }
     if (sr->replay) {
         if (line_open) agent_tool_viz_puts(sr, "\n");
     } else if (sr->renderer->use_color) {
@@ -3314,10 +3358,16 @@ static const char *agent_tool_viz_prefix(const char *name) {
 static void agent_tool_viz_tool(agent_stream_renderer *sr, const char *name) {
     agent_tool_visualizer *v = &sr->viz;
     if (v->tool_announced && !strcmp(v->tool_name, name)) return;
-    if (v->tool_announced && !v->last_output_newline) agent_tool_viz_puts(sr, "\n");
+    bool json_events = agent_tool_viz_json_events(sr);
+    if (!json_events && v->tool_announced && !v->last_output_newline)
+        agent_tool_viz_puts(sr, "\n");
     snprintf(v->tool_name, sizeof(v->tool_name), "%s", name ? name : "tool");
     v->tool_announced = true;
     v->read_style = !strcmp(v->tool_name, "read");
+    if (json_events) {
+        agent_emit_tool_event(sr->renderer->worker, "tool", "name", v->tool_name, NULL, 0);
+        return;
+    }
     agent_tool_viz_line_prefix(sr);
     if (v->read_style) {
         renderer_color(sr->renderer, "\x1b[1;37m");
@@ -3486,6 +3536,13 @@ static void agent_tool_viz_param_begin(agent_stream_renderer *sr, const char *na
     v->param_active = true;
     v->param_end_len = 0;
 
+    if (agent_tool_viz_json_events(sr)) {
+        v->json_param.len = 0;
+        agent_emit_tool_event(sr->renderer->worker, "param_begin", "kind",
+                              agent_tool_param_kind_str(v->param_kind), NULL, 0);
+        return;
+    }
+
     if (v->read_style) return;
 
     if (v->param_kind == AGENT_TOOL_PARAM_DIFF_OLD ||
@@ -3525,9 +3582,28 @@ static void agent_tool_viz_param_begin(agent_stream_renderer *sr, const char *na
     renderer_color(sr->renderer, agent_tool_param_color(v->param_kind));
 }
 
+/* Flush the accumulated --json-events parameter-value buffer as one
+ * "param_value" event.  A no-op when nothing is pending, so it is safe to
+ * call both at the 4096-byte threshold in agent_tool_viz_param_raw_byte and
+ * again (as a final flush of any remainder) from agent_tool_viz_param_end. */
+static void agent_tool_viz_json_param_flush(agent_stream_renderer *sr) {
+    agent_tool_visualizer *v = &sr->viz;
+    if (!v->json_param.len) return;
+    agent_emit_tool_event(sr->renderer->worker, "param_value", NULL, NULL,
+                          v->json_param.ptr, v->json_param.len);
+    v->json_param.len = 0;
+}
+
 static void agent_tool_viz_param_end(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     v->param_end_len = 0;
+    if (agent_tool_viz_json_events(sr)) {
+        agent_tool_viz_json_param_flush(sr);
+        agent_emit_tool_event(sr->renderer->worker, "param_end", NULL, NULL, NULL, 0);
+        v->param_active = false;
+        v->param_name[0] = '\0';
+        return;
+    }
     if (v->code_param_active) agent_tool_viz_code_end(sr);
     if (!v->read_style) renderer_color(sr->renderer, "\x1b[0m");
     v->param_active = false;
@@ -3536,6 +3612,11 @@ static void agent_tool_viz_param_end(agent_stream_renderer *sr) {
 
 static void agent_tool_viz_param_raw_byte(agent_stream_renderer *sr, char c) {
     agent_tool_visualizer *v = &sr->viz;
+    if (agent_tool_viz_json_events(sr)) {
+        agent_buf_append(&v->json_param, &c, 1);
+        if (v->json_param.len >= 4096) agent_tool_viz_json_param_flush(sr);
+        return;
+    }
     if (v->read_style) {
         agent_tool_viz_read_value_byte(sr, c);
         return;
@@ -3609,6 +3690,20 @@ static void agent_tool_viz_finish(agent_stream_renderer *sr, const char *status)
     agent_tool_visualizer *v = &sr->viz;
     if (!v->active) return;
     if (v->param_active) agent_tool_viz_param_end(sr);
+    if (agent_tool_viz_json_events(sr)) {
+        /* Free the param-value buffer here rather than leaving it for the
+         * next agent_tool_viz_start's memset -- that memset only runs again
+         * if another tool-call block follows in this turn, which would
+         * otherwise leak this buffer on the last block of every turn. */
+        free(v->json_param.ptr);
+        v->json_param.ptr = NULL;
+        v->json_param.cap = 0;
+        v->json_param.len = 0;
+        agent_emit_tool_event(sr->renderer->worker, "finish", "status",
+                              (status && status[0]) ? status : NULL, NULL, 0);
+        v->active = false;
+        return;
+    }
     if (!status || !status[0]) agent_tool_viz_render_read(sr);
     if (status && status[0]) {
         if (!v->last_output_newline) agent_tool_viz_puts(sr, "\n");
@@ -4205,6 +4300,34 @@ static void agent_emit_event_str(agent_worker *w, const char *kind,
         agent_publish(w, line, strlen(line));
         free(line);
     }
+}
+
+/* Emit one NDJSON tool event: {"t":"tool","phase":"<phase>"[,"<key>":"<value>"][,"s":"<s>"]}.
+ * Takes pre-built field text rather than a printf-style format so callers
+ * cannot accidentally splice unescaped input into the JSON -- name/kind/status
+ * and the raw value bytes are all escaped here via agent_json_escape(). */
+static void agent_emit_tool_event(agent_worker *w, const char *phase,
+                                  const char *key, const char *value,
+                                  const char *s, size_t n) {
+    agent_buf b = {0};
+    agent_buf_puts(&b, "{\"t\":\"tool\",\"phase\":\"");
+    agent_buf_puts(&b, phase);
+    agent_buf_puts(&b, "\"");
+    if (key && value) {
+        agent_buf_puts(&b, ",\"");
+        agent_buf_puts(&b, key);
+        agent_buf_puts(&b, "\":\"");
+        agent_json_escape(&b, value, strlen(value));
+        agent_buf_puts(&b, "\"");
+    }
+    if (s) {
+        agent_buf_puts(&b, ",\"s\":\"");
+        agent_json_escape(&b, s, n);
+        agent_buf_puts(&b, "\"");
+    }
+    agent_buf_puts(&b, "}\n");
+    char *line = agent_buf_take(&b);
+    if (line) { agent_publish(w, line, strlen(line)); free(line); }
 }
 
 static bool agent_tokens_equal(const ds4_tokens *a, const ds4_tokens *b) {
