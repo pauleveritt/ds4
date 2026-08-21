@@ -227,6 +227,11 @@ typedef struct {
     agent_tail_capture *capture;
     agent_buf json_pending;      /* buffered bytes awaiting a text/think event */
     bool      json_pending_think; /* which kind json_pending holds */
+    double    json_last_flush;   /* now_sec() as of the last renderer_json_flush()
+                                   * that actually emitted something; 0.0 means
+                                   * "never flushed yet" (see renderer_write's
+                                   * json branch, which seeds this before the
+                                   * first time-based check can fire) */
 } agent_token_renderer;
 
 typedef struct {
@@ -2160,6 +2165,11 @@ static void renderer_json_flush(agent_token_renderer *r) {
                          r->json_pending_think ? "think" : "text",
                          r->json_pending.ptr, r->json_pending.len);
     r->json_pending.len = 0;
+    /* Stamp the moment this buffer was retired -- the single place that
+     * knows a flush actually happened, so every trigger (boundary, byte
+     * threshold, time threshold, tool-block start, turn finish) restarts
+     * the 100ms clock the same way. */
+    r->json_last_flush = now_sec();
 }
 
 /* Flush and release the --json-events buffer.  This is the single place that
@@ -2179,15 +2189,33 @@ static void renderer_write(agent_token_renderer *r, const char *s, size_t n) {
     if (r->capture) {
         agent_tail_capture_append(r->capture, s, n);
     } else if (r->worker->cfg->json_events) {
-        /* Buffer text/think bytes and flush only on a boundary: a think/text
-         * mode change, the 4096-byte threshold below, or turn finish (see the
-         * renderer_json_flush() call added to renderer_finish()).  Emitting
-         * one JSON line per character would make this feature unusable. */
+        /* Buffer text/think bytes and flush on any of: a think/text mode
+         * change (just below), the 4096-byte threshold (bounds event size),
+         * 100ms elapsed since the last flush (bounds latency -- restores
+         * perceived streaming without going back to one-line-per-character;
+         * see json_last_flush's field comment), a tool block opening
+         * (agent_tool_viz_start's json branch calls renderer_json_flush()
+         * so prose never arrives on the wire after the tool events it
+         * preceded), or turn finish (renderer_finish() ->
+         * renderer_json_release()).  Emitting one JSON line per character
+         * would make this feature unusable.
+         *
+         * json_last_flush is seeded here, not left at its zero-initialized
+         * value, the first time this renderer ever buffers json bytes:
+         * now_sec() is CLOCK_MONOTONIC, i.e. time since some unspecified
+         * epoch (often boot), so "now - 0.0" is typically thousands of
+         * seconds and would satisfy the 100ms gate on the very first byte,
+         * emitting a one-character first event. Seeding to "now" here means
+         * the very first write only starts the clock; it does not itself
+         * satisfy elapsed >= 0.1. */
         if (r->json_pending.len && r->json_pending_think != r->in_think)
             renderer_json_flush(r);
+        if (r->json_last_flush == 0.0) r->json_last_flush = now_sec();
         r->json_pending_think = r->in_think;
         agent_buf_append(&r->json_pending, s, n);
-        if (r->json_pending.len >= 4096) renderer_json_flush(r);
+        if (r->json_pending.len >= 4096 ||
+            now_sec() - r->json_last_flush >= 0.1)
+            renderer_json_flush(r);
     } else {
         agent_publish(r->worker, s, n);
     }
@@ -3354,6 +3382,17 @@ static void agent_tool_viz_start(agent_stream_renderer *sr) {
     v->at_line_start = true;
     v->last_output_newline = true;
     if (agent_tool_viz_json_events(sr)) {
+        /* Flush any prose still sitting in json_pending before the tool
+         * block's own events start: renderer_write() buffers text/think
+         * bytes and only flushes at a mode change, the byte/time thresholds,
+         * or turn finish, none of which fire just because a tool call is
+         * about to begin.  Without this, prose that immediately preceded a
+         * tool call (the common "I will now read the file." case) would
+         * arrive on the wire AFTER this block's "finish" event instead of
+         * before its "start" -- see the non-json branch below, which
+         * already has to work around the same ordering hazard for the raw
+         * DSML start marker. */
+        renderer_json_flush(sr->renderer);
         agent_emit_tool_event(sr->renderer->worker, "start", v->call_idx,
                               NULL, NULL, NULL, 0);
         return;
@@ -3830,6 +3869,15 @@ static void agent_tool_viz_dump_invalid_dsml(agent_stream_renderer *sr) {
         v->param_active = false;
         v->param_end_len = 0;
         v->param_name[0] = '\0';
+    }
+    if (agent_tool_viz_json_events(sr)) {
+        /* Under --json-events the raw rejected DSML bytes have no honest
+         * home on the wire: emitting them through renderer_write() would
+         * surface as a "text" event, misattributing rejected tool-call
+         * markup as model prose. The caller's agent_tool_viz_finish(sr,
+         * status) already carries the parse error in the "finish" event's
+         * status field, so just suppress the dump here. */
+        return;
     }
     if (!v->last_output_newline) agent_tool_viz_puts(sr, "\n");
     renderer_color(sr->renderer, "\x1b[1;31m");
@@ -8307,6 +8355,126 @@ static void test_agent_publish_unflagged_path_matches_raw(void) {
     pthread_mutex_destroy(&w.mu);
 }
 
+/* Regression test for task 3.7 Part 1: agent_tool_viz_start's json branch
+ * used to call agent_emit_tool_event(..., "start", ...) directly, without
+ * first flushing json_pending -- the buffer renderer_write() fills with
+ * assistant prose and only drains at a think/text mode change, the
+ * 4096-byte threshold, or turn finish. Since none of those fire just
+ * because a tool call is about to start, prose that immediately preceded a
+ * tool call (the common "I will now read the file." case) arrived on the
+ * wire AFTER that block's "start"/"finish" tool events instead of before
+ * them.
+ *
+ * This drives ordinary prose through renderer_write() -- well under the
+ * 4096-byte threshold, no think/text mode change -- then opens a tool block
+ * via agent_tool_viz_start(), and asserts the "text" event's byte offset in
+ * w.out precedes the "start" tool event's offset.
+ *
+ * Confirmed not vacuous by temporarily deleting the
+ * renderer_json_flush(sr->renderer) call this test guards (in
+ * agent_tool_viz_start's json branch) and re-running: w.out then contains
+ * "start" before "text" (the buffered prose only appears once
+ * renderer_json_release() finally runs), and the ordering assertion below
+ * fails as expected. The flush call was then restored. */
+static void test_agent_json_events_tool_start_flushes_pending_text(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    agent_token_renderer renderer = { .worker = &w, .last_output_newline = true };
+    agent_stream_renderer stream = { .renderer = &renderer };
+
+    const char *prose = "I will now read the file.\n\n";
+    renderer_write(&renderer, prose, strlen(prose));
+    AGENT_TEST_ASSERT(renderer.json_pending.len == strlen(prose));
+    AGENT_TEST_ASSERT(w.out_len == 0); /* nothing published yet: still buffered */
+
+    agent_tool_viz_start(&stream);
+
+    AGENT_TEST_ASSERT(renderer.json_pending.len == 0); /* the fix drained it */
+    AGENT_TEST_ASSERT(w.out != NULL);
+    const char *text_evt = strstr(w.out, "\"t\":\"text\"");
+    const char *start_evt = strstr(w.out, "\"phase\":\"start\"");
+    AGENT_TEST_ASSERT(text_evt != NULL);
+    AGENT_TEST_ASSERT(start_evt != NULL);
+    AGENT_TEST_ASSERT(text_evt < start_evt); /* prose precedes the tool block */
+    AGENT_TEST_ASSERT(strstr(w.out, "I will now read the file.") != NULL);
+
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* Regression test for task 3.7 Part 2: renderer_write()'s --json-events
+ * branch used to gate flushing on the 4096-byte threshold alone. A live run
+ * against the real model measured a 3583-byte think block and a 1984-byte
+ * answer that each arrived as a single event at turn end -- neither ever
+ * reached 4096 bytes, so neither ever streamed; the GUI just popped in the
+ * whole answer after a long silent pause. The fix adds a second gate:
+ * flush once at least 100ms has elapsed since this renderer's last flush,
+ * tracked in the new json_last_flush field and stamped by
+ * renderer_json_flush().
+ *
+ * A pure timing test (write, sleep >100ms, write, assert flushed) would be
+ * flaky under load and would slow the suite down for every run, so this
+ * instead drives the exact production comparison (now_sec() -
+ * r->json_last_flush >= 0.1) with a synthetic timestamp instead of a real
+ * sleep: Part B backdates json_last_flush by hand to simulate "100ms have
+ * already passed." That is deterministic and exercises the real
+ * comparison, just with a controlled input instead of a controlled clock.
+ *
+ * Part A covers the seeding requirement separately: a *fresh* renderer's
+ * very first write must not flush just because json_last_flush's
+ * zero-initialized value would make now_sec() - 0.0 satisfy ">= 0.1"
+ * immediately (now_sec() is CLOCK_MONOTONIC, i.e. time since boot, not
+ * epoch, so it is essentially always >= 0.1 seconds) -- see
+ * json_last_flush's field comment and the seed-if-zero guard added to
+ * renderer_write().
+ *
+ * Confirmed not vacuous two ways, each temporarily reverted afterward and
+ * rebuilt/rerun to confirm the failure, then confirmed clean again:
+ *  - Removing the "|| now_sec() - r->json_last_flush >= 0.1" disjunct from
+ *    renderer_write()'s flush condition makes Part B fail (w.out stays
+ *    NULL/empty): 3 bytes never reaches the 4096-byte threshold on its own.
+ *  - Deleting the seed-if-zero guard entirely (so json_last_flush stays 0.0
+ *    and the first check becomes now_sec() - 0.0 >= 0.1) makes Part A fail
+ *    at its "r.json_pending.len == 2" and "w.out_len == 0" assertions,
+ *    since that huge delta trips the time gate on the very first byte
+ *    instead of just seeding the clock. */
+static void test_agent_json_events_time_based_flush(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+    agent_token_renderer r = { .worker = &w };
+
+    /* Part A: seeding. A brand-new renderer's json_last_flush is 0.0; the
+     * first write must seed it to "now" rather than flush immediately. */
+    AGENT_TEST_ASSERT(r.json_last_flush == 0.0);
+    renderer_write(&r, "hi", 2);
+    AGENT_TEST_ASSERT(r.json_last_flush != 0.0); /* seeded */
+    AGENT_TEST_ASSERT(r.json_pending.len == 2);
+    AGENT_TEST_ASSERT(w.out_len == 0); /* neither gate fired: not a premature flush */
+
+    /* Part B: the time gate. Backdate json_last_flush to simulate 100ms+
+     * already elapsed since the last flush, then write a handful more
+     * bytes -- nowhere near the 4096-byte threshold -- and confirm the
+     * time gate flushes them anyway. */
+    r.json_last_flush = now_sec() - 0.2;
+    renderer_write(&r, "!", 1);
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(w.out_len > 0);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"text\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "hi!") != NULL);
+    AGENT_TEST_ASSERT(r.json_pending.len == 0); /* buffer retired by the time gate */
+
+    renderer_json_release(&r);
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_json_events_release_flushes_and_frees_pending();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
@@ -8338,6 +8506,8 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_json_events_param_value_utf8_boundary_no_tear();
     test_agent_publish_backstop_wraps_unguarded_bytes_as_text();
     test_agent_publish_unflagged_path_matches_raw();
+    test_agent_json_events_tool_start_flushes_pending_text();
+    test_agent_json_events_time_based_flush();
 }
 #endif
 
