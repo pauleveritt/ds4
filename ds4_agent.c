@@ -315,6 +315,16 @@ typedef struct {
      * they can be flushed as a handful of "param_value" events instead of
      * one event per byte (see agent_tool_viz_param_raw_byte). */
     agent_buf json_param;
+    /* --json-events only: zero-based index of the call currently being
+     * announced/parsed within this DSML block, stamped onto every tool event
+     * (start/tool/param_begin/param_value/param_end/finish) so a consumer
+     * can associate multi-call blocks' events without relying on arrival
+     * order. Starts at 0 (agent_tool_viz_start's memset); call_idx_started
+     * gates the *first* increment so the first call keeps idx 0 and "finish"
+     * (which never itself announces a call) reports the last real call's
+     * index rather than one past it -- see agent_tool_viz_tool(). */
+    int call_idx;
+    bool call_idx_started;
 } agent_tool_visualizer;
 
 typedef struct {
@@ -363,7 +373,7 @@ static void agent_emit_event_str(agent_worker *w, const char *kind,
 /* --json-events tool-event emitter (defined beside agent_emit_event_str,
  * same placement rule as above): forward-declared here so the tool
  * visualizer hooks further up the file can call it. */
-static void agent_emit_tool_event(agent_worker *w, const char *phase,
+static void agent_emit_tool_event(agent_worker *w, const char *phase, int idx,
                                   const char *key, const char *value,
                                   const char *s, size_t n);
 /* Bypass sink for callers that have already built a complete NDJSON line
@@ -3344,7 +3354,8 @@ static void agent_tool_viz_start(agent_stream_renderer *sr) {
     v->at_line_start = true;
     v->last_output_newline = true;
     if (agent_tool_viz_json_events(sr)) {
-        agent_emit_tool_event(sr->renderer->worker, "start", NULL, NULL, NULL, 0);
+        agent_emit_tool_event(sr->renderer->worker, "start", v->call_idx,
+                              NULL, NULL, NULL, 0);
         return;
     }
     if (sr->replay) {
@@ -3384,11 +3395,21 @@ static void agent_tool_viz_tool(agent_stream_renderer *sr, const char *name) {
     bool json_events = agent_tool_viz_json_events(sr);
     if (!json_events && v->tool_announced && !v->last_output_newline)
         agent_tool_viz_puts(sr, "\n");
+    /* Advance call_idx for the second and later calls in this block -- the
+     * first call keeps idx 0 from agent_tool_viz_start's memset.  Gating on
+     * call_idx_started (rather than incrementing wherever a call is detected
+     * as finished, e.g. agent_stream_tool_events' tool_announced reset) means
+     * the increment only ever happens right before a NEW call's "tool"
+     * event, so "finish" -- which never itself announces a call -- reports
+     * whatever call_idx the last real call left behind, not one past it. */
+    if (v->call_idx_started) v->call_idx++;
+    v->call_idx_started = true;
     snprintf(v->tool_name, sizeof(v->tool_name), "%s", name ? name : "tool");
     v->tool_announced = true;
     v->read_style = !strcmp(v->tool_name, "read");
     if (json_events) {
-        agent_emit_tool_event(sr->renderer->worker, "tool", "name", v->tool_name, NULL, 0);
+        agent_emit_tool_event(sr->renderer->worker, "tool", v->call_idx,
+                              "name", v->tool_name, NULL, 0);
         return;
     }
     agent_tool_viz_line_prefix(sr);
@@ -3569,8 +3590,9 @@ static void agent_tool_viz_param_begin(agent_stream_renderer *sr, const char *na
 
     if (agent_tool_viz_json_events(sr)) {
         v->json_param.len = 0;
-        agent_emit_tool_event(sr->renderer->worker, "param_begin", "kind",
-                              agent_tool_param_kind_str(v->param_kind), NULL, 0);
+        agent_emit_tool_event(sr->renderer->worker, "param_begin", v->call_idx,
+                              "kind", agent_tool_param_kind_str(v->param_kind),
+                              NULL, 0);
         return;
     }
 
@@ -3647,8 +3669,8 @@ static size_t agent_utf8_incomplete_tail_len(const char *buf, size_t len) {
 static void agent_tool_viz_json_param_flush(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->json_param.len) return;
-    agent_emit_tool_event(sr->renderer->worker, "param_value", NULL, NULL,
-                          v->json_param.ptr, v->json_param.len);
+    agent_emit_tool_event(sr->renderer->worker, "param_value", v->call_idx,
+                          NULL, NULL, v->json_param.ptr, v->json_param.len);
     v->json_param.len = 0;
 }
 
@@ -3667,8 +3689,8 @@ static void agent_tool_viz_json_param_flush_safe(agent_stream_renderer *sr) {
     size_t hold = agent_utf8_incomplete_tail_len(v->json_param.ptr, v->json_param.len);
     size_t flush_len = v->json_param.len - hold;
     if (!flush_len) return; /* the whole buffer is still an incomplete tail */
-    agent_emit_tool_event(sr->renderer->worker, "param_value", NULL, NULL,
-                          v->json_param.ptr, flush_len);
+    agent_emit_tool_event(sr->renderer->worker, "param_value", v->call_idx,
+                          NULL, NULL, v->json_param.ptr, flush_len);
     if (hold) memmove(v->json_param.ptr, v->json_param.ptr + flush_len, hold);
     v->json_param.len = hold;
     if (v->json_param.ptr) v->json_param.ptr[hold] = '\0';
@@ -3679,7 +3701,8 @@ static void agent_tool_viz_param_end(agent_stream_renderer *sr) {
     v->param_end_len = 0;
     if (agent_tool_viz_json_events(sr)) {
         agent_tool_viz_json_param_flush(sr);
-        agent_emit_tool_event(sr->renderer->worker, "param_end", NULL, NULL, NULL, 0);
+        agent_emit_tool_event(sr->renderer->worker, "param_end", v->call_idx,
+                              NULL, NULL, NULL, 0);
         v->param_active = false;
         v->param_name[0] = '\0';
         return;
@@ -3779,8 +3802,9 @@ static void agent_tool_viz_finish(agent_stream_renderer *sr, const char *status)
         v->json_param.ptr = NULL;
         v->json_param.cap = 0;
         v->json_param.len = 0;
-        agent_emit_tool_event(sr->renderer->worker, "finish", "status",
-                              (status && status[0]) ? status : NULL, NULL, 0);
+        agent_emit_tool_event(sr->renderer->worker, "finish", v->call_idx,
+                              "status", (status && status[0]) ? status : NULL,
+                              NULL, 0);
         v->active = false;
         return;
     }
@@ -4382,17 +4406,28 @@ static void agent_emit_event_str(agent_worker *w, const char *kind,
     }
 }
 
-/* Emit one NDJSON tool event: {"t":"tool","phase":"<phase>"[,"<key>":"<value>"][,"s":"<s>"]}.
- * Takes pre-built field text rather than a printf-style format so callers
- * cannot accidentally splice unescaped input into the JSON -- name/kind/status
- * and the raw value bytes are all escaped here via agent_json_escape(). */
-static void agent_emit_tool_event(agent_worker *w, const char *phase,
+/* Emit one NDJSON tool event:
+ * {"t":"tool","phase":"<phase>","idx":<idx>[,"<key>":"<value>"][,"s":"<s>"]}.
+ * `idx` is the zero-based index of the call this event belongs to within the
+ * current DSML block (agent_tool_visualizer.call_idx) -- present on every
+ * phase unconditionally (start/tool/param_begin/param_value/param_end/
+ * output/finish), not bolted on to only some of them, so a consumer can key
+ * on it directly instead of associating output with a call by arrival order
+ * (see agent_tool_visualizer.call_idx's comment for why arrival order is
+ * unsafe for multi-call blocks). Takes pre-built field text rather than a
+ * printf-style format so callers cannot accidentally splice unescaped input
+ * into the JSON -- name/kind/status and the raw value bytes are all escaped
+ * here via agent_json_escape(). */
+static void agent_emit_tool_event(agent_worker *w, const char *phase, int idx,
                                   const char *key, const char *value,
                                   const char *s, size_t n) {
     agent_buf b = {0};
     agent_buf_puts(&b, "{\"t\":\"tool\",\"phase\":\"");
     agent_buf_puts(&b, phase);
-    agent_buf_puts(&b, "\"");
+    agent_buf_puts(&b, "\",\"idx\":");
+    char idx_str[24];
+    snprintf(idx_str, sizeof(idx_str), "%d", idx);
+    agent_buf_puts(&b, idx_str);
     if (key && value) {
         agent_buf_puts(&b, ",\"");
         agent_buf_puts(&b, key);
@@ -4479,6 +4514,46 @@ static void agent_emit_status_event(agent_worker *w, const agent_status *st) {
     agent_buf_puts(&b, "\"}\n");
     char *line = agent_buf_take(&b);
     if (line) { agent_publish_raw(w, line, strlen(line)); free(line); }
+}
+
+/* Decide whether to publish a JSON "status" event right now (the 200ms
+ * throttle plus state-change bypass), and emit it via agent_emit_status_event()
+ * if so. Extracted from run_agent_non_interactive's status-emission site so
+ * it is unit testable on its own, without running the full non-interactive
+ * loop (which needs a real ds4_engine).
+ *
+ * The dedupe key here is built from the true state name and every field the
+ * JSON event carries -- it must NOT reuse agent_format_status_line()'s
+ * +DWARFSTAR_STATUS text (that marker collapses DRAINING/SAVING/ERROR/
+ * STOPPED into "idle" and omits st->error entirely). Deduping the JSON
+ * emission decision against that lossy text would silently swallow a real
+ * transition between two states that happen to render identically there --
+ * e.g. SAVING -> IDLE with every numeric field unchanged -- defeating the
+ * whole point of the eight-state fix: agent_emit_status_event() would simply
+ * never run for that transition, and the GUI could show a stale phase
+ * indefinitely, since nothing else would retry it.
+ *
+ * Caller contract: pass the correct `state_changed` for this call (comparing
+ * against a `last_state` the caller updates on every OBSERVED transition, not
+ * only ones this function decides to emit -- see the call site's comment for
+ * why doing it only inside the throttle gate corrupts the bypass's own
+ * bookkeeping). `last_json_key`/`last_status_at` are caller-owned and persist
+ * across calls. */
+static void agent_maybe_emit_status_event(agent_worker *w, const agent_status *st,
+                                          bool state_changed, double now,
+                                          char *last_json_key, size_t last_json_key_cap,
+                                          double *last_status_at) {
+    char json_key[512];
+    snprintf(json_key, sizeof(json_key), "%s|%d|%d|%.1f|%d|%.1f|%d|%d|%d|%s",
+             agent_status_state_name(st->state), st->prefill_done, st->prefill_total,
+             st->prefill_tps, st->generated, st->gen_tps, st->ctx_used, st->ctx_size,
+             st->power_percent, st->error);
+    if (strcmp(json_key, last_json_key) != 0 &&
+        (state_changed || now - *last_status_at >= 0.200)) {
+        agent_emit_status_event(w, st);
+        snprintf(last_json_key, last_json_key_cap, "%s", json_key);
+        *last_status_at = now;
+    }
 }
 
 static bool agent_tokens_equal(const ds4_tokens *a, const ds4_tokens *b) {
@@ -7108,11 +7183,13 @@ static void agent_test_assert(bool cond, const char *expr,
     agent_test_assert((expr), #expr, __FILE__, __LINE__)
 
 /* Forward-declared for the --json-events status/ready/queued/bash-observation
- * tests below: both are defined much later in the file (agent_bash_job
- * plumbing and tool dispatch live near the bottom), well after
+ * tests below: all three are defined much later in the file (agent_bash_job
+ * plumbing and tool dispatch live near the bottom, and agent_format_status_line
+ * lives beside run_agent_non_interactive), well after
  * ds4_agent_unit_tests_run() registers its test list. */
-static void agent_bash_publish_observation(agent_worker *w, const char *obs);
-static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call);
+static void agent_bash_publish_observation(agent_worker *w, const char *obs, int idx);
+static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call, int idx);
+static void agent_format_status_line(const agent_status *st, char *buf, size_t len);
 
 static void test_agent_edit_upto_tail_newline_is_not_part_of_anchor(void) {
     const char *data =
@@ -7491,16 +7568,105 @@ static void test_agent_json_events_read_tool_omits_reading_summary(void) {
     AGENT_TEST_ASSERT(p.calls.v[0].name && !strcmp(p.calls.v[0].name, "read"));
 
     AGENT_TEST_ASSERT(w.out != NULL);
-    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"tool\",\"name\":\"read\"") != NULL);
-    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"param_begin\",\"kind\":\"path\"") != NULL);
-    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"param_value\",\"s\":\"ds4_agent.c\"") != NULL);
-    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"finish\"") != NULL);
+    /* Single-call block: every phase carries idx 0 (Task 3's dedupe/idx fix
+     * added the "idx" field between "phase" and any key/value pair). */
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"tool\",\"idx\":0,\"name\":\"read\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"param_begin\",\"idx\":0,\"kind\":\"path\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"param_value\",\"idx\":0,\"s\":\"ds4_agent.c\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"finish\",\"idx\":0") != NULL);
 
     /* The regression: no "Reading" summary anywhere in the event stream, and
      * specifically no leaked "t":"text" event at all for this turn -- the
      * read summary was the only thing that could have produced one here. */
     AGENT_TEST_ASSERT(strstr(w.out, "Reading") == NULL);
     AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"text\"") == NULL);
+
+    agent_dsml_parser_free(&p);
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* Regression test for a reviewer finding on Task 3's tool-event work
+ * (Important, "multi-call tool blocks can misattribute output to the wrong
+ * card"): agent_execute_tool_calls() dispatches every call in a DSML block
+ * only after the whole block has finished streaming, so for a two-call block
+ * the streamed events for call 0 (start/tool/param_begin/param_value/
+ * param_end) and call 1 are followed by a single "finish", and only THEN --
+ * separately, from tool execution -- do the two "output" events arrive. No
+ * event carried a call identifier, so a consumer keying output to "the most
+ * recently finished tool" would attach both outputs to the last call. This
+ * feeds a two-call "read" DSML block through the streaming renderer (mirrors
+ * test_agent_json_events_read_tool_omits_reading_summary() above, byte at a
+ * time) and asserts: idx 0 on every event belonging to the first call, idx 1
+ * on every event belonging to the second call, and -- the specific hazard
+ * called out in review -- "finish" (which is a once-per-block event, not
+ * once-per-call) carries idx 1, the last real call's index, not 2. */
+static void test_agent_json_events_multi_call_block_stamps_call_idx(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    agent_token_renderer renderer = {
+        .worker = &w,
+        .format_thinking = true,
+        .format_markdown = false,
+        .last_output_newline = true,
+    };
+    agent_dsml_parser p = {
+        .syntax = AGENT_TOOL_SYNTAX_DSML,
+        .state = AGENT_DSML_SEARCH,
+    };
+    agent_stream_renderer stream = {
+        .renderer = &renderer,
+        .parser = &p,
+        .syntax = AGENT_TOOL_SYNTAX_DSML,
+    };
+
+    const char *text =
+        "<｜DSML｜tool_calls>"
+        "<｜DSML｜invoke name=\"read\">"
+        "<｜DSML｜parameter name=\"path\" string=\"true\">file_a.c</｜DSML｜parameter>"
+        "</｜DSML｜invoke>"
+        "<｜DSML｜invoke name=\"read\">"
+        "<｜DSML｜parameter name=\"path\" string=\"true\">file_b.c</｜DSML｜parameter>"
+        "</｜DSML｜invoke>"
+        "</｜DSML｜tool_calls>";
+    size_t len = strlen(text);
+    for (size_t i = 0; i < len; i++)
+        agent_stream_text(&stream, text + i, 1, false);
+    agent_stream_text(&stream, NULL, 0, true);
+    renderer_finish(&renderer);
+
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(p.calls.len == 2);
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    /* Block-level "start" -- fires once, before any call, at idx 0. */
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"start\",\"idx\":0") != NULL);
+    /* Call 0's own events. */
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"tool\",\"idx\":0,\"name\":\"read\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"param_begin\",\"idx\":0,\"kind\":\"path\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"param_value\",\"idx\":0,\"s\":\"file_a.c\"") != NULL);
+    /* Call 1's own events -- idx advanced. */
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"tool\",\"idx\":1,\"name\":\"read\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"param_begin\",\"idx\":1,\"kind\":\"path\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"param_value\",\"idx\":1,\"s\":\"file_b.c\"") != NULL);
+    /* The regression: block-level "finish" fires once, after both calls, and
+     * must carry idx 1 (the last real call) -- NOT idx 2, which is what a
+     * naive "increment whenever a call ends" implementation would produce
+     * since "finish" never itself announces a new call to gate the
+     * increment on. */
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"finish\",\"idx\":1") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"idx\":2") == NULL);
+
+    /* Ordering: call 0's "tool" line must appear before call 1's "tool"
+     * line, and "finish" must be the last tool event in the stream. */
+    const char *tool0 = strstr(w.out, "\"phase\":\"tool\",\"idx\":0");
+    const char *tool1 = strstr(w.out, "\"phase\":\"tool\",\"idx\":1");
+    const char *finish = strstr(w.out, "\"phase\":\"finish\"");
+    AGENT_TEST_ASSERT(tool0 && tool1 && finish && tool0 < tool1 && tool1 < finish);
 
     agent_dsml_parser_free(&p);
     free(w.out);
@@ -7718,10 +7884,10 @@ static void test_agent_json_events_bash_observation_tail_wraps_as_tool_output(vo
         "<tail -12 /tmp/x>\n"
         "line one\nline two: boom\n"
         "</tail>\n";
-    agent_bash_publish_observation(&w, obs);
+    agent_bash_publish_observation(&w, obs, 2); /* non-zero idx: confirm it threads through */
 
     AGENT_TEST_ASSERT(w.out != NULL);
-    AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"tool\",\"phase\":\"output\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"tool\",\"phase\":\"output\",\"idx\":2") != NULL);
     AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"text\"") == NULL);
     AGENT_TEST_ASSERT(strstr(w.out, "showing last output lines") != NULL);
     AGENT_TEST_ASSERT(strstr(w.out, "line one") != NULL);
@@ -7755,10 +7921,10 @@ static void test_agent_json_events_bash_observation_plain_output_wraps_as_tool_o
         "<output>\n"
         "hello from bash\n"
         "</output>\n";
-    agent_bash_publish_observation(&w, obs);
+    agent_bash_publish_observation(&w, obs, 0);
 
     AGENT_TEST_ASSERT(w.out != NULL);
-    AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"tool\",\"phase\":\"output\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"tool\",\"phase\":\"output\",\"idx\":0") != NULL);
     AGENT_TEST_ASSERT(strstr(w.out, "hello from bash") != NULL);
     AGENT_TEST_ASSERT(memchr(w.out, '\x1b', w.out_len) == NULL);
     /* No notice line for the plain <output> shape. */
@@ -7783,7 +7949,7 @@ static void test_agent_bash_observation_unflagged_path_unchanged(void) {
         "<output>\n"
         "hello from bash\n"
         "</output>\n";
-    agent_bash_publish_observation(&w, obs);
+    agent_bash_publish_observation(&w, obs, 0);
 
     AGENT_TEST_ASSERT(w.out != NULL);
     AGENT_TEST_ASSERT(strstr(w.out, "hello from bash") != NULL);
@@ -7810,12 +7976,12 @@ static void test_agent_json_events_unknown_tool_header_wraps_as_tool_output(void
     agent_tool_call call = {0};
     call.name = name_buf;
 
-    char *result = agent_execute_tool_call(&w, &call);
+    char *result = agent_execute_tool_call(&w, &call, 1); /* non-zero idx: confirm it threads through */
     AGENT_TEST_ASSERT(result != NULL);
     AGENT_TEST_ASSERT(strstr(result, "unknown tool") != NULL);
 
     AGENT_TEST_ASSERT(w.out != NULL);
-    AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"tool\",\"phase\":\"output\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"tool\",\"phase\":\"output\",\"idx\":1") != NULL);
     AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"text\"") == NULL);
     AGENT_TEST_ASSERT(strstr(w.out, "not_a_real_tool") != NULL);
     AGENT_TEST_ASSERT(memchr(w.out, '\x1b', w.out_len) == NULL);
@@ -7889,6 +8055,80 @@ static void test_agent_emit_status_event_escapes_error_field(void) {
 
     AGENT_TEST_ASSERT(w.out != NULL);
     AGENT_TEST_ASSERT(strstr(w.out, "\\\"path\\\\name\\\"") != NULL);
+
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* Regression test for a reviewer finding (Critical, "the dedupe key defeats
+ * your own 8-state fix"): agent_maybe_emit_status_event()'s predecessor
+ * compared the JSON emission decision against agent_format_status_line()'s
+ * +DWARFSTAR_STATUS text, which collapses DRAINING/SAVING/ERROR/STOPPED into
+ * "idle" and omits st->error. SAVING -> IDLE with every numeric field
+ * unchanged is the reviewer's demonstrated pair: both states format to the
+ * exact same +DWARFSTAR_STATUS text, so the old `strcmp(cur, last_status) !=
+ * 0` half of the gate was false even though state_changed was true, and the
+ * whole condition (an AND of the two) evaluated false -- the second status
+ * event was silently dropped despite being a real transition, and (since
+ * last_state was only updated inside that same dropped branch) the state
+ * tracking used for the *next* transition's bypass was corrupted too.
+ *
+ * Drives agent_maybe_emit_status_event() directly (it doesn't need the full
+ * non-interactive loop) with SAVING then IDLE, identical numeric fields,
+ * and -- to prove it is specifically the state-change BYPASS doing the work,
+ * not the 200ms throttle -- a `now` for the second call only 50ms after the
+ * first. Both events must appear. */
+static void test_agent_maybe_emit_status_event_distinguishes_collapsed_states(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    char last_json_key[512] = {0};
+    double last_status_at = 0.0;
+
+    agent_status saving = {0};
+    saving.state = AGENT_WORKER_SAVING;
+    saving.generated = 22;
+    saving.gen_tps = 62.8;
+    saving.ctx_used = 1038;
+    saving.ctx_size = 8192;
+    saving.power_percent = 100;
+
+    agent_status idle = saving; /* identical numeric fields -- only state differs */
+    idle.state = AGENT_WORKER_IDLE;
+
+    /* Sanity-check the premise: both states really do collapse to the same
+     * +DWARFSTAR_STATUS text with these numbers, which is exactly why the
+     * old lossy-key dedupe swallowed the transition. */
+    char saving_marker[256], idle_marker[256];
+    agent_format_status_line(&saving, saving_marker, sizeof(saving_marker));
+    agent_format_status_line(&idle, idle_marker, sizeof(idle_marker));
+    AGENT_TEST_ASSERT(!strcmp(saving_marker, idle_marker));
+
+    /* First call: nothing emitted yet, so this is a "transition" by
+     * construction (state_changed = true). */
+    agent_maybe_emit_status_event(&w, &saving, true, 100.000,
+                                  last_json_key, sizeof(last_json_key),
+                                  &last_status_at);
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"state\":\"saving\"") != NULL);
+    size_t after_first = w.out_len;
+
+    /* Second call: SAVING -> IDLE, identical numerics, only 50ms later --
+     * well under the 200ms throttle, so only the state-change bypass can
+     * let this through. */
+    agent_maybe_emit_status_event(&w, &idle, true, 100.050,
+                                  last_json_key, sizeof(last_json_key),
+                                  &last_status_at);
+    AGENT_TEST_ASSERT(w.out_len > after_first); /* a second line was actually appended */
+    AGENT_TEST_ASSERT(strstr(w.out, "\"state\":\"idle\"") != NULL);
+    /* Both lines present, not just the second overwriting/duplicating the
+     * first in some ambiguous way. */
+    size_t newline_count = 0;
+    for (size_t i = 0; i < w.out_len; i++) if (w.out[i] == '\n') newline_count++;
+    AGENT_TEST_ASSERT(newline_count == 2);
 
     free(w.out);
     pthread_mutex_destroy(&w.mu);
@@ -8084,6 +8324,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_glm_stream_greedy_sampling_boundaries();
     test_agent_dsml_stream_tool_call_chunked();
     test_agent_json_events_read_tool_omits_reading_summary();
+    test_agent_json_events_multi_call_block_stamps_call_idx();
     test_agent_glm_tool_parser_rejects_missing_value();
     test_agent_tagged_structural_candidate_guard();
     test_agent_json_events_bash_observation_tail_wraps_as_tool_output();
@@ -8092,6 +8333,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_json_events_unknown_tool_header_wraps_as_tool_output();
     test_agent_emit_status_event_covers_all_eight_states();
     test_agent_emit_status_event_escapes_error_field();
+    test_agent_maybe_emit_status_event_distinguishes_collapsed_states();
     test_agent_emit_bare_event_ready_and_queued();
     test_agent_json_events_param_value_utf8_boundary_no_tear();
     test_agent_publish_backstop_wraps_unguarded_bytes_as_text();
@@ -8940,7 +9182,7 @@ static char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
     return agent_buf_take(&out);
 }
 
-static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
+static void agent_bash_publish_observation(agent_worker *w, const char *obs, int idx) {
     if (!obs || !obs[0]) return;
     const char *body = NULL;
     const char *notice = NULL;
@@ -8992,7 +9234,7 @@ static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
             if (notice) agent_buf_puts(&combined, notice);
             agent_buf_append(&combined, body, n);
             if (trailing_newline) agent_buf_puts(&combined, "\n");
-            agent_emit_tool_event(w, "output", NULL, NULL,
+            agent_emit_tool_event(w, "output", idx, NULL, NULL,
                                   combined.ptr ? combined.ptr : "", combined.len);
             free(combined.ptr);
             return;
@@ -9025,7 +9267,7 @@ static void agent_bash_refresh_for(agent_worker *w, agent_bash_job *job,
 /* Common implementation for bash, bash_status, and bash_stop. */
 static char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
                                         bool wait, int refresh_sec,
-                                        bool stop, bool remove_if_done) {
+                                        bool stop, bool remove_if_done, int idx) {
     if (stop && job->running) {
         kill(-job->pid, SIGTERM);
         kill(job->pid, SIGTERM);
@@ -9044,7 +9286,7 @@ static char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
     else agent_bash_poll(job);
 
     char *obs = agent_bash_observation(job, true);
-    agent_bash_publish_observation(w, obs);
+    agent_bash_publish_observation(w, obs, idx);
     if (remove_if_done && !job->running) agent_bash_remove_job(w, job);
     return obs;
 }
@@ -9065,7 +9307,7 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
 /* Execute one parsed DSML tool call and return the text that will be appended as
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
-static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call) {
+static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call, int idx) {
     agent_buf result = {0};
     if (!call->name) return xstrdup("Tool error: missing tool name\n");
 
@@ -9092,7 +9334,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
             agent_buf_puts(&result, "\n");
             return agent_buf_take(&result);
         }
-        return agent_bash_job_tool_result(w, job, true, refresh, false, true);
+        return agent_bash_job_tool_result(w, job, true, refresh, false, true, idx);
     }
 
     if (!strcmp(call->name, "bash_status") ||
@@ -9111,14 +9353,14 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
                                               60, 1, 3600);
         bool stop = !strcmp(call->name, "bash_stop");
         bool wait = stop;
-        return agent_bash_job_tool_result(w, job, wait, refresh, stop, true);
+        return agent_bash_job_tool_result(w, job, wait, refresh, stop, true, idx);
     }
 
     {
         char header[256];
         snprintf(header, sizeof(header), "\n[tool:%s] unknown tool\n", call->name);
         if (w->cfg->json_events)
-            agent_emit_tool_event(w, "output", NULL, NULL, header, strlen(header));
+            agent_emit_tool_event(w, "output", idx, NULL, NULL, header, strlen(header));
         else
             agent_publish(w, header, strlen(header));
         agent_buf_puts(&result, "Tool error: unknown tool: ");
@@ -9133,7 +9375,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
 static char *agent_execute_tool_calls(agent_worker *w, const agent_tool_calls *calls) {
     agent_buf all = {0};
     for (int i = 0; i < calls->len; i++) {
-        char *res = agent_execute_tool_call(w, &calls->v[i]);
+        char *res = agent_execute_tool_call(w, &calls->v[i], i);
         char hdr[128];
         snprintf(hdr, sizeof(hdr), "Tool result %d (%s):\n", i + 1,
                  calls->v[i].name ? calls->v[i].name : "unknown");
@@ -11942,7 +12184,11 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     agent_prompt_queue queue = {0};
     double quiet_deadline = 0.0;
     int rc = 0;
-    char last_status[256] = {0};
+    /* 512, not 256: in JSON mode the dedupe key below folds in st.error
+     * (itself up to 255 bytes) alongside the state name and every numeric
+     * field, and must not truncate -- a truncated key could alias two
+     * genuinely different states/errors onto the same comparison string. */
+    char last_status[512] = {0};
     double last_status_at = 0.0;
     agent_worker_state last_state = (agent_worker_state)-1;  /* nothing emitted yet */
 
@@ -12036,7 +12282,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         }
         free(out);
 
-        /* Publish status at most every 200 ms.  Dedupe on the whole formatted line:
+        /* Publish status at most every 200 ms.  Dedupe on a formatted line:
          * while generating, the token count changes so this emits at the throttle
          * rate, and at idle the numbers freeze so it emits once per transition
          * instead of repeating forever. */
@@ -12045,24 +12291,34 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             agent_format_status_line(&st, cur, sizeof(cur));
             double now = now_sec();
             bool state_changed = st.state != last_state;
+            /* Track every OBSERVED transition here, unconditionally -- not just
+             * ones that end up emitted below.  If this were only set inside the
+             * throttle-gated block, a transition swallowed by that gate would
+             * also corrupt state_changed's bookkeeping for the next iteration,
+             * compounding a dropped event into a dropped bypass too. */
+            last_state = st.state;
+
             /* A state change publishes immediately — the consumer's spinner keys off
              * the phase, and at idle the loop blocks in poll() indefinitely, so a
              * dropped transition is never retried. Within a state, throttle. */
-            if (strcmp(cur, last_status) != 0 &&
-                (state_changed || now - last_status_at >= 0.200)) {
-                if (cfg->json_events) {
-                    /* Publish through the worker's normal out buffer (not a
-                     * direct stdout write) so this event lands in the same
-                     * FIFO as text/tool events instead of possibly jumping
-                     * ahead of output still sitting in that buffer. */
-                    agent_emit_status_event(&worker, &st);
-                } else {
-                    write_all(STDERR_FILENO, cur, strlen(cur));
-                    write_all(STDERR_FILENO, "\n", 1);
-                }
+            if (cfg->json_events) {
+                /* agent_maybe_emit_status_event() has its own dedupe key --
+                 * it does NOT reuse `cur` (agent_format_status_line()'s
+                 * +DWARFSTAR_STATUS text), which is lossy for this purpose:
+                 * see that function's comment for why. Publishes through the
+                 * worker's normal out buffer (not a direct stdout write) so
+                 * the event lands in the same FIFO as text/tool events
+                 * instead of possibly jumping ahead of output still sitting
+                 * in that buffer. */
+                agent_maybe_emit_status_event(&worker, &st, state_changed, now,
+                                              last_status, sizeof(last_status),
+                                              &last_status_at);
+            } else if (strcmp(cur, last_status) != 0 &&
+                      (state_changed || now - last_status_at >= 0.200)) {
+                write_all(STDERR_FILENO, cur, strlen(cur));
+                write_all(STDERR_FILENO, "\n", 1);
                 snprintf(last_status, sizeof(last_status), "%s", cur);
                 last_status_at = now;
-                last_state = st.state;
             }
         }
 
