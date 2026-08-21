@@ -386,6 +386,8 @@ static void agent_worker_compact_stream_flush(agent_worker *w, agent_buf *pub,
  * visualizer hooks further up the file can call it. */
 static void agent_emit_tool_event(agent_worker *w, const char *phase, int idx,
                                   const char *key, const char *value,
+                                  const char *key2, const char *value2,
+                                  const char *int_key, int int_value,
                                   const char *s, size_t n);
 /* Bypass sink for callers that have already built a complete NDJSON line
  * (agent_emit_event_str and friends, near :4132) -- forward-declared here so
@@ -3414,7 +3416,7 @@ static void agent_tool_viz_start(agent_stream_renderer *sr) {
          * DSML start marker. */
         renderer_json_flush(sr->renderer);
         agent_emit_tool_event(sr->renderer->worker, "start", v->call_idx,
-                              NULL, NULL, NULL, 0);
+                              NULL, NULL, NULL, NULL, NULL, 0, NULL, 0);
         return;
     }
     if (sr->replay) {
@@ -3468,7 +3470,7 @@ static void agent_tool_viz_tool(agent_stream_renderer *sr, const char *name) {
     v->read_style = !strcmp(v->tool_name, "read");
     if (json_events) {
         agent_emit_tool_event(sr->renderer->worker, "tool", v->call_idx,
-                              "name", v->tool_name, NULL, 0);
+                              "name", v->tool_name, NULL, NULL, NULL, 0, NULL, 0);
         return;
     }
     agent_tool_viz_line_prefix(sr);
@@ -3651,7 +3653,8 @@ static void agent_tool_viz_param_begin(agent_stream_renderer *sr, const char *na
         v->json_param.len = 0;
         agent_emit_tool_event(sr->renderer->worker, "param_begin", v->call_idx,
                               "kind", agent_tool_param_kind_str(v->param_kind),
-                              NULL, 0);
+                              "name", v->param_name[0] ? v->param_name : NULL,
+                              NULL, 0, NULL, 0);
         return;
     }
 
@@ -3729,7 +3732,8 @@ static void agent_tool_viz_json_param_flush(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->json_param.len) return;
     agent_emit_tool_event(sr->renderer->worker, "param_value", v->call_idx,
-                          NULL, NULL, v->json_param.ptr, v->json_param.len);
+                          NULL, NULL, NULL, NULL, NULL, 0,
+                          v->json_param.ptr, v->json_param.len);
     v->json_param.len = 0;
 }
 
@@ -3749,7 +3753,8 @@ static void agent_tool_viz_json_param_flush_safe(agent_stream_renderer *sr) {
     size_t flush_len = v->json_param.len - hold;
     if (!flush_len) return; /* the whole buffer is still an incomplete tail */
     agent_emit_tool_event(sr->renderer->worker, "param_value", v->call_idx,
-                          NULL, NULL, v->json_param.ptr, flush_len);
+                          NULL, NULL, NULL, NULL, NULL, 0,
+                          v->json_param.ptr, flush_len);
     if (hold) memmove(v->json_param.ptr, v->json_param.ptr + flush_len, hold);
     v->json_param.len = hold;
     if (v->json_param.ptr) v->json_param.ptr[hold] = '\0';
@@ -3761,7 +3766,7 @@ static void agent_tool_viz_param_end(agent_stream_renderer *sr) {
     if (agent_tool_viz_json_events(sr)) {
         agent_tool_viz_json_param_flush(sr);
         agent_emit_tool_event(sr->renderer->worker, "param_end", v->call_idx,
-                              NULL, NULL, NULL, 0);
+                              NULL, NULL, NULL, NULL, NULL, 0, NULL, 0);
         v->param_active = false;
         v->param_name[0] = '\0';
         return;
@@ -3875,9 +3880,15 @@ static void agent_tool_viz_finish(agent_stream_renderer *sr, const char *status)
          * if another tool-call block follows in this turn, which would
          * otherwise leak this buffer on the last block of every turn. */
         agent_tool_viz_json_param_release(v);
+        /* Number of calls actually announced in this block, not v->call_idx
+         * + 1 unconditionally: call_idx_started gates whether call_idx was
+         * ever advanced past its agent_tool_viz_start memset-to-0, so an
+         * empty block (no "tool" event fired) must report 0 calls rather
+         * than 1. See agent_tool_visualizer.call_idx's comment. */
+        int calls = v->call_idx_started ? v->call_idx + 1 : 0;
         agent_emit_tool_event(sr->renderer->worker, "finish", v->call_idx,
                               "status", (status && status[0]) ? status : NULL,
-                              NULL, 0);
+                              NULL, NULL, "calls", calls, NULL, 0);
         v->active = false;
         return;
     }
@@ -4489,7 +4500,8 @@ static void agent_emit_event_str(agent_worker *w, const char *kind,
 }
 
 /* Emit one NDJSON tool event:
- * {"t":"tool","phase":"<phase>","idx":<idx>[,"<key>":"<value>"][,"s":"<s>"]}.
+ * {"t":"tool","phase":"<phase>","idx":<idx>[,"<key>":"<value>"]
+ *  [,"<key2>":"<value2>"][,"<int_key>":<int_value>][,"s":"<s>"]}.
  * `idx` is the zero-based index of the call this event belongs to within the
  * current DSML block (agent_tool_visualizer.call_idx) -- present on every
  * phase unconditionally (start/tool/param_begin/param_value/param_end/
@@ -4499,9 +4511,19 @@ static void agent_emit_event_str(agent_worker *w, const char *kind,
  * unsafe for multi-call blocks). Takes pre-built field text rather than a
  * printf-style format so callers cannot accidentally splice unescaped input
  * into the JSON -- name/kind/status and the raw value bytes are all escaped
- * here via agent_json_escape(). */
+ * here via agent_json_escape().
+ *
+ * `key`/`value` and `key2`/`value2` are independent optional string fields
+ * (each emitted only when both halves of its pair are non-NULL), so a caller
+ * needing two string fields on one event -- e.g. param_begin's "kind" and
+ * "name" -- does not have to split it across two NDJSON lines. `int_key`/
+ * `int_value` is a third optional field emitted as a bare JSON number (like
+ * `idx`), for a caller with a count rather than a string; it is emitted
+ * whenever `int_key` is non-NULL. */
 static void agent_emit_tool_event(agent_worker *w, const char *phase, int idx,
                                   const char *key, const char *value,
+                                  const char *key2, const char *value2,
+                                  const char *int_key, int int_value,
                                   const char *s, size_t n) {
     agent_buf b = {0};
     agent_buf_puts(&b, "{\"t\":\"tool\",\"phase\":\"");
@@ -4516,6 +4538,21 @@ static void agent_emit_tool_event(agent_worker *w, const char *phase, int idx,
         agent_buf_puts(&b, "\":\"");
         agent_json_escape(&b, value, strlen(value));
         agent_buf_puts(&b, "\"");
+    }
+    if (key2 && value2) {
+        agent_buf_puts(&b, ",\"");
+        agent_buf_puts(&b, key2);
+        agent_buf_puts(&b, "\":\"");
+        agent_json_escape(&b, value2, strlen(value2));
+        agent_buf_puts(&b, "\"");
+    }
+    if (int_key) {
+        agent_buf_puts(&b, ",\"");
+        agent_buf_puts(&b, int_key);
+        agent_buf_puts(&b, "\":");
+        char int_str[24];
+        snprintf(int_str, sizeof(int_str), "%d", int_value);
+        agent_buf_puts(&b, int_str);
     }
     if (s) {
         agent_buf_puts(&b, ",\"s\":\"");
@@ -7797,6 +7834,186 @@ static void test_agent_json_events_multi_call_block_stamps_call_idx(void) {
     pthread_mutex_destroy(&w.mu);
 }
 
+/* Regression test for Task 3.10 fix 1 (Important, "param_begin cannot
+ * identify which parameter it describes"): agent_tool_param_kind_for() maps
+ * many distinct parameter names onto the same agent_tool_param_kind --
+ * start_line, max_lines, end_line, offset, timeout_sec, and refresh_sec all
+ * collapse onto AGENT_TOOL_PARAM_OFFSET ("offset"). Before this fix,
+ * "param_begin" carried only "kind", so a read call with both start_line and
+ * max_lines produced two indistinguishable "kind":"offset" events -- a
+ * consumer could not tell which one belonged to which parameter without
+ * assuming a fixed emission order. This feeds a "read" call with exactly that
+ * pair of same-kind parameters and asserts each "param_begin" event now also
+ * carries the correct "name", not just matching kinds. A test using two
+ * parameters of *different* kinds (e.g. "path" and "start_line") would not
+ * pin this: kind alone would already disambiguate them, so it would pass
+ * even if "name" were wired up backwards or dropped. */
+static void test_agent_json_events_param_begin_carries_name_for_same_kind_params(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    agent_token_renderer renderer = {
+        .worker = &w,
+        .format_thinking = true,
+        .format_markdown = false,
+        .last_output_newline = true,
+    };
+    agent_dsml_parser p = {
+        .syntax = AGENT_TOOL_SYNTAX_DSML,
+        .state = AGENT_DSML_SEARCH,
+    };
+    agent_stream_renderer stream = {
+        .renderer = &renderer,
+        .parser = &p,
+        .syntax = AGENT_TOOL_SYNTAX_DSML,
+    };
+
+    const char *text =
+        "<｜DSML｜tool_calls><｜DSML｜invoke name=\"read\">"
+        "<｜DSML｜parameter name=\"start_line\" string=\"true\">100</｜DSML｜parameter>"
+        "<｜DSML｜parameter name=\"max_lines\" string=\"true\">50</｜DSML｜parameter>"
+        "</｜DSML｜invoke></｜DSML｜tool_calls>";
+    size_t len = strlen(text);
+    for (size_t i = 0; i < len; i++)
+        agent_stream_text(&stream, text + i, 1, false);
+    agent_stream_text(&stream, NULL, 0, true);
+    renderer_finish(&renderer);
+
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(w.out != NULL);
+
+    /* Both parameters share kind "offset" -- the pre-fix wire format could
+     * not tell them apart. The fix adds "name" alongside "kind". */
+    const char *begin_start_line = strstr(w.out,
+        "\"phase\":\"param_begin\",\"idx\":0,\"kind\":\"offset\",\"name\":\"start_line\"");
+    const char *begin_max_lines = strstr(w.out,
+        "\"phase\":\"param_begin\",\"idx\":0,\"kind\":\"offset\",\"name\":\"max_lines\"");
+    AGENT_TEST_ASSERT(begin_start_line != NULL);
+    AGENT_TEST_ASSERT(begin_max_lines != NULL);
+    /* start_line's param_begin precedes max_lines' in emission order. */
+    AGENT_TEST_ASSERT(begin_start_line < begin_max_lines);
+
+    agent_dsml_parser_free(&p);
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* Regression test for Task 3.10 fix 2 (Minor, "finish reuses the last call's
+ * idx, which is ambiguous at zero"): before this fix, "finish" carried only
+ * the last real call's idx, so a block with a single call at idx 0 and a
+ * block with zero calls were both reported as "idx":0 -- indistinguishable
+ * without an independent count. The fix adds a "calls" field carrying the
+ * actual number of calls announced in the block.
+ *
+ * Part A feeds the same two-invoke block as
+ * test_agent_json_events_multi_call_block_stamps_call_idx() above and checks
+ * "finish" carries "calls":2 (idx stays 1, the last call's index -- untouched
+ * by this fix per the brief's constraint).
+ *
+ * Part B feeds a tool_calls block that opens and closes with no <invoke> at
+ * all -- the zero-call case the fix exists for -- and checks "finish" carries
+ * "calls":0 rather than omitting the field or reporting a stale idx as if it
+ * were a real count. */
+static void test_agent_json_events_finish_carries_calls_count(void) {
+    /* Part A: multi-call block -> calls:2. */
+    {
+        agent_worker w = {0};
+        pthread_mutex_init(&w.mu, NULL);
+        w.wake_fd[1] = -1;
+        agent_config cfg = { .json_events = true };
+        w.cfg = &cfg;
+
+        agent_token_renderer renderer = {
+            .worker = &w,
+            .format_thinking = true,
+            .format_markdown = false,
+            .last_output_newline = true,
+        };
+        agent_dsml_parser p = {
+            .syntax = AGENT_TOOL_SYNTAX_DSML,
+            .state = AGENT_DSML_SEARCH,
+        };
+        agent_stream_renderer stream = {
+            .renderer = &renderer,
+            .parser = &p,
+            .syntax = AGENT_TOOL_SYNTAX_DSML,
+        };
+
+        const char *text =
+            "<｜DSML｜tool_calls>"
+            "<｜DSML｜invoke name=\"read\">"
+            "<｜DSML｜parameter name=\"path\" string=\"true\">file_a.c</｜DSML｜parameter>"
+            "</｜DSML｜invoke>"
+            "<｜DSML｜invoke name=\"read\">"
+            "<｜DSML｜parameter name=\"path\" string=\"true\">file_b.c</｜DSML｜parameter>"
+            "</｜DSML｜invoke>"
+            "</｜DSML｜tool_calls>";
+        size_t len = strlen(text);
+        for (size_t i = 0; i < len; i++)
+            agent_stream_text(&stream, text + i, 1, false);
+        agent_stream_text(&stream, NULL, 0, true);
+        renderer_finish(&renderer);
+
+        AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+        AGENT_TEST_ASSERT(p.calls.len == 2);
+        AGENT_TEST_ASSERT(w.out != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out,
+            "\"phase\":\"finish\",\"idx\":1,\"calls\":2") != NULL);
+
+        agent_dsml_parser_free(&p);
+        free(w.out);
+        pthread_mutex_destroy(&w.mu);
+    }
+
+    /* Part B: zero-call block (no <invoke> ever seen) -> calls:0. */
+    {
+        agent_worker w = {0};
+        pthread_mutex_init(&w.mu, NULL);
+        w.wake_fd[1] = -1;
+        agent_config cfg = { .json_events = true };
+        w.cfg = &cfg;
+
+        agent_token_renderer renderer = {
+            .worker = &w,
+            .format_thinking = true,
+            .format_markdown = false,
+            .last_output_newline = true,
+        };
+        agent_dsml_parser p = {
+            .syntax = AGENT_TOOL_SYNTAX_DSML,
+            .state = AGENT_DSML_SEARCH,
+        };
+        agent_stream_renderer stream = {
+            .renderer = &renderer,
+            .parser = &p,
+            .syntax = AGENT_TOOL_SYNTAX_DSML,
+        };
+
+        const char *text = "<｜DSML｜tool_calls></｜DSML｜tool_calls>";
+        size_t len = strlen(text);
+        for (size_t i = 0; i < len; i++)
+            agent_stream_text(&stream, text + i, 1, false);
+        agent_stream_text(&stream, NULL, 0, true);
+        renderer_finish(&renderer);
+
+        AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+        AGENT_TEST_ASSERT(w.out != NULL);
+        /* No "tool" event was ever announced (no <invoke> was seen), so
+         * call_idx never advanced past agent_tool_viz_start's memset-to-0 --
+         * idx stays 0, and the fix's "calls" field must read 0, not 1. */
+        AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"tool\"") == NULL);
+        AGENT_TEST_ASSERT(strstr(w.out,
+            "\"phase\":\"finish\",\"idx\":0,\"calls\":0") != NULL);
+
+        agent_dsml_parser_free(&p);
+        free(w.out);
+        pthread_mutex_destroy(&w.mu);
+    }
+}
+
 static void test_agent_glm_tool_parser_rejects_missing_value(void) {
     const char *text = "<tool_call>list<arg_key>path</arg_key></tool_call>";
     agent_dsml_parser p = {
@@ -9014,6 +9231,8 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_dsml_stream_tool_call_chunked();
     test_agent_json_events_read_tool_omits_reading_summary();
     test_agent_json_events_multi_call_block_stamps_call_idx();
+    test_agent_json_events_param_begin_carries_name_for_same_kind_params();
+    test_agent_json_events_finish_carries_calls_count();
     test_agent_glm_tool_parser_rejects_missing_value();
     test_agent_tagged_structural_candidate_guard();
     test_agent_json_events_bash_observation_tail_wraps_as_tool_output();
@@ -9974,7 +10193,7 @@ static void agent_bash_publish_observation(agent_worker *w, const char *obs, int
             } else if (trailing_newline) {
                 agent_buf_puts(&combined, "\n");
             }
-            agent_emit_tool_event(w, "output", idx, NULL, NULL,
+            agent_emit_tool_event(w, "output", idx, NULL, NULL, NULL, NULL, NULL, 0,
                                   combined.ptr ? combined.ptr : "", combined.len);
             free(combined.ptr);
             return;
@@ -10100,7 +10319,8 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
         char header[256];
         snprintf(header, sizeof(header), "\n[tool:%s] unknown tool\n", call->name);
         if (w->cfg->json_events)
-            agent_emit_tool_event(w, "output", idx, NULL, NULL, header, strlen(header));
+            agent_emit_tool_event(w, "output", idx, NULL, NULL, NULL, NULL, NULL, 0,
+                                  header, strlen(header));
         else
             agent_publish(w, header, strlen(header));
         agent_buf_puts(&result, "Tool error: unknown tool: ");
