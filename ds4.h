@@ -187,6 +187,17 @@ typedef struct {
     uint32_t comp_cap;
 } ds4_context_memory;
 
+/* Startup memory budget for a session, computed once when the engine opens.
+ * Constant for the life of the engine: KV is allocated upfront for the whole
+ * context, so these do not vary with usage. Mirrors the "ds4: memory:" startup
+ * log line exactly — both come from the same computation. */
+typedef struct {
+    uint64_t kv_bytes;       /* raw + compressed KV cache */
+    uint64_t scratch_bytes;  /* per-context prefill scratch */
+    uint64_t model_bytes;    /* resident model span */
+    uint64_t planned_bytes;  /* total, including buffers and reserves */
+} ds4_memory_plan;
+
 typedef struct {
     uint8_t *ptr;
     uint64_t len;
@@ -228,6 +239,9 @@ int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
+/* Copies the engine's startup memory plan into *out. Returns false if the
+ * engine has not computed one (e or out NULL, or opened with ctx_size <= 0). */
+bool ds4_engine_memory_plan(const ds4_engine *e, ds4_memory_plan *out);
 /* Decode gate schedule for the TP transport; see ds4_tp_identity. */
 void ds4_engine_tp_gate_schedule(ds4_engine *e,
                                  uint32_t *start,

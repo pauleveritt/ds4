@@ -36144,6 +36144,8 @@ struct ds4_engine {
     uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
     uint64_t startup_model_span_bytes;
+    ds4_memory_plan startup_memory;
+    bool            startup_memory_valid;
     ds4_ssd_memory_lock simulated_memory;
     bool quality;
     bool glm_mtp;
@@ -36240,6 +36242,19 @@ static void ds4_engine_print_startup_memory(
     total = ds4_add_sat_u64(total, e->ssd_streaming_full_layer_bytes);
     total = ds4_add_sat_u64(total, expert_reserved_bytes);
 
+    /* Cache for ds4_engine_memory_plan(). Deliberately stored here rather than
+     * recomputed: this function already owns the distributed/non-distributed
+     * branch, so the accessor and the log line can never disagree. The cast
+     * drops const only to fill a cache; no observable engine state changes. */
+    {
+        ds4_engine *self = (ds4_engine *)e;
+        self->startup_memory.kv_bytes      = kv_bytes;
+        self->startup_memory.scratch_bytes = mem.scratch_bytes;
+        self->startup_memory.model_bytes   = e->startup_model_span_bytes;
+        self->startup_memory.planned_bytes = total;
+        self->startup_memory_valid         = true;
+    }
+
     const bool color = ds4_log_is_tty(stderr);
     const char *green = color ? "\x1b[32m" : "";
     const char *bright_green = color ? "\x1b[1;32m" : "";
@@ -36290,6 +36305,12 @@ static void ds4_engine_print_startup_memory(
             mem.comp_cap,
             ds4_backend_name(e->backend),
             reset);
+}
+
+bool ds4_engine_memory_plan(const ds4_engine *e, ds4_memory_plan *out) {
+    if (!e || !out || !e->startup_memory_valid) return false;
+    *out = e->startup_memory;
+    return true;
 }
 
 static bool cpu_directional_steering_enabled(
