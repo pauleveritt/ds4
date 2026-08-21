@@ -8380,32 +8380,66 @@ static void test_agent_json_events_param_value_utf8_boundary_no_tear(void) {
  *
  * Driving the real token loop would need a live model/session, so this
  * drives the helper directly the same way agent_worker_compact()'s loop
- * does: append per "token" via agent_buf_append(), check the 4096-byte
- * threshold and flush(force=false) after each append, then flush(force=
- * true) once at the end. The em dash (U+2014, 3 bytes: E2 80 94) is fed as
- * two separate "token" appends -- one carrying just its lead byte, the next
- * carrying its two continuation bytes -- so the threshold trips exactly
- * between them and the split lands mid-character rather than at a clean
- * boundary. That mirrors a byte-fallback tokenizer emitting a multi-byte
- * character across more than one token, which is the real-world shape of
- * this bug (see the task brief's account of ds4_token_text output).
+ * does. Two scenarios, since the fix has two distinct halves:
  *
- * The important property (per the task brief) is that no emitted event
- * contains a torn sequence, not just that events were emitted, so this
- * reconstructs every "text" event's "s" field (mirroring the "param_value"
- * reconstruction just above) and asserts each individually-emitted chunk is
- * valid UTF-8 on its own: it never opens on a stray continuation byte and
- * never ends on an incomplete multi-byte lead sequence. A test that only
- * counted events would pass even with the tearing bug intact.
+ * Part A: interior threshold, force=false. 4095 one-byte ASCII "tokens",
+ * then the em dash's lead byte as its own "token" (pub.len becomes exactly
+ * 4096, tripping the threshold with only 1 of the em dash's 3 bytes
+ * present), then its two continuation bytes as a second "token", then
+ * trailing ASCII, checking the 4096-byte threshold and flushing
+ * force=false after each append. That mirrors a byte-fallback tokenizer
+ * emitting a multi-byte character across more than one token, which is the
+ * real-world shape of this bug (see the task brief's account of
+ * ds4_token_text output). The held-back lead byte must survive to be
+ * completed by the next append, and the em dash must appear whole in the
+ * output.
  *
- * Confirmed not vacuous: temporarily replaced the call under test with a
- * bare "agent_publish(w, pub->ptr, pub->len); pub->len = 0;" (no UTF-8
- * holdback -- the pre-fix behavior applied to this buffering site) and
- * reran. The first emitted event's payload then ends on the bare 0xE2 lead
- * byte, so the "agent_utf8_incomplete_tail_len(sval, chunk_len) == 0"
- * assertion on that chunk fails as expected. The substitution was then
- * reverted and the test re-confirmed passing. */
+ * Part B (fix-round 1): terminal force=true with an incomplete tail still
+ * pending -- the case Part A does not cover, since Part A's force=true call
+ * only ever drains an already-complete buffer. This is the shape a real
+ * compaction hits when the token loop stops (summary_max reached, a
+ * stop/dsml_id token, an error, or an interrupt) immediately after a
+ * byte-fallback lead-byte token, with no chance for the continuation bytes
+ * to ever arrive. Feeds ordinary ASCII text followed by just the em dash's
+ * lead byte, then calls flush(force=true) directly with nothing further
+ * appended -- exactly what the real loop's post-loop drain does on that
+ * exit path. Asserts the dangling lead byte is dropped rather than
+ * emitted: every "text" event's payload is independently valid UTF-8 (so a
+ * naive "force just means don't hold anything back" reading of the fix
+ * would fail this), the reconstructed output is exactly the ASCII prefix
+ * with no partial character appended, and the buffer is left empty
+ * afterward (nothing lingers to be double-emitted or leaked).
+ *
+ * For both parts, the important property (per the task brief and the
+ * fix-round-1 review) is that no emitted event contains a torn sequence,
+ * not just that events were emitted, so this reconstructs every "text"
+ * event's "s" field (mirroring the "param_value" reconstruction just
+ * above) and asserts each individually-emitted chunk is valid UTF-8 on its
+ * own: it never opens on a stray continuation byte and never ends on an
+ * incomplete multi-byte lead sequence. A test that only counted events
+ * would pass even with the tearing bug intact.
+ *
+ * Confirmed not vacuous, in two steps corresponding to the fix's two
+ * halves:
+ *  - Original bug (Part A): temporarily replaced the call under test with
+ *    a bare "agent_publish(w, pub->ptr, pub->len); pub->len = 0;" (no UTF-8
+ *    holdback at all) and reran. The first emitted event's payload then
+ *    ends on the bare 0xE2 lead byte, so Part A's
+ *    "agent_utf8_incomplete_tail_len(sval, chunk_len) == 0" assertion
+ *    fails as expected.
+ *  - Fix-round-1 gap (Part B): with the holdback restored but
+ *    "size_t hold = force ? 0 : agent_utf8_incomplete_tail_len(...);" (the
+ *    pre-fix-round-1 shape, which zeroes the holdback unconditionally under
+ *    force), reran. Part B's payload then ends on the bare 0xE2 lead byte
+ *    too, so its "agent_utf8_incomplete_tail_len(sval, chunk_len) == 0"
+ *    assertion fails, and the "reconstructed.len == strlen(prefix)"
+ *    assertion also fails since the dangling byte is emitted instead of
+ *    dropped.
+ * Both substitutions were reverted afterward and the test re-confirmed
+ * passing. */
 static void test_agent_worker_compact_stream_flush_no_utf8_tear(void) {
+    /* Part A: interior threshold (force=false) does not tear a character
+     * split across the 4096-byte boundary. */
     agent_worker w = {0};
     pthread_mutex_init(&w.mu, NULL);
     w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
@@ -8414,10 +8448,6 @@ static void test_agent_worker_compact_stream_flush_no_utf8_tear(void) {
 
     agent_buf pub = {0};
 
-    /* 4095 one-byte ASCII "tokens", then the em dash's lead byte as its own
-     * "token" (pub.len becomes exactly 4096, tripping the threshold with
-     * only 1 of the em dash's 3 bytes present), then its two continuation
-     * bytes as a second "token", then trailing ASCII. */
     for (int i = 0; i < 4095; i++) {
         agent_buf_append(&pub, "a", 1);
         if (pub.len >= 4096) agent_worker_compact_stream_flush(&w, &pub, false);
@@ -8471,6 +8501,60 @@ static void test_agent_worker_compact_stream_flush_no_utf8_tear(void) {
     free(reconstructed.ptr);
     free(w.out);
     pthread_mutex_destroy(&w.mu);
+
+    /* Part B: terminal force=true with an incomplete tail still pending --
+     * the stream ends (summary_max/stop-token/error/interrupt) right after
+     * a byte-fallback lead byte, with no continuation bytes ever coming.
+     * The dangling lead byte must be dropped, not emitted torn. */
+    agent_worker w2 = {0};
+    pthread_mutex_init(&w2.mu, NULL);
+    w2.wake_fd[1] = -1;
+    agent_config cfg2 = { .json_events = true };
+    w2.cfg = &cfg2;
+
+    agent_buf pub2 = {0};
+    const char *prefix = "durable task state so far: ";
+    agent_buf_append(&pub2, prefix, strlen(prefix));
+    agent_buf_append(&pub2, "\xe2", 1); /* dangling lead byte; loop stops right here */
+    agent_worker_compact_stream_flush(&w2, &pub2, true);
+
+    AGENT_TEST_ASSERT(pub2.len == 0); /* dropped, not held for a flush that will never come */
+    AGENT_TEST_ASSERT(w2.out != NULL);
+
+    agent_buf reconstructed2 = {0};
+    pos = 0;
+    event_count = 0;
+    while (pos < w2.out_len) {
+        const char *line_start = w2.out + pos;
+        const char *newline = memchr(line_start, '\n', w2.out_len - pos);
+        size_t line_len = newline ? (size_t)(newline - line_start) : (w2.out_len - pos);
+        const char *skey = agent_memmem(line_start, line_len, "\"s\":\"", 5);
+        AGENT_TEST_ASSERT(skey != NULL);
+        const char *sval = skey + 5;
+        const char *line_end = line_start + line_len;
+        AGENT_TEST_ASSERT((size_t)(line_end - sval) >= 2);
+        const char *send = line_end - 2;
+        size_t chunk_len = (size_t)(send - sval);
+
+        if (chunk_len) {
+            AGENT_TEST_ASSERT(((unsigned char)sval[0] & 0xC0) != 0x80);
+            AGENT_TEST_ASSERT(agent_utf8_incomplete_tail_len(sval, chunk_len) == 0);
+        }
+        agent_buf_append(&reconstructed2, sval, chunk_len);
+        event_count++;
+        pos += line_len + (newline ? 1 : 0);
+    }
+
+    AGENT_TEST_ASSERT(event_count >= 1);
+    /* The dangling 0xE2 must not appear anywhere in the output: exactly the
+     * ASCII prefix, nothing more. */
+    AGENT_TEST_ASSERT(reconstructed2.len == strlen(prefix));
+    AGENT_TEST_ASSERT(!memcmp(reconstructed2.ptr, prefix, strlen(prefix)));
+
+    free(reconstructed2.ptr);
+    free(pub2.ptr);
+    free(w2.out);
+    pthread_mutex_destroy(&w2.mu);
 }
 
 /* Regression test for the NDJSON contract's backstop (Task 3.5). Per-site
@@ -10164,20 +10248,39 @@ static char *agent_compact_make_prompt(const char *reason) {
  * silently drops. Mirrors agent_tool_viz_json_param_flush_safe()'s pattern
  * for the identical class of bug at the tool-param-streaming site.
  *
- * force=true drains the whole buffer unconditionally (used once, right
- * after the token loop ends on every exit path -- normal completion, error,
- * and interrupt -- so nothing is ever left unpublished). force=false holds
- * back any trailing incomplete UTF-8 sequence via
+ * force=false holds back any trailing incomplete UTF-8 sequence via
  * agent_utf8_incomplete_tail_len() so only whole characters are ever
  * published; that is used at the periodic 4096-byte threshold inside the
- * loop. The caller owns pub->ptr and must free() it once done -- a cheap
- * no-op if json_events was never true, since then nothing was ever
- * appended. */
+ * loop, where a held-back tail can still be completed by the next append.
+ *
+ * force=true drains the buffer unconditionally (used once, right after the
+ * token loop ends, on every exit path -- normal completion, error, and
+ * interrupt). It still checks for an incomplete trailing sequence, but here
+ * there is no "next append" to complete it with: the stream has ended
+ * (summary_max reached, a stop/dsml_id token, an error, or an interrupt can
+ * all land right after a byte-fallback lead byte, e.g. the model stops
+ * immediately after emitting the 0xE2 of an em dash). Emitting those
+ * trailing bytes anyway would produce the exact torn-UTF-8 "text" event
+ * this function exists to prevent, so they are dropped instead -- a
+ * truncated partial character that can never be completed once the stream
+ * is over is correctly lost, not correctly mis-emitted. The caller owns
+ * pub->ptr and must free() it once done -- a cheap no-op if json_events was
+ * never true, since then nothing was ever appended.
+ *
+ * worker_raw_prompt_stream_flush() is a deliberate duplicate of this exact
+ * logic for a different call site; keep the two in sync by hand -- nothing
+ * enforces it mechanically. */
 static void agent_worker_compact_stream_flush(agent_worker *w, agent_buf *pub,
                                               bool force) {
     if (!pub->len) return;
-    size_t hold = force ? 0 : agent_utf8_incomplete_tail_len(pub->ptr, pub->len);
+    size_t hold = agent_utf8_incomplete_tail_len(pub->ptr, pub->len);
     size_t flush_len = pub->len - hold;
+    if (force) {
+        if (flush_len) agent_publish(w, pub->ptr, flush_len);
+        pub->len = 0;
+        if (pub->ptr) pub->ptr[0] = '\0';
+        return;
+    }
     if (!flush_len) return;
     agent_publish(w, pub->ptr, flush_len);
     if (hold) memmove(pub->ptr, pub->ptr + flush_len, hold);
@@ -11076,12 +11179,28 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
  * flush-with-holdback logic rather than a shared helper -- raw-prompt mode
  * is unused by the app and lower stakes, and the task that added this asked
  * for the two sites to stay independent rather than factored into one
- * abstraction. */
+ * abstraction.
+ *
+ * force=false holds back any trailing incomplete UTF-8 sequence so a
+ * held-back tail can still be completed by the next append. force=true
+ * (end of the sampling loop, every exit path) still checks for an
+ * incomplete trailing sequence, but there is no further append to complete
+ * it with once generation has stopped -- so instead of emitting it torn,
+ * those trailing bytes are dropped: see
+ * agent_worker_compact_stream_flush()'s matching comment for the full
+ * rationale (this function must be kept in sync with that one -- they are
+ * deliberate duplicates, but nothing enforces it mechanically). */
 static void worker_raw_prompt_stream_flush(agent_worker *w, agent_buf *pub,
                                            bool force) {
     if (!pub->len) return;
-    size_t hold = force ? 0 : agent_utf8_incomplete_tail_len(pub->ptr, pub->len);
+    size_t hold = agent_utf8_incomplete_tail_len(pub->ptr, pub->len);
     size_t flush_len = pub->len - hold;
+    if (force) {
+        if (flush_len) agent_publish(w, pub->ptr, flush_len);
+        pub->len = 0;
+        if (pub->ptr) pub->ptr[0] = '\0';
+        return;
+    }
     if (!flush_len) return;
     agent_publish(w, pub->ptr, flush_len);
     if (hold) memmove(pub->ptr, pub->ptr + flush_len, hold);
