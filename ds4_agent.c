@@ -870,6 +870,20 @@ static agent_config parse_options(int argc, char **argv) {
                 "ds4-agent: --raw-prompt is only supported with --non-interactive -p\n");
         exit(2);
     }
+    /* Every --json-events gate in this file keys off cfg->json_events alone,
+     * not non_interactive -- so with --json-events but no --non-interactive,
+     * worker output gets JSON-wrapped while linenoise prompts/redraws,
+     * slash-command output, and the user-prompt echo all still hit stdout
+     * raw, producing a broken hybrid stream, and the interactive loop never
+     * emits "ready"/"queued"/"status" at all. Reject the combination here,
+     * at option-parse time (before any model load), rather than silently
+     * implying --non-interactive: quietly changing a mode the user asked
+     * for is worse than refusing outright. */
+    if (c.json_events && !c.non_interactive) {
+        fprintf(stderr,
+                "ds4-agent: --json-events is only supported with --non-interactive\n");
+        exit(2);
+    }
     return c;
 }
 
@@ -3834,6 +3848,23 @@ static void agent_tool_viz_param_value_byte(agent_stream_renderer *sr, char c) {
     agent_tool_viz_param_raw_byte(sr, c);
 }
 
+/* Free agent_tool_visualizer.json_param -- the --json-events buffer that
+ * accumulates one tool parameter's raw value bytes between "param_value"
+ * flushes (see agent_tool_viz_param_raw_byte) -- without emitting anything.
+ * Kept as its own small helper, alongside renderer_json_release() for the
+ * sibling json_pending buffer, so every release site (agent_tool_viz_finish's
+ * normal-close path below, and worker_run_turn's turn_fail hard-error
+ * bail-out) shares one place that knows how to retire this buffer; a future
+ * buffer added to agent_tool_visualizer has an obvious spot to be released
+ * from too. Safe to call whether or not a buffer was ever allocated, and
+ * safe to call more than once. */
+static void agent_tool_viz_json_param_release(agent_tool_visualizer *v) {
+    free(v->json_param.ptr);
+    v->json_param.ptr = NULL;
+    v->json_param.cap = 0;
+    v->json_param.len = 0;
+}
+
 static void agent_tool_viz_finish(agent_stream_renderer *sr, const char *status) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->active) return;
@@ -3843,10 +3874,7 @@ static void agent_tool_viz_finish(agent_stream_renderer *sr, const char *status)
          * next agent_tool_viz_start's memset -- that memset only runs again
          * if another tool-call block follows in this turn, which would
          * otherwise leak this buffer on the last block of every turn. */
-        free(v->json_param.ptr);
-        v->json_param.ptr = NULL;
-        v->json_param.cap = 0;
-        v->json_param.len = 0;
+        agent_tool_viz_json_param_release(v);
         agent_emit_tool_event(sr->renderer->worker, "finish", v->call_idx,
                               "status", (status && status[0]) ? status : NULL,
                               NULL, 0);
@@ -4608,6 +4636,48 @@ static void agent_maybe_emit_status_event(agent_worker *w, const agent_status *s
         snprintf(last_json_key, last_json_key_cap, "%s", json_key);
         *last_status_at = now;
     }
+}
+
+/* Decide whether the un-flagged +DWARFSTAR_STATUS stderr marker should be
+ * emitted for `cur` right now, and if so, update the caller's dedupe
+ * bookkeeping (`last_status`, `last_status_at`, `*last_emitted_state`) to
+ * match. Extracted from run_agent_non_interactive's status-emission site so
+ * this decision -- unchanged in substance since before --json-events existed
+ * -- is independently testable without a live ds4_engine, the same reason
+ * agent_maybe_emit_status_event() above was extracted.
+ *
+ * `*last_emitted_state` must advance ONLY when this function returns true,
+ * i.e. only on an actual emission -- this restores the pre-json-events
+ * behavior (verified at 9bca6d4:11198), where the single `last_state`
+ * variable this loop used was assigned exclusively inside the emission
+ * branch. That is deliberately a SEPARATE variable from the call site's own
+ * `last_state`, which the JSON branch's agent_maybe_emit_status_event() call
+ * needs updated on every OBSERVED transition regardless of whether this
+ * function's sibling decides to emit (see that function's caller-contract
+ * comment for why). The two branches used to share one `last_state`
+ * variable; once the JSON branch's unconditional-update requirement was
+ * added, that sharing silently changed this un-flagged branch's semantics
+ * too -- a transition swallowed by the `strcmp(cur, last_status) != 0`
+ * dedupe (e.g. DRAINING -> IDLE formatting to the identical marker text)
+ * would still advance the shared `last_state`, so a *later* un-flagged
+ * transition's state-changed bypass could differ from what the pre-refactor
+ * code would have computed for it (throttled where it used to bypass, or
+ * vice versa). Un-flagged output must stay byte-identical to before
+ * --json-events existed, so this branch gets its own tracker instead. */
+static bool agent_maybe_emit_marker_status(const char *cur, double now,
+                                           char *last_status, size_t last_status_cap,
+                                           double *last_status_at,
+                                           agent_worker_state state,
+                                           agent_worker_state *last_emitted_state) {
+    bool marker_state_changed = state != *last_emitted_state;
+    if (strcmp(cur, last_status) != 0 &&
+        (marker_state_changed || now - *last_status_at >= 0.200)) {
+        snprintf(last_status, last_status_cap, "%s", cur);
+        *last_status_at = now;
+        *last_emitted_state = state;
+        return true;
+    }
+    return false;
 }
 
 static bool agent_tokens_equal(const ds4_tokens *a, const ds4_tokens *b) {
@@ -8589,6 +8659,259 @@ static void test_agent_json_events_time_based_flush(void) {
     pthread_mutex_destroy(&w.mu);
 }
 
+/* Best-effort regression coverage for task 3.9 Fix 1: worker_run_turn's
+ * turn_fail bail-out (reached by three `goto`s inside the generation loop on
+ * a hard mid-generation error) used to release renderer.json_pending but
+ * never stream.viz.json_param, and never closed a tool block that was
+ * mid-parameter-stream when the error hit -- up to ~4KB of buffered
+ * parameter-value bytes leaked, and the consumer's open tool card was left
+ * dangling (only the unrelated "error" status event ever followed).
+ *
+ * Driving turn_fail itself needs a live ds4_engine/session (it is reached
+ * from deep inside worker_run_turn's token-generation loop), so this instead
+ * drives agent_tool_viz_finish() directly -- the exact call the fix adds to
+ * turn_fail in place of a bare free -- with a viz state that mirrors what
+ * worker_accept_generated_token() failing mid-parameter leaves behind: an
+ * open tool block, an open parameter, and json_param holding bytes not yet
+ * flushed as a "param_value" event. This proves the primitive turn_fail now
+ * relies on actually frees the buffer (not just empties it) and actually
+ * closes the block on the wire (flushes the pending param bytes, ends the
+ * param, emits exactly one "finish" carrying the error status) rather than
+ * leaving it dangling.
+ *
+ * This does NOT exercise turn_fail's own `goto` sites or confirm they now
+ * call agent_tool_viz_finish() -- that integration needs a live engine and
+ * is not covered by any automated test here; it was instead checked by
+ * inspection (every `goto turn_fail` site precedes, in the same generation
+ * loop, the only other call that can reach agent_tool_viz_finish() for this
+ * invocation -- see turn_fail's own comment) and by the manual CLI check in
+ * the report. What this test does confirm, and non-vacuously: temporarily
+ * changed `stream.viz.active = true;` to `false` above (simulating
+ * turn_fail firing before any tool block had opened, so
+ * agent_tool_viz_finish() must no-op per its `if (!v->active) return;`
+ * guard) and reran -- every assertion failed as expected: json_param stayed
+ * non-NULL (the early return skips the free too, which is also correct: a
+ * viz that was never started has nothing of its own to release), and w.out
+ * stayed NULL since nothing was published. Reverted afterward and
+ * re-confirmed passing. That block-not-open no-op is one case turn_fail's
+ * error path can hit; this test's default state (active/param_active/
+ * json_param populated) exercises the mid-stream leak case the fix targets. */
+static void test_agent_tool_viz_finish_releases_json_param_and_closes_block(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    agent_token_renderer renderer = { .worker = &w };
+    agent_stream_renderer stream = { .renderer = &renderer };
+
+    /* Simulate a tool block mid-parameter-stream when a hard error hit. */
+    stream.viz.active = true;
+    snprintf(stream.viz.tool_name, sizeof(stream.viz.tool_name), "%s", "edit");
+    stream.viz.param_active = true;
+    snprintf(stream.viz.param_name, sizeof(stream.viz.param_name), "%s", "old");
+    agent_buf_puts(&stream.viz.json_param, "partial value bytes");
+
+    agent_tool_viz_finish(&stream, "[tool call failed: session error]\n");
+
+    /* The buffer must be released, not just emptied -- and the block marked
+     * closed so a later agent_tool_viz_start() memset isn't the only thing
+     * standing between this and a leak. */
+    AGENT_TEST_ASSERT(stream.viz.json_param.ptr == NULL);
+    AGENT_TEST_ASSERT(stream.viz.json_param.cap == 0);
+    AGENT_TEST_ASSERT(stream.viz.active == false);
+
+    /* The block must be closed on the wire: the buffered param bytes reach
+     * a "param_value" event, the open param gets "param_end", and the block
+     * gets exactly one "finish" carrying the error status -- not left
+     * dangling for the consumer. */
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "partial value bytes") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"param_end\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"finish\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "tool call failed: session error") != NULL);
+
+    size_t finish_count = 0;
+    const char *p = w.out;
+    while ((p = strstr(p, "\"phase\":\"finish\"")) != NULL) { finish_count++; p++; }
+    AGENT_TEST_ASSERT(finish_count == 1); /* not double-emitted */
+
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* Regression test for task 3.9 Fix 2: agent_bash_publish_observation()'s
+ * --json-events branch used to hand agent_emit_tool_event() an unbounded
+ * raw body. agent_emit_tool_event() JSON-escapes that payload into its own
+ * fresh agent_buf, which shares agent_buf_append()'s 128KB hard cap; once
+ * that cap latches its `truncated` flag, every later append -- including
+ * the closing `"}\n` agent_emit_tool_event() writes last -- silently
+ * no-ops, leaving an unterminated NDJSON line that merges with whatever the
+ * worker emits next.
+ *
+ * This drives agent_bash_publish_observation() with a synthetic <tail>
+ * body of 100000 raw `"` bytes -- each escapes to the 2-byte sequence \"
+ * (agent_json_escape's `case '"'` branch), so escaped alone that is 200000
+ * bytes, well past the 128KB cap even before accounting for the worse 6x
+ * control-byte case AGENT_BASH_JSON_OUTPUT_BODY_CAP's comment sizes against.
+ * This is the same shape of input as the brief's own example ("cat of a
+ * large minified JSON file": quote-dense text), not a contrived edge case.
+ *
+ * Confirmed not vacuous: temporarily reverted the cap (set body_n = n
+ * unconditionally and dropped the truncation-note branch, restoring the
+ * pre-fix "hand the escaper an unbounded body" behavior) and reran. The
+ * emitted line then does NOT end in `"}\n` (its last few bytes are instead
+ * mid-escaped-content, wherever agent_buf_append()'s 128KB latch happened to
+ * fire), so the `!memcmp(..., "\"}\n", 3)` assertion below fails as
+ * expected -- and the "truncated" note is absent too. The cap was then
+ * restored and the test re-confirmed passing. */
+static void test_agent_json_events_bash_observation_huge_body_cap_keeps_line_complete(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    agent_buf obs_buf = {0};
+    agent_buf_puts(&obs_buf,
+        "bash job=9 pid=555 status=done elapsed_sec=1.0 timed_out=0\n"
+        "exit_status=0\n"
+        "output_path=/tmp/x (200000 bytes, 5000 lines)\n"
+        "<tail -20 /tmp/x>\n");
+    for (int i = 0; i < 100000; i++) agent_buf_puts(&obs_buf, "\"");
+    agent_buf_puts(&obs_buf, "\n</tail>\n");
+    char *obs = agent_buf_take(&obs_buf);
+
+    agent_bash_publish_observation(&w, obs, 0);
+    free(obs);
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(w.out_len > 3);
+
+    /* The line must be complete: it must end with the closing `"}\n`
+     * agent_emit_tool_event() writes last, not have that silently dropped
+     * by agent_buf_append()'s 128KB truncated latch. */
+    AGENT_TEST_ASSERT(!memcmp(w.out + w.out_len - 3, "\"}\n", 3));
+    /* And it must actually parse as one well-formed tool/output event, not
+     * just happen to end in those three bytes. */
+    AGENT_TEST_ASSERT(!strncmp(w.out, "{\"t\":\"tool\",\"phase\":\"output\",\"idx\":0", 36));
+
+    /* Exactly one NDJSON line: if the closing bytes had instead been
+     * dropped mid-escape, nothing here would have merged onto it (this test
+     * emits only once), but a truncated line missing its close would still
+     * be detectable structurally by the two assertions above -- this
+     * assertion instead guards against the fix accidentally emitting a
+     * *second* line (e.g. from a badly-placed early return). */
+    size_t newline_count = 0;
+    for (size_t i = 0; i < w.out_len; i++) if (w.out[i] == '\n') newline_count++;
+    AGENT_TEST_ASSERT(newline_count == 1);
+
+    /* A visible truncation note must be present -- the consumer must be
+     * told output was shortened, not silently lose 80000 of the 100001
+     * body bytes. */
+    AGENT_TEST_ASSERT(strstr(w.out, "truncated") != NULL);
+
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* Regression test for task 3.9 Fix 4: run_agent_non_interactive's un-flagged
+ * +DWARFSTAR_STATUS marker branch and its --json-events sibling used to
+ * share one `last_state` tracker. The JSON branch's
+ * agent_maybe_emit_status_event() needs that tracker updated on every
+ * OBSERVED transition (see its caller-contract comment); once that
+ * requirement was added, a transition the un-flagged branch's own lossy
+ * strcmp(cur, last_status) dedupe swallowed (two different states whose
+ * agent_format_status_line() text collapses to the same "idle ..." string --
+ * SAVING and DRAINING both hit the default case) would still silently
+ * advance the shared tracker despite nothing having actually been reported,
+ * corrupting the *next* un-flagged transition's state-changed bypass: a line
+ * the pre-json-events code (verified at 9bca6d4:11198, which updated
+ * `last_state` only inside the write branch) would have throttled up to
+ * 200ms could instead bypass the throttle immediately, or vice versa.
+ *
+ * Drives agent_maybe_emit_marker_status() -- the decision the fix extracted
+ * from that call site, using its own last_emitted_state parameter instead of
+ * the JSON branch's unconditionally-updated tracker -- through the exact
+ * swallow-then-transition sequence: SAVING (emits) -> DRAINING with
+ * identical numerics (swallowed) -> SAVING again shortly after (must still
+ * be measured against the SAVING last actually reported, not DRAINING).
+ *
+ * Confirmed not vacuous: temporarily changed the function under test to
+ * advance *last_emitted_state unconditionally (moving that assignment
+ * outside the `if`, mirroring the bug this fix removes) and reran. The
+ * `last_emitted_state == AGENT_WORKER_SAVING` assertion right after step 2
+ * then fails (it reads AGENT_WORKER_DRAINING instead), exactly as expected.
+ * The change was then reverted and the test re-confirmed passing. */
+static void test_agent_maybe_emit_marker_status_matches_original_semantics(void) {
+    char last_status[256] = {0};
+    double last_status_at = 0.0;
+    agent_worker_state last_emitted_state = (agent_worker_state)-1;
+
+    agent_status saving = {0};
+    saving.state = AGENT_WORKER_SAVING;
+    saving.generated = 40;
+    saving.gen_tps = 12.0;
+    saving.ctx_used = 900;
+    saving.ctx_size = 8192;
+
+    agent_status draining = saving; /* identical numeric fields -- only state differs */
+    draining.state = AGENT_WORKER_DRAINING;
+
+    char saving_cur[256], draining_cur[256];
+    agent_format_status_line(&saving, saving_cur, sizeof(saving_cur));
+    agent_format_status_line(&draining, draining_cur, sizeof(draining_cur));
+    /* Sanity-check the premise: SAVING and DRAINING really do collapse to
+     * identical +DWARFSTAR_STATUS text with these numbers (both hit
+     * agent_format_status_line's default "idle" case) -- exactly why the
+     * un-flagged strcmp dedupe swallows the transition in step 2. */
+    AGENT_TEST_ASSERT(!strcmp(saving_cur, draining_cur));
+
+    /* Step 1: first-ever call, a transition by construction. Emits, and
+     * must advance last_emitted_state to SAVING. */
+    bool emitted1 = agent_maybe_emit_marker_status(saving_cur, 100.000,
+                                                    last_status, sizeof(last_status),
+                                                    &last_status_at,
+                                                    AGENT_WORKER_SAVING,
+                                                    &last_emitted_state);
+    AGENT_TEST_ASSERT(emitted1);
+    AGENT_TEST_ASSERT(last_emitted_state == AGENT_WORKER_SAVING);
+
+    /* Step 2: SAVING -> DRAINING, identical formatted text -- the strcmp
+     * dedupe swallows it (must not emit), and last_emitted_state must stay
+     * at SAVING: nothing was actually reported, so the next transition
+     * still has to be measured against SAVING. This is the exact invariant
+     * the bug broke. */
+    bool emitted2 = agent_maybe_emit_marker_status(draining_cur, 100.010,
+                                                    last_status, sizeof(last_status),
+                                                    &last_status_at,
+                                                    AGENT_WORKER_DRAINING,
+                                                    &last_emitted_state);
+    AGENT_TEST_ASSERT(!emitted2);
+    AGENT_TEST_ASSERT(last_emitted_state == AGENT_WORKER_SAVING);
+
+    /* Step 3: SAVING again, numerics changed so the text differs from what
+     * is still recorded in last_status, only 50ms after step 1 -- well
+     * under the 200ms throttle. Because last_emitted_state correctly still
+     * reads SAVING, state != last_emitted_state is FALSE here, so this must
+     * be throttled, not bypassed -- matching 9bca6d4 exactly. (Had
+     * last_emitted_state incorrectly advanced to DRAINING in step 2, this
+     * call would wrongly see SAVING != DRAINING and bypass the throttle.) */
+    agent_status saving2 = saving;
+    saving2.generated = 41;
+    char saving2_cur[256];
+    agent_format_status_line(&saving2, saving2_cur, sizeof(saving2_cur));
+    AGENT_TEST_ASSERT(strcmp(saving2_cur, saving_cur) != 0);
+
+    bool emitted3 = agent_maybe_emit_marker_status(saving2_cur, 100.050,
+                                                    last_status, sizeof(last_status),
+                                                    &last_status_at,
+                                                    AGENT_WORKER_SAVING,
+                                                    &last_emitted_state);
+    AGENT_TEST_ASSERT(!emitted3);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_json_events_release_flushes_and_frees_pending();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
@@ -8623,6 +8946,9 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_publish_unflagged_path_matches_raw();
     test_agent_json_events_tool_start_flushes_pending_text();
     test_agent_json_events_time_based_flush();
+    test_agent_tool_viz_finish_releases_json_param_and_closes_block();
+    test_agent_json_events_bash_observation_huge_body_cap_keeps_line_complete();
+    test_agent_maybe_emit_marker_status_matches_original_semantics();
 }
 #endif
 
@@ -9072,6 +9398,23 @@ static char *agent_tool_visit_page(agent_worker *w, const agent_tool_call *call)
 #define AGENT_BASH_PROGRESS_TAIL_LINES 4
 #define AGENT_BASH_FINAL_TAIL_LINES 20
 
+/* Max raw (pre-JSON-escape) bytes of bash output agent_bash_publish_observation()
+ * will fold into one --json-events "tool"/"output" event body. agent_buf_append()
+ * (the buffer agent_emit_tool_event() escapes this payload into) hard-caps at
+ * 128KB and, once that cap latches, silently drops every further append --
+ * including the closing `"}\n` agent_emit_tool_event() writes last, which
+ * corrupts that line AND merges it with whatever the worker emits next. JSON
+ * escaping can expand a byte up to 6x (a raw control byte, e.g. an unstripped
+ * ANSI escape a colorizing tool left in even when writing to a non-tty pipe,
+ * becomes the 6-byte string \u001b), so the cap here is sized against that worst case, not the
+ * common ~2x case (quotes/newlines) -- 6 * 20KB plus this event's small fixed
+ * overhead (type/phase/idx/key wrapper, the truncation note below) stays safely
+ * under 128KB, so the closing bytes can never be dropped, by construction,
+ * regardless of what the command actually printed. Deliberately tighter than
+ * AGENT_BASH_TAIL_BYTES above (32KB): that cap bounds what a human tail reads
+ * comfortably; this one bounds what can survive JSON escaping intact. */
+#define AGENT_BASH_JSON_OUTPUT_BODY_CAP (20*1024)
+
 struct agent_bash_job {
     int id;
     pid_t pid;
@@ -9515,10 +9858,38 @@ static void agent_bash_publish_observation(agent_worker *w, const char *obs, int
              * renderer, so shell output containing '#', '*', backticks, or
              * '|' would render as headings/bullets/tables misattributed to
              * the model instead of nesting inside the tool's own card. */
+            /* Cap the raw body BEFORE it reaches agent_emit_tool_event()'s
+             * escaper, not after: agent_json_escape() writes into its own
+             * fresh agent_buf that shares agent_buf_append()'s 128KB hard
+             * cap, and once that cap latches its `truncated` flag, every
+             * later append -- including the closing `"}\n` written last --
+             * silently no-ops, producing an unterminated NDJSON line that
+             * merges with whatever the worker emits next and corrupts two
+             * events instead of one for a line-oriented parser. Capping
+             * here, at a size AGENT_BASH_JSON_OUTPUT_BODY_CAP's comment
+             * proves safe even under worst-case escaping, keeps "every
+             * emitted line is complete and valid JSON" true by
+             * construction instead of relying on real bash output rarely
+             * containing enough escape-heavy bytes to trip the 128KB cap
+             * downstream. */
+            size_t body_n = n;
+            bool body_truncated = false;
+            if (body_n > AGENT_BASH_JSON_OUTPUT_BODY_CAP) {
+                body_n = AGENT_BASH_JSON_OUTPUT_BODY_CAP;
+                body_truncated = true;
+            }
             agent_buf combined = {0};
             if (notice) agent_buf_puts(&combined, notice);
-            agent_buf_append(&combined, body, n);
-            if (trailing_newline) agent_buf_puts(&combined, "\n");
+            agent_buf_append(&combined, body, body_n);
+            if (body_truncated) {
+                char note[96];
+                snprintf(note, sizeof(note),
+                         "\n[output truncated: %zu of %zu bytes shown]\n",
+                         body_n, n);
+                agent_buf_puts(&combined, note);
+            } else if (trailing_newline) {
+                agent_buf_puts(&combined, "\n");
+            }
             agent_emit_tool_event(w, "output", idx, NULL, NULL,
                                   combined.ptr ? combined.ptr : "", combined.len);
             free(combined.ptr);
@@ -10661,6 +11032,35 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
          * that flushes/frees that buffer -- is never reached on this path. */
     turn_fail: {
         renderer_json_release(&renderer);
+        /* stream.viz.json_param may hold up to a streaming tool parameter's
+         * un-flushed tail (see agent_tool_viz_param_raw_byte's 4096-byte
+         * threshold) by the time one of the three hard-error `goto
+         * turn_fail` sites above fires, and a dangling tool block's "start"
+         * (and any "param_begin"/"param_value" already on the wire) has no
+         * matching "finish" -- the consumer's open tool card is left open
+         * forever even though the `error` status event that follows lets it
+         * recover the turn overall.
+         *
+         * agent_tool_viz_finish() both frees that buffer (via
+         * agent_tool_viz_json_param_release(), a no-op if no buffer was ever
+         * allocated) and, if a block is actually open (v->active), closes it
+         * out properly on the wire: flushes any still-buffered param bytes
+         * as a final "param_value", emits "param_end" if a param was mid-
+         * stream, then "finish" with an error status. It is a safe no-op if
+         * no tool block was open when the error hit.
+         *
+         * This cannot double-emit "finish": the only other place this
+         * function reaches agent_tool_viz_finish() is via
+         * agent_stream_text(&stream, NULL, 0, true) after the generation
+         * loop exits normally (above, near the top of this same `while`
+         * iteration) -- and every `goto turn_fail` site lives strictly
+         * inside that generation loop, so control reaches at most one of
+         * {that agent_stream_text() call, this turn_fail block} per
+         * iteration, never both. */
+        char finish_status[300];
+        snprintf(finish_status, sizeof(finish_status),
+                 "[tool call failed: %s]\n", err[0] ? err : "internal error");
+        agent_tool_viz_finish(&stream, finish_status);
         agent_dsml_parser_free(&dsml);
         agent_set_error(w, err);
         return 1;
@@ -12584,6 +12984,14 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     char last_status[512] = {0};
     double last_status_at = 0.0;
     agent_worker_state last_state = (agent_worker_state)-1;  /* nothing emitted yet */
+    /* Separate from last_state above: the JSON branch's
+     * agent_maybe_emit_status_event() needs last_state updated on every
+     * OBSERVED transition (see its call below), but the un-flagged marker
+     * branch must only advance on an actual emission, matching pre-
+     * json-events semantics -- see agent_maybe_emit_marker_status()'s
+     * comment for why sharing one variable between the two branches drifted
+     * the un-flagged output. */
+    agent_worker_state last_emitted_state = (agent_worker_state)-1;
 
     if (!one_shot) {
         if (set_nonblock(STDIN_FILENO, true, &old_stdin_flags) != 0) {
@@ -12688,7 +13096,13 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
              * ones that end up emitted below.  If this were only set inside the
              * throttle-gated block, a transition swallowed by that gate would
              * also corrupt state_changed's bookkeeping for the next iteration,
-             * compounding a dropped event into a dropped bypass too. */
+             * compounding a dropped event into a dropped bypass too.
+             *
+             * This feeds ONLY the JSON branch's state_changed below.  The
+             * un-flagged marker branch has its own last_emitted_state,
+             * updated only on emission by agent_maybe_emit_marker_status() --
+             * see that function's comment for why the two must not share one
+             * variable. */
             last_state = st.state;
 
             /* A state change publishes immediately — the consumer's spinner keys off
@@ -12706,12 +13120,12 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
                 agent_maybe_emit_status_event(&worker, &st, state_changed, now,
                                               last_status, sizeof(last_status),
                                               &last_status_at);
-            } else if (strcmp(cur, last_status) != 0 &&
-                      (state_changed || now - last_status_at >= 0.200)) {
+            } else if (agent_maybe_emit_marker_status(cur, now, last_status,
+                                                       sizeof(last_status),
+                                                       &last_status_at, st.state,
+                                                       &last_emitted_state)) {
                 write_all(STDERR_FILENO, cur, strlen(cur));
                 write_all(STDERR_FILENO, "\n", 1);
-                snprintf(last_status, sizeof(last_status), "%s", cur);
-                last_status_at = now;
             }
         }
 
