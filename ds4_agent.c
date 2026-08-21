@@ -2040,8 +2040,24 @@ static void agent_dsml_parse(agent_dsml_parser *p) {
             p->param_close_prefix = false;
             p->state = AGENT_DSML_PARAM_VALUE;
         } else {
+            /* tag is raw, unbounded, model-controlled bytes (fix-round 2
+             * review, task 3.9, Critical 2). %.*s's precision is a byte
+             * count, not UTF-8-aware, so cropping at a bare 80 can cut a
+             * multi-byte character (this tag syntax's own `｜` delimiters
+             * are 3 bytes each) mid-sequence. Compute a boundary-safe crop
+             * length first so p->error can never end up holding a torn
+             * tail in the first place -- this is the ROOT of the bug, not
+             * just a downstream symptom: a torn byte embedded here survives
+             * unmodified through "[invalid tool call: %s]\n" (built later
+             * in agent_stream_feed_dsml_byte()) with further text appended
+             * AFTER it, which moves the tear out of the tail position and
+             * out of reach of any trim applied only to the wrapped
+             * string's own end (see agent_tool_viz_finish()'s status trim,
+             * and this task's report for how that was discovered). */
+            size_t crop_len = tag_len > 80 ? 80 : tag_len;
+            crop_len = agent_utf8_safe_len(tag, crop_len);
             snprintf(p->error, sizeof(p->error), "unexpected DSML tag: %.*s",
-                     (int)(tag_len > 80 ? 80 : tag_len), tag);
+                     (int)crop_len, tag);
             free(tag);
             p->state = AGENT_DSML_ERROR;
             return;
@@ -3770,13 +3786,32 @@ static size_t agent_utf8_safe_len(const char *s, size_t len) {
 /* Flush the accumulated --json-events parameter-value buffer as one
  * "param_value" event.  A no-op when nothing is pending, so it is safe to
  * call both at the 4096-byte threshold in agent_tool_viz_param_raw_byte and
- * again (as a final flush of any remainder) from agent_tool_viz_param_end. */
+ * again (as a final flush of any remainder) from agent_tool_viz_param_end.
+ *
+ * This is the FINAL flush -- called whether the parameter closed normally
+ * or, via agent_tool_viz_finish()'s `if (v->param_active)
+ * agent_tool_viz_param_end(sr);`, because the turn ended while this
+ * parameter was still mid-stream (ordinary turn-budget exhaustion or a user
+ * interrupt, not just a hard error). Unlike
+ * agent_tool_viz_json_param_flush_safe() (the 4096-byte threshold flush),
+ * there is no future agent_buf_append() here to complete a held-back tail
+ * with -- generation has genuinely ended -- so a trailing incomplete UTF-8
+ * sequence is trimmed and silently DROPPED here rather than held back
+ * (fix-round 2 review, task 3.9, Critical 1: this site handed the raw,
+ * untrimmed buffer straight to the escaper, confirmed reachable via the
+ * ordinary "[tool call interrupted]" path, not just a hard error). Emitting
+ * it torn would be exactly the invalid-JSON-string bug this whole
+ * fix-round exists to close, and a partial multi-byte character that will
+ * never be completed has nothing useful left to hold onto anyway. */
 static void agent_tool_viz_json_param_flush(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->json_param.len) return;
-    agent_emit_tool_event(sr->renderer->worker, "param_value", v->call_idx,
-                          NULL, NULL, NULL, NULL, NULL, 0,
-                          v->json_param.ptr, v->json_param.len);
+    size_t safe_len = agent_utf8_safe_len(v->json_param.ptr, v->json_param.len);
+    if (safe_len) {
+        agent_emit_tool_event(sr->renderer->worker, "param_value", v->call_idx,
+                              NULL, NULL, NULL, NULL, NULL, 0,
+                              v->json_param.ptr, safe_len);
+    }
     v->json_param.len = 0;
 }
 
@@ -3929,8 +3964,38 @@ static void agent_tool_viz_finish(agent_stream_renderer *sr, const char *status)
          * empty block (no "tool" event fired) must report 0 calls rather
          * than 1. See agent_tool_visualizer.call_idx's comment. */
         int calls = v->call_idx_started ? v->call_idx + 1 : 0;
+        /* status can carry sr->parser->error's raw content by way of the
+         * "[invalid tool call: %s]" status text built at this function's
+         * caller (agent_stream_feed_dsml_byte()) -- and
+         * agent_dsml_parse()'s "unexpected DSML tag: %.*s" writes
+         * model-controlled raw bytes directly into p->error, bypassing
+         * agent_dsml_set_error()'s fixed-literal-only discipline entirely
+         * (fix-round 2 review, task 3.9, Critical 2: that %.*s precision
+         * cap is a byte count, not UTF-8-aware, and the DSML tag syntax's
+         * own multi-byte `｜` delimiters make a torn cutoff there an
+         * ordinary hallucinated-nested-tag failure mode, not a contrived
+         * one). Rather than patch that one snprintf, trim centrally here:
+         * every current caller of agent_tool_viz_finish() -- and any
+         * future one -- is covered by a single trim, the same discipline
+         * already applied locally to tool_name/param_name in
+         * agent_tool_viz_tool()/agent_tool_viz_param_begin(). status may be
+         * a string literal (not safely mutable in place), so bound-copy it
+         * into a local buffer before trimming; 512 bytes covers every
+         * known caller (the largest, turn_fail's finish_status, is 300)
+         * with headroom, and a caller that somehow exceeds it is itself
+         * bounded here rather than left unbounded. */
+        char safe_status[512];
+        const char *safe_status_ptr = NULL;
+        if (status && status[0]) {
+            size_t len = strlen(status);
+            if (len >= sizeof(safe_status)) len = sizeof(safe_status) - 1;
+            memcpy(safe_status, status, len);
+            len = agent_utf8_safe_len(safe_status, len);
+            safe_status[len] = '\0';
+            if (safe_status[0]) safe_status_ptr = safe_status;
+        }
         agent_emit_tool_event(sr->renderer->worker, "finish", v->call_idx,
-                              "status", (status && status[0]) ? status : NULL,
+                              "status", safe_status_ptr,
                               NULL, NULL, "calls", calls, NULL, 0);
         v->active = false;
         return;
@@ -4497,43 +4562,110 @@ static char *agent_buf_take(agent_buf *b) {
     return p;
 }
 
-/* JSON string-body escaping.  Bytes >= 0x80 pass through untouched so UTF-8
- * multi-byte sequences survive; only the characters JSON actually forbids in a
- * string body are escaped.  Distinct from agent_trace_escaped(), which uses
- * C-style \xNN escapes that are not valid JSON. */
+/* JSON string-body escaping.  Bytes >= 0x80 pass through untouched (as a
+ * complete, validated multi-byte sequence -- see below) so UTF-8 survives;
+ * only the characters JSON actually forbids in a string body are escaped.
+ * Distinct from agent_trace_escaped(), which uses C-style \xNN escapes that
+ * are not valid JSON.
+ *
+ * Validates UTF-8 as it goes, not just at the boundary (task 3.9 fix-round
+ * 2): seven call sites across six review rounds each handed this function
+ * (via its three callers, agent_emit_event_str()/agent_emit_tool_event()/
+ * agent_emit_status_event()) a byte range that could end in a torn
+ * multi-byte sequence, and this round's own attempted fix -- trimming a
+ * trailing incomplete sequence before the string ever reaches here -- turned
+ * out to have a real gap: a caller can bury a tear in the MIDDLE of a string
+ * by appending more valid text after an already-truncated fragment (e.g.
+ * wrapping a truncated parser error in "[invalid tool call: %s]\n" -- see
+ * agent_dsml_parse()'s and agent_tool_viz_finish()'s comments for exactly
+ * this case, found empirically while testing this fix-round's Critical 2).
+ * At that point the tear is no longer at the tail, so a boundary trim
+ * upstream cannot find it. This function is the last point every string
+ * field passes through before reaching the wire, so validating a complete
+ * sequence here -- and dropping any byte that is not part of one, wherever
+ * it falls in the input -- is the only place that can guarantee validity
+ * regardless of where in the input a tear ends up, including ones no one
+ * has found yet. The upstream trims (agent_utf8_safe_len() at each of the
+ * three callers, and the specific-site fixes elsewhere) are kept as
+ * defense-in-depth -- cheap, and they avoid escaping bytes already known to
+ * be garbage -- but this function no longer depends on any of them being
+ * correct. */
 static void agent_json_escape(agent_buf *b, const char *s, size_t n) {
-    for (size_t i = 0; i < n; i++) {
+    size_t i = 0;
+    while (i < n) {
         unsigned char c = (unsigned char)s[i];
-        switch (c) {
-        case '"':  agent_buf_puts(b, "\\\""); break;
-        case '\\': agent_buf_puts(b, "\\\\"); break;
-        case '\n': agent_buf_puts(b, "\\n"); break;
-        case '\r': agent_buf_puts(b, "\\r"); break;
-        case '\t': agent_buf_puts(b, "\\t"); break;
-        default:
-            if (c < 0x20) {
-                char esc[8];
-                snprintf(esc, sizeof(esc), "\\u%04x", c);
-                agent_buf_puts(b, esc);
-            } else {
-                char ch[2] = {(char)c, '\0'};
-                agent_buf_puts(b, ch);
+        if (c < 0x80) {
+            switch (c) {
+            case '"':  agent_buf_puts(b, "\\\""); break;
+            case '\\': agent_buf_puts(b, "\\\\"); break;
+            case '\n': agent_buf_puts(b, "\\n"); break;
+            case '\r': agent_buf_puts(b, "\\r"); break;
+            case '\t': agent_buf_puts(b, "\\t"); break;
+            default:
+                if (c < 0x20) {
+                    char esc[8];
+                    snprintf(esc, sizeof(esc), "\\u%04x", c);
+                    agent_buf_puts(b, esc);
+                } else {
+                    char ch[2] = {(char)c, '\0'};
+                    agent_buf_puts(b, ch);
+                }
+                break;
             }
-            break;
+            i++;
+            continue;
         }
+        /* Non-ASCII: only ever emit a complete, well-formed sequence.
+         * Anything else -- a stray continuation byte, an invalid lead byte,
+         * a lead byte with too few bytes left in the input, or a lead byte
+         * whose following bytes aren't valid continuations -- is dropped
+         * (advance by exactly one byte and re-synchronize on the next),
+         * never passed through raw. This mirrors
+         * agent_utf8_incomplete_tail_len()'s notion of a valid sequence
+         * (lead-byte class determines length, 0x80..0xBF continuation
+         * bytes) plus the standard exclusions for overlong/out-of-range
+         * lead bytes (0xC0/0xC1, > 0xF4). */
+        size_t seq_len;
+        if ((c & 0xE0) == 0xC0 && c >= 0xC2) seq_len = 2;
+        else if ((c & 0xF0) == 0xE0) seq_len = 3;
+        else if ((c & 0xF8) == 0xF0 && c <= 0xF4) seq_len = 4;
+        else { i++; continue; }
+        if (i + seq_len > n) { i++; continue; }
+        bool valid = true;
+        for (size_t k = 1; k < seq_len; k++) {
+            if (((unsigned char)s[i + k] & 0xC0) != 0x80) { valid = false; break; }
+        }
+        if (!valid) { i++; continue; }
+        agent_buf_append(b, s + i, seq_len);
+        i += seq_len;
     }
 }
 
 /* Emit one NDJSON event through the worker's normal publish path, so events
  * reach stdout on the same channel and in the same order as everything else
- * the worker produces. */
+ * the worker produces.
+ *
+ * Choke-point UTF-8 guarantee (task 3.9 fix-round 2): this, agent_emit_tool_event(),
+ * and agent_emit_status_event() are the ONLY three functions in this file that call
+ * agent_json_escape() -- confirmed by grepping every agent_json_escape() call site.
+ * Seven truncation sites across six review rounds each fixed a call site that handed
+ * one of these three a byte range ending mid-UTF8-character; trimming here instead,
+ * once, on every string field immediately before escaping, means a future truncation
+ * site cannot produce torn UTF-8 on the wire no matter who writes it or whether they
+ * know this rule. Safe to apply unconditionally: every current caller that already
+ * holds back an incomplete tail for later completion (agent_tool_viz_json_param_flush_safe,
+ * agent_worker_compact_stream_flush, worker_raw_prompt_stream_flush) does so by keeping
+ * the held-back bytes in ITS OWN buffer and passing only the already-boundary-clean
+ * portion down to the emitter -- so trimming again here is a proven no-op for them (see
+ * this task's report for the full verification), never a second, unwanted cut into
+ * bytes the caller still expects to resume. */
 static void agent_emit_event_str(agent_worker *w, const char *kind,
                                  const char *s, size_t n) {
     agent_buf b = {0};
     agent_buf_puts(&b, "{\"t\":\"");
     agent_buf_puts(&b, kind);
     agent_buf_puts(&b, "\",\"s\":\"");
-    agent_json_escape(&b, s, n);
+    agent_json_escape(&b, s, agent_utf8_safe_len(s, n));
     agent_buf_puts(&b, "\"}\n");
     char *line = agent_buf_take(&b);
     if (line) {
@@ -4562,7 +4694,14 @@ static void agent_emit_event_str(agent_worker *w, const char *kind,
  * "name" -- does not have to split it across two NDJSON lines. `int_key`/
  * `int_value` is a third optional field emitted as a bare JSON number (like
  * `idx`), for a caller with a count rather than a string; it is emitted
- * whenever `int_key` is non-NULL. */
+ * whenever `int_key` is non-NULL.
+ *
+ * Choke-point UTF-8 guarantee (task 3.9 fix-round 2): every string field
+ * below (`value`, `value2`, `s`) is trimmed to agent_utf8_safe_len() right
+ * before agent_json_escape() -- see agent_emit_event_str()'s matching
+ * comment for the full reasoning (this, that function, and
+ * agent_emit_status_event() are the only three callers of
+ * agent_json_escape() in this file). */
 static void agent_emit_tool_event(agent_worker *w, const char *phase, int idx,
                                   const char *key, const char *value,
                                   const char *key2, const char *value2,
@@ -4579,14 +4718,14 @@ static void agent_emit_tool_event(agent_worker *w, const char *phase, int idx,
         agent_buf_puts(&b, ",\"");
         agent_buf_puts(&b, key);
         agent_buf_puts(&b, "\":\"");
-        agent_json_escape(&b, value, strlen(value));
+        agent_json_escape(&b, value, agent_utf8_safe_len(value, strlen(value)));
         agent_buf_puts(&b, "\"");
     }
     if (key2 && value2) {
         agent_buf_puts(&b, ",\"");
         agent_buf_puts(&b, key2);
         agent_buf_puts(&b, "\":\"");
-        agent_json_escape(&b, value2, strlen(value2));
+        agent_json_escape(&b, value2, agent_utf8_safe_len(value2, strlen(value2)));
         agent_buf_puts(&b, "\"");
     }
     if (int_key) {
@@ -4599,7 +4738,7 @@ static void agent_emit_tool_event(agent_worker *w, const char *phase, int idx,
     }
     if (s) {
         agent_buf_puts(&b, ",\"s\":\"");
-        agent_json_escape(&b, s, n);
+        agent_json_escape(&b, s, agent_utf8_safe_len(s, n));
         agent_buf_puts(&b, "\"");
     }
     agent_buf_puts(&b, "}\n");
@@ -4641,7 +4780,14 @@ static const char *agent_status_state_name(agent_worker_state state) {
 /* Emit one NDJSON "status" event carrying every agent_status field, the
  * --json-events replacement for the +DWARFSTAR_STATUS stderr marker.  Unlike
  * that marker (whose "state" name collapses four of the eight states into
- * "idle"), this emits the full state set via agent_status_state_name(). */
+ * "idle"), this emits the full state set via agent_status_state_name().
+ *
+ * Choke-point UTF-8 guarantee (task 3.9 fix-round 2): `error` below is the
+ * only field here that reaches agent_json_escape() -- `state` is written via
+ * agent_buf_puts() (no escaping at all: agent_status_state_name() always
+ * returns one of eight fixed ASCII literals with no characters JSON would
+ * need escaped), so it is not part of the agent_json_escape() choke point
+ * agent_emit_event_str()'s matching comment describes and needs no trim. */
 static void agent_emit_status_event(agent_worker *w, const agent_status *st) {
     agent_buf b = {0};
     char num[64];
@@ -9619,6 +9765,280 @@ static void test_agent_maybe_emit_marker_status_matches_original_semantics(void)
     AGENT_TEST_ASSERT(!emitted3);
 }
 
+/* Regression test for task 3.9 fix-round 2, Critical 1:
+ * agent_tool_viz_json_param_flush() -- the FINAL param-value flush, as
+ * opposed to its sibling agent_tool_viz_json_param_flush_safe()'s 4096-byte
+ * threshold flush -- handed v->json_param straight to agent_emit_tool_event()
+ * with no UTF-8 trim. Reachable on an ordinary path, not just a hard error:
+ * agent_tool_viz_finish() calls agent_tool_viz_param_end() (which calls this
+ * flush) whenever a parameter is still open when a turn ends, including the
+ * "[tool call interrupted]" case -- ordinary turn-budget exhaustion or a
+ * user interrupt hitting mid-parameter, e.g. a write/edit call streaming
+ * non-ASCII content.
+ *
+ * Drives agent_tool_viz_finish() with json_param holding a torn EURO SIGN
+ * (the reviewer's own reproduction shape: "ab" + the first two of the three
+ * bytes E2 82 AC, missing the closing continuation byte) and the interrupted
+ * status. Asserts the emitted "param_value" event's "s" field is exactly
+ * "ab" -- the torn tail dropped, not held back (there is nothing left to
+ * complete it with) -- and that no raw 0xE2/0x82 byte reaches the wire
+ * anywhere.
+ *
+ * Unlike Critical 2, this tear genuinely IS at the tail of what reaches the
+ * wire (nothing gets appended after it, unlike the "[invalid tool call:
+ * %s]\n" wrapping that buries Critical 2's tear mid-string) -- so this
+ * fix-round's other two layers (agent_emit_tool_event()'s own
+ * agent_utf8_safe_len(s, n) trim on its "s" field, and
+ * agent_json_escape()'s full validation) independently catch it too, on
+ * top of this specific fix. Confirmed not vacuous by reverting all three
+ * together (this function's own trim, agent_emit_tool_event()'s "s,n"
+ * trim, and agent_json_escape()'s validation) and rerunning: the "s":"ab"
+ * and "no raw 0xE2/0x82 byte" assertions all failed as expected. Reverting
+ * this function's trim ALONE, with the other two layers still active,
+ * leaves the test passing (they cover it independently) -- confirmed by
+ * trying that combination too, so this comment doesn't overclaim what
+ * reverting just this one site actually demonstrates. Restored all three
+ * and re-confirmed passing. */
+static void test_agent_tool_viz_finish_trims_torn_utf8_param_value(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    agent_token_renderer renderer = { .worker = &w };
+    agent_stream_renderer stream = { .renderer = &renderer };
+
+    stream.viz.active = true;
+    stream.viz.param_active = true;
+    agent_buf_puts(&stream.viz.json_param, "ab");
+    agent_buf_append(&stream.viz.json_param, "\xe2\x82", 2); /* torn EURO SIGN, missing 0xac */
+
+    agent_tool_viz_finish(&stream, "[tool call interrupted]\n");
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    if (w.out) {
+        AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"param_value\"") != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"param_end\"") != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"finish\"") != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\"s\":\"ab\"") != NULL);
+        AGENT_TEST_ASSERT(memchr(w.out, '\xe2', w.out_len) == NULL);
+        AGENT_TEST_ASSERT(memchr(w.out, '\x82', w.out_len) == NULL);
+    }
+
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* Regression test for task 3.9 fix-round 2, Critical 2: agent_dsml_parse()'s
+ * "unexpected DSML tag" error writes model-controlled raw bytes DIRECTLY
+ * into p->error via `snprintf(p->error, sizeof(p->error),
+ * "unexpected DSML tag: %.*s", (int)(tag_len > 80 ? 80 : tag_len), tag)`,
+ * bypassing agent_dsml_set_error()'s fixed-literal-only discipline entirely
+ * -- which is exactly why the fix-round 1 sweep's conclusion ("every
+ * agent_dsml_set_error() call site passes a fixed literal") was true but
+ * did not cover this site. `%.*s`'s precision is a byte count, not
+ * UTF-8-aware, so a tag whose text straddles the 80-byte cutoff with a
+ * multi-byte character truncated mid-sequence. That error string then flows
+ * into the "[invalid tool call: %s]" status text built in
+ * agent_stream_feed_dsml_byte() and on into agent_tool_viz_finish()'s
+ * "status" field.
+ *
+ * IMPORTANT: the reviewer's suggested fix location (trim `status` centrally
+ * inside agent_tool_viz_finish(), before it reaches the wire) turned out to
+ * have a real gap, found while writing this test: "[invalid tool call: %s]"
+ * appends "]\n" AFTER the substituted error text, so by the time a torn
+ * tail from p->error reaches agent_tool_viz_finish(), it is no longer at
+ * the END of `status` -- it's buried in the middle, followed by two more
+ * ASCII bytes. A trim that only inspects the tail of `status` (which is
+ * what agent_utf8_safe_len()/agent_utf8_incomplete_tail_len() do, by
+ * design, since that's the shape every other site in this whole fix-round
+ * needed) cannot find a tear that isn't at the tail. Verified this
+ * empirically with a debug harness before writing the fix: the torn 0xC3
+ * showed up more than a hundred bytes before the end of the emitted line,
+ * not at it. So this required going one layer deeper than the reviewer's
+ * suggestion, in two ways (see the report's fix-round 2 section for the
+ * full account): (1) agent_dsml_parse()'s own snprintf now computes a
+ * UTF-8-safe crop length before building p->error, so the tear never enters
+ * p->error at all -- the actual root cause; and (2) agent_json_escape()
+ * itself (this fix-round's true final choke point) now validates every
+ * multi-byte sequence as it escapes and drops anything that isn't a
+ * complete one, wherever in the input it falls, rather than trusting a
+ * boundary trim applied somewhere upstream. agent_tool_viz_finish()'s
+ * status trim is kept (harmless, and correct for a hypothetical future
+ * caller that passes an unwrapped torn string directly), but on its own it
+ * does not close this specific gap -- (1) and (2) do.
+ *
+ * Drives the real parsing pipeline (not just a trim function in isolation)
+ * with the reviewer's own known-good shape: a malformed nested DSML tag,
+ * opened inside an active <｜DSML｜invoke> block so it hits the "else"
+ * (unrecognized tag) branch, whose name is built so a 2-byte character
+ * (e-acute, C3 A9) straddles the 80-byte crop exactly -- the fixed
+ * "<｜DSML｜" tag prefix is 11 bytes, followed by 68 ASCII 'a' bytes
+ * (indices 11..78), putting the e-acute's lead byte (0xC3) at index 79 and
+ * its continuation byte (0xA9) at index 80 -- one byte past the 80-byte
+ * `%.*s` crop.
+ *
+ * Confirmed not vacuous, in stages, each verified with a standalone debug
+ * harness before settling on the final fix (not just the test binary,
+ * since an early version of this test's own premise assertion -- p->error
+ * itself ending in a bare 0xC3 -- became false once fix (1) above landed,
+ * which is the expected and correct consequence of closing the root cause,
+ * not a broken test):
+ *   - With none of this round's fixes applied: the emitted line's status
+ *     field ends in the torn 0xC3 (confirmed via the debug harness).
+ *   - With only agent_tool_viz_finish()'s status trim applied (the
+ *     reviewer's original suggestion, fixes (1) and (2) above reverted):
+ *     STILL fails -- the 0xC3 is buried mid-string, not at the tail, so the
+ *     trim finds nothing to trim. This is the specific gap this test exists
+ *     to catch.
+ *   - With fix (1) alone (agent_dsml_parse()'s crop, fix (2) reverted): the
+ *     wire is clean, because the tear is closed before it ever exists.
+ *   - With fix (2) alone (agent_json_escape() validation, fix (1)
+ *     reverted): the wire is clean, because the escaper drops the bad
+ *     sequence regardless of where the tear falls in its input.
+ *   - With both (1) and (2) restored (the final state): clean, and
+ *     redundantly so on purpose. */
+static void test_agent_dsml_unexpected_tag_error_trims_torn_utf8_status(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    agent_token_renderer renderer = {
+        .worker = &w,
+        .format_thinking = true,
+        .format_markdown = false,
+        .last_output_newline = true,
+    };
+    agent_dsml_parser p = {
+        .syntax = AGENT_TOOL_SYNTAX_DSML,
+        .state = AGENT_DSML_SEARCH,
+    };
+    agent_stream_renderer stream = {
+        .renderer = &renderer,
+        .parser = &p,
+        .syntax = AGENT_TOOL_SYNTAX_DSML,
+    };
+
+    agent_buf input = {0};
+    agent_buf_puts(&input, "<\xef\xbd\x9c" "DSML\xef\xbd\x9ctool_calls>");
+    agent_buf_puts(&input, "<\xef\xbd\x9c" "DSML\xef\xbd\x9cinvoke name=\"test\">");
+    agent_buf_puts(&input, "<\xef\xbd\x9c" "DSML\xef\xbd\x9c");
+    for (int i = 0; i < 68; i++) agent_buf_puts(&input, "a");
+    agent_buf_append(&input, "\xc3\xa9", 2); /* e-acute, straddles the 80-byte crop */
+    agent_buf_puts(&input, ">");
+    char *text = agent_buf_take(&input);
+    size_t len = strlen(text);
+
+    for (size_t i = 0; i < len; i++)
+        agent_stream_text(&stream, text + i, 1, false);
+    free(text);
+
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_ERROR);
+    /* p->error's own content is no longer torn -- fix (1) above closes the
+     * tear at its root, so this reads a complete "unexpected DSML tag: "
+     * message rather than one ending in a bare 0xC3. (An earlier version of
+     * this test asserted the opposite -- p->error ending in 0xC3 -- as its
+     * "confirmed the premise" check; that assertion is what actually caught
+     * fix (1) landing and is why it was rewritten to this, rather than a
+     * sign the test stopped meaning anything.) */
+    AGENT_TEST_ASSERT(strstr(p.error, "unexpected DSML tag:") != NULL);
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    if (w.out) {
+        AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"finish\"") != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "unexpected DSML tag") != NULL);
+        /* No raw euro-sign-straddling byte (0xC3, the torn e-acute lead
+         * byte) anywhere on the wire -- true regardless of which of this
+         * fix-round's layers (the root-cause crop in agent_dsml_parse(),
+         * the status trim in agent_tool_viz_finish(), or
+         * agent_json_escape()'s own validation) is doing the work. */
+        AGENT_TEST_ASSERT(memchr(w.out, '\xc3', w.out_len) == NULL);
+    }
+
+    free(w.out);
+    agent_dsml_parser_free(&p);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* Regression test for task 3.9 fix-round 2's structural fix: rather than
+ * chase individual call sites (seven found across six review rounds), the
+ * three functions that call agent_json_escape() -- agent_emit_event_str(),
+ * agent_emit_tool_event(), agent_emit_status_event() -- now trim every
+ * string field to agent_utf8_safe_len() themselves, immediately before
+ * escaping, AND agent_json_escape() itself validates every multi-byte
+ * sequence as it escapes (added after discovering, while testing Critical
+ * 2, that a trailing-only trim cannot find a tear buried mid-string -- see
+ * that test and agent_json_escape()'s own comment). This drives all three
+ * emitters DIRECTLY with deliberately torn (trailing-tear) input, bypassing
+ * every specific-site fix entirely, to prove the guarantee holds at the
+ * choke point itself: a hypothetical future call site that forgot to trim
+ * still cannot put torn UTF-8 on the wire.
+ *
+ * Two independent layers now cover this test's inputs, so an honest
+ * non-vacuousness account has to say which combination actually matters:
+ * reverting ONLY the three emitter-level agent_utf8_safe_len() calls, with
+ * agent_json_escape()'s validation left in place, leaves this test passing
+ * -- the escaper catches it on its own. Reverting ONLY
+ * agent_json_escape()'s validation, with the emitter-level trims left in
+ * place, ALSO leaves it passing -- the pre-trim already hands the escaper
+ * clean input for these (trailing-tear) cases. Confirmed not vacuous by
+ * reverting BOTH layers together and rerunning: all three sub-tests'
+ * torn-byte assertions failed (nine assertions across the three emitters).
+ * Restored both and re-confirmed passing. This is the intended shape for a
+ * defense-in-depth choke point, not redundant test coverage: it demonstrates
+ * neither layer alone is load-bearing for trailing tears, which is exactly
+ * what makes the escaper's validation (the layer that ALSO covers Critical
+ * 2's buried-tear case, which no pre-trim can) the one true guarantee. */
+static void test_agent_emitters_choke_point_trims_torn_utf8(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    agent_emit_event_str(&w, "text", "ab\xe2\x82", 4);
+    AGENT_TEST_ASSERT(w.out != NULL);
+    if (w.out) {
+        AGENT_TEST_ASSERT(strstr(w.out, "\"s\":\"ab\"") != NULL);
+        AGENT_TEST_ASSERT(memchr(w.out, '\xe2', w.out_len) == NULL);
+    }
+    free(w.out);
+    w.out = NULL; w.out_len = 0; w.out_cap = 0;
+
+    /* value, value2, and s all torn at once. */
+    agent_emit_tool_event(&w, "test_phase", 0,
+                          "key1", "cd\xe2\x82",
+                          "key2", "ef\xe2\x82",
+                          NULL, 0,
+                          "gh\xe2\x82", 4);
+    AGENT_TEST_ASSERT(w.out != NULL);
+    if (w.out) {
+        AGENT_TEST_ASSERT(strstr(w.out, "\"key1\":\"cd\"") != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\"key2\":\"ef\"") != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\"s\":\"gh\"") != NULL);
+        AGENT_TEST_ASSERT(memchr(w.out, '\xe2', w.out_len) == NULL);
+    }
+    free(w.out);
+    w.out = NULL; w.out_len = 0; w.out_cap = 0;
+
+    agent_status st = {0};
+    st.state = AGENT_WORKER_ERROR;
+    memcpy(st.error, "ij\xe2\x82", 5);
+    st.error[4] = '\0';
+    agent_emit_status_event(&w, &st);
+    AGENT_TEST_ASSERT(w.out != NULL);
+    if (w.out) {
+        AGENT_TEST_ASSERT(strstr(w.out, "\"error\":\"ij\"") != NULL);
+        AGENT_TEST_ASSERT(memchr(w.out, '\xe2', w.out_len) == NULL);
+    }
+
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_json_events_release_flushes_and_frees_pending();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
@@ -9662,6 +10082,9 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_json_events_bash_observation_huge_body_cap_keeps_line_complete();
     test_agent_json_events_bash_observation_utf8_cap_boundary_no_tear();
     test_agent_maybe_emit_marker_status_matches_original_semantics();
+    test_agent_tool_viz_finish_trims_torn_utf8_param_value();
+    test_agent_dsml_unexpected_tag_error_trims_torn_utf8_status();
+    test_agent_emitters_choke_point_trims_torn_utf8();
 }
 #endif
 
