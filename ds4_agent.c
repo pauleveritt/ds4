@@ -375,6 +375,12 @@ static void agent_trace(agent_worker *w, const char *fmt, ...);
 static void agent_buf_append(agent_buf *b, const char *s, size_t n);
 static void agent_emit_event_str(agent_worker *w, const char *kind,
                                  const char *s, size_t n);
+/* --json-events streaming buffer flush for agent_worker_compact() (defined
+ * beside that function, near :9800); forward-declared here so its unit test
+ * -- grouped with the file's other --json-events buffering tests, well
+ * above agent_worker_compact()'s own definition -- can call it directly. */
+static void agent_worker_compact_stream_flush(agent_worker *w, agent_buf *pub,
+                                              bool force);
 /* --json-events tool-event emitter (defined beside agent_emit_event_str,
  * same placement rule as above): forward-declared here so the tool
  * visualizer hooks further up the file can call it. */
@@ -8289,6 +8295,114 @@ static void test_agent_json_events_param_value_utf8_boundary_no_tear(void) {
     pthread_mutex_destroy(&w.mu);
 }
 
+/* Regression test for task 3.8: agent_worker_compact()'s summary token loop
+ * used to call agent_publish(w, text, text_len) once per generated token,
+ * with no UTF-8 holdback. Under --json-events, agent_publish()'s backstop
+ * turns every one of those calls into its own "text" event, so a
+ * multi-byte character split across a token boundary would tear across two
+ * events -- each individually invalid UTF-8 once JSON-escaped, which a
+ * Swift JSONDecoder silently drops. The fix,
+ * agent_worker_compact_stream_flush(), mirrors
+ * agent_tool_viz_json_param_flush_safe()'s existing holdback pattern
+ * (exercised just above by
+ * test_agent_json_events_param_value_utf8_boundary_no_tear) for the
+ * identical class of bug at this different call site.
+ *
+ * Driving the real token loop would need a live model/session, so this
+ * drives the helper directly the same way agent_worker_compact()'s loop
+ * does: append per "token" via agent_buf_append(), check the 4096-byte
+ * threshold and flush(force=false) after each append, then flush(force=
+ * true) once at the end. The em dash (U+2014, 3 bytes: E2 80 94) is fed as
+ * two separate "token" appends -- one carrying just its lead byte, the next
+ * carrying its two continuation bytes -- so the threshold trips exactly
+ * between them and the split lands mid-character rather than at a clean
+ * boundary. That mirrors a byte-fallback tokenizer emitting a multi-byte
+ * character across more than one token, which is the real-world shape of
+ * this bug (see the task brief's account of ds4_token_text output).
+ *
+ * The important property (per the task brief) is that no emitted event
+ * contains a torn sequence, not just that events were emitted, so this
+ * reconstructs every "text" event's "s" field (mirroring the "param_value"
+ * reconstruction just above) and asserts each individually-emitted chunk is
+ * valid UTF-8 on its own: it never opens on a stray continuation byte and
+ * never ends on an incomplete multi-byte lead sequence. A test that only
+ * counted events would pass even with the tearing bug intact.
+ *
+ * Confirmed not vacuous: temporarily replaced the call under test with a
+ * bare "agent_publish(w, pub->ptr, pub->len); pub->len = 0;" (no UTF-8
+ * holdback -- the pre-fix behavior applied to this buffering site) and
+ * reran. The first emitted event's payload then ends on the bare 0xE2 lead
+ * byte, so the "agent_utf8_incomplete_tail_len(sval, chunk_len) == 0"
+ * assertion on that chunk fails as expected. The substitution was then
+ * reverted and the test re-confirmed passing. */
+static void test_agent_worker_compact_stream_flush_no_utf8_tear(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    agent_buf pub = {0};
+
+    /* 4095 one-byte ASCII "tokens", then the em dash's lead byte as its own
+     * "token" (pub.len becomes exactly 4096, tripping the threshold with
+     * only 1 of the em dash's 3 bytes present), then its two continuation
+     * bytes as a second "token", then trailing ASCII. */
+    for (int i = 0; i < 4095; i++) {
+        agent_buf_append(&pub, "a", 1);
+        if (pub.len >= 4096) agent_worker_compact_stream_flush(&w, &pub, false);
+    }
+    agent_buf_append(&pub, "\xe2", 1); /* lead byte of U+2014 EM DASH */
+    if (pub.len >= 4096) agent_worker_compact_stream_flush(&w, &pub, false);
+    agent_buf_append(&pub, "\x80\x94", 2); /* its two continuation bytes */
+    if (pub.len >= 4096) agent_worker_compact_stream_flush(&w, &pub, false);
+    const char *tail = "trailing text after the boundary";
+    agent_buf_append(&pub, tail, strlen(tail));
+    agent_worker_compact_stream_flush(&w, &pub, true); /* final drain, as the loop's end does */
+    free(pub.ptr);
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+
+    /* Reconstruct every "text" event's "s" field and check each chunk is
+     * independently valid UTF-8, the same way
+     * test_agent_json_events_param_value_utf8_boundary_no_tear() does for
+     * "param_value" events. */
+    agent_buf reconstructed = {0};
+    size_t pos = 0;
+    int event_count = 0;
+    while (pos < w.out_len) {
+        const char *line_start = w.out + pos;
+        const char *newline = memchr(line_start, '\n', w.out_len - pos);
+        size_t line_len = newline ? (size_t)(newline - line_start) : (w.out_len - pos);
+        const char *skey = agent_memmem(line_start, line_len, "\"s\":\"", 5);
+        AGENT_TEST_ASSERT(skey != NULL);
+        const char *sval = skey + 5;
+        const char *line_end = line_start + line_len;
+        AGENT_TEST_ASSERT((size_t)(line_end - sval) >= 2);
+        const char *send = line_end - 2; /* line ends with `"}`; drop it */
+        size_t chunk_len = (size_t)(send - sval);
+
+        if (chunk_len) {
+            AGENT_TEST_ASSERT(((unsigned char)sval[0] & 0xC0) != 0x80);
+            AGENT_TEST_ASSERT(agent_utf8_incomplete_tail_len(sval, chunk_len) == 0);
+        }
+        agent_buf_append(&reconstructed, sval, chunk_len);
+        event_count++;
+        pos += line_len + (newline ? 1 : 0);
+    }
+
+    AGENT_TEST_ASSERT(event_count >= 2); /* the threshold flush plus the final flush */
+    const char *expected_tail = "\xe2\x80\x94trailing text after the boundary";
+    size_t expected_tail_len = strlen(expected_tail);
+    AGENT_TEST_ASSERT(reconstructed.len >= expected_tail_len);
+    AGENT_TEST_ASSERT(!memcmp(reconstructed.ptr + reconstructed.len - expected_tail_len,
+                              expected_tail, expected_tail_len));
+
+    free(reconstructed.ptr);
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
 /* Regression test for the NDJSON contract's backstop (Task 3.5). Per-site
  * --json-events gating fails open: any call site that writes through
  * agent_publish() without an explicit gate would otherwise leak raw bytes
@@ -8504,6 +8618,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_maybe_emit_status_event_distinguishes_collapsed_states();
     test_agent_emit_bare_event_ready_and_queued();
     test_agent_json_events_param_value_utf8_boundary_no_tear();
+    test_agent_worker_compact_stream_flush_no_utf8_tear();
     test_agent_publish_backstop_wraps_unguarded_bytes_as_text();
     test_agent_publish_unflagged_path_matches_raw();
     test_agent_json_events_tool_start_flushes_pending_text();
@@ -9668,10 +9783,50 @@ static char *agent_compact_make_prompt(const char *reason) {
  * the compacted transcript.  Any failure invalidates live KV because the model
  * may have just seen private compaction instructions that are not part of the
  * real conversation. */
+/* --json-events streaming buffer for agent_worker_compact()'s summary token
+ * loop.  Under the flag, agent_worker_compact() accumulates each token's
+ * text here instead of calling agent_publish() once per token -- the
+ * backstop in agent_publish() would otherwise turn every token into its own
+ * "text" event (hundreds per compaction), and some of those torn boundaries
+ * can land mid-UTF-8-sequence when a multi-byte character straddles a token
+ * boundary, producing an invalid-UTF-8 JSON string a Swift JSONDecoder
+ * silently drops. Mirrors agent_tool_viz_json_param_flush_safe()'s pattern
+ * for the identical class of bug at the tool-param-streaming site.
+ *
+ * force=true drains the whole buffer unconditionally (used once, right
+ * after the token loop ends on every exit path -- normal completion, error,
+ * and interrupt -- so nothing is ever left unpublished). force=false holds
+ * back any trailing incomplete UTF-8 sequence via
+ * agent_utf8_incomplete_tail_len() so only whole characters are ever
+ * published; that is used at the periodic 4096-byte threshold inside the
+ * loop. The caller owns pub->ptr and must free() it once done -- a cheap
+ * no-op if json_events was never true, since then nothing was ever
+ * appended. */
+static void agent_worker_compact_stream_flush(agent_worker *w, agent_buf *pub,
+                                              bool force) {
+    if (!pub->len) return;
+    size_t hold = force ? 0 : agent_utf8_incomplete_tail_len(pub->ptr, pub->len);
+    size_t flush_len = pub->len - hold;
+    if (!flush_len) return;
+    agent_publish(w, pub->ptr, flush_len);
+    if (hold) memmove(pub->ptr, pub->ptr + flush_len, hold);
+    pub->len = hold;
+    if (pub->ptr) pub->ptr[hold] = '\0';
+}
+
 static bool agent_worker_compact(agent_worker *w, const char *reason,
                                  char *err, size_t err_len) {
     const int bottom = w->transcript.len;
     if (bottom <= 0) return true;
+    /* Gates both the ANSI compaction narration (header, "\x1b[0m\n" resets,
+     * the rebuild-context line, the bash-job-update line) and the summary
+     * token stream's buffering below. Under the flag, narration is
+     * suppressed outright (it has no honest home inside a "text" event --
+     * see agent_publish()'s backstop) and the summary stream is buffered
+     * through agent_worker_compact_stream_flush() instead of published one
+     * token at a time. With the flag off, every one of those call sites
+     * behaves exactly as before this task -- same bytes, same timing. */
+    const bool json_events = w->cfg && w->cfg->json_events;
 
     ds4_tokens sys = {0};
     agent_worker_build_system_tokens(w, &sys);
@@ -9680,9 +9835,11 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
         return true;
     }
 
-    agent_publishf(w,
-        "\n\x1b[1;95mCOMPACTING\x1b[0m %s: summarizing durable task state\n\x1b[38;5;245m",
-        reason && reason[0] ? reason : "context");
+    if (!json_events) {
+        agent_publishf(w,
+            "\n\x1b[1;95mCOMPACTING\x1b[0m %s: summarizing durable task state\n\x1b[38;5;245m",
+            reason && reason[0] ? reason : "context");
+    }
 
     char *prompt_text = agent_compact_make_prompt(reason);
     ds4_tokens prompt = {0};
@@ -9709,7 +9866,7 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
         snprintf(err, err_len, "not enough context left to request compaction summary");
         ds4_tokens_free(&prompt);
         ds4_tokens_free(&sys);
-        agent_publish(w, "\x1b[0m\n", 5);
+        if (!json_events) agent_publish(w, "\x1b[0m\n", 5);
         return false;
     }
     int summary_max = summary_room < AGENT_COMPACT_SUMMARY_MAX_TOKENS ?
@@ -9729,7 +9886,7 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
             w, "Compaction interrupted; keeping the previous conversation state.");
         ds4_tokens_free(&prompt);
         ds4_tokens_free(&sys);
-        agent_publish(w, "\x1b[0m\n", 5);
+        if (!json_events) agent_publish(w, "\x1b[0m\n", 5);
         worker_clear_interrupt(w);
         return false;
     }
@@ -9737,7 +9894,7 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
         ds4_session_invalidate(w->session);
         ds4_tokens_free(&prompt);
         ds4_tokens_free(&sys);
-        agent_publish(w, "\x1b[0m\n", 5);
+        if (!json_events) agent_publish(w, "\x1b[0m\n", 5);
         return false;
     }
 
@@ -9746,6 +9903,11 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
      * conversation.  If anything fails, invalidate live KV so the next turn
      * cannot accidentally continue from the private compaction exchange. */
     agent_buf summary = {0};
+    /* Only ever appended to when json_events is true (see the loop body
+     * below); agent_worker_compact_stream_flush() and free() are both
+     * cheap no-ops on an untouched {0} buffer, so every exit path below
+     * flushes+frees it unconditionally rather than re-checking the flag. */
+    agent_buf stream_pub = {0};
     char eval_err[160] = {0};
     int dsml_id = agent_special_token_id(w->engine, "｜DSML｜");
     double t0 = now_sec();
@@ -9756,7 +9918,9 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
             ds4_tokens_free(&prompt);
             ds4_tokens_free(&sys);
             free(summary.ptr);
-            agent_publish(w, "\x1b[0m\n", 5);
+            agent_worker_compact_stream_flush(w, &stream_pub, true);
+            free(stream_pub.ptr);
+            if (!json_events) agent_publish(w, "\x1b[0m\n", 5);
             agent_publish_system_status(
                 w, "Compaction interrupted; keeping the previous conversation state.");
             worker_clear_interrupt(w);
@@ -9779,14 +9943,22 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
             ds4_tokens_free(&prompt);
             ds4_tokens_free(&sys);
             free(summary.ptr);
-            agent_publish(w, "\x1b[0m\n", 5);
+            agent_worker_compact_stream_flush(w, &stream_pub, true);
+            free(stream_pub.ptr);
+            if (!json_events) agent_publish(w, "\x1b[0m\n", 5);
             return false;
         }
 
         size_t text_len = 0;
         char *text = ds4_token_text(w->engine, token, &text_len);
         agent_buf_append(&summary, text, text_len);
-        agent_publish(w, text, text_len);
+        if (json_events) {
+            agent_buf_append(&stream_pub, text, text_len);
+            if (stream_pub.len >= 4096)
+                agent_worker_compact_stream_flush(w, &stream_pub, false);
+        } else {
+            agent_publish(w, text, text_len);
+        }
         free(text);
 
         double dt = now_sec() - t0;
@@ -9797,7 +9969,13 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
         agent_wake_locked(w);
         pthread_mutex_unlock(&w->mu);
     }
-    agent_publish(w, "\x1b[0m\n", 5);
+    /* Loop over: normal completion or the stop-token break above. Nothing
+     * further appends to stream_pub after this point, so drain and free it
+     * here -- the single place both loop-exit routes converge -- rather
+     * than at every later return below. */
+    agent_worker_compact_stream_flush(w, &stream_pub, true);
+    free(stream_pub.ptr);
+    if (!json_events) agent_publish(w, "\x1b[0m\n", 5);
     ds4_tokens_free(&prompt);
 
     if (!summary.ptr || !summary.ptr[0]) {
@@ -9825,9 +10003,11 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
 
     agent_tokens_append_range(&compacted, &w->transcript, tail_start, bottom);
 
-    agent_publishf(w,
-        "\x1b[1;95mCOMPACTING\x1b[0m rebuilding context: old=%d summary+tail=%d tail=%d\n",
-        bottom, compacted.len, bottom - tail_start);
+    if (!json_events) {
+        agent_publishf(w,
+            "\x1b[1;95mCOMPACTING\x1b[0m rebuilding context: old=%d summary+tail=%d tail=%d\n",
+            bottom, compacted.len, bottom - tail_start);
+    }
 
     ds4_tokens old_transcript = {0};
     ds4_tokens_copy(&old_transcript, &w->transcript);
@@ -9848,8 +10028,10 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
         ds4_chat_append_message(w->engine, &w->transcript, "tool", bash_update);
         w->session_dirty = true;
         agent_trace_text(w, "tool-after-compaction", bash_update, strlen(bash_update));
-        agent_publish(w, "\x1b[90mCOMPACTING added bash job update after rebuild\x1b[0m\n",
-                      strlen("\x1b[90mCOMPACTING added bash job update after rebuild\x1b[0m\n"));
+        if (!json_events) {
+            agent_publish(w, "\x1b[90mCOMPACTING added bash job update after rebuild\x1b[0m\n",
+                          strlen("\x1b[90mCOMPACTING added bash job update after rebuild\x1b[0m\n"));
+        }
         free(bash_update);
     }
     agent_trace(w, "compacted reason=\"%s\" old=%d new=%d tail_start=%d tail=%d",
@@ -10486,6 +10668,27 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
     }
 }
 
+/* --json-events streaming buffer for worker_run_raw_prompt(). Same torn-
+ * UTF-8 problem as agent_worker_compact()'s summary loop (task 3.8: a
+ * multi-byte character split across two tokens would otherwise be split
+ * across two agent_publish()-backstopped "text" events, each invalid UTF-8
+ * once JSON-escaped). This is a deliberately separate copy of that same
+ * flush-with-holdback logic rather than a shared helper -- raw-prompt mode
+ * is unused by the app and lower stakes, and the task that added this asked
+ * for the two sites to stay independent rather than factored into one
+ * abstraction. */
+static void worker_raw_prompt_stream_flush(agent_worker *w, agent_buf *pub,
+                                           bool force) {
+    if (!pub->len) return;
+    size_t hold = force ? 0 : agent_utf8_incomplete_tail_len(pub->ptr, pub->len);
+    size_t flush_len = pub->len - hold;
+    if (!flush_len) return;
+    agent_publish(w, pub->ptr, flush_len);
+    if (hold) memmove(pub->ptr, pub->ptr + flush_len, hold);
+    pub->len = hold;
+    if (pub->ptr) pub->ptr[hold] = '\0';
+}
+
 static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
     agent_config *cfg = w->cfg;
     pthread_mutex_lock(&w->mu);
@@ -10519,6 +10722,12 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
         ds4_tokens_free(&prompt);
         return 1;
     }
+
+    /* Only ever appended to when cfg->json_events is true (see the inner
+     * for loop below); worker_raw_prompt_stream_flush() and free() are both
+     * cheap no-ops on an untouched {0} buffer, so every exit path below
+     * flushes+frees it unconditionally rather than re-checking the flag. */
+    agent_buf raw_pub = {0};
 
     ds4_tokens_free(&w->transcript);
     ds4_tokens_copy(&w->transcript, &prompt);
@@ -10575,6 +10784,8 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
         if (ntok < 0) {
             agent_set_error(w, err[0] ? err : "raw decode failed");
             ds4_tokens_free(&prompt);
+            worker_raw_prompt_stream_flush(w, &raw_pub, true);
+            free(raw_pub.ptr);
             return 1;
         }
 
@@ -10590,7 +10801,13 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
             char *text = ds4_token_text(w->engine, token, &text_len);
             agent_trace_token(w, token, text, text_len, generated + 1);
             ds4_tokens_push(&w->transcript, token);
-            agent_publish(w, text, text_len);
+            if (cfg->json_events) {
+                agent_buf_append(&raw_pub, text, text_len);
+                if (raw_pub.len >= 4096)
+                    worker_raw_prompt_stream_flush(w, &raw_pub, false);
+            } else {
+                agent_publish(w, text, text_len);
+            }
             free(text);
             generated++;
 
@@ -10603,6 +10820,12 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
         }
         if (stop) break;
     }
+    /* Nothing further appends to raw_pub past this point on any remaining
+     * path (interrupted or normal completion), so drain and free it here --
+     * the single place both routes converge -- rather than at each return
+     * below. */
+    worker_raw_prompt_stream_flush(w, &raw_pub, true);
+    free(raw_pub.ptr);
 
     if (worker_should_interrupt(w)) {
         worker_clear_interrupt(w);
