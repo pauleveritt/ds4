@@ -389,6 +389,13 @@ static void agent_emit_tool_event(agent_worker *w, const char *phase, int idx,
                                   const char *key2, const char *value2,
                                   const char *int_key, int int_value,
                                   const char *s, size_t n);
+/* UTF-8-safe trimmed length (defined beside agent_utf8_incomplete_tail_len,
+ * near :3739): forward-declared here so agent_tool_viz_tool() and
+ * agent_tool_viz_param_begin() (further up the file) can use it to keep a
+ * model-controlled tool/param name's --json-events "name" field from ending
+ * on a torn multi-byte sequence when the 64-byte snprintf that builds
+ * v->tool_name/v->param_name truncates it (fix-round 1 review, task 3.9). */
+static size_t agent_utf8_safe_len(const char *s, size_t len);
 /* Bypass sink for callers that have already built a complete NDJSON line
  * (agent_emit_event_str and friends, near :4132) -- forward-declared here so
  * agent_publish() (defined just above its body, near :1367) can call it
@@ -3469,8 +3476,20 @@ static void agent_tool_viz_tool(agent_stream_renderer *sr, const char *name) {
     v->tool_announced = true;
     v->read_style = !strcmp(v->tool_name, "read");
     if (json_events) {
+        /* v->tool_name is a model-controlled name copied through a 64-byte
+         * snprintf above (see agent_utf8_safe_len's forward-declaration
+         * comment) -- an over-long or malformed name (e.g. a rambling
+         * hallucinated tool-call attempt, which is a very ordinary failure
+         * mode, not a contrived attack) can truncate mid-character there.
+         * Emit a locally trimmed copy rather than v->tool_name itself, so
+         * the untrimmed buffer is still available for read_style/kind
+         * lookups and ANSI display exactly as before. */
+        char safe_name[sizeof(v->tool_name)];
+        size_t safe_len = agent_utf8_safe_len(v->tool_name, strlen(v->tool_name));
+        memcpy(safe_name, v->tool_name, safe_len);
+        safe_name[safe_len] = '\0';
         agent_emit_tool_event(sr->renderer->worker, "tool", v->call_idx,
-                              "name", v->tool_name, NULL, NULL, NULL, 0, NULL, 0);
+                              "name", safe_name, NULL, NULL, NULL, 0, NULL, 0);
         return;
     }
     agent_tool_viz_line_prefix(sr);
@@ -3651,9 +3670,19 @@ static void agent_tool_viz_param_begin(agent_stream_renderer *sr, const char *na
 
     if (agent_tool_viz_json_events(sr)) {
         v->json_param.len = 0;
+        /* v->param_name is a model-controlled name copied through a 64-byte
+         * snprintf above and can truncate mid-character the same way
+         * v->tool_name can (see agent_tool_viz_tool()'s matching comment) --
+         * emit a locally trimmed copy, leaving v->param_name itself
+         * untouched for the param_kind lookup just above and any later ANSI
+         * display use. */
+        char safe_param_name[sizeof(v->param_name)];
+        size_t safe_param_len = agent_utf8_safe_len(v->param_name, strlen(v->param_name));
+        memcpy(safe_param_name, v->param_name, safe_param_len);
+        safe_param_name[safe_param_len] = '\0';
         agent_emit_tool_event(sr->renderer->worker, "param_begin", v->call_idx,
                               "kind", agent_tool_param_kind_str(v->param_kind),
-                              "name", v->param_name[0] ? v->param_name : NULL,
+                              "name", safe_param_name[0] ? safe_param_name : NULL,
                               NULL, 0, NULL, 0);
         return;
     }
@@ -3722,6 +3751,20 @@ static size_t agent_utf8_incomplete_tail_len(const char *buf, size_t len) {
         return seq_len > back ? back : 0;
     }
     return 0;
+}
+
+/* s[0..len) trimmed back to its longest valid-UTF-8 prefix -- i.e. len minus
+ * any trailing incomplete multi-byte sequence, per
+ * agent_utf8_incomplete_tail_len(). A thin convenience wrapper for call
+ * sites that just want the safe length to pass to agent_json_escape() or to
+ * bound a copy, rather than the holdback count itself (fix-round 1 review,
+ * task 3.9: a byte buffer sliced or capped at a fixed offset with no
+ * character-boundary awareness -- e.g. a model-controlled name or error
+ * string truncated by a fixed-size snprintf -- must never hand a torn
+ * trailing sequence to the JSON escaper, which passes bytes >= 0x80 through
+ * unescaped by design). */
+static size_t agent_utf8_safe_len(const char *s, size_t len) {
+    return len - agent_utf8_incomplete_tail_len(s, len);
 }
 
 /* Flush the accumulated --json-events parameter-value buffer as one
@@ -4629,7 +4672,19 @@ static void agent_emit_status_event(agent_worker *w, const agent_status *st) {
     snprintf(num, sizeof(num), "%d", st->power_percent);
     agent_buf_puts(&b, num);
     agent_buf_puts(&b, ",\"error\":\"");
-    agent_json_escape(&b, st->error, strlen(st->error));
+    /* st->error is populated by agent_set_error() via a bare 256-byte
+     * `snprintf(w->status.error, sizeof(w->status.error), "%s", msg)` (see
+     * that function) with no character-boundary awareness -- if `msg`
+     * (which can itself embed arbitrary content, e.g. a file path, from an
+     * engine or filesystem error deeper in the call chain) is long enough
+     * to truncate there, a multi-byte character can be cut mid-sequence.
+     * This is the "status" event's error field on literally every worker
+     * error transition, so unlike the other sites this fix-round found,
+     * it needs no unusual input to reach agent_json_escape() -- it is
+     * escaped unconditionally here rather than passing strlen(st->error)
+     * directly. */
+    size_t error_len = agent_utf8_safe_len(st->error, strlen(st->error));
+    agent_json_escape(&b, st->error, error_len);
     agent_buf_puts(&b, "\"}\n");
     char *line = agent_buf_take(&b);
     if (line) { agent_publish_raw(w, line, strlen(line)); free(line); }
@@ -7330,6 +7385,35 @@ static bool agent_edit_find_old_span(const char *data, size_t len,
     return true;
 }
 
+/* Max raw (pre-JSON-escape) bytes of bash output agent_bash_publish_observation()
+ * (defined near the other agent_bash_job constants further down, next to
+ * AGENT_BASH_HEAD_BYTES/AGENT_BASH_TAIL_BYTES) will fold into one
+ * --json-events "tool"/"output" event body. Defined up here, ahead of that
+ * natural home, so the UTF-8-boundary regression test below -- which needs
+ * to compute an expected trimmed length in terms of this constant -- can see
+ * it. Placed just above the `#ifdef DS4_AGENT_TEST` block (rather than
+ * inside it, beside the function forward-declarations that serve the same
+ * purpose) because the actual cap check in agent_bash_publish_observation()
+ * is ordinary, always-compiled code, not test-only -- a `#define` living
+ * inside the test guard would leave it undeclared for the non-test
+ * `ds4-agent` build.
+ *
+ * agent_buf_append() (the buffer agent_emit_tool_event() escapes this
+ * payload into) hard-caps at 128KB and, once that cap latches, silently
+ * drops every further append -- including the closing `"}\n` written last,
+ * which corrupts that line AND merges it with whatever the worker emits
+ * next. JSON escaping can expand a byte up to 6x (a raw control byte, e.g.
+ * an unstripped ANSI escape a colorizing tool left in even when writing to
+ * a non-tty pipe, becomes the 6-byte string \u001b), so the cap here is
+ * sized against that worst case, not the common ~2x case (quotes/newlines)
+ * -- 6 * 20KB plus this event's small fixed overhead (type/phase/idx/key
+ * wrapper, the truncation note) stays safely under 128KB, so the closing
+ * bytes can never be dropped, by construction, regardless of what the
+ * command actually printed. Deliberately tighter than AGENT_BASH_TAIL_BYTES
+ * (32KB): that cap bounds what a human tail reads comfortably; this one
+ * bounds what can survive JSON escaping intact. */
+#define AGENT_BASH_JSON_OUTPUT_BODY_CAP (20*1024)
+
 #ifdef DS4_AGENT_TEST
 static int agent_test_failures;
 
@@ -8401,6 +8485,206 @@ static void test_agent_emit_status_event_escapes_error_field(void) {
     pthread_mutex_destroy(&w.mu);
 }
 
+/* Regression test for task 3.9 fix-round 1 (Critical, "the third instance of
+ * one bug class"): agent_set_error() populates agent_status.error via a bare
+ * `snprintf(w->status.error, sizeof(w->status.error), "%s", msg)` with no
+ * character-boundary awareness. If `msg` (which can carry arbitrary content,
+ * e.g. a file path, from a deeper engine or filesystem error) is long enough
+ * to truncate at that 256-byte cap, a multi-byte character can be cut
+ * mid-sequence -- and agent_emit_status_event() then handed that torn tail
+ * straight to agent_json_escape(), which passes bytes >= 0x80 through
+ * unescaped by design. Unlike this fix-round's other findings, this needs no
+ * unusual input to reach the escaper: it is the "status" event's error
+ * field on every worker error transition.
+ *
+ * This constructs st.error directly with a torn trailing sequence -- "ok "
+ * followed by the lead byte and first continuation byte of a 3-byte euro
+ * sign (E2 82 AC) with the closing continuation byte cut off, exactly what
+ * a boundary-unaware truncation at that exact offset leaves behind -- rather
+ * than trying to drive a real 256-byte message through agent_set_error(),
+ * since the resulting buffer state is identical either way and this is far
+ * more direct. Asserts the emitted "error" field is exactly the valid
+ * prefix ("ok "), with no trace of the torn bytes anywhere in the line.
+ *
+ * Confirmed not vacuous: temporarily reverted
+ * `agent_json_escape(&b, st->error, error_len);` back to
+ * `agent_json_escape(&b, st->error, strlen(st->error));` (the pre-fix
+ * behavior) and reran. The exact-field assertion failed (the field then
+ * contains the raw 0xE2 0x82 tail too), and the "no torn bytes anywhere"
+ * memchr assertion failed as well. Restored the fix and re-confirmed
+ * passing. */
+static void test_agent_emit_status_event_trims_torn_utf8_error_tail(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1;
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    agent_status st = {0};
+    st.state = AGENT_WORKER_ERROR;
+    memcpy(st.error, "ok \xe2\x82", 5);
+    st.error[4] = '\0';
+
+    agent_emit_status_event(&w, &st);
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    if (w.out) {
+        AGENT_TEST_ASSERT(strstr(w.out, "\"error\":\"ok \"") != NULL);
+        AGENT_TEST_ASSERT(memchr(w.out, '\xe2', w.out_len) == NULL);
+        AGENT_TEST_ASSERT(memchr(w.out, '\x82', w.out_len) == NULL);
+    }
+
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* Regression test for task 3.9 fix-round 1: agent_tool_viz_tool() and
+ * agent_tool_viz_param_begin() copy a model-controlled name into a 64-byte
+ * buffer (v->tool_name / v->param_name) via a bare snprintf with the same
+ * boundary-unaware truncation problem as agent_set_error() above -- and
+ * this one needs no unusual input at all, just an over-long tool/param name,
+ * which is a very ordinary hallucinated/malformed-generation failure mode.
+ *
+ * Drives agent_tool_viz_tool() and agent_tool_viz_param_begin() directly
+ * with a 65-byte name: 62 ASCII 'a' bytes followed by a 3-byte euro sign
+ * (E2 82 AC). The 64-byte snprintf keeps only the first 63 bytes (62 'a's
+ * plus the euro sign's lead byte E2), truncating exactly at that lead byte
+ * -- a 1-byte torn sequence, distinct from the 2-byte torn sequence the
+ * status.error test above exercises, so together they cover both ways
+ * agent_utf8_incomplete_tail_len() can trim.
+ *
+ * Confirmed not vacuous: temporarily reverted both emission sites to pass
+ * v->tool_name / v->param_name directly (the pre-fix behavior, dropping the
+ * safe_name/safe_param_name copies) and reran. Both "ends with 62 a's, no
+ * trailing 0xE2" assertions failed (the emitted name then ends in the raw
+ * 0xE2 lead byte). Restored the fix and re-confirmed passing. */
+static void test_agent_tool_viz_trims_torn_utf8_names(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    agent_token_renderer renderer = { .worker = &w };
+    agent_stream_renderer stream = { .renderer = &renderer };
+
+    char long_name[70] = {0};
+    memset(long_name, 'a', 62);
+    memcpy(long_name + 62, "\xe2\x82\xac", 3);
+    long_name[65] = '\0'; /* 65 raw bytes: 62 'a's + one euro sign */
+
+    agent_tool_viz_tool(&stream, long_name);
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    if (w.out) {
+        AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"tool\"") != NULL);
+        char expected_name_field[80];
+        agent_buf expected = {0};
+        agent_buf_puts(&expected, "\"name\":\"");
+        for (int i = 0; i < 62; i++) agent_buf_puts(&expected, "a");
+        agent_buf_puts(&expected, "\"");
+        snprintf(expected_name_field, sizeof(expected_name_field), "%s",
+                 expected.ptr ? expected.ptr : "");
+        free(expected.ptr);
+        AGENT_TEST_ASSERT(strstr(w.out, expected_name_field) != NULL);
+        AGENT_TEST_ASSERT(memchr(w.out, '\xe2', w.out_len) == NULL);
+    }
+    free(w.out);
+    w.out = NULL; w.out_len = 0; w.out_cap = 0;
+
+    /* Same shape, param_begin's "name" field. tool_announced is already
+     * true from agent_tool_viz_tool() above, so this exercises param_begin
+     * in isolation without re-triggering the "tool" event. */
+    agent_tool_viz_param_begin(&stream, long_name);
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    if (w.out) {
+        AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"param_begin\"") != NULL);
+        char expected_name_field[80];
+        agent_buf expected = {0};
+        agent_buf_puts(&expected, "\"name\":\"");
+        for (int i = 0; i < 62; i++) agent_buf_puts(&expected, "a");
+        agent_buf_puts(&expected, "\"");
+        snprintf(expected_name_field, sizeof(expected_name_field), "%s",
+                 expected.ptr ? expected.ptr : "");
+        free(expected.ptr);
+        AGENT_TEST_ASSERT(strstr(w.out, expected_name_field) != NULL);
+        AGENT_TEST_ASSERT(memchr(w.out, '\xe2', w.out_len) == NULL);
+    }
+
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* Regression test for task 3.9 fix-round 1: agent_execute_tool_call()'s
+ * "unknown tool" fallback formats call->name (a model-controlled name with
+ * no length cap -- see agent_dsml_feed's xstrndup(name_start, name_end -
+ * name_start)) into a 256-byte `header` via
+ * `snprintf(header, sizeof(header), "\n[tool:%s] unknown tool\n", call->name)`,
+ * sharing the exact same boundary-unaware truncation risk as the other
+ * sites in this fix-round.
+ *
+ * The fixed prefix "\n[tool:" is 7 bytes, and `header`'s 256-byte buffer
+ * holds 255 usable bytes before its own NUL, leaving a 248-byte budget for
+ * the name before truncation. This test's name is built so the cut lands
+ * exactly one byte into a 3-byte euro sign (E2 82 AC): 247 ASCII 'a' bytes
+ * (indices 0..246) followed by the euro sign at indices 247..249 -- the
+ * truncated header therefore keeps the prefix plus name[0..247] (248
+ * bytes: 247 a's plus the euro's lead byte 0xE2), an unambiguous 1-byte
+ * torn sequence at the very end, the same shape the tool_name/param_name
+ * test above exercises. The name is 250 bytes total, comfortably past the
+ * 248-byte budget, so truncation is guaranteed regardless of the exact
+ * arithmetic above being slightly off in either direction.
+ *
+ * Confirmed not vacuous: temporarily reverted the fix (passed
+ * `header, strlen(header)` instead of `header, header_len` to
+ * agent_emit_tool_event()) and reran. The "no raw 0xE2 byte anywhere"
+ * assertion failed (the emitted line then ends in the torn lead byte).
+ * Restored the fix and re-confirmed passing. */
+static void test_agent_execute_tool_call_unknown_tool_trims_torn_utf8_name(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    char name_buf[251];
+    memset(name_buf, 'a', 247);
+    memcpy(name_buf + 247, "\xe2\x82\xac", 3);
+    name_buf[250] = '\0';
+
+    agent_tool_call call = {0};
+    call.name = name_buf;
+
+    char *result = agent_execute_tool_call(&w, &call, 3);
+    AGENT_TEST_ASSERT(result != NULL);
+    free(result);
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    if (w.out) {
+        AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"output\",\"idx\":3") != NULL);
+        /* The truncated-and-trimmed header ends right after 247 'a' bytes --
+         * the euro sign and everything meant to follow it ("] unknown
+         * tool\n") were already cut off by the 256-byte snprintf before the
+         * UTF-8 trim even runs, so this line's "s" field is exactly
+         * "\n[tool:" + 247 a's, with no trace of the euro sign at all. */
+        agent_buf expected = {0};
+        agent_buf_puts(&expected, "\\n[tool:");
+        for (int i = 0; i < 247; i++) agent_buf_puts(&expected, "a");
+        agent_buf_puts(&expected, "\"}");
+        char *expected_str = agent_buf_take(&expected);
+        AGENT_TEST_ASSERT(strstr(w.out, expected_str) != NULL);
+        free(expected_str);
+        /* No raw euro-sign byte (lead or continuation) survives anywhere
+         * in the emitted line. */
+        AGENT_TEST_ASSERT(memchr(w.out, '\xe2', w.out_len) == NULL);
+        AGENT_TEST_ASSERT(memchr(w.out, '\xac', w.out_len) == NULL);
+    }
+
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
 /* Regression test for a reviewer finding (Critical, "the dedupe key defeats
  * your own 8-state fix"): agent_maybe_emit_status_event()'s predecessor
  * compared the JSON emission decision against agent_format_status_line()'s
@@ -9026,17 +9310,27 @@ static void test_agent_tool_viz_finish_releases_json_param_and_closes_block(void
     /* The block must be closed on the wire: the buffered param bytes reach
      * a "param_value" event, the open param gets "param_end", and the block
      * gets exactly one "finish" carrying the error status -- not left
-     * dangling for the consumer. */
+     * dangling for the consumer.
+     *
+     * AGENT_TEST_ASSERT records-and-continues rather than aborting, so every
+     * dereference of w.out below is guarded by `if (w.out)`: under the
+     * active=false permutation this test's own comment describes (used to
+     * confirm non-vacuousness), w.out is NULL, and an unguarded
+     * strstr(w.out, ...) right after a *failed* `w.out != NULL` assertion
+     * would crash the whole test binary (SIGSEGV) instead of reporting the
+     * failure cleanly and letting the rest of the suite run. */
     AGENT_TEST_ASSERT(w.out != NULL);
-    AGENT_TEST_ASSERT(strstr(w.out, "partial value bytes") != NULL);
-    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"param_end\"") != NULL);
-    AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"finish\"") != NULL);
-    AGENT_TEST_ASSERT(strstr(w.out, "tool call failed: session error") != NULL);
+    if (w.out) {
+        AGENT_TEST_ASSERT(strstr(w.out, "partial value bytes") != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"param_end\"") != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\"phase\":\"finish\"") != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "tool call failed: session error") != NULL);
 
-    size_t finish_count = 0;
-    const char *p = w.out;
-    while ((p = strstr(p, "\"phase\":\"finish\"")) != NULL) { finish_count++; p++; }
-    AGENT_TEST_ASSERT(finish_count == 1); /* not double-emitted */
+        size_t finish_count = 0;
+        const char *p = w.out;
+        while ((p = strstr(p, "\"phase\":\"finish\"")) != NULL) { finish_count++; p++; }
+        AGENT_TEST_ASSERT(finish_count == 1); /* not double-emitted */
+    }
 
     free(w.out);
     pthread_mutex_destroy(&w.mu);
@@ -9112,6 +9406,118 @@ static void test_agent_json_events_bash_observation_huge_body_cap_keeps_line_com
      * told output was shortened, not silently lose 80000 of the 100001
      * body bytes. */
     AGENT_TEST_ASSERT(strstr(w.out, "truncated") != NULL);
+
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* Regression test for task 3.9 Fix 2 round 2 (fix-round 1 review, Critical):
+ * the byte cap in agent_bash_publish_observation() above cuts the raw body
+ * at a fixed byte OFFSET with no character-boundary awareness.
+ * agent_json_escape() passes bytes >= 0x80 through unescaped by design, so a
+ * cut landing mid-multi-byte-sequence puts truncated (invalid) UTF-8
+ * directly into the JSON string -- syntactically valid JSON containing
+ * invalid UTF-8, which a strict decoder (e.g. Swift's JSONDecoder) rejects.
+ * The 128KB-latch bug the cap was added to fix would have been relocated to
+ * a UTF-8-boundary bug at a much smaller, much more easily reached size,
+ * rather than eliminated.
+ *
+ * Uses the reviewer's own reproduction shape: 8000x U+20AC EURO SIGN
+ * (E2 82 AC, 3 bytes each) = 24000 raw bytes, comfortably past
+ * AGENT_BASH_JSON_OUTPUT_BODY_CAP (20480). Since 20480 % 3 == 2, a
+ * boundary-unaware cut at exactly 20480 bytes lands 2 bytes into a
+ * character -- the last two kept bytes would be E2 82 (a 3-byte lead byte
+ * plus its first continuation byte, with the closing continuation byte
+ * dropped): an incomplete sequence, invalid UTF-8 on its own. The fix trims
+ * back to the last complete character with agent_utf8_incomplete_tail_len(),
+ * the same primitive agent_tool_viz_json_param_flush_safe() already uses for
+ * this identical byte-stream shape.
+ *
+ * This asserts the *kept* body bytes in the emitted event -- the substring
+ * between `"s":"` and the escaped truncation note's leading `\n` (that
+ * marker text is JSON-escaped as literal backslash-n, distinguishing it from
+ * a raw 0x0A byte) -- are (a) a whole number of 3-byte characters, i.e.
+ * AGENT_BASH_JSON_OUTPUT_BODY_CAP trimmed down to the nearest multiple of 3
+ * given an all-3-byte-character payload, and (b) independently confirmed
+ * boundary-clean via agent_utf8_incomplete_tail_len() returning 0 on that
+ * exact slice -- not just "some length was chosen" but "the chosen length
+ * ends on a real character boundary".
+ *
+ * Confirmed not vacuous: temporarily removed the
+ * `body_n -= agent_utf8_incomplete_tail_len(body, body_n);` line from the
+ * fix (reverting to a bare byte-offset cap) and reran. `kept_len % 3 == 0`
+ * failed (kept_len read 20480, not a multiple of 3), and
+ * `agent_utf8_incomplete_tail_len(body_start, kept_len) == 0` failed too
+ * (it read 2, exactly the dangling E2 82 the reviewer predicted). Restored
+ * the fix and re-confirmed passing. */
+static void test_agent_json_events_bash_observation_utf8_cap_boundary_no_tear(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    agent_buf obs_buf = {0};
+    agent_buf_puts(&obs_buf,
+        "bash job=9 pid=555 status=done elapsed_sec=1.0 timed_out=0\n"
+        "exit_status=0\n"
+        "output_path=/tmp/x (24000 bytes, 1 lines)\n"
+        "<tail -20 /tmp/x>\n");
+    for (int i = 0; i < 8000; i++) agent_buf_append(&obs_buf, "\xe2\x82\xac", 3); /* U+20AC EURO SIGN */
+    agent_buf_puts(&obs_buf, "\n</tail>\n");
+    char *obs = agent_buf_take(&obs_buf);
+
+    agent_bash_publish_observation(&w, obs, 0);
+    free(obs);
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    if (w.out) {
+        AGENT_TEST_ASSERT(strstr(w.out, "truncated") != NULL); /* did trip the cap */
+
+        const char *s_key = strstr(w.out, "\"s\":\"");
+        AGENT_TEST_ASSERT(s_key != NULL);
+        /* The emitted "s" field is `<notice><body><truncation note>`, per
+         * agent_bash_publish_observation()'s `combined` buffer -- this is
+         * the "<tail>" shape, so notice is the fixed
+         * "[showing last output lines]\n" string. Skip past it explicitly
+         * (rather than assuming the euro run starts right after `"s":"`)
+         * so this test measures the *body*'s boundary, not the notice's.
+         * The trailing newline is JSON-escaped by agent_json_escape() (a
+         * literal `\n`, i.e. backslash-n, not a raw 0x0A byte), so this
+         * comparison string uses `\\n` to match the escaped bytes actually
+         * on the wire. */
+        const char *notice_text = "[showing last output lines]\\n";
+        const char *note_marker = s_key ? strstr(s_key, "\\n[output truncated") : NULL;
+        AGENT_TEST_ASSERT(note_marker != NULL);
+        if (s_key && note_marker) {
+            AGENT_TEST_ASSERT(!strncmp(s_key + 5, notice_text, strlen(notice_text)));
+            const char *body_start = s_key + 5 + strlen(notice_text);
+            size_t kept_len = (size_t)(note_marker - body_start);
+
+            /* (a) a whole number of 3-byte euro-sign characters -- i.e. the
+             * cap was trimmed DOWN to the nearest character boundary, not
+             * just capped at the raw byte offset. */
+            AGENT_TEST_ASSERT(kept_len % 3 == 0);
+            AGENT_TEST_ASSERT(kept_len == (AGENT_BASH_JSON_OUTPUT_BODY_CAP / 3) * 3);
+            AGENT_TEST_ASSERT(kept_len < AGENT_BASH_JSON_OUTPUT_BODY_CAP); /* actually trimmed something */
+
+            /* (b) independently confirmed boundary-clean: no incomplete
+             * trailing sequence in the kept bytes at all. */
+            AGENT_TEST_ASSERT(agent_utf8_incomplete_tail_len(body_start, kept_len) == 0);
+
+            /* And every kept byte is actually part of a euro sign (not, say,
+             * kept_len bytes of garbage that merely happens to be a multiple
+             * of 3) -- reconstructs the kept run and compares it against
+             * kept_len/3 repetitions of the raw 3-byte character. */
+            size_t want_chars = kept_len / 3;
+            bool all_euro = true;
+            for (size_t i = 0; i < want_chars; i++) {
+                const unsigned char *c = (const unsigned char *)body_start + i * 3;
+                if (c[0] != 0xe2 || c[1] != 0x82 || c[2] != 0xac) { all_euro = false; break; }
+            }
+            AGENT_TEST_ASSERT(all_euro);
+        }
+    }
 
     free(w.out);
     pthread_mutex_destroy(&w.mu);
@@ -9241,6 +9647,9 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_json_events_unknown_tool_header_wraps_as_tool_output();
     test_agent_emit_status_event_covers_all_eight_states();
     test_agent_emit_status_event_escapes_error_field();
+    test_agent_emit_status_event_trims_torn_utf8_error_tail();
+    test_agent_tool_viz_trims_torn_utf8_names();
+    test_agent_execute_tool_call_unknown_tool_trims_torn_utf8_name();
     test_agent_maybe_emit_status_event_distinguishes_collapsed_states();
     test_agent_emit_bare_event_ready_and_queued();
     test_agent_json_events_param_value_utf8_boundary_no_tear();
@@ -9251,6 +9660,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_json_events_time_based_flush();
     test_agent_tool_viz_finish_releases_json_param_and_closes_block();
     test_agent_json_events_bash_observation_huge_body_cap_keeps_line_complete();
+    test_agent_json_events_bash_observation_utf8_cap_boundary_no_tear();
     test_agent_maybe_emit_marker_status_matches_original_semantics();
 }
 #endif
@@ -9701,22 +10111,6 @@ static char *agent_tool_visit_page(agent_worker *w, const agent_tool_call *call)
 #define AGENT_BASH_PROGRESS_TAIL_LINES 4
 #define AGENT_BASH_FINAL_TAIL_LINES 20
 
-/* Max raw (pre-JSON-escape) bytes of bash output agent_bash_publish_observation()
- * will fold into one --json-events "tool"/"output" event body. agent_buf_append()
- * (the buffer agent_emit_tool_event() escapes this payload into) hard-caps at
- * 128KB and, once that cap latches, silently drops every further append --
- * including the closing `"}\n` agent_emit_tool_event() writes last, which
- * corrupts that line AND merges it with whatever the worker emits next. JSON
- * escaping can expand a byte up to 6x (a raw control byte, e.g. an unstripped
- * ANSI escape a colorizing tool left in even when writing to a non-tty pipe,
- * becomes the 6-byte string \u001b), so the cap here is sized against that worst case, not the
- * common ~2x case (quotes/newlines) -- 6 * 20KB plus this event's small fixed
- * overhead (type/phase/idx/key wrapper, the truncation note below) stays safely
- * under 128KB, so the closing bytes can never be dropped, by construction,
- * regardless of what the command actually printed. Deliberately tighter than
- * AGENT_BASH_TAIL_BYTES above (32KB): that cap bounds what a human tail reads
- * comfortably; this one bounds what can survive JSON escaping intact. */
-#define AGENT_BASH_JSON_OUTPUT_BODY_CAP (20*1024)
 
 struct agent_bash_job {
     int id;
@@ -10179,6 +10573,19 @@ static void agent_bash_publish_observation(agent_worker *w, const char *obs, int
             bool body_truncated = false;
             if (body_n > AGENT_BASH_JSON_OUTPUT_BODY_CAP) {
                 body_n = AGENT_BASH_JSON_OUTPUT_BODY_CAP;
+                /* The cap above is a raw byte offset with no character-
+                 * boundary awareness -- agent_json_escape() passes bytes
+                 * >= 0x80 through unescaped by design, so a cut landing
+                 * mid-multi-byte-sequence puts truncated (invalid) UTF-8
+                 * directly into the JSON string: syntactically valid JSON
+                 * containing invalid UTF-8, which Swift's JSONDecoder
+                 * rejects outright (JSON strings must be valid UTF-8).
+                 * Trim back to the last complete character with the same
+                 * primitive agent_tool_viz_json_param_flush_safe() already
+                 * uses for exactly this byte-stream shape (a raw tool/bash
+                 * byte stream cut at a fixed threshold with no regard for
+                 * character boundaries). */
+                body_n -= agent_utf8_incomplete_tail_len(body, body_n);
                 body_truncated = true;
             }
             agent_buf combined = {0};
@@ -10318,11 +10725,25 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     {
         char header[256];
         snprintf(header, sizeof(header), "\n[tool:%s] unknown tool\n", call->name);
-        if (w->cfg->json_events)
+        if (w->cfg->json_events) {
+            /* call->name is whatever the model generated between DSML
+             * markers (agent_dsml_feed_tagged/agent_dsml_feed's name
+             * parsing has no length cap -- see xstrndup(name_start,
+             * name_end - name_start)), so a sufficiently long hallucinated
+             * "tool name" (an ordinary malformed-generation failure mode,
+             * not a contrived attack) can push this snprintf's total past
+             * 256 bytes, truncating call->name mid-character with no
+             * boundary awareness. Trim the resulting header back to its
+             * longest valid-UTF-8 prefix before emitting -- the non-json
+             * branch below is untouched, since a torn byte in a raw
+             * terminal write has no JSON-validity consequence and must stay
+             * byte-identical to before this fix-round. */
+            size_t header_len = agent_utf8_safe_len(header, strlen(header));
             agent_emit_tool_event(w, "output", idx, NULL, NULL, NULL, NULL, NULL, 0,
-                                  header, strlen(header));
-        else
+                                  header, header_len);
+        } else {
             agent_publish(w, header, strlen(header));
+        }
         agent_buf_puts(&result, "Tool error: unknown tool: ");
         agent_buf_puts(&result, call->name);
         agent_buf_puts(&result, "\n");
@@ -11358,19 +11779,24 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         /* stream.viz.json_param may hold up to a streaming tool parameter's
          * un-flushed tail (see agent_tool_viz_param_raw_byte's 4096-byte
          * threshold) by the time one of the three hard-error `goto
-         * turn_fail` sites above fires, and a dangling tool block's "start"
-         * (and any "param_begin"/"param_value" already on the wire) has no
-         * matching "finish" -- the consumer's open tool card is left open
-         * forever even though the `error` status event that follows lets it
-         * recover the turn overall.
-         *
-         * agent_tool_viz_finish() both frees that buffer (via
-         * agent_tool_viz_json_param_release(), a no-op if no buffer was ever
-         * allocated) and, if a block is actually open (v->active), closes it
-         * out properly on the wire: flushes any still-buffered param bytes
-         * as a final "param_value", emits "param_end" if a param was mid-
-         * stream, then "finish" with an error status. It is a safe no-op if
-         * no tool block was open when the error hit.
+         * turn_fail` sites above fires -- free it unconditionally (this is
+         * the leak fix and is side-effect-free: no bytes reach any output
+         * sink, un-flagged or json_events, either way). */
+        agent_tool_viz_json_param_release(&stream.viz);
+        /* Closing the block on the wire with a "finish" event, in contrast,
+         * is NOT side-effect-free outside --json-events: agent_tool_viz_finish()'s
+         * non-json branch renders real bytes to the terminal (color-wrapped
+         * status text plus a newline -- see its `if (!agent_tool_viz_json_events(sr))`
+         * tail). Pre-fix, turn_fail called only renderer_json_release() (a
+         * no-op un-flagged), so a hard mid-generation error printed nothing
+         * extra un-flagged; calling agent_tool_viz_finish() unconditionally
+         * here would change that, printing status text on an error path that
+         * previously printed none -- a byte-identity violation of the
+         * un-flagged path, even though the printed text would arguably be a
+         * cosmetic improvement (it mirrors how the interrupt and
+         * preflight-error paths already close a dangling block). Gate it on
+         * cfg->json_events so the un-flagged terminal stays byte-identical to
+         * before this task; only the JSON wire gets the closing "finish".
          *
          * This cannot double-emit "finish": the only other place this
          * function reaches agent_tool_viz_finish() is via
@@ -11379,11 +11805,27 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
          * iteration) -- and every `goto turn_fail` site lives strictly
          * inside that generation loop, so control reaches at most one of
          * {that agent_stream_text() call, this turn_fail block} per
-         * iteration, never both. */
-        char finish_status[300];
-        snprintf(finish_status, sizeof(finish_status),
-                 "[tool call failed: %s]\n", err[0] ? err : "internal error");
-        agent_tool_viz_finish(&stream, finish_status);
+         * iteration, never both. agent_tool_viz_finish() is also a safe
+         * no-op if no tool block was open when the error hit. */
+        if (cfg->json_events) {
+            char finish_status[300];
+            snprintf(finish_status, sizeof(finish_status),
+                     "[tool call failed: %s]\n", err[0] ? err : "internal error");
+            /* finish_status (300 bytes) has ample headroom over err (160
+             * bytes) plus this format's fixed text, so THIS snprintf cannot
+             * itself truncate -- but err's own content is engine-supplied
+             * and not something this function controls the construction of,
+             * so trim defensively anyway (the same discipline applied to
+             * every other site this fix-round's sweep found) rather than
+             * relying on err always being clean UTF-8. agent_tool_viz_finish()
+             * -> agent_emit_tool_event() escapes this via strlen(), which
+             * has no length parameter to pass a pre-trimmed count to, so
+             * trim the buffer itself in place. */
+            size_t finish_status_len =
+                agent_utf8_safe_len(finish_status, strlen(finish_status));
+            finish_status[finish_status_len] = '\0';
+            agent_tool_viz_finish(&stream, finish_status);
+        }
         agent_dsml_parser_free(&dsml);
         agent_set_error(w, err);
         return 1;
