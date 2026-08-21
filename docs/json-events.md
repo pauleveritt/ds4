@@ -274,12 +274,22 @@ them.
   an artifact of the ANSI-era paragraph separator between thinking output
   and the reply. Do not treat a leading `"\n\n"` (or occasionally just
   `"\n"`) on the first post-think `text` chunk as meaningful content.
-- **Invalid UTF-8 emitted by the model passes through unescaped.** The JSON
-  string escaper only escapes `"`, `\`, and control bytes `< 0x20`; any byte
-  `>= 0x80` — including a byte that is not part of a well-formed UTF-8
-  sequence — is copied straight into the JSON string body. A strict JSON/UTF-8
-  decoder may reject such a line. This can appear in `text`/`think` events
-  bodies and in `param_value`/`output` bodies.
+- **Invalid UTF-8 emitted by the model is silently dropped, not passed
+  through.** The JSON string escaper validates every multi-byte sequence
+  (lead-byte class, correct continuation-byte count, and — per RFC 3629 —
+  the narrower first-continuation-byte range required for overlong
+  encodings and the UTF-16-surrogate range) before copying it into a JSON
+  string body; `"`, `\`, and control bytes `< 0x20` are escaped as usual.
+  Any byte that is not part of a complete, well-formed sequence — a torn
+  multi-byte character cut by a buffering/size threshold, a lone
+  continuation byte, an overlong encoding, a surrogate half, or anything
+  else a byte-level tokenizer can emit directly — is dropped from the
+  output rather than copied in raw. A consumer therefore never sees invalid
+  UTF-8 on the wire, but this means the `s`/`status`/`name` text a consumer
+  receives is not always byte-identical to what the model generated: bytes
+  can silently vanish rather than arrive mangled. This can affect
+  `text`/`think` event bodies and `param_value`/`output`/`tool`/`finish`
+  string fields alike, since all of them pass through the same escaper.
 - **There is no turn-end event.** A consumer must infer "the turn is over"
   from the `status` event's `state` transitioning from `generating` to
   `idle`. This is reliable specifically because state changes bypass the

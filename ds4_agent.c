@@ -4589,7 +4589,17 @@ static char *agent_buf_take(agent_buf *b) {
  * three callers, and the specific-site fixes elsewhere) are kept as
  * defense-in-depth -- cheap, and they avoid escaping bytes already known to
  * be garbage -- but this function no longer depends on any of them being
- * correct. */
+ * correct.
+ *
+ * Validates STRUCTURE, not just boundaries, per RFC 3629 (task 3.9
+ * fix-round 3): a generic lead-byte-class-plus-0x80..0xBF-continuation
+ * check accepts overlong encodings and lone UTF-16 surrogate halves as
+ * "complete and well-formed" -- e.g. `E0 80 80` (overlong U+0000) or
+ * `ED A0 80` (a surrogate half, not a valid standalone scalar value) --
+ * even though neither is truncated. A byte-level BPE tokenizer can emit
+ * such bytes directly, not just tear a real character at a boundary, so
+ * the fix-round 2 validation above was necessary but not sufficient. The
+ * per-lead-byte first-continuation-byte range table below closes that. */
 static void agent_json_escape(agent_buf *b, const char *s, size_t n) {
     size_t i = 0;
     while (i < n) {
@@ -4624,16 +4634,41 @@ static void agent_json_escape(agent_buf *b, const char *s, size_t n) {
          * agent_utf8_incomplete_tail_len()'s notion of a valid sequence
          * (lead-byte class determines length, 0x80..0xBF continuation
          * bytes) plus the standard exclusions for overlong/out-of-range
-         * lead bytes (0xC0/0xC1, > 0xF4). */
+         * lead bytes (0xC0/0xC1, > 0xF4).
+         *
+         * The generic 0x80..0xBF check below is not sufficient on its own
+         * (fix-round 3 review, task 3.9): RFC 3629 additionally restricts
+         * the FIRST continuation byte's range for four edge lead bytes, to
+         * rule out overlong encodings and the UTF-16-surrogate range, which
+         * a generic per-byte 0x80..0xBF check does not catch -- e.g.
+         * `E0 80 80` (an overlong encoding of U+0000) and `ED A0 80` (a
+         * lone UTF-16 surrogate half, not a valid Unicode scalar value on
+         * its own) both pass a lead-byte-class-plus-generic-continuation
+         * check despite being structurally invalid UTF-8. A byte-level BPE
+         * tokenizer can emit such bytes directly (not just torn ones), so
+         * this table has to be enforced here, not just at truncation
+         * boundaries. `cont1_lo`/`cont1_hi` narrow the first continuation
+         * byte's allowed range for E0/ED/F0/F4; every other lead byte (and
+         * every later continuation byte in a 3- or 4-byte sequence) uses
+         * the unrestricted 0x80..0xBF range. */
         size_t seq_len;
+        unsigned char cont1_lo = 0x80, cont1_hi = 0xBF;
         if ((c & 0xE0) == 0xC0 && c >= 0xC2) seq_len = 2;
-        else if ((c & 0xF0) == 0xE0) seq_len = 3;
-        else if ((c & 0xF8) == 0xF0 && c <= 0xF4) seq_len = 4;
-        else { i++; continue; }
+        else if ((c & 0xF0) == 0xE0) {
+            seq_len = 3;
+            if (c == 0xE0) cont1_lo = 0xA0;      /* else: overlong 3-byte */
+            else if (c == 0xED) cont1_hi = 0x9F;  /* else: UTF-16 surrogate */
+        } else if ((c & 0xF8) == 0xF0 && c <= 0xF4) {
+            seq_len = 4;
+            if (c == 0xF0) cont1_lo = 0x90;      /* else: overlong 4-byte */
+            else if (c == 0xF4) cont1_hi = 0x8F;  /* else: > U+10FFFF */
+        } else { i++; continue; }
         if (i + seq_len > n) { i++; continue; }
         bool valid = true;
         for (size_t k = 1; k < seq_len; k++) {
-            if (((unsigned char)s[i + k] & 0xC0) != 0x80) { valid = false; break; }
+            unsigned char cc = (unsigned char)s[i + k];
+            if ((cc & 0xC0) != 0x80) { valid = false; break; }
+            if (k == 1 && (cc < cont1_lo || cc > cont1_hi)) { valid = false; break; }
         }
         if (!valid) { i++; continue; }
         agent_buf_append(b, s + i, seq_len);
@@ -10039,6 +10074,69 @@ static void test_agent_emitters_choke_point_trims_torn_utf8(void) {
     pthread_mutex_destroy(&w.mu);
 }
 
+/* Regression test for task 3.9 fix-round 3: agent_json_escape()'s non-ASCII
+ * validation checked only the lead-byte class and a generic continuation-
+ * byte pattern (0x80..0xBF for every continuation byte), which is not
+ * sufficient per RFC 3629 -- it never restricted the FIRST continuation
+ * byte's range for four edge lead bytes, so it accepted overlong encodings
+ * and lone UTF-16 surrogate halves as "complete and well-formed" even
+ * though neither is truncated: E0 80 80 (overlong U+0000), ED A0 80 (a
+ * surrogate half, not a valid standalone scalar value), F0 80 80 80
+ * (overlong 4-byte), F4 90 80 80 (past U+10FFFF). A byte-level BPE
+ * tokenizer can emit such bytes directly, not just tear a real character.
+ *
+ * Drives agent_json_escape() with all four invalid sequences interleaved
+ * with their valid boundary-value counterparts (E0 A0 80, ED 9F BF,
+ * F0 90 80 80, F4 8F BF BF -- the lowest/highest first-continuation-byte
+ * values that must still be ACCEPTED, chosen because an off-by-one in the
+ * range table is most likely to reject exactly these). Asserts the output
+ * is EXACTLY the concatenation of the four valid sequences, byte-for-byte,
+ * in order, with nothing else -- not merely "some bytes survived" or "no
+ * particular byte appears", either of which could pass even if the table
+ * were shifted by one and silently corrupted or dropped a boundary value.
+ *
+ * Confirmed not vacuous, in both directions:
+ *  - Under-tightening: temporarily reverted the per-lead-byte
+ *    cont1_lo/cont1_hi restriction back to the generic 0x80..0xBF check for
+ *    every continuation byte (this fix-round's starting state) and reran.
+ *    The output then included all four invalid sequences' raw bytes too,
+ *    so the exact-concatenation assertion failed.
+ *  - Over-tightening: temporarily widened E0's cont1_lo from 0xA0 to 0xA1
+ *    and reran. This made the valid boundary value E0 A0 80 wrongly
+ *    rejected -- the same assertion failed from the opposite direction,
+ *    which is exactly the failure mode an off-by-one in this table would
+ *    produce in production (a real character silently vanishing).
+ * Both reverts were restored and the test re-confirmed passing. */
+static void test_agent_json_escape_rejects_overlong_and_surrogate_utf8(void) {
+    agent_buf input = {0};
+    agent_buf_append(&input, "\xe0\x80\x80", 3);     /* invalid: overlong 3-byte (< A0) */
+    agent_buf_append(&input, "\xe0\xa0\x80", 3);     /* valid: lower boundary */
+    agent_buf_append(&input, "\xed\xa0\x80", 3);     /* invalid: surrogate half (>= A0) */
+    agent_buf_append(&input, "\xed\x9f\xbf", 3);     /* valid: upper boundary */
+    agent_buf_append(&input, "\xf0\x80\x80\x80", 4); /* invalid: overlong 4-byte (< 90) */
+    agent_buf_append(&input, "\xf0\x90\x80\x80", 4); /* valid: lower boundary */
+    agent_buf_append(&input, "\xf4\x90\x80\x80", 4); /* invalid: past U+10FFFF (> 8F) */
+    agent_buf_append(&input, "\xf4\x8f\xbf\xbf", 4); /* valid: upper boundary */
+
+    agent_buf out = {0};
+    agent_json_escape(&out, input.ptr, input.len);
+
+    agent_buf expected = {0};
+    agent_buf_append(&expected, "\xe0\xa0\x80", 3);
+    agent_buf_append(&expected, "\xed\x9f\xbf", 3);
+    agent_buf_append(&expected, "\xf0\x90\x80\x80", 4);
+    agent_buf_append(&expected, "\xf4\x8f\xbf\xbf", 4);
+
+    AGENT_TEST_ASSERT(out.len == expected.len);
+    AGENT_TEST_ASSERT(out.ptr && expected.ptr &&
+                      out.len == expected.len &&
+                      !memcmp(out.ptr, expected.ptr, expected.len));
+
+    free(input.ptr);
+    free(out.ptr);
+    free(expected.ptr);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_json_events_release_flushes_and_frees_pending();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
@@ -10085,6 +10183,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_tool_viz_finish_trims_torn_utf8_param_value();
     test_agent_dsml_unexpected_tag_error_trims_torn_utf8_status();
     test_agent_emitters_choke_point_trims_torn_utf8();
+    test_agent_json_escape_rejects_overlong_and_surrogate_utf8();
 }
 #endif
 
