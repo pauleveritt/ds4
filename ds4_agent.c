@@ -366,6 +366,11 @@ static void agent_emit_event_str(agent_worker *w, const char *kind,
 static void agent_emit_tool_event(agent_worker *w, const char *phase,
                                   const char *key, const char *value,
                                   const char *s, size_t n);
+/* Bypass sink for callers that have already built a complete NDJSON line
+ * (agent_emit_event_str and friends, near :4132) -- forward-declared here so
+ * agent_publish() (defined just above its body, near :1367) can call it
+ * without wrapping the JSON a second time. */
+static void agent_publish_raw(agent_worker *w, const char *s, size_t n);
 static void agent_trace_text(agent_worker *w, const char *label,
                              const char *text, size_t len);
 static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr);
@@ -1344,9 +1349,27 @@ static void agent_wake_locked(agent_worker *w) {
     (void)wr;
 }
 
-/* Queue rendered output for the UI thread.  The worker never writes directly
- * to the terminal, which keeps linenoise redraws serialized in one place. */
+/* The NDJSON contract's backstop.  Under --json-events every byte reaching
+ * stdout must be part of a JSON line, but emission is gated per-call-site, and
+ * a missed site (or a new one arriving from an upstream merge) would otherwise
+ * inject raw bytes that the consumer silently drops.  Wrapping here makes the
+ * failure mode "an unexpected text event" instead of "a lost line".
+ * Callers that have ALREADY built a complete JSON line must use
+ * agent_publish_raw to avoid double-wrapping. */
 static void agent_publish(agent_worker *w, const char *s, size_t n) {
+    if (!n) return;
+    if (w && w->cfg && w->cfg->json_events) {
+        agent_emit_event_str(w, "text", s, n);
+        return;
+    }
+    agent_publish_raw(w, s, n);
+}
+
+/* Queue rendered output for the UI thread.  The worker never writes directly
+ * to the terminal, which keeps linenoise redraws serialized in one place.
+ * Bypass sink for callers that have already built a complete NDJSON line --
+ * see agent_publish() above. */
+static void agent_publish_raw(agent_worker *w, const char *s, size_t n) {
     if (!n) return;
     pthread_mutex_lock(&w->mu);
     if (w->out_len + n + 1 > w->out_cap) {
@@ -4354,7 +4377,7 @@ static void agent_emit_event_str(agent_worker *w, const char *kind,
     agent_buf_puts(&b, "\"}\n");
     char *line = agent_buf_take(&b);
     if (line) {
-        agent_publish(w, line, strlen(line));
+        agent_publish_raw(w, line, strlen(line));
         free(line);
     }
 }
@@ -4384,7 +4407,7 @@ static void agent_emit_tool_event(agent_worker *w, const char *phase,
     }
     agent_buf_puts(&b, "}\n");
     char *line = agent_buf_take(&b);
-    if (line) { agent_publish(w, line, strlen(line)); free(line); }
+    if (line) { agent_publish_raw(w, line, strlen(line)); free(line); }
 }
 
 /* Emit one NDJSON event with no payload: {"t":"<kind>"}.  Used for the
@@ -4396,7 +4419,7 @@ static void agent_emit_bare_event(agent_worker *w, const char *kind) {
     agent_buf_puts(&b, kind);
     agent_buf_puts(&b, "\"}\n");
     char *line = agent_buf_take(&b);
-    if (line) { agent_publish(w, line, strlen(line)); free(line); }
+    if (line) { agent_publish_raw(w, line, strlen(line)); free(line); }
 }
 
 /* agent_status.state -> lowercase wire name for the "status" event.  Unlike
@@ -4455,7 +4478,7 @@ static void agent_emit_status_event(agent_worker *w, const agent_status *st) {
     agent_json_escape(&b, st->error, strlen(st->error));
     agent_buf_puts(&b, "\"}\n");
     char *line = agent_buf_take(&b);
-    if (line) { agent_publish(w, line, strlen(line)); free(line); }
+    if (line) { agent_publish_raw(w, line, strlen(line)); free(line); }
 }
 
 static bool agent_tokens_equal(const ds4_tokens *a, const ds4_tokens *b) {
@@ -7978,6 +8001,72 @@ static void test_agent_json_events_param_value_utf8_boundary_no_tear(void) {
     pthread_mutex_destroy(&w.mu);
 }
 
+/* Regression test for the NDJSON contract's backstop (Task 3.5). Per-site
+ * --json-events gating fails open: any call site that writes through
+ * agent_publish() without an explicit gate would otherwise leak raw bytes
+ * into the NDJSON stream, which the Swift consumer silently drops. This
+ * verifies agent_publish() itself now wraps unguarded bytes as a "text"
+ * event instead of passing them through, and that agent_publish_raw() --
+ * the bypass every emitter that has already built a complete JSON line must
+ * use -- still passes bytes through untouched. */
+static void test_agent_publish_backstop_wraps_unguarded_bytes_as_text(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1; /* agent_wake_locked() writes here; -1 is a safe no-op fd. */
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    /* agent_publish() must wrap unguarded bytes as a single "text" event,
+     * not pass them through raw. If the wrap were removed (agent_publish()
+     * reduced unconditionally to agent_publish_raw()), w.out would be the
+     * 10 raw bytes "raw bytes\n" instead of this JSON line, so this
+     * assertion is not vacuously true. */
+    agent_publish(&w, "raw bytes\n", 10);
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(!strcmp(w.out, "{\"t\":\"text\",\"s\":\"raw bytes\\n\"}\n"));
+
+    free(w.out);
+    w.out = NULL; w.out_len = 0; w.out_cap = 0;
+
+    /* agent_publish_raw() is the bypass every emitter that has already
+     * built a complete JSON line depends on -- it must pass bytes through
+     * exactly, even under json_events, or every emitter double-wraps. */
+    agent_publish_raw(&w, "raw bytes\n", 10);
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(!strcmp(w.out, "raw bytes\n"));
+
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* With json_events off, agent_publish() must reduce exactly to
+ * agent_publish_raw() -- the un-flagged path stays byte-identical to
+ * pre-backstop behavior. Covers both a NULL cfg (agent_publish()'s guard
+ * against dereferencing w->cfg when a worker hasn't been configured yet --
+ * unit tests elsewhere construct workers with NULL fields for exactly this
+ * reason; agent_tool_viz_json_events exists for the same reason, see Task 2)
+ * and json_events explicitly false. */
+static void test_agent_publish_unflagged_path_matches_raw(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1;
+    w.cfg = NULL;
+
+    agent_publish(&w, "raw bytes\n", 10);
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(!strcmp(w.out, "raw bytes\n"));
+    free(w.out);
+    w.out = NULL; w.out_len = 0; w.out_cap = 0;
+
+    agent_config cfg = { .json_events = false };
+    w.cfg = &cfg;
+    agent_publish(&w, "raw bytes\n", 10);
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(!strcmp(w.out, "raw bytes\n"));
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_json_events_release_flushes_and_frees_pending();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
@@ -8005,6 +8094,8 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_emit_status_event_escapes_error_field();
     test_agent_emit_bare_event_ready_and_queued();
     test_agent_json_events_param_value_utf8_boundary_no_tear();
+    test_agent_publish_backstop_wraps_unguarded_bytes_as_text();
+    test_agent_publish_unflagged_path_matches_raw();
 }
 #endif
 
