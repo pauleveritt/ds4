@@ -4793,6 +4793,29 @@ static void agent_emit_bare_event(agent_worker *w, const char *kind) {
     if (line) { agent_publish_raw(w, line, strlen(line)); free(line); }
 }
 
+/* The "ready" event, optionally carrying the session's constant memory budget.
+ * Values are identical on every ready of a session, so a consumer may take the
+ * first and ignore the rest; they are repeated because a consumer that starts
+ * late or drops a line still recovers. A NULL plan emits the bare form. */
+static void agent_emit_ready_event(agent_worker *w, const ds4_memory_plan *plan) {
+    agent_buf b = {0};
+    agent_buf_puts(&b, "{\"t\":\"ready\"");
+    if (plan) {
+        char nums[192];
+        snprintf(nums, sizeof(nums),
+                 ",\"kv_bytes\":%llu,\"scratch_bytes\":%llu"
+                 ",\"model_bytes\":%llu,\"planned_bytes\":%llu",
+                 (unsigned long long)plan->kv_bytes,
+                 (unsigned long long)plan->scratch_bytes,
+                 (unsigned long long)plan->model_bytes,
+                 (unsigned long long)plan->planned_bytes);
+        agent_buf_puts(&b, nums);
+    }
+    agent_buf_puts(&b, "}\n");
+    char *line = agent_buf_take(&b);
+    if (line) { agent_publish_raw(w, line, strlen(line)); free(line); }
+}
+
 /* agent_status.state -> lowercase wire name for the "status" event.  Unlike
  * agent_format_status_line() (the +DWARFSTAR_STATUS stderr marker), this
  * covers all eight agent_worker_state values distinctly: the stderr marker
@@ -8962,6 +8985,43 @@ static void test_agent_emit_bare_event_ready_and_queued(void) {
     pthread_mutex_destroy(&w.mu);
 }
 
+/* The ready event carries the session's constant memory budget. */
+static void test_agent_emit_ready_event_carries_memory_plan(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1;
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    const ds4_memory_plan plan = {
+        .kv_bytes = 1685774336u,
+        .scratch_bytes = 6146715648u,
+        .model_bytes = 48254631936u,
+        .planned_bytes = 56087121920u,
+    };
+    agent_emit_ready_event(&w, &plan);
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    if (w.out) {
+        AGENT_TEST_ASSERT(!strcmp(w.out,
+            "{\"t\":\"ready\",\"kv_bytes\":1685774336,\"scratch_bytes\":6146715648"
+            ",\"model_bytes\":48254631936,\"planned_bytes\":56087121920}\n"));
+    }
+    free(w.out);
+    w.out = NULL; w.out_len = 0; w.out_cap = 0;
+
+    /* A NULL plan must still produce a valid bare ready line: the engine may
+     * have no plan (opened with ctx_size <= 0), and a missing event would
+     * strand the consumer waiting for a turn boundary that never arrives. */
+    agent_emit_ready_event(&w, NULL);
+    AGENT_TEST_ASSERT(w.out != NULL);
+    if (w.out) {
+        AGENT_TEST_ASSERT(!strcmp(w.out, "{\"t\":\"ready\"}\n"));
+    }
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
 /* Regression test for a code-review finding on Task 2's --json-events tool
  * events work: agent_tool_viz_param_raw_byte() appends one byte at a time
  * into v->json_param and flushes as a "param_value" event as soon as its
@@ -10170,6 +10230,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_execute_tool_call_unknown_tool_trims_torn_utf8_name();
     test_agent_maybe_emit_status_event_distinguishes_collapsed_states();
     test_agent_emit_bare_event_ready_and_queued();
+    test_agent_emit_ready_event_carries_memory_plan();
     test_agent_json_events_param_value_utf8_boundary_no_tear();
     test_agent_worker_compact_stream_flush_no_utf8_tear();
     test_agent_publish_backstop_wraps_unguarded_bytes_as_text();
@@ -14329,7 +14390,12 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         if (!one_shot && initialized && idle && !queue.len &&
             input.len == 0 && !stdin_eof && !waiting_announced)
         {
-            if (cfg->json_events) agent_emit_bare_event(&worker, "ready");
+            if (cfg->json_events) {
+                ds4_memory_plan plan;
+                const bool have_plan =
+                    ds4_engine_memory_plan(worker.engine, &plan);
+                agent_emit_ready_event(&worker, have_plan ? &plan : NULL);
+            }
             else agent_noninteractive_marker("+DWARFSTAR_WAITING");
             waiting_announced = true;
         }

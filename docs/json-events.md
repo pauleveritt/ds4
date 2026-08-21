@@ -175,14 +175,30 @@ changes and is throttled (not silently dropped) otherwise.
 ### `ready`
 
 ```json
-{"t":"ready"}
+{"t":"ready","kv_bytes":1685774336,"scratch_bytes":6146715648,"model_bytes":48254631936,"planned_bytes":56087121920}
 ```
 
-No fields besides `t`. The `--json-events` replacement for the
-`+DWARFSTAR_WAITING` stderr marker: emitted when the worker is idle, has no
-queued/pending input, and is waiting for more stdin. Only emitted in the
-persistent (piped-stdin) non-interactive loop, never in one-shot (`-p`)
-mode.
+The `--json-events` replacement for the `+DWARFSTAR_WAITING` stderr marker:
+emitted when the worker is idle, has no queued/pending input, and is waiting
+for more stdin. Only emitted in the persistent (piped-stdin) non-interactive
+loop, never in one-shot (`-p`) mode.
+
+Besides `t`, the four `*_bytes` fields carry the session's startup memory
+budget:
+
+| field | type | meaning |
+|---|---|---|
+| `kv_bytes` | uint64 | raw + compressed KV cache |
+| `scratch_bytes` | uint64 | per-context prefill scratch |
+| `model_bytes` | uint64 | resident model span |
+| `planned_bytes` | uint64 | total, including buffers and reserves |
+
+These values are constant for the life of the session — KV is allocated
+upfront for the whole context, so none of them vary with usage — and are
+identical on every `ready` of a session; a consumer may take the first and
+ignore the rest. They are **absent** (only `{"t":"ready"}` is emitted)
+when the engine has no memory plan to report (opened with `ctx_size <= 0`),
+so a parser must treat all four fields as optional.
 
 ### `queued`
 
