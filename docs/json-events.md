@@ -237,6 +237,13 @@ rely on:
   block's `finish` — tool execution happens only once the whole block has
   finished streaming — and are dispatched and published one call at a time,
   strictly in `idx` order (dispatch is a sequential loop, not concurrent).
+- **A block's `output` events all arrive before the next block's `start`.**
+  Tool dispatch is synchronous on the single worker thread, and the model
+  cannot write a new tool block until it has seen the prior block's results
+  in context. This matters because `idx` restarts at `0` every block: a
+  consumer that keys tool state by `idx` and clears that state at `start`
+  relies on this guarantee to avoid attributing a late `output` to a
+  same-`idx` call in the *following* block.
 - A `status` event whose `state` differs from the previous one is emitted
   immediately, never delayed by the throttle.
 
@@ -274,6 +281,11 @@ them.
   an artifact of the ANSI-era paragraph separator between thinking output
   and the reply. Do not treat a leading `"\n\n"` (or occasionally just
   `"\n"`) on the first post-think `text` chunk as meaningful content.
+  **Strip all leading whitespace rather than matching a fixed count.** The
+  one-or-two above describes only what the renderer itself writes; the
+  model's own first content bytes may then add more. A real capture
+  contains post-think items beginning with three newlines, so a consumer
+  matching the literal `"\n\n"` will under-handle this.
 - **Invalid UTF-8 emitted by the model is silently dropped, not passed
   through.** The JSON string escaper validates every multi-byte sequence
   (lead-byte class, correct continuation-byte count, and — per RFC 3629 —
