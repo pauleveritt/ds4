@@ -213,7 +213,7 @@ endif
 test-mellum-oracle-checker:
 	python3 tests/test_check_mellum_layer0_oracle.py
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+ds4.o: ds4.c ds4_mellum_diag.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
