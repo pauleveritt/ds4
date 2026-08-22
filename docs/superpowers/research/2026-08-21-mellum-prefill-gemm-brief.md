@@ -636,18 +636,24 @@ Env knobs that exist:
 
 | Variable | Effect |
 | --- | --- |
-| `DS4_MELLUM_MOE_GEMM` | expert-major MoE prefill (default off; **now reachable from a session**, worth 2.9x — see §5b) |
-| `DS4_MELLUM_PREFILL_EXACT` | row-exact prefill projections (**default ON** since `d6e4808`; 0 is faster and looser) |
+| `DS4_MELLUM_MOE_GEMM` | **default ON.** 0 selects the bitwise path, which exists as the test oracle rather than a shippable mode |
+| `DS4_MELLUM_PREFILL_EXACT` | **default ON.** Row-exact prefill projections; 0 is faster and looser |
+| `DS4_MELLUM_ATTN_GROUP` | **default ON.** Head-grouped decode attention above 256 keys |
 | `DS4_MELLUM_SYNC_BATCH` | 0 forces the old tokenwise session sync; the only way to A/B the two |
+| `DS4_MELLUM_PREFILL_CHUNK` | prefill chunk width; also tunes cancellation granularity |
 | `DS4_MELLUM_SYNC_TRACE` | report which sync path ran, and its throughput |
-| `DS4_MELLUM_ATTN_GROUP` | head-grouped decode attention (**default ON**, set 0 to disable) |
-| `DS4_MELLUM_ATTN_SPLIT` | split-K decode attention (**default ON**, set 0 to disable) |
-| `DS4_MELLUM_ATTN_OVERDISPATCH` | test hook: over-size the split launch |
 | `DS4_MELLUM_ATTN_TRACE` | report the decode kernel chosen and max key_count |
-| `DS4_MELLUM_DOWN_ROWTILE` | row-tiled token-major down (default off) |
-| `DS4_MELLUM_PREFILL_CHUNK` | prefill chunk width |
-| `DS4_MELLUM_PROFILE_PREFILL_TOKENS` | profile prefill width, 64 .. 2^20 |
-| `DS4_MELLUM_PROFILE_DECODE_DEPTH` | prime cache before decode timing |
+| `DS4_MELLUM_PROFILE_PREFILL_TOKENS` | diagnostic profile geometry, 64 .. 2^20 |
+| `DS4_MELLUM_PROFILE_DECODE_DEPTH` | prime the cache to this depth before timing decode |
+
+All of them are resolved **once**, into `ds4_mellum_runtime`
+(`ds4_mellum_runtime_get()` in `ds4_gpu.h`), rather than through static `getenv`
+caches scattered through dispatch code. Read that struct to see what Mellum
+does; do not re-derive a default at a call site.
+
+**Removed in the cleanup pass — do not look for them:**
+`DS4_MELLUM_ATTN_SPLIT`, `DS4_MELLUM_ATTN_OVERDISPATCH`,
+`DS4_MELLUM_DOWN_ROWTILE`, `DS4_MELLUM_GROUPED_MOE`. See 12f.
 
 ## 12. Measurement hygiene on this box — read before trusting any number
 
@@ -833,6 +839,79 @@ Add `DS4_MELLUM_SYNC_BATCH` and `DS4_MELLUM_SYNC_TRACE`, and Mellum now has
 **eight** environment switches. A reviewer should ask which are load-bearing
 and which are scaffolding from a period when none of this reached a session.
 
+## 12f. The cleanup pass
+
+An external review argued the biggest opportunity here was deletion rather
+than abstraction, and that Mellum could lose most of its configuration surface
+without losing capability. That turned out to be right.
+
+### One policy, chosen on evidence
+
+Exact projections, expert-major MoE, head-grouped attention above 256 keys,
+serial below. The open question was whether to default the MoE GEMM on, since
+a 0.09% relative rms on logits says nothing about whether a *token* changes,
+and the orchestrator evals cannot answer it — they run through `llama-server`
+and measure the model, not ds4's kernels.
+
+With `ds4-server` hosting Mellum, ds4 could be compared against itself: **five
+greedy transcripts at temperature 0, 531 tokens, byte-identical** with the
+GEMM on and off, on 109-token prompts where `DS4_MELLUM_SYNC_TRACE` confirmed
+`path=layer-major`. The deviation does not move a token. `commit 5534547`.
+
+### What was deleted
+
+| Removed | Why it existed | Lines |
+| --- | --- | ---: |
+| Split-K attention, its flag, launch contract and over-dispatch hook | never the better kernel; grouped beat it at every depth, and it served a GQA ratio Mellum lacks | ~190 |
+| Row-tiled down projection, both kernels and template | a 9.9% win over the token-major path expert-major replaced entirely | ~100 |
+| Old grouped gate/up kernel and `DS4_MELLUM_GROUPED_MOE` | superseded by expert-major; shared the bucket machinery, so it needed untangling rather than excision | ~123 |
+| The SWA probe's bitwise branch | unreachable: 1,030 keys is past the grouping threshold, so decode reassociates however the engine is configured | — |
+
+**423 lines net**, four flags, and the six-way decode configuration matrix
+reduced to one production path plus one oracle. `2731c61`, `c407770`.
+
+### Consolidation
+
+- **Workspace**: engine-owned and full-width. It was per-session and sized
+  from whichever suffix arrived first, so eight sessions held ~1 GiB of
+  scratch only one could use, and a first 64-token sync pinned every later
+  prompt to 64-token chunks. `806603c`.
+- **Runtime settings**: nine scattered `getenv` sites, each stating its own
+  default, became one struct resolved once. Three named helpers — opt-in,
+  opt-out, bounded integer — make the polarity explicit, which was previously
+  implicit in whether the test was `!= "0"` or `== "0"`. Getting that backwards
+  is how a test came to encode "unset means off" and break when a default
+  moved. `7d7e6f5`.
+- **Diagnostics**: twenty CLI flags and twelve near-identical dispatch blocks
+  became `--mellum-diag NAME` plus three parameters. An unknown name now lists
+  the twelve that exist instead of silently doing nothing. `d5e5673`.
+
+### Extraction, and where it stops
+
+2,967 lines now sit in Mellum-specific files: `ds4_metal_mellum.m` (1,555) and
+`ds4_mellum_diag.c` (1,491). Both are `#include`d rather than compiled apart.
+
+**The full runtime extraction was attempted and reverted.** Three obstacles,
+in increasing order of how much they bind:
+
+1. 25 file-static helpers in `ds4.c`, 12 plus 7 mutable globals in
+   `ds4_metal.m` — these make a separate translation unit expensive.
+2. `ds4_engine` and `ds4_session` are opaque in `ds4.h` and defined only in
+   `ds4.c`. A separate TU needs them in a private header shared by every model
+   family, for the benefit of one.
+3. **`ds4.c` is densely conditional.** Several runtime functions sit inside
+   `#ifndef DS4_NO_GPU` regions *thousands of lines long that they share with
+   other model families* — one is 10,985 lines. Cutting a function from the
+   middle leaves an `#endif` without its `#if`. This blocks even the textual
+   move.
+
+The extraction now refuses to move any block that is not preprocessor-balanced
+on its own, and asserts the remainder stays balanced. The twelve diagnostics
+carry their conditionals inside their braces, which is exactly why they could
+move and the runtime could not. Untangling (3) is a refactor of `ds4.c`'s
+conditional structure that would benefit every model family — worth scoping on
+its own terms, not as the tail of a Mellum pass. `bf29e51`, `83df491`.
+
 ## 13. Recommended order of work
 
 Rewritten after an external review; the previous version listed finished work
@@ -845,20 +924,13 @@ head grouping shipped and defaulted (`3c2b379`, `ce757c7`, `290005e`),
 merge from main (`e3dd644`), gates for the accelerated paths and an
 engine-owned workspace (`806603c`, `fef8e1c`).
 
-1. **Collapse the flag matrix** (12e). Gates now exist for every reachable
-   decode configuration, so this can be done safely. Remove
-   `DS4_MELLUM_GROUPED_MOE` outright — it is superseded. Split-K,
-   `DS4_MELLUM_ATTN_OVERDISPATCH` and `DS4_MELLUM_DOWN_ROWTILE` are all
-   candidates to go with it. **Keep the serial attention kernel** as the
-   short-history bitwise oracle the probes compare against.
+1. ~~Collapse the flag matrix.~~ **Done — see 12f.**
 
-2. **Decide the production numerics policy.** Exact projections plus
-   expert-major GEMM is the candidate: 2.9x with 0.09% relative rms on logits,
-   comfortably inside the model's own 0.26% error against FP32. Its drift is
-   small but has only been measured on fixtures — **confirm with greedy
-   transcripts and the task eval at n>=3 before enabling it by default**. Keep
-   the bitwise configuration as a diagnostic oracle, not as a second product
-   personality to maintain.
+2. ~~Decide the production numerics policy.~~ **Done — five greedy transcripts
+   byte-identical, so it shipped. See 12f.** The task eval at n>=3 was *not*
+   run against it and remains the one unrun check from the review; the greedy
+   comparison is stronger evidence for this specific question, but it is five
+   prompts, not a scored benchmark.
 
 3. **Build the selective 9.33 GiB artifact** (§10). This is the stated goal and
    it needs **Q4_K expert gate/up only** — not Q6_K, not Q5_0, which belong to
@@ -897,6 +969,15 @@ a new numerics story, and does nothing for decode.
 | `3c2b379` | split-K decode attention |
 | `418dadf` | split-K hardening after review; curve to 64K |
 | `ce757c7` | head-grouped (gqa8) decode attention |
+| `5534547` | expert-major MoE becomes the production policy |
+| `2731c61` | delete split-K and row-tile |
+| `c407770` | untangle and delete the old grouped path |
+| `806603c` | gates for the accelerated paths; engine-owned workspace |
+| `fef8e1c` | `chat_template_kwargs` tests; server tests given a build rule |
+| `7d7e6f5` | one resolved runtime struct instead of nine `getenv` sites |
+| `d5e5673` | every diagnostic behind `--mellum-diag` |
+| `bf29e51` | `ds4_metal_mellum.m` |
+| `83df491` | `ds4_mellum_diag.c` |
 | `0557a85` | corrected the record: prefill was in no session path |
 | `290005e` | faster decode attention made the default |
 | `e3dd644` | merge from main; `58421ee` fixed two hand-resolution defects |
