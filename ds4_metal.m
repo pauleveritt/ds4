@@ -255,13 +255,50 @@ static id<MTLComputePipelineState> g_mellum_gqa_decode_pipeline;
  */
 #define DS4_MELLUM_GROUP_HEADS 8u
 
-int ds4_gpu_mellum_attn_group_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("DS4_MELLUM_ATTN_GROUP");
-        cached = !(env && *env && strcmp(env, "0") == 0);
+/* An override that is off unless explicitly set to something other than 0. */
+static int ds4_mellum_env_opt_in(const char *name) {
+    const char *env = getenv(name);
+    return env && *env && strcmp(env, "0") != 0;
+}
+
+/* A default-on policy, disabled only by an explicit 0. */
+static int ds4_mellum_env_opt_out(const char *name) {
+    const char *env = getenv(name);
+    return !(env && *env && strcmp(env, "0") == 0);
+}
+
+static uint32_t ds4_mellum_env_u32(const char *name, uint32_t lo, uint32_t hi) {
+    const char *env = getenv(name);
+    if (!env || !*env) return 0;
+    char *end = NULL;
+    const unsigned long v = strtoul(env, &end, 10);
+    if (end == env || v < lo || v > hi) return 0;
+    return (uint32_t)v;
+}
+
+const ds4_mellum_runtime *ds4_mellum_runtime_get(void) {
+    static ds4_mellum_runtime rt;
+    static int resolved = 0;
+    if (!resolved) {
+        rt.moe_gemm       = ds4_mellum_env_opt_out("DS4_MELLUM_MOE_GEMM");
+        rt.prefill_exact  = ds4_mellum_env_opt_out("DS4_MELLUM_PREFILL_EXACT");
+        rt.attn_group     = ds4_mellum_env_opt_out("DS4_MELLUM_ATTN_GROUP");
+        rt.sync_batch     = ds4_mellum_env_opt_out("DS4_MELLUM_SYNC_BATCH");
+        rt.prefill_chunk  = ds4_mellum_env_u32("DS4_MELLUM_PREFILL_CHUNK",
+                                               1u, 1u << 20);
+        rt.attn_trace     = ds4_mellum_env_opt_in("DS4_MELLUM_ATTN_TRACE");
+        rt.sync_trace     = ds4_mellum_env_opt_in("DS4_MELLUM_SYNC_TRACE");
+        rt.profile_prefill_tokens = (int)ds4_mellum_env_u32(
+            "DS4_MELLUM_PROFILE_PREFILL_TOKENS", 64u, 1u << 20);
+        rt.profile_decode_depth = (int)ds4_mellum_env_u32(
+            "DS4_MELLUM_PROFILE_DECODE_DEPTH", 1u, 1u << 20);
+        resolved = 1;
     }
-    return cached;
+    return &rt;
+}
+
+int ds4_gpu_mellum_attn_group_enabled(void) {
+    return ds4_mellum_runtime_get()->attn_group;
 }
 
 /*
@@ -35143,7 +35180,7 @@ int ds4_gpu_mellum_gqa_decode_tensor(
         /* Which kernel ran, reported only on a new maximum key_count: a run
          * that never prints one above the threshold never left the serial
          * path, however many times it was dispatched. */
-        if (getenv("DS4_MELLUM_ATTN_TRACE")) {
+        if (ds4_mellum_runtime_get()->attn_trace) {
             static uint32_t reported_max = 0;
             if (key_count > reported_max) {
                 reported_max = key_count;
@@ -35440,12 +35477,7 @@ int ds4_gpu_mellum_attention_decode_tensor(
  * DS4_MELLUM_PREFILL_EXACT=0 to measure or ship the faster, looser path.
  */
 static bool ds4_gpu_mellum_prefill_exact_projections(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("DS4_MELLUM_PREFILL_EXACT");
-        cached = !(env && *env && strcmp(env, "0") == 0);
-    }
-    return cached != 0;
+    return ds4_mellum_runtime_get()->prefill_exact != 0;
 }
 
 int ds4_gpu_mellum_prefill_exact_projections_enabled(void) {
@@ -36167,12 +36199,7 @@ typedef struct {
  * as a second configuration to ship.
  */
 int ds4_gpu_mellum_moe_gemm_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("DS4_MELLUM_MOE_GEMM");
-        cached = !(env && *env && strcmp(env, "0") == 0);
-    }
-    return cached;
+    return ds4_mellum_runtime_get()->moe_gemm;
 }
 
 static id<MTLComputePipelineState> g_mellum_down_grouped4_pipeline;

@@ -2479,6 +2479,34 @@ int ds4_gpu_mellum_attention_decode_tensor(
 /* Diagnostic: whether Mellum prefill projections use the row-exact decode
  * kernel.  Reported by the profile so a measurement is self-describing. */
 int ds4_gpu_mellum_prefill_exact_projections_enabled(void);
+/*
+ * Every Mellum runtime setting, resolved once from the environment the first
+ * time it is asked for and constant thereafter.  It replaces a scatter of
+ * static getenv() caches inside dispatch code, each of which stated its own
+ * default independently -- which is how the batch-versus-decode test came to
+ * encode "unset means off" and break the moment a default moved.  Defaults
+ * live here now, in one readable block, and callers ask rather than re-derive.
+ *
+ * Policy fields describe what ships.  Diagnostic fields are overrides for
+ * measurement and should not change results.
+ */
+typedef struct {
+    /* Policy. */
+    int      moe_gemm;              /* expert-major MoE prefill            */
+    int      prefill_exact;         /* row-exact prefill projections       */
+    int      attn_group;            /* head-grouped decode attention       */
+    int      sync_batch;            /* layer-major session prefill         */
+    uint32_t prefill_chunk;         /* 0 keeps the caller's own default    */
+    /* Diagnostics. */
+    int      attn_trace;
+    int      sync_trace;
+    /* Diagnostic profile geometry; only --mellum-resident-profile reads it. */
+    int      profile_prefill_tokens;
+    int      profile_decode_depth;
+} ds4_mellum_runtime;
+
+const ds4_mellum_runtime *ds4_mellum_runtime_get(void);
+
 int ds4_gpu_mellum_moe_gemm_enabled(void);
 int ds4_gpu_mellum_attn_group_enabled(void);
 

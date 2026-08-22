@@ -62689,26 +62689,14 @@ int ds4_engine_mellum_resident_profile(ds4_engine *e, FILE *out,
      * marginal rate at depth, which is the number a long session actually
      * experiences.  Defaults to the sliding-window cap.
      */
-    int prefill_tokens = 1024;
-    {
-        const char *env = getenv("DS4_MELLUM_PROFILE_PREFILL_TOKENS");
-        if (env && *env) {
-            const long v = strtol(env, NULL, 10);
-            if (v >= 64 && v <= (1L << 20)) prefill_tokens = (int)v;
-        }
-    }
+    const ds4_mellum_runtime *rt = ds4_mellum_runtime_get();
+    int prefill_tokens = rt->profile_prefill_tokens ?
+        rt->profile_prefill_tokens : 1024;
     /*
      * Decode depth: prime the cache with this many tokens before timing the
      * decode passes.  Zero keeps the historical empty-cache measurement.
      */
-    int decode_depth = 0;
-    {
-        const char *env = getenv("DS4_MELLUM_PROFILE_DECODE_DEPTH");
-        if (env && *env) {
-            const long v = strtol(env, NULL, 10);
-            if (v >= 0 && v <= (1L << 20)) decode_depth = (int)v;
-        }
-    }
+    const int decode_depth = rt->profile_decode_depth;
     ds4_mellum_prefill_scratch depth_scratch = {0};
     int     *depth_toks  = NULL;
     uint32_t depth_n     = 0;
@@ -62861,12 +62849,9 @@ static bool ds4_mellum_prefill_chunks(const ds4_engine           *e,
  * separates layer-major graph semantics from batched-kernel precision.
  */
 static uint32_t ds4_mellum_probe_chunk(uint32_t fallback, uint32_t max_chunk) {
-    const char *env = getenv("DS4_MELLUM_PREFILL_CHUNK");
-    if (!env || !*env) return fallback;
-    char *end = NULL;
-    const unsigned long value = strtoul(env, &end, 10);
-    if (end == env || value == 0 || value > max_chunk) return fallback;
-    return (uint32_t)value;
+    const uint32_t chunk = ds4_mellum_runtime_get()->prefill_chunk;
+    if (chunk == 0u || chunk > max_chunk) return fallback;
+    return chunk;
 }
 #endif
 
@@ -64373,8 +64358,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         }
         ds4_mellum_decode_state *state = s->mellum->decode;
         int i = start;
+        const ds4_mellum_runtime *rt = ds4_mellum_runtime_get();
         /* Which path actually ran, and how fast, under DS4_MELLUM_SYNC_TRACE. */
-        const bool sync_trace = getenv("DS4_MELLUM_SYNC_TRACE") != NULL;
+        const bool sync_trace = rt->sync_trace != 0;
         const double sync_t0 = sync_trace ? now_sec() : 0.0;
         int sync_batched_tokens = 0;
         /*
@@ -64394,13 +64380,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
          * the way the tokenwise path does.
          */
         enum { sync_batch_min_tokens = 64 };
-        static int sync_batch_enabled = -1;
-        if (sync_batch_enabled < 0) {
-            /* An escape hatch, and the only way to A/B the two sync paths. */
-            const char *env = getenv("DS4_MELLUM_SYNC_BATCH");
-            sync_batch_enabled = !(env && *env && strcmp(env, "0") == 0);
-        }
-        if (sync_batch_enabled && prompt->len - i >= sync_batch_min_tokens) {
+        /* rt->sync_batch is the escape hatch, and the only way to A/B the
+         * two sync paths against each other. */
+        if (rt->sync_batch && prompt->len - i >= sync_batch_min_tokens) {
             if (!s->engine->mellum_prefill_workspace) {
                 /*
                  * Always the full width, never the width of whichever prompt

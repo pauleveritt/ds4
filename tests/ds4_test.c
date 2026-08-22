@@ -8725,7 +8725,8 @@ static void test_metal_mellum_moe_bench(void) {
         const double mean = total_ms / (double)reps;
         printf("ds4-test: Mellum MoE bench tokens=%u reps=%u gemm=%s "
                "best=%.1fms mean=%.1fms best_layer_tok_s=%.1f\n",
-               n_tokens, reps, getenv("DS4_MELLUM_MOE_GEMM") ? "on" : "off",
+               n_tokens, reps,
+               ds4_gpu_mellum_moe_gemm_enabled() ? "on" : "off",
                best, mean, (double)n_tokens / (best / 1000.0));
     }
     ds4_gpu_tensor_free(weights); ds4_gpu_tensor_free(selected);
