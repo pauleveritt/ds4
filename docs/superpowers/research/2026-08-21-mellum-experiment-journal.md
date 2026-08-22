@@ -1,22 +1,20 @@
-# Mellum 2 on ds4: expert-major MoE prefill, and where it stops
+# Mellum 2 on ds4: experiment journal
 
-Written 2026-08-21 for an agent picking this up cold. Branch
-`mellum-2.1-overnight`, worktree `~/projects/ds4/.claude/worktrees/mellum-2.1`.
-Everything below was measured on one Apple M5 Max unless stated.
+**This is the archive, not the current state.** It records how the work was
+done, what was measured, what was tried and rejected, and several claims that
+were true when written and are not now. Read it for *why* something is the way
+it is, or to avoid repeating an experiment that already failed.
 
-**The one-line result:** prefill at a 1,024-token width went from ~191 t/s to
-**941 t/s (4.9x)** by making the MoE expert-major, and the remaining gap to
-llama.cpp is now instruction-issue bound in one kernel, not bandwidth bound.
-**The one-line surprise, since fixed:** decode, long believed to be at parity
-with llama.cpp, was only ever measured from an *empty cache*, and at depth it
-collapsed **30x** (154.5 t/s at depth 0 down to 5.1 t/s at 64K). The decode
-kernel turned out to be a self-declared placeholder running 1,024 threads per
-layer through a serial latency chain. Split-K over eight SIMD groups
-(`3c2b379`) cut the decay to **4.5x** and is worth 2.1x at 1K rising to
-**6.6x at 64K**. **What remains is an 8x redundant KV read, and that — not a
-wider MoE GEMM — is the best-value item left.** See sections 7 and 7a.
+**For what Mellum does today, how to run it, and what to do next, read
+`docs/superpowers/MELLUM.md`.** That document is short and current. This one is
+long and historical, and sections marked HISTORICAL are wrong on purpose.
 
----
+Two things in here are worth knowing before you trust any number:
+
+- Numbers predating `d6e4808` describe a prefill path no session could reach.
+  Section 5a explains that; 5b has the figures a session actually gets.
+- The Laguna comparison in section 8 rests on a decode baseline that section 8a
+  shows does not survive arithmetic.
 
 ## 1. The goal, restated by the user
 
