@@ -3122,9 +3122,14 @@ static inline void mellum_down_grouped_impl(
             mid + (uint64_t)token * args.mid_token_stride + (uint64_t)slot * K;
         float acc[R];
         for (uint r = 0; r < R; r++) acc[r] = 0.0f;
-        for (uint k = simd_lane; k < K; k += lanes) {
-            const float xv = v[k];
-            for (uint r = 0; r < R; r++) acc[r] += wstage[r * K + k] * xv;
+        /* Four elements per lane per step.  K is 896 here and the activation
+         * slice starts on a 16-byte boundary (mid_dim * 4 is a multiple of 16),
+         * so both sides vectorize without a tail. */
+        for (uint k = simd_lane * 4u; k < K; k += lanes * 4u) {
+            const float4 xv = *(device const float4 *)(v + k);
+            for (uint r = 0; r < R; r++) {
+                acc[r] += dot(*(threadgroup const float4 *)(wstage + r * K + k), xv);
+            }
         }
         for (uint r = 0; r < R; r++) {
             const float total = simd_sum(acc[r]);
@@ -3253,10 +3258,10 @@ kernel void kernel_mellum_q8_0_pair_swiglu_gemm_f32(
         const uint slot = pair - token * args.n_expert_used;
         device const float *token_x = x + (uint64_t)token * K;
         float ag = 0.0f, au = 0.0f;
-        for (uint k = simd_lane; k < K; k += lanes) {
-            const float xv = token_x[k];
-            ag += wstage[k] * xv;
-            au += wstage[K + k] * xv;
+        for (uint k = simd_lane * 4u; k < K; k += lanes * 4u) {
+            const float4 xv = *(device const float4 *)(token_x + k);
+            ag += dot(*(threadgroup const float4 *)(wstage + k), xv);
+            au += dot(*(threadgroup const float4 *)(wstage + K + k), xv);
         }
         const float g = simd_sum(ag);
         const float u = simd_sum(au);
