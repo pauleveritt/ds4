@@ -61574,10 +61574,23 @@ static bool ds4_mellum_resident_prefill_pass(
     return true;
 }
 
+/*
+ * `prime_n` tokens are prefilled before the clock starts, so decode can be
+ * timed at depth rather than only from an empty cache.  Decode cost is
+ * dominated by the KV read, which grows with position, and the flat-versus-
+ * decaying shape of that curve is the thing a long session actually feels.
+ */
 static bool ds4_mellum_resident_profile_pass(
         const ds4_engine *e, ds4_mellum_decode_state *state,
-        const int *tokens, int n_tokens, bool compute_logits, double *elapsed) {
+        const int *tokens, int n_tokens, bool compute_logits, double *elapsed,
+        ds4_mellum_prefill_scratch *prime_scratch, const int *prime_tokens,
+        uint32_t prime_n, uint32_t prime_chunk) {
     ds4_mellum_decode_state_reset(state);
+    if (prime_n > 0 &&
+        !ds4_mellum_prefill_chunks(e, state, prime_scratch, prime_tokens,
+                                   prime_n, prime_chunk, NULL, NULL)) {
+        return false;
+    }
     const double t0 = now_sec();
     for (int i = 0; i < n_tokens; i++) {
         if (!ds4_mellum_decode_token(e, state, tokens[i], NULL, NULL, NULL,
@@ -61615,6 +61628,22 @@ int ds4_engine_mellum_resident_profile(ds4_engine *e, FILE *out,
             if (v >= 64 && v <= (1L << 20)) prefill_tokens = (int)v;
         }
     }
+    /*
+     * Decode depth: prime the cache with this many tokens before timing the
+     * decode passes.  Zero keeps the historical empty-cache measurement.
+     */
+    int decode_depth = 0;
+    {
+        const char *env = getenv("DS4_MELLUM_PROFILE_DECODE_DEPTH");
+        if (env && *env) {
+            const long v = strtol(env, NULL, 10);
+            if (v >= 0 && v <= (1L << 20)) decode_depth = (int)v;
+        }
+    }
+    ds4_mellum_prefill_scratch depth_scratch = {0};
+    int     *depth_toks  = NULL;
+    uint32_t depth_n     = 0;
+    uint32_t depth_chunk = 0;
     if (!e || !out || ctx_size <= measured_tokens ||
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
         e->backend != DS4_BACKEND_METAL || !e->mellum_decode_contract_ready ||
@@ -61630,23 +61659,45 @@ int ds4_engine_mellum_resident_profile(ds4_engine *e, FILE *out,
     bool ok = ds4_mellum_session_create(&session, e, ctx_size, true, true) == 0 &&
               session && session->mellum && session->mellum->decode;
     double layers_sec = 0.0, logits_sec = 0.0, pass_sec = 0.0;
+    if (ok && decode_depth > 0) {
+        if (ctx_size < decode_depth + measured_tokens) {
+            fprintf(stderr,
+                    "ds4: Mellum resident profile decode depth %d needs ctx >= %d\n",
+                    decode_depth, decode_depth + measured_tokens);
+            ok = false;
+        } else {
+            depth_n = (uint32_t)decode_depth;
+            depth_chunk = ds4_mellum_probe_chunk(depth_n < 1024u ? depth_n : 1024u,
+                                                 depth_n);
+            depth_toks = xmalloc((size_t)depth_n * sizeof(*depth_toks));
+            for (uint32_t i = 0; i < depth_n; i++) {
+                depth_toks[i] = (int)((i * 7919u + 27u) % DS4_N_VOCAB);
+            }
+            ok = ds4_mellum_prefill_scratch_create(&depth_scratch, depth_chunk);
+            if (!ok) fprintf(stderr, "ds4: Mellum decode-depth priming failed\n");
+        }
+    }
     if (ok) {
         /* Warm both paths before timing to avoid compilation/first-use costs. */
         ok = ds4_mellum_resident_profile_pass(e, session->mellum->decode,
                                               tokens, warmup_tokens, false,
-                                              &pass_sec) &&
+                                              &pass_sec, &depth_scratch,
+                                              depth_toks, depth_n, depth_chunk) &&
              ds4_mellum_resident_profile_pass(e, session->mellum->decode,
                                               tokens, warmup_tokens, true,
-                                              &pass_sec);
+                                              &pass_sec, &depth_scratch,
+                                              depth_toks, depth_n, depth_chunk);
     }
     for (int i = 0; ok && i < repeats; i++) {
         ok = ds4_mellum_resident_profile_pass(e, session->mellum->decode,
                                               tokens, measured_tokens, false,
-                                              &pass_sec);
+                                              &pass_sec, &depth_scratch,
+                                              depth_toks, depth_n, depth_chunk);
         layers_sec += pass_sec;
         ok = ok && ds4_mellum_resident_profile_pass(
                        e, session->mellum->decode, tokens, measured_tokens,
-                       true, &pass_sec);
+                       true, &pass_sec, &depth_scratch, depth_toks, depth_n,
+                       depth_chunk);
         logits_sec += pass_sec;
     }
     /*
@@ -61681,8 +61732,8 @@ int ds4_engine_mellum_resident_profile(ds4_engine *e, FILE *out,
         const double no_head_ms = layers_sec * 1000.0 / (repeats * measured_tokens);
         const double logits_ms = logits_sec * 1000.0 / (repeats * measured_tokens);
         fprintf(out,
-                "Mellum resident profile tokens=%d repeats=%d no-head=%.3fms %.1ft/s with-head=%.3fms %.1ft/s output-head-delta=%.3fms\n",
-                measured_tokens, repeats, no_head_ms, 1000.0 / no_head_ms,
+                "Mellum resident profile tokens=%d depth=%d repeats=%d no-head=%.3fms %.1ft/s with-head=%.3fms %.1ft/s output-head-delta=%.3fms\n",
+                measured_tokens, decode_depth, repeats, no_head_ms, 1000.0 / no_head_ms,
                 logits_ms, 1000.0 / logits_ms, logits_ms - no_head_ms);
         if (prefill_ok) {
             const double prefill_ms =
@@ -61697,6 +61748,8 @@ int ds4_engine_mellum_resident_profile(ds4_engine *e, FILE *out,
     } else {
         fprintf(stderr, "ds4: Mellum resident profile decode failed\n");
     }
+    ds4_mellum_prefill_scratch_free(&depth_scratch);
+    free(depth_toks);
     ds4_mellum_prefill_scratch_free(&prefill_scratch);
     free(prefill_toks);
     ds4_session_free(session);
