@@ -1144,6 +1144,22 @@ static size_t utf8_stream_safe_len(const char *s, size_t start,
  * Left as a tri-state: absent means "caller said nothing", so an explicit
  * `thinking`/`think` field elsewhere in the request still wins.
  */
+/*
+ * An explicit `thinking`/`think` field outranks chat_template_kwargs wherever
+ * it appears in the object, so the kwargs value is only adopted when nothing
+ * has claimed the flag yet.  Extracted so both request parsers share one rule
+ * and it can be tested without a live engine.
+ */
+static void apply_kwargs_thinking(bool kwargs_thinking,
+                                  bool got_kwargs_thinking,
+                                  bool *thinking_enabled,
+                                  bool *got_thinking) {
+    if (!got_kwargs_thinking || !thinking_enabled || !got_thinking) return;
+    if (*got_thinking) return;
+    *thinking_enabled = kwargs_thinking;
+    *got_thinking = true;
+}
+
 static bool parse_chat_template_kwargs(const char **p, bool *enable_thinking,
                                        bool *got_enable_thinking) {
     json_ws(p);
@@ -3330,10 +3346,8 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
-            if (got_kwargs_thinking && !got_thinking) {
-                thinking_enabled = kwargs_thinking;
-                got_thinking = true;
-            }
+            apply_kwargs_thinking(kwargs_thinking, got_kwargs_thinking,
+                                  &thinking_enabled, &got_thinking);
         } else if (!strcmp(key, "reasoning_effort")) {
             if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
                 free(key);
@@ -3544,10 +3558,8 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
-            if (got_kwargs_thinking && !got_thinking) {
-                thinking_enabled = kwargs_thinking;
-                got_thinking = true;
-            }
+            apply_kwargs_thinking(kwargs_thinking, got_kwargs_thinking,
+                                  &thinking_enabled, &got_thinking);
         } else if (!strcmp(key, "output_config")) {
             if (!parse_output_config_effort(&p, &reasoning_effort)) {
                 free(key);
@@ -16794,6 +16806,67 @@ static void test_json_skip_has_nesting_limit(void) {
     free(bad);
 }
 
+/*
+ * chat_template_kwargs is how llama.cpp's --jinja clients disable thinking, so
+ * a regression here silently costs three to four times the output tokens on
+ * every request rather than failing loudly.  The full request parsers need a
+ * live engine to tokenize, so these cover the two units the feature is made
+ * of: the object parser and the precedence rule both call sites share.
+ */
+static void test_chat_template_kwargs_thinking(void) {
+    bool flag, got;
+    const char *p;
+
+    p = "{\"enable_thinking\":false}";
+    flag = true; got = false;
+    TEST_ASSERT(parse_chat_template_kwargs(&p, &flag, &got));
+    TEST_ASSERT(got && !flag);
+
+    p = "{\"enable_thinking\":true}";
+    flag = false; got = false;
+    TEST_ASSERT(parse_chat_template_kwargs(&p, &flag, &got));
+    TEST_ASSERT(got && flag);
+
+    /* Absent flag stays absent, so an explicit field elsewhere still decides. */
+    p = "{\"other\":1}";
+    flag = true; got = false;
+    TEST_ASSERT(parse_chat_template_kwargs(&p, &flag, &got));
+    TEST_ASSERT(!got);
+
+    /* Kwargs for a Jinja template DS4 does not have are skipped, not rejected,
+     * and must not disturb the flag beside them. */
+    p = "{\"a\":{\"deep\":[1,2,{\"x\":null}]},\"enable_thinking\":false,\"z\":\"s\"}";
+    flag = true; got = false;
+    TEST_ASSERT(parse_chat_template_kwargs(&p, &flag, &got));
+    TEST_ASSERT(got && !flag);
+
+    /* A non-boolean flag is malformed, not a silent default. */
+    p = "{\"enable_thinking\":\"no\"}";
+    flag = true; got = false;
+    TEST_ASSERT(!parse_chat_template_kwargs(&p, &flag, &got));
+
+    /* A non-object value is skipped rather than treated as a parse error, so a
+     * client sending null does not lose its whole request. */
+    p = "null";
+    flag = true; got = false;
+    TEST_ASSERT(parse_chat_template_kwargs(&p, &flag, &got));
+    TEST_ASSERT(!got);
+
+    /* Precedence: kwargs lose to an explicit field claimed either before or
+     * after them, and win only when nothing else has spoken. */
+    bool enabled = true, seen = true;   /* explicit field already parsed */
+    apply_kwargs_thinking(false, true, &enabled, &seen);
+    TEST_ASSERT(enabled);
+
+    enabled = true; seen = false;       /* nothing else has spoken */
+    apply_kwargs_thinking(false, true, &enabled, &seen);
+    TEST_ASSERT(!enabled && seen);
+
+    enabled = false; seen = false;      /* kwargs absent: leave it alone */
+    apply_kwargs_thinking(true, false, &enabled, &seen);
+    TEST_ASSERT(!enabled && !seen);
+}
+
 static void test_request_parsers_reject_malformed_duplicate_owned_fields(void) {
     const char *p =
         "{\"name\":\"ok\",\"name\":\"bad\\q\",\"arguments\":\"{}\"}";
@@ -18292,6 +18365,7 @@ static void ds4_server_unit_tests_run(void) {
     test_stop_list_parses_all_sequences();
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
+    test_chat_template_kwargs_thinking();
     test_request_parsers_reject_malformed_duplicate_owned_fields();
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();

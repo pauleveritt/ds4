@@ -423,6 +423,19 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
+# The server's unit tests live inside ds4_server.c behind DS4_SERVER_TEST and
+# had no build rule, so nothing ran them.  They cover the request parsers,
+# prompt rendering and the KV cache -- all host-side, no GPU or model needed.
+ds4_server_test.o: ds4_server.c ds4.h
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_SERVER_TEST -I. -c -o $@ ds4_server.c
+
+ds4_server_test: ds4_server_test.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(CFLAGS) -o $@ ds4_server_test.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
+else
+	$(CC) $(CFLAGS) -o $@ ds4_server_test.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS) $(LDLIBS)
+endif
+
 ds4_agent_test: ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
@@ -430,11 +443,12 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
+test: ds4_test ds4_agent_test ds4_server_test ds4-eval q4k-dot-test mxfp4-dot-test \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	$(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
+	./ds4_server_test
 	./ds4_test
 	# Every Mellum acceleration is env-gated, so the default run above reaches
 	# none of them.  Re-run the Metal kernel suite once per gated path: the
