@@ -685,7 +685,22 @@ Verified by running it, not by reading: `ds4-server -c 8192 --batched-session 2`
 loads the Q8 model, reports two resident sessions, and answers. Two concurrent
 requests were served on separate slots with distinct, correct completions.
 
-**Two caveats that matter for a harness.** Sessions still interleave
+**Correction to `31c8757`'s commit message.** It says "so parallel agent work
+is possible", which overstates it. ds4 has **two** host surfaces and this
+unblocked one of them:
+
+- **Chat/completions via `ds4-server`** — unblocked, verified.
+- **Agent mode via `ds4-agent`** — still one session per process.
+  `ds4_session_create` appears exactly once in `ds4_agent.c`, `agent_worker
+  worker` is a single stack instance, and `/tmp/ds4.lock` `exit(2)`s a second
+  process, so N agent processes are not an option either.
+
+A harness that parallelises **agent** sessions using ds4-agent's built-in tool
+loop is therefore still blocked. One that drives parallel completions through
+`ds4-server` and runs its own tool loop works today. Which of those a caller
+wants is an architecture question for the caller, not an engine one.
+
+**Two further caveats that matter for a harness.** Sessions still interleave
 **serially** on the GPU, so N agents *share* the single-stream rate rather
 than multiplying it — genuine scaling needs fused batched decode (12b(c)),
 whose MoE half already exists. And what was verified is concurrency

@@ -1133,6 +1133,52 @@ static size_t utf8_stream_safe_len(const char *s, size_t start,
     return (limit - lead) < (size_t)need ? lead : limit;
 }
 
+/*
+ * `chat_template_kwargs` is how llama.cpp's --jinja path, and therefore most
+ * clients written against it, turn thinking off: {"enable_thinking": false}.
+ * DS4 renders its own templates rather than running Jinja, so the only part
+ * that can be honoured is the flag itself -- which is the part callers use.
+ * Unknown keys are skipped rather than rejected, because a client may send
+ * kwargs meant for a Jinja template DS4 does not have.
+ *
+ * Left as a tri-state: absent means "caller said nothing", so an explicit
+ * `thinking`/`think` field elsewhere in the request still wins.
+ */
+static bool parse_chat_template_kwargs(const char **p, bool *enable_thinking,
+                                       bool *got_enable_thinking) {
+    json_ws(p);
+    if (**p != '{') return json_skip_value(p);
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "enable_thinking")) {
+            if (!json_bool(p, enable_thinking)) {
+                free(key);
+                return false;
+            }
+            *got_enable_thinking = true;
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
 static bool parse_stream_options(const char **p, bool *include_usage) {
     json_ws(p);
     if (**p != '{') return json_skip_value(p);
@@ -3277,6 +3323,17 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
             got_thinking = true;
+        } else if (!strcmp(key, "chat_template_kwargs")) {
+            bool kwargs_thinking = false, got_kwargs_thinking = false;
+            if (!parse_chat_template_kwargs(&p, &kwargs_thinking,
+                                            &got_kwargs_thinking)) {
+                free(key);
+                goto bad;
+            }
+            if (got_kwargs_thinking && !got_thinking) {
+                thinking_enabled = kwargs_thinking;
+                got_thinking = true;
+            }
         } else if (!strcmp(key, "reasoning_effort")) {
             if (!parse_reasoning_effort_value(&p, &reasoning_effort)) {
                 free(key);
@@ -3480,6 +3537,17 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
             got_thinking = true;
+        } else if (!strcmp(key, "chat_template_kwargs")) {
+            bool kwargs_thinking = false, got_kwargs_thinking = false;
+            if (!parse_chat_template_kwargs(&p, &kwargs_thinking,
+                                            &got_kwargs_thinking)) {
+                free(key);
+                goto bad;
+            }
+            if (got_kwargs_thinking && !got_thinking) {
+                thinking_enabled = kwargs_thinking;
+                got_thinking = true;
+            }
         } else if (!strcmp(key, "output_config")) {
             if (!parse_output_config_effort(&p, &reasoning_effort)) {
                 free(key);
