@@ -35484,11 +35484,21 @@ int ds4_gpu_mellum_attention_decode_tensor(
  * graph semantics.  It validates the single release path and is not a second
  * semantic variant.
  */
+/*
+ * On by default since layer-major prefill became a session path rather than a
+ * diagnostic.  Batched Q8 projections dequantize weights *and* activations to
+ * half, and against sequential decode over 1,030 tokens that is worth roughly
+ * max_abs 0.89 on logits of scale 21.8; forcing the row-exact decode kernel
+ * brings it to 0.019.  It costs about half the prefill throughput, which still
+ * leaves layer-major several times faster than the tokenwise path it replaced,
+ * so the accuracy is the better trade for a shipped session.  Set
+ * DS4_MELLUM_PREFILL_EXACT=0 to measure or ship the faster, looser path.
+ */
 static bool ds4_gpu_mellum_prefill_exact_projections(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_MELLUM_PREFILL_EXACT");
-        cached = env && *env && strcmp(env, "0") != 0;
+        cached = !(env && *env && strcmp(env, "0") == 0);
     }
     return cached != 0;
 }

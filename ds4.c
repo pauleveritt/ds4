@@ -37195,9 +37195,20 @@ static bool ds4_mellum_kv_layout_alloc(const ds4_engine *e,
     return true;
 }
 
+struct ds4_mellum_prefill_scratch_s;
+
 struct ds4_mellum_session_state {
     ds4_mellum_kv_layout kv;
     ds4_mellum_decode_state *decode;
+    /*
+     * Created on the first sync long enough to be worth it, then reused for
+     * the session's lifetime.  It is per-session rather than engine-owned
+     * because sessions are independent and nothing currently serializes two
+     * of them through one workspace; at a 1,024-token cap it costs on the
+     * order of 120 MB, which is the price of a second concurrent session and
+     * the reason to revisit this if many are ever resident at once.
+     */
+    struct ds4_mellum_prefill_scratch_s *prefill;
     uint32_t ctx_size;
     bool decode_enabled;
     bool interactive_enabled;
@@ -37282,10 +37293,11 @@ struct ds4_mellum_decode_state {
     float *hidden_cpu;
 };
 
-/* Workspace for an inspect-only layer-major batch. It deliberately owns no KV
- * cache: the caller supplies the per-layer rings from a decode state so the
- * batch can be compared directly with the established sequential path. */
-typedef struct {
+/* Workspace for a layer-major batch. It deliberately owns no KV cache: the
+ * caller supplies the per-layer rings from a decode state, which is what lets
+ * the same workspace serve both the diagnostic probes that compare against the
+ * sequential path and a live session's prefill. */
+typedef struct ds4_mellum_prefill_scratch_s {
     uint32_t cap;
     ds4_gpu_tensor *tokens;
     ds4_gpu_tensor *hidden;
@@ -37762,6 +37774,10 @@ static ds4_mellum_session_state *ds4_mellum_session_state_create(
 
 static void ds4_mellum_session_state_free(ds4_mellum_session_state *state) {
     if (!state) return;
+    if (state->prefill) {
+        ds4_mellum_prefill_scratch_free(state->prefill);
+        free(state->prefill);
+    }
     ds4_mellum_decode_state_free(state->decode);
     ds4_mellum_kv_layout_free(&state->kv);
     free(state);
@@ -64356,14 +64372,85 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         } else {
             ds4_session_invalidate(s);
         }
-        /* This is still tokenwise autoregressive prefill, not the later
-         * multi-token graph. Batching bounded runs removes host submission
-         * waits while retaining the established decode arithmetic and KV
-         * update order. Keep the cap modest until long-context watchdog and
-         * cancellation measurements are available. */
-        static const int sync_batch_tokens = 32;
         ds4_mellum_decode_state *state = s->mellum->decode;
-        for (int i = start; i < prompt->len;) {
+        int i = start;
+        /* Which path actually ran, and how fast, under DS4_MELLUM_SYNC_TRACE. */
+        const bool sync_trace = getenv("DS4_MELLUM_SYNC_TRACE") != NULL;
+        const double sync_t0 = sync_trace ? now_sec() : 0.0;
+        int sync_batched_tokens = 0;
+        /*
+         * Layer-major prefill, for spans long enough to pay for the workspace.
+         * The tokenwise loop below evaluates one token per kernel launch, so a
+         * long prompt used to sync at decode speed no matter how fast the
+         * batch kernels were; this is the path that lets a session actually
+         * reach them.
+         *
+         * Short spans stay tokenwise deliberately.  Extending a checkpoint by
+         * a turn is the common case, it does not repay a ~120 MB allocation,
+         * and keeping it on the sequential path preserves the decode
+         * arithmetic those syncs have always produced.
+         *
+         * ds4_mellum_prefill_tokens opens its own command batch and refuses to
+         * run inside one, so this loop must not wrap it in begin/end commands
+         * the way the tokenwise path does.
+         */
+        enum { sync_batch_min_tokens = 64 };
+        static int sync_batch_enabled = -1;
+        if (sync_batch_enabled < 0) {
+            /* An escape hatch, and the only way to A/B the two sync paths. */
+            const char *env = getenv("DS4_MELLUM_SYNC_BATCH");
+            sync_batch_enabled = !(env && *env && strcmp(env, "0") == 0);
+        }
+        if (sync_batch_enabled && prompt->len - i >= sync_batch_min_tokens) {
+            if (!s->mellum->prefill) {
+                const uint32_t pending = (uint32_t)(prompt->len - i);
+                uint32_t cap = pending < DS4_N_SWA ? pending : DS4_N_SWA;
+                cap = ds4_mellum_probe_chunk(cap, DS4_N_SWA);
+                struct ds4_mellum_prefill_scratch_s *fresh =
+                    xmalloc(sizeof(*fresh));
+                memset(fresh, 0, sizeof(*fresh));
+                if (ds4_mellum_prefill_scratch_create(fresh, cap)) {
+                    s->mellum->prefill = fresh;
+                } else {
+                    /* Fall back to tokenwise rather than failing the sync. */
+                    ds4_mellum_prefill_scratch_free(fresh);
+                    free(fresh);
+                }
+            }
+            ds4_mellum_prefill_scratch *scratch = s->mellum->prefill;
+            while (scratch && i < prompt->len) {
+                /* Cancellation granularity is one chunk here, not one token. */
+                if (ds4_session_cancelled(s)) {
+                    snprintf(err, errlen, "interrupted");
+                    s->checkpoint_valid = s->checkpoint.len != 0;
+                    return DS4_SESSION_SYNC_INTERRUPTED;
+                }
+                uint32_t chunk = (uint32_t)(prompt->len - i);
+                if (chunk > scratch->cap) chunk = scratch->cap;
+                const bool last = i + (int)chunk == prompt->len;
+                if (!ds4_mellum_prefill_tokens(s->engine, state, scratch,
+                                               prompt->v + i, chunk,
+                                               NULL, NULL, last)) {
+                    snprintf(err, errlen, "Mellum layer-major prefill failed");
+                    ds4_session_invalidate(s);
+                    return 1;
+                }
+                for (uint32_t j = 0; j < chunk; j++) {
+                    token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
+                }
+                i += (int)chunk;
+                sync_batched_tokens += (int)chunk;
+                if (s->progress) {
+                    s->progress(s->progress_ud, "prefill_chunk", i,
+                                prompt->len);
+                }
+            }
+        }
+        /* Tokenwise remainder: a short span, or anything the batch path could
+         * not take.  Batching bounded runs removes host submission waits while
+         * retaining the established decode arithmetic and KV update order. */
+        static const int sync_batch_tokens = 32;
+        for (; i < prompt->len;) {
             const int end = prompt->len - i > sync_batch_tokens ?
                 i + sync_batch_tokens : prompt->len;
             const bool batch_started = ds4_gpu_begin_commands() != 0;
@@ -64396,6 +64483,16 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 s->checkpoint_valid = s->checkpoint.len != 0;
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
+        }
+        if (sync_trace && prompt->len > start) {
+            const double elapsed = now_sec() - sync_t0;
+            fprintf(stderr,
+                    "ds4: Mellum sync tokens=%d path=%s %.1fms %.1ft/s\n",
+                    prompt->len - start,
+                    sync_batched_tokens ? (sync_batched_tokens == prompt->len - start ?
+                        "layer-major" : "mixed") : "tokenwise",
+                    elapsed * 1000.0,
+                    (double)(prompt->len - start) / elapsed);
         }
         if (start < prompt->len &&
             ds4_gpu_tensor_read(state->logits, 0, s->logits,
