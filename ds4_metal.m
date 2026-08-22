@@ -240,6 +240,16 @@ static id<MTLComputePipelineState> g_mellum_router_select_batch_pipeline;
 static id<MTLComputePipelineState> g_mellum_gqa_decode_pipeline;
 static id<MTLComputePipelineState> g_mellum_gqa_decode_split_pipeline;
 
+/*
+ * Launch contract for kernel_mellum_attention_decode_gqa_split_f16, kept in
+ * one place because the kernel indexes threadgroup memory by SIMD-group id:
+ * dispatch exactly this many SIMD groups and size scratch to match, or the
+ * kernel writes past the allocation.  Must equal DS4_MELLUM_SPLIT_SIMD_GROUPS
+ * in metal/laguna.metal.
+ */
+#define DS4_MELLUM_SPLIT_SIMD_GROUPS 8u
+#define DS4_MELLUM_SPLIT_THREADS (DS4_MELLUM_SPLIT_SIMD_GROUPS * 32u)
+
 int ds4_gpu_mellum_attn_split_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -34106,14 +34116,29 @@ int ds4_gpu_mellum_gqa_decode_tensor(
         [enc setBuffer:keybuf offset:ds4_gpu_tensor_offset(key_cache) atIndex:2];
         [enc setBuffer:valuebuf offset:ds4_gpu_tensor_offset(value_cache) atIndex:3];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        NSUInteger split_threads = DS4_MELLUM_SPLIT_THREADS;
         if (split) {
-            /* 8 maxima + 8 sums + 8 head-dim partial vectors. */
-            const NSUInteger scratch_floats = 8u + 8u + 8u * head_dim;
+            /* One maximum, one sum and one head-dim vector per SIMD group. */
+            const NSUInteger scratch_floats =
+                (NSUInteger)DS4_MELLUM_SPLIT_SIMD_GROUPS * (2u + head_dim);
             [enc setThreadgroupMemoryLength:scratch_floats * sizeof(float)
                                     atIndex:0];
+            /*
+             * Test hook for the surplus-SIMD-group path.  The kernel absorbs
+             * an over-sized launch by giving the extra groups an empty key
+             * range rather than returning early, because a non-uniform return
+             * ahead of its threadgroup_barrier would be undefined.  Without a
+             * way to over-dispatch, that safety property is unverifiable.
+             */
+            if (getenv("DS4_MELLUM_ATTN_OVERDISPATCH")) {
+                const NSUInteger cap = pipeline.maxTotalThreadsPerThreadgroup;
+                const NSUInteger wanted = split_threads * 2u;
+                if (wanted <= cap) split_threads = wanted;
+            }
         }
         [enc dispatchThreadgroups:MTLSizeMake(n_head, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(split ? 256 : 32, 1, 1)];
+             threadsPerThreadgroup:MTLSizeMake(
+                 split ? split_threads : 32u, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Mellum GQA decode")) return 0;
     }

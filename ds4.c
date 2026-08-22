@@ -61547,7 +61547,24 @@ int ds4_engine_mellum_swa_boundary_probe(ds4_engine *e,
             if (fabs(d) > max_abs) max_abs = fabs(d);
             sum_sq += d * d;
         }
-        if (!split) ok = memcmp(reference, actual, logit_bytes) == 0;
+        if (split) {
+            /*
+             * Reassociation moves these logits by ~5e-3 against a ~22 scale.
+             * A bound two orders above that still catches a broken merge --
+             * zeroed output, dropped stripes, a corrupted running maximum --
+             * while leaving arithmetic noise room, so the split arm stays a
+             * gate rather than a report.
+             */
+            const double split_max_abs_limit = 0.5;
+            ok = max_abs <= split_max_abs_limit;
+            if (!ok) {
+                snprintf(err, sizeof(err),
+                         "split-k logits deviate max_abs=%g beyond %g",
+                         max_abs, split_max_abs_limit);
+            }
+        } else {
+            ok = memcmp(reference, actual, logit_bytes) == 0;
+        }
     }
     if (!ok) {
         fprintf(stderr, "ds4: Mellum SWA boundary schedules diverged: %s\n",

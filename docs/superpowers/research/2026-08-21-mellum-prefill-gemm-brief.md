@@ -7,13 +7,14 @@ Everything below was measured on one Apple M5 Max unless stated.
 **The one-line result:** prefill at a 1,024-token width went from ~191 t/s to
 **941 t/s (4.9x)** by making the MoE expert-major, and the remaining gap to
 llama.cpp is now instruction-issue bound in one kernel, not bandwidth bound.
-**The one-line surprise:** decode, long believed to be at parity with
-llama.cpp, was only ever measured from an *empty cache*. At depth it collapses
-**30x** — 154.5 t/s at depth 0, 57.7 at 1K, 15.9 at 16K, **5.1 t/s at 64K** —
-while the comparable Laguna S 2.1 holds 56–68 t/s flat at any depth. The
-sliding-window cap is provably honoured, so this is a per-key kernel
-inefficiency (~75x off bandwidth), not a scheduling bug. **That is the most
-valuable open problem in this brief, and it is bigger than the prefill work.**
+**The one-line surprise, since fixed:** decode, long believed to be at parity
+with llama.cpp, was only ever measured from an *empty cache*, and at depth it
+collapsed **30x** (154.5 t/s at depth 0 down to 5.1 t/s at 64K). The decode
+kernel turned out to be a self-declared placeholder running 1,024 threads per
+layer through a serial latency chain. Split-K over eight SIMD groups
+(`3c2b379`) cut the decay to **4.5x** and is worth 2.1x at 1K rising to
+**6.6x at 64K**. **What remains is an 8x redundant KV read, and that — not a
+wider MoE GEMM — is the best-value item left.** See sections 7 and 7a.
 
 ---
 
@@ -204,17 +205,18 @@ A `DS4_MELLUM_PROFILE_DECODE_DEPTH` knob was added (this brief's only
 uncommitted code change, in `ds4.c`) to prime the cache with D tokens before
 the clock starts. The result:
 
-| Decode depth | no-head | t/s | attention share of the step |
+| Decode depth | serial t/s | split-K t/s | speedup |
 | ---: | ---: | ---: | ---: |
-| 0 | 6.471 ms | **154.5** | 0% |
-| 1,024 | 17.322 ms | **57.7** | 63% |
-| 4,096 | 27.535 ms | **36.3** | 77% |
-| 16,384 | 62.999 ms | **15.9** | 90% |
-| 32,768 | 106.614 ms | **9.4** | 94% |
-| 65,536 | 196.128 ms | **5.1** | 97% |
+| 0 | 154.5 | 151.4 | — (below threshold) |
+| 1,024 | 57.7 | **122.7** | 2.13x |
+| 4,096 | 36.3 | **108.6** | 2.99x |
+| 16,384 | 15.9 | **67.0** | 4.22x |
+| 32,768 | 9.4 | **49.3** | 5.25x |
+| 65,536 | 5.1 | **33.4** | 6.55x |
 
-**30x from empty cache to 64K.** By 16K the step is 90% attention and the
-whole MoE effort of section 5 is touching a tenth of the cost.
+The serial column decayed **30x** from empty cache to 64K. Split-K (section
+7a) cuts that to **4.5x**, and the win grows with depth because the serial
+chain it removes was proportional to depth.
 
 The empty-cache 154.5 t/s is what was being compared against llama.cpp's
 150–155 t/s. **The parity claim does not survive.** llama.cpp's 110–148 t/s
@@ -237,6 +239,51 @@ floor. **Whoever picks this up should start here, not in the MoE.** The MoE
 rewrite is 1–2 days for maybe 2x on short-prompt prefill; decode attention
 looks like a similar effort for a much larger win on the number users feel
 during generation.
+
+### Fixed: split-K, committed and measured (section 7a)
+
+Root cause was that `kernel_mellum_attention_decode_gqa_f16` was a
+**self-declared placeholder** — "a later split-K specialization can retain
+this interface" — and that specialization existed for Laguna and was never
+written for Mellum. The dispatch was `MTLSizeMake(n_head,1,1)` x 32 threads:
+**1,024 threads for a whole layer's attention**, each threadgroup walking the
+key range serially through a loop-carried online-softmax maximum with a
+`simd_sum` and two `exp` per iteration.
+
+`kernel_mellum_attention_decode_gqa_split_f16` stripes the key range over the
+eight SIMD groups of a 256-thread threadgroup and merges their independently
+normalized partials in threadgroup memory, mirroring
+`kernel_laguna_attention_decode_gqa_f16`. Histories of 256 keys or fewer keep
+the single-SIMD path and stay bitwise identical.
+
+Cost per key-layer, which is the clean way to read this:
+
+| Depth | before | after | issued BW | *useful* BW |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,024 | 373.8 ns | 53.9 ns | 304 GB/s | 38 GB/s |
+| 4,096 | 417.1 ns | 51.9 ns | 315 GB/s | 39 GB/s |
+| 16,384 | 414.1 ns | 61.1 ns | 268 GB/s | 34 GB/s |
+| 32,768 | 398.6 ns | 54.5 ns | 301 GB/s | 38 GB/s |
+
+A flat **~7x** at every depth, against a ceiling of 8 stripes. The latency
+chain is gone.
+
+### What is left, and it is not the MoE
+
+The kernel now **issues** 268–315 GB/s against a ~400 GB/s ceiling, so it has
+become bandwidth-bound. But **only one eighth of that traffic is unique**:
+`heads_per_kv = 32/4 = 8`, and all eight query heads sharing a KV head load
+the same K/V row independently. Useful bandwidth is 34–39 GB/s.
+
+So the next lever is **head grouping**, not a wider GEMM: evaluate the eight
+query heads that share a KV head in one threadgroup so each row is loaded
+once. `kernel_laguna_attention_decode_gqa3_split_f16` already does exactly
+this three-wide and is the pattern to copy. Mellum's 8:1 ratio makes the prize
+larger than Laguna's.
+
+Note this composes with, rather than replaces, a further `nwg` workgroup
+split: at 64K each of the 8 stripes still walks ~8,192 keys serially, and
+Laguna's gqa3 kernel adds a z-dimension over workgroups for exactly that.
 
 ### The sliding-window cap is honoured — so that is not the bug
 
@@ -287,15 +334,18 @@ its decay is slightly gentler. Laguna's golden fixture at 32,768 ctx bursts
 
 ### Decode
 
-| Depth | Laguna S 2.1 | Mellum 2 on ds4 | Mellum vs Laguna |
-| --- | --- | ---: | --- |
-| empty / early | 58–68 t/s | 154.5 t/s | **2.4x faster** |
-| ~1K | 56–68 t/s | 57.7 t/s | parity |
-| ~4K | 56–68 t/s | 36.3 t/s | 1.7x slower |
-| ~16K | 56–68 t/s | 15.9 t/s | **3.9x slower** |
-| ~32K | 56–68 t/s | 9.4 t/s | **6.6x slower** |
-| ~64K | 56–68 t/s | 5.1 t/s | **12x slower** |
-| **shape** | **flat** | **30x decay** | |
+| Depth | Laguna S 2.1 | Mellum (serial) | Mellum (split-K) | vs Laguna now |
+| --- | --- | ---: | ---: | --- |
+| empty / early | 58–68 t/s | 154.5 | **151.4** | 2.4x faster |
+| ~1K | 56–68 t/s | 57.7 | **122.7** | ~2x faster |
+| ~4K | 56–68 t/s | 36.3 | **108.6** | ~1.7x faster |
+| ~16K | 56–68 t/s | 15.9 | **67.0** | **parity** |
+| ~32K | 56–68 t/s | 9.4 | **49.3** | ~1.2x slower |
+| ~64K | 56–68 t/s | 5.1 | **33.4** | ~1.8x slower |
+| **shape** | **flat** | 30x decay | **4.5x decay** | |
+
+The crossover — the depth past which Laguna's flat decode wins — moved from
+**about 1K to about 20K**.
 
 **This is the headline of the comparison.** The user described Laguna's
 mechanism precisely: *"prefill collapses with context, decode barely moves —
@@ -311,9 +361,11 @@ Laguna is still sitting at 56–68 t/s at 92K.
 Put plainly: on a short prompt Mellum on ds4 is the better experience on both
 axes. On a long session it is worse on the axis the user stares at.
 
-Section 7 argues that decay is a fixable implementation problem, not a property
-of the model. If it is fixed, Mellum on ds4 beats Laguna on both axes. Until it
-is, the honest summary is: **faster to first token, slower to finish.**
+Section 7 argued the decay was a fixable implementation problem rather than a
+property of the model, and split-K has now shown that directly. Mellum on ds4
+beats Laguna on both axes out to roughly 20K of context, and head grouping
+(section 7a) targets the 8x redundancy that accounts for most of what remains
+past that.
 
 ## 9. Quality gates — how to not get a false green
 
@@ -415,11 +467,13 @@ Env knobs that exist:
 
 ## 13. Recommended order of work
 
-1. **Decode attention at depth** (§7). Largest measured gap by far: 30x decay
-   to 64K, ~75x off bandwidth on the incremental KV read, 90% of the step by
-   16K, and it is the number a user feels during generation. The sliding-window
-   cap is already confirmed honoured, so go straight to the per-key cost in the
-   decode attention kernel — 378.5 ns to move 2 KiB is the whole problem.
+1. **Head-group the decode attention** (§7a). Split-K is done and banked
+   (2.1–6.6x). What remains is an **8x redundant KV read**: all eight query
+   heads sharing a KV head load the same row. The kernel is now bandwidth-bound
+   on issued traffic (268–315 GB/s of ~400) while only a eighth of it is
+   useful. `kernel_laguna_attention_decode_gqa3_split_f16` is a working
+   three-wide version of exactly this. Cheaper than item 2 and, on current
+   evidence, worth more.
 2. **`simdgroup_float8x8` MoE rewrite**, F32 accumulation preserved (§5). 1–2
    days, closes prefill toward llama.cpp — but note §6: this buys less as
    context grows.

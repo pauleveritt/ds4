@@ -709,6 +709,12 @@ kernel void kernel_mellum_attention_decode_gqa_f16(
 //
 // Short histories keep the single-SIMD path and therefore stay bitwise
 // identical to the serial kernel; only key_count > 256 reassociates.
+//
+// DS4_MELLUM_SPLIT_SIMD_GROUPS below is the launch contract: the host must
+// dispatch exactly this many SIMD groups (32 threads each) and must size
+// threadgroup memory as (2 + head_dim) * DS4_MELLUM_SPLIT_SIMD_GROUPS floats.
+// ds4_metal.m derives both from this constant rather than repeating it.
+#define DS4_MELLUM_SPLIT_SIMD_GROUPS 8u
 kernel void kernel_mellum_attention_decode_gqa_split_f16(
         constant ds4_metal_args_mellum_gqa_decode &args,
         device const float *q,
@@ -719,13 +725,21 @@ kernel void kernel_mellum_attention_decode_gqa_split_f16(
         ushort lane [[thread_index_in_simdgroup]],
         ushort simd_group_u [[simdgroup_index_in_threadgroup]],
         uint head [[threadgroup_position_in_grid]]) {
-    constexpr uint split_simd_groups = 8u;
+    constexpr uint split_simd_groups = DS4_MELLUM_SPLIT_SIMD_GROUPS;
     constexpr uint split_threshold = 256u;
+    /*
+     * Every early return here must be uniform across the threadgroup, because
+     * a threadgroup_barrier below has to be reached by all threads.  A guard
+     * on simd_group would not be uniform, so an over-sized launch is absorbed
+     * by giving the surplus groups an empty key range instead of returning:
+     * they fall through to the barrier and publish a partial that the merge
+     * discards.
+     */
     if (head >= args.n_head || args.n_head_kv == 0u ||
         args.n_head % args.n_head_kv != 0u || args.head_dim != 128u ||
         args.cache_cap == 0u || args.key_count == 0u) return;
     const uint simd_group = (uint)simd_group_u;
-    if (simd_group >= split_simd_groups) return;
+    const bool surplus = simd_group >= split_simd_groups;
     const bool split = args.key_count > split_threshold;
     const uint heads_per_kv = args.n_head / args.n_head_kv;
     const uint kv_head = head / heads_per_kv;
@@ -740,7 +754,8 @@ kernel void kernel_mellum_attention_decode_gqa_split_f16(
     /* A non-splitting launch leaves the other seven groups with nothing to
      * contribute; they must still reach the barrier, so they skip the loop and
      * publish an empty partial that the merge below ignores. */
-    const uint key_end = (!split && simd_group != 0u) ? 0u : args.key_count;
+    const uint key_end =
+        (surplus || (!split && simd_group != 0u)) ? 0u : args.key_count;
     for (uint i = key_first; i < key_end; i += key_stride) {
         const uint row = (uint)(((uint64_t)args.key_start + i) %
                                 args.cache_cap);
@@ -770,15 +785,17 @@ kernel void kernel_mellum_attention_decode_gqa_split_f16(
     threadgroup float *partial_max = scratch;
     threadgroup float *partial_sum = partial_max + split_simd_groups;
     threadgroup float *partial_value = partial_sum + split_simd_groups;
-    if (lane == 0u) {
-        partial_max[simd_group] = max_score;
-        partial_sum[simd_group] = score_sum;
+    if (!surplus) {
+        if (lane == 0u) {
+            partial_max[simd_group] = max_score;
+            partial_sum[simd_group] = score_sum;
+        }
+        const uint value_base = simd_group * args.head_dim;
+        partial_value[value_base + lane] = acc.x;
+        partial_value[value_base + lane + 32u] = acc.y;
+        partial_value[value_base + lane + 64u] = acc.z;
+        partial_value[value_base + lane + 96u] = acc.w;
     }
-    const uint value_base = simd_group * args.head_dim;
-    partial_value[value_base + lane] = acc.x;
-    partial_value[value_base + lane + 32u] = acc.y;
-    partial_value[value_base + lane + 64u] = acc.z;
-    partial_value[value_base + lane + 96u] = acc.w;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (simd_group != 0u) return;
