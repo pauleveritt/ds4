@@ -233,6 +233,39 @@ documented literal.
 - The same applies to `ds4_gpu_mellum_q8_0_routed_moe_one_tensor` and
   `..._batch_tensor`, whose names now describe one of two supported formats.
 
+## Finding: generic retry cannot fix fabricated validation (baseline for P9/P10)
+
+Overnight tool-calling work (nudge, malformed-retry cap, recovery framing —
+see `MELLUM.md`) got Mellum reliably *emitting* well-formed native tool calls.
+It did not fix a separate failure mode: Mellum produces good implementation
+content but does not reliably distinguish "printed code" from "mutated
+workspace," and it fabricates validation (claims tests passed without a
+recorded execution). This surfaced across five smoke-test rounds; tuning the
+generic `DS4_AGENT_TOOL_NUDGE` retry further does not correct it, because the
+nudge only prompts for *a* tool call, not the *right* one, and does nothing
+about untrusted self-reported results. **Do not spend more rounds tuning the
+generic nudge against this failure mode — that thread is closed.**
+
+The fix is not `tool_choice=required` globally — conversational turns
+legitimately need no tool, and forcing one there is the wrong trade. Instead,
+a later phase (P9/P10 — not yet broken out in this doc) should add an
+explicit host-controlled action mode:
+
+- A handoff packet declares required files and a validation command.
+- The host reports objective state back to the model — e.g. "0/4 files
+  exist; pytest was not run" — computed by the host, not asserted by the
+  model.
+- A turn cannot complete while declared objectives fail.
+- The retry round for a failed turn requires one registered tool call;
+  prose-only output is rejected in that round.
+- Claimed test results are never trusted without a host-recorded command
+  execution backing them.
+
+This run is the baseline that motivates that machinery — keep it referenced
+from whatever P9/P10 doc eventually specs the action-mode design. If forced
+execution is tested later, label those results separately from native-agent
+competence numbers; they measure different things.
+
 ## Context: what this does *not* fix
 
 Cross-session decode batching is separately excluded for Mellum at

@@ -191,6 +191,18 @@ host-side scaffolding is the more promising lever than further parser work.
 **Q8_0 behaves identically throughout, so none of this is the selective
 artifact.**
 
+**Thinking mode is not the cause.** One bounded check, Q8_0 with `--nothink`,
+same task, same `-n 8192`, `DS4_AGENT_TOOL_NUDGE=2`, 180s wall clock, no code
+changes: rc=0 in 7s, 0 tool calls, 0/4 files, both nudges exhausted. The model
+narrated the same "I cannot directly access files" reasoning it gives with
+thinking on, then stopped generating on its own — not a timeout, not
+degeneration. Disabling thinking does not make Mellum call tools it was
+otherwise avoiding. This closes the thinking-mode hypothesis; the gap is
+agent competence/tool-use grounding at this model size, not a reasoning-mode
+artifact, and host-side scaffolding (see [the P9/P10
+finding](plans/mellum-q4k-artifact.md)) remains the right lever. Mellum work
+is paused pending that scaffolding.
+
 ## Hosts
 
 - **`ds4-agent`** — one session per process, and `/tmp/ds4.lock` refuses a
