@@ -57,6 +57,11 @@ Development record: the SDD ledger
 in `~/projects/ds4-control` is the authoritative history of how the 16
 `--json-events` commits were built and reviewed.
 
+Note on the original (orig) SHAs: they are historical identifiers from the
+pre-fork DS4 Control lineage and are **not fetchable from this fork** — treat
+them as provenance references only. The durable authority for that lineage is
+the `progress.md` ledger above.
+
 ## Development branches
 
 Model lines, not patch divergences. The app never pins them; a line enters the

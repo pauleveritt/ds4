@@ -9,6 +9,9 @@
 > The patch set instruments `ds4_agent.c`'s decode loops and emitters, so a
 > rebase can apply cleanly and still be semantically wrong. Golden-fixture
 > recapture against the real binary is mandatory on every submodule bump.
+> (Docs-only bumps — no change to the engine tree, e.g. this file or the
+> ledger — do not require recapture: the binary is byte-identical. The gate
+> applies to any bump that changes engine code or the pinned engine SHA.)
 
 `git rebase` completing without conflict is **not** a success signal. The wire
 contract lives at `docs/json-events.md`; the golden fixture lives in the
@@ -34,6 +37,13 @@ one model line is `laguna-s2.1`.
    (the file the patches instrument).
 4. Build: `make ds4-server ds4-agent` — must be clean, zero warnings.
 5. Recapture (see the standing rule above) — the gate, not the cherry-pick.
+   Harness method: all 21 `DS4_METAL_*_SOURCE` env vars (absolute paths to
+   `metal/*.metal` — required whenever the capture uses `--chdir`, which
+   defeats the in-submodule `cd`), a distinct `DS4_LOCK_FILE`, and a
+   FIFO-keepalive loop. The authoritative, worked method is documented in the
+   SwiftStar repo at `fixtures/agent/provenance.md` (gotchas #1–#3) and
+   `fixtures/server/provenance.md` — follow those, not any single literal
+   command line.
 6. Move `swiftstar-integration` to the new `patch-set` tip and push.
 7. In SwiftStar, bump the submodule (`git -C external/ds4 checkout` + parent
    gitlink commit) and re-run `just engine` + recapture.
