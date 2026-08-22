@@ -3183,7 +3183,8 @@ kernel void kernel_mellum_q8_0_down_grouped8_f32(
 kernel void kernel_mellum_moe_slot_reduce_f32(
         constant ds4_metal_glm_routed_moe_args &args [[buffer(0)]],
         device const float *partial [[buffer(1)]],
-        device float *out [[buffer(2)]],
+        device const int32_t *selected [[buffer(2)]],
+        device float *out [[buffer(3)]],
         uint gid [[thread_position_in_grid]]) {
     const uint total = args.n_tokens * args.out_dim;
     if (gid >= total) return;
@@ -3191,6 +3192,16 @@ kernel void kernel_mellum_moe_slot_reduce_f32(
     const uint row = gid - token * args.out_dim;
     float acc = 0.0f;
     for (uint slot = 0; slot < args.n_expert_used; slot++) {
+        /*
+         * Consult the routing rather than trusting the staging buffer.  A slot
+         * whose expert is out of range is never bucketed, so nothing writes its
+         * partial this layer and the buffer -- reused across all 28 layers --
+         * still holds the previous layer's value.  The token-major kernels
+         * contribute 0.0 for such a slot; matching that here costs eight
+         * cached int reads and removes the need to clear 75 MiB per layer.
+         */
+        const int expert = selected[(uint64_t)token * args.n_expert_used + slot];
+        if (expert < 0 || (uint)expert >= args.n_total_expert) continue;
         acc += partial[((uint64_t)token * args.n_expert_used + slot) *
                        args.out_dim + row];
     }

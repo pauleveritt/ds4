@@ -35479,7 +35479,8 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
             [enc setBytes:&args length:sizeof(args) atIndex:0];
             [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.partial)
                     offset:ds4_gpu_tensor_offset(ggroup.partial) atIndex:1];
-            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:2];
+            [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
             const NSUInteger n_out = (NSUInteger)n_tokens * out_dim;
             [enc dispatchThreadgroups:MTLSizeMake((n_out + 255u) / 256u, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];

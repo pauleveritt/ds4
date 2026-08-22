@@ -8693,6 +8693,119 @@ static void test_server_unit_group(void) {
     test_laguna_variant_shapes();
 }
 
+static double test_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+/*
+ * Mellum routed-MoE microbenchmark at the real prefill shape.
+ *
+ * The MoE is 96.8% of Mellum prefill, so it is the only part worth timing when
+ * iterating on kernels -- and timing it here rather than through
+ * --mellum-resident-profile means no GGUF, no engine open, and therefore no
+ * ds4 instance lock.  Weights are synthetic, which does not matter for
+ * throughput: expert traffic and arithmetic depend on the shapes, not the
+ * values.  Routing is a fixed hash so every run does the same work.
+ *
+ * Note the router distribution is synthetic and therefore more uniform than
+ * real text, which flatters any expert-major schedule slightly; use the
+ * resident profile for a headline number.
+ */
+static void test_metal_mellum_moe_bench(void) {
+    const uint32_t in_dim = 2304, mid_dim = 896, out_dim = 2304;
+    const uint32_t n_total = 64, n_selected = 8;
+    uint32_t n_tokens = 1024;
+    const char *tok_env = getenv("DS4_BENCH_TOKENS");
+    if (tok_env && *tok_env) {
+        const long v = strtol(tok_env, NULL, 10);
+        if (v > 0 && v <= 8192) n_tokens = (uint32_t)v;
+    }
+    uint32_t reps = 5;
+    const char *rep_env = getenv("DS4_BENCH_REPS");
+    if (rep_env && *rep_env) {
+        const long v = strtol(rep_env, NULL, 10);
+        if (v > 0 && v <= 100) reps = (uint32_t)v;
+    }
+
+    const uint64_t gate_row = (uint64_t)(in_dim / 32u) * 34u;
+    const uint64_t down_row = (uint64_t)(mid_dim / 32u) * 34u;
+    const uint64_t gate_expert = gate_row * mid_dim;
+    const uint64_t down_expert = down_row * out_dim;
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = gate_expert * n_total;
+    const uint64_t down_offset = up_offset + gate_expert * n_total;
+    const uint64_t model_bytes = down_offset + down_expert * n_total;
+
+    uint8_t *model = malloc((size_t)model_bytes);
+    int32_t *selected_host = malloc((size_t)n_tokens * n_selected * sizeof(int32_t));
+    float *weights_host = malloc((size_t)n_tokens * n_selected * sizeof(float));
+    float *x_host = malloc((size_t)n_tokens * in_dim * sizeof(float));
+    TEST_ASSERT(model && selected_host && weights_host && x_host);
+    if (!model || !selected_host || !weights_host || !x_host) {
+        free(model); free(selected_host); free(weights_host); free(x_host);
+        return;
+    }
+    memset(model, 0, (size_t)model_bytes);
+    for (uint32_t e = 0; e < n_total; e++) {
+        test_fill_q8_0_weights(model + gate_offset + (uint64_t)e * gate_expert,
+                               in_dim, mid_dim, e + 1u);
+        test_fill_q8_0_weights(model + up_offset + (uint64_t)e * gate_expert,
+                               in_dim, mid_dim, e + 17u);
+        test_fill_q8_0_weights(model + down_offset + (uint64_t)e * down_expert,
+                               mid_dim, out_dim, e + 31u);
+    }
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        /* Distinct experts per token, which is what the bucket capacity
+         * argument in the grouped kernels assumes. */
+        uint32_t e = (t * 37u) % n_total;
+        for (uint32_t s = 0; s < n_selected; s++) {
+            selected_host[(uint64_t)t * n_selected + s] =
+                (int32_t)((e + s * 7u) % n_total);
+            weights_host[(uint64_t)t * n_selected + s] = 1.0f / (float)n_selected;
+        }
+        for (uint32_t i = 0; i < in_dim; i++) {
+            x_host[(uint64_t)t * in_dim + i] =
+                (float)((int)(((t * 13u) + i * 19u) % 41u) - 20) / 32.0f;
+        }
+    }
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)n_tokens * in_dim * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_selected * mid_dim * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)n_tokens * out_dim * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_selected * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_selected * sizeof(float));
+    const bool ok = x && mid && out && selected && weights &&
+        ds4_gpu_tensor_write(x, 0, x_host, (uint64_t)n_tokens * in_dim * sizeof(float)) &&
+        ds4_gpu_tensor_write(selected, 0, selected_host, (uint64_t)n_tokens * n_selected * sizeof(int32_t)) &&
+        ds4_gpu_tensor_write(weights, 0, weights_host, (uint64_t)n_tokens * n_selected * sizeof(float));
+    TEST_ASSERT(ok);
+    if (ok) {
+        double best = 0.0, total_ms = 0.0;
+        for (uint32_t r = 0; r < reps + 1u; r++) {
+            const double t0 = test_now_ms();
+            const int rc = ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
+                out, mid, model, model_bytes, gate_offset, up_offset, down_offset,
+                gate_expert, gate_row, down_expert, down_row, in_dim, mid_dim,
+                out_dim, selected, weights, n_total, n_selected, x, n_tokens);
+            TEST_ASSERT(rc != 0);
+            const double ms = test_now_ms() - t0;
+            if (r == 0) continue;            /* discard warmup */
+            total_ms += ms;
+            if (best == 0.0 || ms < best) best = ms;
+        }
+        const double mean = total_ms / (double)reps;
+        printf("ds4-test: Mellum MoE bench tokens=%u reps=%u gemm=%s "
+               "best=%.1fms mean=%.1fms best_layer_tok_s=%.1f\n",
+               n_tokens, reps, getenv("DS4_MELLUM_MOE_GEMM") ? "on" : "off",
+               best, mean, (double)n_tokens / (best / 1000.0));
+    }
+    ds4_gpu_tensor_free(weights); ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(x);
+    free(x_host); free(weights_host); free(selected_host); free(model);
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -8711,6 +8824,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-ssd-streaming-cache-pressure", "metal-ssd-streaming-cache-pressure", "Metal SSD-streaming layer-batched decode cache-pressure repro for issue #384", test_metal_ssd_streaming_cache_pressure},
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
+    {"--mellum-moe-bench", "mellum-moe-bench", "Mellum routed-MoE throughput at prefill shape (no model, no lock)", test_metal_mellum_moe_bench},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
