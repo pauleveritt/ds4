@@ -1818,3 +1818,31 @@ near 100--120 tok/s; a tensor-core project is principally a prefill project and
 should not be judged by decode speedup. These are targets, not present
 measurements: no trustworthy true-prefill throughput has been recorded while
 the correctness gate remains blocked.
+
+### 2026-08-21 Independent FP32 oracle: circularity broken, envelopes reframed
+
+Full detail in `2026-08-21-mellum2-independent-fp32-oracle.md`; scripts in
+`tests/mellum-fp32-oracle/`. Headline results, all against the pinned Thinking
+weights the fixtures were captured from:
+
+- Transformers' own `MellumForCausalLM` in FP32 reproduces `l-out-0.f32` to
+  **0.26% relative** (cosine 0.999997) and `result-output-tokenwise.f32` to
+  **2.40%**, and selects the same greedy token. Review finding **2.4** —
+  correlated ds4-and-llama.cpp error — is retired for coarse architecture
+  misreadings.
+- `l_out-27` differs by **9.30% relative**: Q8_0 quantization alone moves that
+  hidden state far more than any batched-versus-decode drift measured here.
+  Third independent confirmation that absolute RMS at layer 27 is the wrong
+  tracking metric.
+- ds4 sits **one to two orders of magnitude closer** to llama.cpp's Q8
+  arithmetic than that arithmetic sits to the FP32 model. The envelopes are
+  sound regression tripwires and cannot be fidelity acceptance criteria.
+- **Open Question 2 is closed.** The flattened `qwen3_moe` export was never a
+  faithful runtime contract: on the same weights it flips the greedy token at 26
+  tokens, and `MellumForCausalLM` structurally refuses to load it.
+
+Two gaps in this document surfaced in the process, both recorded in the note:
+post-dot4 `l_out-0` and `l_out-27` RMS were never measured (only maxima and
+logit RMS were), and the relative conversion is easy to do against the
+superseded "Before" column of the down-accumulation table — a stale-reference
+mistake of the same kind as Phase 0 and the Phase 6 soak.
