@@ -242,7 +242,6 @@ static id<MTLComputePipelineState> g_mellum_q8_0_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_down_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_pair_swiglu_batch_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_down_batch_f32_pipeline;
-static id<MTLComputePipelineState> g_mellum_q8_0_pair_swiglu_grouped_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_moe_bucket_reset_pipeline;
 static id<MTLComputePipelineState> g_mellum_moe_bucket_build_pipeline;
 static id<MTLComputePipelineState> g_mellum_router_select_one_pipeline;
@@ -36181,14 +36180,6 @@ static id<MTLComputePipelineState> g_mellum_down_grouped8_pipeline;
 static id<MTLComputePipelineState> g_mellum_slot_reduce_pipeline;
 static id<MTLComputePipelineState> g_mellum_pair_swiglu_gemm_pipeline;
 
-static int ds4_gpu_mellum_grouped_moe_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("DS4_MELLUM_GROUPED_MOE");
-        cached = env && *env && strcmp(env, "0") != 0;
-    }
-    return cached;
-}
 
 /*
  * Bucket the chunk's (token, slot) pairs by selected expert, then hand the
@@ -36449,16 +36440,6 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
         }
         const bool want_gemm = gemm_pair_pipeline && gemm_down_pipeline &&
                                gemm_reduce_pipeline && gemm_rows;
-        id<MTLComputePipelineState> grouped_pipeline = nil;
-        if (ds4_gpu_mellum_grouped_moe_enabled()) {
-            if (!g_mellum_q8_0_pair_swiglu_grouped_f32_pipeline)
-                g_mellum_q8_0_pair_swiglu_grouped_f32_pipeline =
-                    ds4_gpu_get_pipeline(
-                        "kernel_mellum_q8_0_pair_swiglu_grouped_f32");
-            grouped_pipeline = ds4_gpu_hot_pipeline(
-                g_mellum_q8_0_pair_swiglu_grouped_f32_pipeline,
-                "kernel_mellum_q8_0_pair_swiglu_grouped_f32");
-        }
         ds4_gpu_glm_routed_moe_args args = {
             .in_dim = expert_in_dim, .mid_dim = expert_mid_dim, .out_dim = out_dim,
             .n_total_expert = n_total_expert, .n_expert_used = n_expert,
@@ -36477,15 +36458,17 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
         id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
         id<MTLBuffer> weightsbuf = ds4_gpu_tensor_buffer(weights);
         ds4_gpu_mellum_moe_group ggroup = {0};
-        const bool need_group = want_gemm ||
-            (ds4_gpu_mellum_grouped_moe_enabled() && grouped_pipeline);
-        const bool grouped = need_group &&
+        /*
+         * Bucketing tokens by expert is what the GEMM path consumes; it is no
+         * longer shared with anything else, so it is built only for that.
+         */
+        const bool grouped = want_gemm &&
             ds4_gpu_mellum_moe_group_begin(&ggroup, cb, n_total_expert, n_expert,
                                             n_tokens, gate_expert_bytes,
                                             down_expert_bytes, out_dim,
                                             selectedbuf,
                                             ds4_gpu_tensor_offset(selected));
-        const bool gemm = grouped && want_gemm && ggroup.partial;
+        const bool gemm = grouped && ggroup.partial;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         if (gemm) {
             [enc setComputePipelineState:gemm_pair_pipeline];
@@ -36507,29 +36490,6 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
             [enc useResource:gatebuf usage:MTLResourceUsageRead];
             [enc useResource:upbuf usage:MTLResourceUsageRead];
             [enc setThreadgroupMemoryLength:2u * (NSUInteger)expert_in_dim * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(expert_mid_dim, n_total_expert, 1)
-                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        } else if (grouped) {
-            [enc setComputePipelineState:grouped_pipeline];
-            [enc setBytes:&args length:sizeof(args) atIndex:0];
-            [enc setBytes:&ggroup.args length:sizeof(ggroup.args) atIndex:1];
-            [enc setBuffer:gatebuf offset:(NSUInteger)gate_inner atIndex:2];
-            [enc setBuffer:upbuf offset:(NSUInteger)up_inner atIndex:3];
-            [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.gate_offsets)
-                    offset:ds4_gpu_tensor_offset(ggroup.gate_offsets) atIndex:4];
-            [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.up_offsets)
-                    offset:ds4_gpu_tensor_offset(ggroup.up_offsets) atIndex:5];
-            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:6];
-            [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:7];
-            [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.counts)
-                    offset:ds4_gpu_tensor_offset(ggroup.counts) atIndex:8];
-            [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.pairs)
-                    offset:ds4_gpu_tensor_offset(ggroup.pairs) atIndex:9];
-            [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:10];
-            [enc useResource:gatebuf usage:MTLResourceUsageRead];
-            [enc useResource:upbuf usage:MTLResourceUsageRead];
-            [enc setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
-            [enc setThreadgroupMemoryLength:(((NSUInteger)gate_row_bytes * 2u) + 15u) & ~(NSUInteger)15u atIndex:1];
             [enc dispatchThreadgroups:MTLSizeMake(expert_mid_dim, n_total_expert, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         } else {
