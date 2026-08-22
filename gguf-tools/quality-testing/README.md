@@ -77,9 +77,6 @@ python3 gguf-tools/quality-testing/collect_official.py \
   --reasoning-effort none
 ```
 
-Use one output directory per official model. For PRO through the official
-DeepSeek API:
-
 For Laguna S 2.1 through OpenRouter:
 
 ```sh

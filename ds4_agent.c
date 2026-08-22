@@ -1142,16 +1142,14 @@ static const char agent_laguna_tools_prompt_after_schemas[] =
     "- read path alone returns a context-sized bounded chunk, not the whole file; for first looks at large files, prefer max_lines around 80-160.\n"
     "- If read says more lines are available, call more with count=<lines> to read the next chunk.\n"
     "- Use whole=true only when the user explicitly asks for the complete file contents or when bounded chunks are insufficient; add raw=true only when line numbers would corrupt the payload.\n"
-    "- " AGENT_EDIT_TARGET_RULE "\n"
-    "- Use edit with exact old text and replacement new text; old may contain one [upto] marker between unique anchors.\n"
-    "- For long bash jobs, pass refresh_sec and then poll with bash_status or stop with bash_stop.\n"
-    "- Preserve the current system configuration unless the user explicitly asks otherwise.\n";
+    "- " AGENT_EDIT_TARGET_RULE "\n";
 
 /*
- * Laguna shares GLM's schema block and tool-call syntax but has its own rules
- * tail.  It takes edit_upto for the same reason the other two builders do:
- * without it the prompt would describe the exact-replacement Edit while the
- * agent had anchored edits enabled, and the model would never reach for them.
+ * Laguna has its own intro and rules but shares GLM's schema block, tool-call
+ * syntax, edit rule and rules tail.  Composing it the same way GLM does keeps
+ * the edit rule *selected* rather than duplicated: Laguna's rules previously
+ * hard-coded the [upto] wording, so appending a second rule contradicted it
+ * whenever anchored edits were off and repeated it when they were on.
  */
 static char *agent_build_laguna_tools_prompt(bool edit_upto) {
     const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
@@ -1160,11 +1158,13 @@ static char *agent_build_laguna_tools_prompt(bool edit_upto) {
     size_t b = strlen(agent_glm_tool_schemas);
     size_t c = strlen(agent_laguna_tools_prompt_after_schemas);
     size_t d = strlen(edit);
-    char *out = xmalloc(a + b + c + d + 1);
+    size_t e = strlen(agent_glm_tools_prompt_rules_tail);
+    char *out = xmalloc(a + b + c + d + e + 1);
     memcpy(out, agent_laguna_tools_prompt_intro, a);
     memcpy(out + a, agent_glm_tool_schemas, b);
     memcpy(out + a + b, agent_laguna_tools_prompt_after_schemas, c);
-    memcpy(out + a + b + c, edit, d + 1);
+    memcpy(out + a + b + c, edit, d);
+    memcpy(out + a + b + c + d, agent_glm_tools_prompt_rules_tail, e + 1);
     return out;
 }
 
