@@ -61599,8 +61599,22 @@ int ds4_engine_mellum_resident_profile(ds4_engine *e, FILE *out,
     fprintf(stderr, "ds4: Mellum resident profile requires Metal support\n");
     return 1;
 #else
-    enum { warmup_tokens = 8, measured_tokens = 64, repeats = 3,
-           prefill_tokens = 1024 };
+    enum { warmup_tokens = 8, measured_tokens = 64, repeats = 3 };
+    /*
+     * Prefill width is a diagnostic knob rather than a constant so the
+     * throughput-versus-context curve can be measured: prefilling N tokens from
+     * an empty cache and differencing the cumulative times across N gives the
+     * marginal rate at depth, which is the number a long session actually
+     * experiences.  Defaults to the sliding-window cap.
+     */
+    int prefill_tokens = 1024;
+    {
+        const char *env = getenv("DS4_MELLUM_PROFILE_PREFILL_TOKENS");
+        if (env && *env) {
+            const long v = strtol(env, NULL, 10);
+            if (v >= 64 && v <= (1L << 20)) prefill_tokens = (int)v;
+        }
+    }
     if (!e || !out || ctx_size <= measured_tokens ||
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
         e->backend != DS4_BACKEND_METAL || !e->mellum_decode_contract_ready ||
