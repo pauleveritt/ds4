@@ -61153,6 +61153,11 @@ bool ds4_engine_is_laguna(ds4_engine *e) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA;
 }
 
+bool ds4_engine_is_mellum(ds4_engine *e) {
+    (void)e;
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM;
+}
+
 const char *ds4_engine_default_system_prompt(ds4_engine *e) {
     (void)e;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
@@ -61175,6 +61180,14 @@ void ds4_engine_sampling_defaults(ds4_engine *e, float *temperature,
         *top_p = 0.95f;
         *min_p = 0.0f;
     } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        *top_k = 20;
+        *min_p = 0.0f;
+    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        /* JetBrains' published sampling for Mellum 2. Without this it ran at
+         * the generic temperature 1.0 / top_p 1.0, which is a poor setting for
+         * a model expected to emit well-formed JSON tool calls. */
+        *temperature = 0.6f;
+        *top_p = 0.95f;
         *top_k = 20;
         *min_p = 0.0f;
     }

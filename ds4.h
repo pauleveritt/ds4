@@ -418,6 +418,7 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_laguna(ds4_engine *e);
+bool ds4_engine_is_mellum(ds4_engine *e);
 const char *ds4_engine_default_system_prompt(ds4_engine *e);
 void ds4_engine_sampling_defaults(ds4_engine *e, float *temperature,
                                   int *top_k, float *top_p, float *min_p);

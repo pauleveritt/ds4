@@ -238,6 +238,9 @@ typedef enum {
     AGENT_TOOL_SYNTAX_DSML,
     AGENT_TOOL_SYNTAX_GLM,
     AGENT_TOOL_SYNTAX_LAGUNA,
+    /* Hermes-style JSON inside <tool_call> tags -- what Mellum's own chat
+     * template specifies and what it was trained on. */
+    AGENT_TOOL_SYNTAX_MELLUM,
 } agent_tool_syntax;
 
 typedef enum {
@@ -353,12 +356,20 @@ static int agent_read_default_lines(agent_worker *w);
 static agent_tool_syntax agent_tool_syntax_for_engine(ds4_engine *engine) {
     if (ds4_engine_is_glm_dsa(engine)) return AGENT_TOOL_SYNTAX_GLM;
     if (ds4_engine_is_laguna(engine)) return AGENT_TOOL_SYNTAX_LAGUNA;
+    if (ds4_engine_is_mellum(engine)) return AGENT_TOOL_SYNTAX_MELLUM;
     return AGENT_TOOL_SYNTAX_DSML;
 }
 
+/* "Tagged" means the call is delimited by <tool_call> ... </tool_call>, which
+ * governs stream detection and -- via agent_append_system_prompt -- whether the
+ * tools prompt is framed as a chat message at all.  Mellum belongs here even
+ * though its arguments are JSON rather than <arg_key>/<arg_value>: falling
+ * through to DSML sent it unframed instructions in a markup it has no tokens
+ * for. */
 static bool agent_tool_syntax_is_tagged(agent_tool_syntax syntax) {
     return syntax == AGENT_TOOL_SYNTAX_GLM ||
-           syntax == AGENT_TOOL_SYNTAX_LAGUNA;
+           syntax == AGENT_TOOL_SYNTAX_LAGUNA ||
+           syntax == AGENT_TOOL_SYNTAX_MELLUM;
 }
 
 static void agent_worker_append_assistant_turn_end(agent_worker *w) {
@@ -1168,12 +1179,63 @@ static char *agent_build_laguna_tools_prompt(bool edit_upto) {
     return out;
 }
 
+/*
+ * Mellum's embedded chat template specifies Hermes-style tool calls: a JSON
+ * object with "name" and "arguments" inside <tool_call></tool_call>.  The
+ * wording below tracks that template so the model sees the framing it was
+ * trained on; the schema block and rules tail are shared with GLM because they
+ * are plain JSON schemas and syntax-independent advice.
+ */
+static const char agent_mellum_tools_prompt_intro[] =
+    "You are a coding agent running in a local workspace. Use tools for local file and system work. "
+    "Avoid printing large file contents or large code blocks as answers; create or edit files with tools, "
+    "then summarize results briefly.\n\n"
+    "# Tools\n\n"
+    "You may call one or more functions to assist with the user query.\n\n"
+    "You are provided with function signatures within <tools></tools> XML tags:\n"
+    "<tools>\n";
+
+static const char agent_mellum_tools_prompt_after_schemas[] =
+    "</tools>\n\n"
+    "For each function call, return a json object with function name and arguments "
+    "within <tool_call></tool_call> XML tags:\n"
+    "<tool_call>\n"
+    "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
+    "</tool_call>\n\n"
+    "Tool calls are not allowed inside <think></think>; finish thinking before emitting <tool_call>.\n\n"
+    "# Rules\n\n"
+    "- Emit one JSON object per <tool_call>; put every argument inside \"arguments\".\n"
+    "- Argument values are JSON, so newlines inside file contents must be escaped as \\n.\n"
+    "- read path alone returns a context-sized bounded chunk, not the whole file; for first looks at large files, prefer max_lines around 80-160.\n"
+    "- If read says more lines are available, call more with count=<lines> to read the next chunk.\n"
+    "- Use whole=true only when the user explicitly asks for the complete file contents or when bounded chunks are insufficient; add raw=true only when line numbers would corrupt the payload.\n"
+    "- " AGENT_EDIT_TARGET_RULE "\n";
+
+static char *agent_build_mellum_tools_prompt(bool edit_upto) {
+    const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
+                                 : agent_glm_tools_prompt_edit_exact;
+    size_t a = strlen(agent_mellum_tools_prompt_intro);
+    size_t b = strlen(agent_glm_tool_schemas);
+    size_t c = strlen(agent_mellum_tools_prompt_after_schemas);
+    size_t d = strlen(edit);
+    size_t e = strlen(agent_glm_tools_prompt_rules_tail);
+    char *out = xmalloc(a + b + c + d + e + 1);
+    memcpy(out, agent_mellum_tools_prompt_intro, a);
+    memcpy(out + a, agent_glm_tool_schemas, b);
+    memcpy(out + a + b, agent_mellum_tools_prompt_after_schemas, c);
+    memcpy(out + a + b + c, edit, d);
+    memcpy(out + a + b + c + d, agent_glm_tools_prompt_rules_tail, e + 1);
+    return out;
+}
+
 static char *agent_build_tools_prompt(ds4_engine *engine, bool edit_upto) {
     agent_tool_syntax syntax = agent_tool_syntax_for_engine(engine);
     if (syntax == AGENT_TOOL_SYNTAX_GLM)
         return agent_build_glm_tools_prompt(edit_upto);
     if (syntax == AGENT_TOOL_SYNTAX_LAGUNA)
         return agent_build_laguna_tools_prompt(edit_upto);
+    if (syntax == AGENT_TOOL_SYNTAX_MELLUM)
+        return agent_build_mellum_tools_prompt(edit_upto);
     return agent_build_dsml_tools_prompt(edit_upto);
 }
 
@@ -1844,11 +1906,259 @@ static void agent_dsml_finish(agent_dsml_parser *p) {
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Mellum tool calls: Hermes-style JSON inside <tool_call> tags.
+ *
+ * Unlike the GLM/Laguna tag grammar there is nothing useful to do with a
+ * partial payload -- a half-read JSON object cannot be executed -- so this
+ * waits for a complete </tool_call> and then parses in one pass.  That keeps
+ * the JSON reader ordinary rather than resumable, at the cost of buffering one
+ * call, which the parser already does anyway.
+ * ------------------------------------------------------------------------ */
+
+static const char *agent_json_skip_ws(const char *s, const char *end) {
+    while (s < end && (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')) s++;
+    return s;
+}
+
+static void agent_json_put_utf8(char **out, uint32_t cp) {
+    char *o = *out;
+    if (cp < 0x80) { *o++ = (char)cp; }
+    else if (cp < 0x800) {
+        *o++ = (char)(0xC0 | (cp >> 6)); *o++ = (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        *o++ = (char)(0xE0 | (cp >> 12));
+        *o++ = (char)(0x80 | ((cp >> 6) & 0x3F));
+        *o++ = (char)(0x80 | (cp & 0x3F));
+    } else {
+        *o++ = (char)(0xF0 | (cp >> 18));
+        *o++ = (char)(0x80 | ((cp >> 12) & 0x3F));
+        *o++ = (char)(0x80 | ((cp >> 6) & 0x3F));
+        *o++ = (char)(0x80 | (cp & 0x3F));
+    }
+    *out = o;
+}
+
+static bool agent_json_hex4(const char *s, uint32_t *out) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = s[i];
+        v <<= 4;
+        if (c >= '0' && c <= '9') v |= (uint32_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') v |= (uint32_t)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v |= (uint32_t)(c - 'A' + 10);
+        else return false;
+    }
+    *out = v;
+    return true;
+}
+
+/* Reads a JSON string at *sp (which must point at the opening quote) and
+ * returns the unescaped bytes.  Caller frees *out. */
+static bool agent_json_read_string(const char **sp, const char *end,
+                                   char **out, size_t *out_len) {
+    const char *s = *sp;
+    if (s >= end || *s != '"') return false;
+    s++;
+    /* Unescaping never grows the text, so the raw span bounds the result. */
+    char *buf = xmalloc((size_t)(end - s) + 4);
+    char *o = buf;
+    while (s < end && *s != '"') {
+        if (*s != '\\') { *o++ = *s++; continue; }
+        s++;
+        if (s >= end) { free(buf); return false; }
+        switch (*s) {
+        case '"': *o++ = '"'; s++; break;
+        case '\\': *o++ = '\\'; s++; break;
+        case '/': *o++ = '/'; s++; break;
+        case 'b': *o++ = '\b'; s++; break;
+        case 'f': *o++ = '\f'; s++; break;
+        case 'n': *o++ = '\n'; s++; break;
+        case 'r': *o++ = '\r'; s++; break;
+        case 't': *o++ = '\t'; s++; break;
+        case 'u': {
+            uint32_t cp = 0;
+            if (s + 5 > end || !agent_json_hex4(s + 1, &cp)) { free(buf); return false; }
+            s += 5;
+            if (cp >= 0xD800 && cp <= 0xDBFF && s + 6 <= end &&
+                s[0] == '\\' && s[1] == 'u') {
+                uint32_t lo = 0;
+                if (agent_json_hex4(s + 2, &lo) && lo >= 0xDC00 && lo <= 0xDFFF) {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    s += 6;
+                }
+            }
+            agent_json_put_utf8(&o, cp);
+            break;
+        }
+        default: free(buf); return false;
+        }
+    }
+    if (s >= end) { free(buf); return false; }
+    *sp = s + 1;
+    *out = buf;
+    *out_len = (size_t)(o - buf);
+    return true;
+}
+
+/* Advances past any JSON value, returning its raw span.  Used for argument
+ * values that are not strings: numbers, booleans, null, and nested
+ * objects/arrays are handed to the tool as their JSON text. */
+static bool agent_json_scan_value(const char **sp, const char *end,
+                                  const char **val, size_t *val_len) {
+    const char *s = agent_json_skip_ws(*sp, end);
+    if (s >= end) return false;
+    *val = s;
+    if (*s == '"') {
+        char *tmp = NULL; size_t tmp_len = 0;
+        if (!agent_json_read_string(&s, end, &tmp, &tmp_len)) return false;
+        free(tmp);
+    } else if (*s == '{' || *s == '[') {
+        int depth = 0;
+        bool in_str = false;
+        while (s < end) {
+            char c = *s;
+            if (in_str) {
+                if (c == '\\') { s += 2; continue; }
+                if (c == '"') in_str = false;
+            } else if (c == '"') in_str = true;
+            else if (c == '{' || c == '[') depth++;
+            else if (c == '}' || c == ']') { depth--; if (depth == 0) { s++; break; } }
+            s++;
+        }
+        if (depth != 0) return false;
+    } else {
+        while (s < end && *s != ',' && *s != '}' && *s != ' ' && *s != '\t' &&
+               *s != '\r' && *s != '\n')
+            s++;
+    }
+    *val_len = (size_t)(s - *val);
+    /* No JSON value is zero-length.  Without this, `{"k": }` scans an empty
+     * span, reports success, and the malformed call reaches the tool as an
+     * empty argument instead of a retryable parse error. */
+    if (*val_len == 0) return false;
+    *sp = s;
+    return true;
+}
+
+/* Parses {"name": "...", "arguments": {...}} into p->current. */
+static bool agent_mellum_parse_call_json(agent_dsml_parser *p,
+                                         const char *s, const char *end) {
+    s = agent_json_skip_ws(s, end);
+    if (s >= end || *s != '{') return false;
+    s++;
+    bool have_name = false;
+    for (;;) {
+        s = agent_json_skip_ws(s, end);
+        if (s < end && *s == '}') { s++; break; }
+        char *key = NULL; size_t key_len = 0;
+        if (!agent_json_read_string(&s, end, &key, &key_len)) return false;
+        s = agent_json_skip_ws(s, end);
+        if (s >= end || *s != ':') { free(key); return false; }
+        s++;
+        if (key_len == 4 && memcmp(key, "name", 4) == 0) {
+            char *name = NULL; size_t name_len = 0;
+            s = agent_json_skip_ws(s, end);
+            if (!agent_json_read_string(&s, end, &name, &name_len)) { free(key); return false; }
+            agent_tool_call_free(&p->current);
+            p->current.name = xstrndup(name, name_len);
+            free(name);
+            have_name = true;
+        } else if (key_len == 9 && memcmp(key, "arguments", 9) == 0) {
+            s = agent_json_skip_ws(s, end);
+            if (s >= end || *s != '{') { free(key); return false; }
+            s++;
+            for (;;) {
+                s = agent_json_skip_ws(s, end);
+                if (s < end && *s == '}') { s++; break; }
+                char *ak = NULL; size_t ak_len = 0;
+                if (!agent_json_read_string(&s, end, &ak, &ak_len)) { free(key); return false; }
+                s = agent_json_skip_ws(s, end);
+                if (s >= end || *s != ':') { free(ak); free(key); return false; }
+                s++;
+                s = agent_json_skip_ws(s, end);
+                if (s < end && *s == '"') {
+                    char *av = NULL; size_t av_len = 0;
+                    if (!agent_json_read_string(&s, end, &av, &av_len)) {
+                        free(ak); free(key); return false;
+                    }
+                    agent_tool_call_add_arg(&p->current, ak, av, av_len, true);
+                    free(av);
+                } else {
+                    const char *rv = NULL; size_t rv_len = 0;
+                    if (!agent_json_scan_value(&s, end, &rv, &rv_len)) {
+                        free(ak); free(key); return false;
+                    }
+                    agent_tool_call_add_arg(&p->current, ak, rv, rv_len, false);
+                }
+                free(ak);
+                s = agent_json_skip_ws(s, end);
+                if (s < end && *s == ',') { s++; continue; }
+            }
+        } else {
+            const char *rv = NULL; size_t rv_len = 0;
+            if (!agent_json_scan_value(&s, end, &rv, &rv_len)) { free(key); return false; }
+        }
+        free(key);
+        s = agent_json_skip_ws(s, end);
+        if (s < end && *s == ',') { s++; continue; }
+    }
+    return have_name;
+}
+
+static void agent_mellum_tool_parse(agent_dsml_parser *p) {
+    static const char start[] = "<tool_call>";
+    static const char close[] = "</tool_call>";
+
+    if (p->raw_len < sizeof(start) - 1 ||
+        memcmp(p->raw, start, sizeof(start) - 1) != 0) {
+        return;
+    }
+    if (p->parse_pos == 0) p->parse_pos = sizeof(start) - 1;
+
+    while (p->state == AGENT_DSML_STRUCTURAL) {
+        const char *raw = p->raw;
+        const char *end = raw + p->raw_len;
+        while (p->parse_pos < p->raw_len &&
+               (raw[p->parse_pos] == ' ' || raw[p->parse_pos] == '\t' ||
+                raw[p->parse_pos] == '\r' || raw[p->parse_pos] == '\n'))
+            p->parse_pos++;
+        const char *cur = raw + p->parse_pos;
+
+        if (p->glm_after_call) {
+            if (agent_bytes_starts_with(cur, end, start)) {
+                p->parse_pos += sizeof(start) - 1;
+                p->glm_after_call = false;
+                continue;
+            }
+            if (agent_bytes_partial_prefix_at(cur, end, start)) return;
+            p->glm_after_call = false;
+            p->state = AGENT_DSML_DONE;
+            return;
+        }
+
+        const char *call_end = strstr(cur, close);
+        if (!call_end) return;  /* wait for the rest of the call */
+        if (!agent_mellum_parse_call_json(p, cur, call_end)) {
+            agent_dsml_set_error(p, "malformed JSON in Mellum <tool_call>");
+            return;
+        }
+        agent_tool_calls_push(&p->calls, &p->current);
+        memset(&p->current, 0, sizeof(p->current));
+        p->parse_pos = (size_t)(call_end - raw) + sizeof(close) - 1;
+        p->glm_after_call = true;
+    }
+}
+
 /* Parse as much of the accumulated DSML buffer as possible.  The parser can be
  * called after every streamed byte: incomplete input leaves state unchanged
  * until enough bytes arrive, while malformed completed input switches to
  * AGENT_DSML_ERROR so the model gets a retryable tool error. */
 static void agent_dsml_parse(agent_dsml_parser *p) {
+    if (p->syntax == AGENT_TOOL_SYNTAX_MELLUM) {
+        agent_mellum_tool_parse(p);
+        return;
+    }
     if (agent_tool_syntax_is_tagged(p->syntax)) {
         agent_glm_tool_parse(p);
         return;
@@ -6922,6 +7232,78 @@ static void test_agent_glm_stream_tool_call_chunked(void) {
     agent_dsml_parser_free(&p);
 }
 
+static void test_agent_mellum_stream_tool_call_chunked(void) {
+    /* Split mid-tag and mid-JSON: the parser must hold until </tool_call>. */
+    const char *chunks[] = {
+        "intro ",
+        "<to",
+        "ol_call>\n{\"name\": \"bash\", \"argum",
+        "ents\": {\"command\": \"printf hi\", \"refresh_sec\": 1}}\n</tool_call>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(p.calls.v[0].name && !strcmp(p.calls.v[0].name, "bash"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "command"), "printf hi"));
+    /* Non-string arguments arrive as their JSON text. */
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "refresh_sec"), "1"));
+    AGENT_TEST_ASSERT(strstr(out, "intro ") != NULL);
+    AGENT_TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_stream_tool_call_escapes(void) {
+    /* The residual risk with Hermes JSON is multi-line file payloads, which
+     * must arrive as \n escapes and come back out as real newlines. */
+    const char *chunks[] = {
+        "<tool_call>\n{\"name\": \"write\", \"arguments\": {\"path\": \"app.py\", ",
+        "\"content\": \"line1\\nline2\\t\\\"q\\\"\\n\"}}\n</tool_call>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "path"), "app.py"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "content"),
+                              "line1\nline2\t\"q\"\n"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_stream_two_calls(void) {
+    const char *chunks[] = {
+        "<tool_call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"a\"}}\n</tool_call>\n",
+        "<tool_call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"b\"}}\n</tool_call>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 2);
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "path"), "a"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[1], "path"), "b"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_stream_malformed_json(void) {
+    /* A completed but malformed call must become a retryable tool error, not
+     * a call whose name is the whole payload -- which is what the GLM parser
+     * would have produced from JSON. */
+    const char *chunks[] = {
+        "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": }}\n</tool_call>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_ERROR);
+    AGENT_TEST_ASSERT(p.calls.len == 0);
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
 static void test_agent_glm_stream_ignores_tool_inside_think(void) {
     const char *chunks[] = {
         "<think>plan <tool",
@@ -7167,6 +7549,10 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_glm_tool_parser_streams_param_state();
     test_agent_glm_tool_parser_multiple_adjacent_calls();
     test_agent_glm_stream_tool_call_chunked();
+    test_agent_mellum_stream_tool_call_chunked();
+    test_agent_mellum_stream_tool_call_escapes();
+    test_agent_mellum_stream_two_calls();
+    test_agent_mellum_stream_malformed_json();
     test_agent_glm_stream_ignores_tool_inside_think();
     test_agent_glm_stream_greedy_sampling_boundaries();
     test_agent_dsml_stream_tool_call_chunked();

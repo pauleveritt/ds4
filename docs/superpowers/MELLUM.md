@@ -112,6 +112,51 @@ macOS refuses, failing at `104.00/112.00 GiB`. The tightest reachable
 simulation leaves ~24 GiB. Both models load there. Real 16 GiB hardware is the
 only way to answer this.
 
+## Tool calling in ds4-agent
+
+**Mellum does not emit tool calls today.** Three integration bugs were fixed
+and the model still answers in prose; treat agentic use as unproven.
+
+What was wrong, and is now fixed:
+
+- `agent_tool_syntax_for_engine` had no Mellum branch, so Mellum fell through
+  to `AGENT_TOOL_SYNTAX_DSML` -- DeepSeek's markup, for which Mellum has no
+  tokens at all (its vocab has `<tool_call>`=29, `</tool_call>`=30,
+  `<tool_response>`=31, `<|im_start|>`=27, and zero DSML markers).
+- Because DSML is not "tagged", the tools prompt was tokenized by
+  `ds4_tokenize_rendered_chat` as raw text, so it arrived with no
+  `<|im_start|>system ... <|im_end|>` framing at all.
+- `ds4_engine_sampling_defaults` had no Mellum branch, leaving it at
+  temperature 1.0 / top_p 1.0 instead of JetBrains' 0.6 / 0.95 / top_k 20.
+
+Mellum's own chat template specifies Hermes-style calls -- a JSON object with
+`name` and `arguments` inside `<tool_call>` tags, the format vLLM serves with
+`--tool-call-parser hermes` -- *not* GLM's `<arg_key>`/`<arg_value>`. Routing
+Mellum to the GLM syntax would have been worse than the bug: the GLM parser
+scans a tool name up to the next `<`, and JSON has none until `</tool_call>`,
+so it would push a call whose name is the entire payload, then loop on
+unknown-tool errors. `AGENT_TOOL_SYNTAX_MELLUM` and a JSON parser were added
+instead, covered by unit tests that need no GPU.
+
+What is still unresolved: with a correct, ChatML-framed 4,302-character tools
+prompt confirmed in the token trace, the model narrates its intent and never
+emits `<tool_call>`. Measured on the AgentClinic spec task:
+
+| Arm | tool calls | files created |
+| --- | ---: | ---: |
+| Q4_K, thinking | 0 | 0/4 |
+| Q8_0, thinking | 0 | 0/4 |
+| Q4_K, `--nothink` | 0 | 0/4 |
+
+**Q8_0 behaves identically, so this is not the selective artifact and not
+quantization.** `--nothink` visibly improves the framing ("Let me start by
+examining the files") without producing a call. Remaining suspects, untested:
+the second generic system message appended after the tools prompt; feeding
+tools through the chat template's own `tools` parameter rather than a
+hand-written prompt; and the plain possibility that a 12B-A2.5B
+completion-oriented model is weak at agentic tool use. Run the Q8_0 control
+before attributing any future tool-calling change to quantization.
+
 ## Hosts
 
 - **`ds4-agent`** — one session per process, and `/tmp/ds4.lock` refuses a
