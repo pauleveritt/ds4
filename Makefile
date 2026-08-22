@@ -450,13 +450,10 @@ test: ds4_test ds4_agent_test ds4_server_test ds4-eval q4k-dot-test mxfp4-dot-te
 	./ds4_agent_test
 	./ds4_server_test
 	./ds4_test
-	# Every Mellum acceleration is env-gated, so the default run above reaches
-	# none of them.  Re-run the Metal kernel suite once per gated path: the
-	# batch-equals-decode checks are what hold their output within bounds, and
-	# without these the accelerated paths ship untested.
-	DS4_MELLUM_GROUPED_MOE=1 ./ds4_test --metal-kernels
+	# The default run above covers the production path.  Re-run the Metal
+	# kernel suite once against the bitwise oracle, which is the only other
+	# configuration Mellum still has.
 	DS4_MELLUM_MOE_GEMM=0 ./ds4_test --metal-kernels
-	DS4_MELLUM_DOWN_ROWTILE=1 ./ds4_test --metal-kernels
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args

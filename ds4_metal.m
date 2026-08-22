@@ -248,18 +248,6 @@ static id<MTLComputePipelineState> g_mellum_moe_bucket_build_pipeline;
 static id<MTLComputePipelineState> g_mellum_router_select_one_pipeline;
 static id<MTLComputePipelineState> g_mellum_router_select_batch_pipeline;
 static id<MTLComputePipelineState> g_mellum_gqa_decode_pipeline;
-static id<MTLComputePipelineState> g_mellum_gqa_decode_split_pipeline;
-
-/*
- * Launch contract for kernel_mellum_attention_decode_gqa_split_f16, kept in
- * one place because the kernel indexes threadgroup memory by SIMD-group id:
- * dispatch exactly this many SIMD groups and size scratch to match, or the
- * kernel writes past the allocation.  Must equal DS4_MELLUM_SPLIT_SIMD_GROUPS
- * in metal/laguna.metal.
- */
-#define DS4_MELLUM_SPLIT_SIMD_GROUPS 8u
-#define DS4_MELLUM_SPLIT_THREADS (DS4_MELLUM_SPLIT_SIMD_GROUPS * 32u)
-
 /*
  * Head grouping evaluates every query head sharing a KV head in one
  * threadgroup so each K/V row is fetched once instead of DS4_MELLUM_GROUP_HEADS
@@ -278,22 +266,11 @@ int ds4_gpu_mellum_attn_group_enabled(void) {
 }
 
 /*
- * Both decode-attention accelerations are on by default and are switched off
- * with an explicit "0".  They reassociate the softmax, so they cannot hold the
- * bitwise decode-equals-prefill contract -- but only above
- * DS4_MELLUM_ATTN_MIN_KEYS, below which the serial kernel still runs and the
- * old arithmetic is preserved exactly.
+ * Above this many keys the head-grouped kernel runs; at or below it the serial
+ * kernel does, preserving exactly the arithmetic short histories have always
+ * produced and giving the tests a bitwise oracle to compare against.
  */
 #define DS4_MELLUM_ATTN_MIN_KEYS 256u
-
-int ds4_gpu_mellum_attn_split_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("DS4_MELLUM_ATTN_SPLIT");
-        cached = !(env && *env && strcmp(env, "0") == 0);
-    }
-    return cached;
-}
 static id<MTLComputePipelineState> g_mellum_gqa_prefill_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_addr_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_addr_down_f32_pipeline;
@@ -9894,7 +9871,6 @@ void ds4_gpu_cleanup(void) {
         g_mellum_router_select_one_pipeline = nil;
         g_mellum_router_select_batch_pipeline = nil;
         g_mellum_gqa_decode_pipeline = nil;
-        g_mellum_gqa_decode_split_pipeline = nil;
         g_mellum_gqa_prefill_pipeline = nil;
         g_glm_q2_k_addr_down_f32_pipeline = nil;
         g_glm_q4_k_addr_down_f32_pipeline = nil;
@@ -35151,32 +35127,23 @@ int ds4_gpu_mellum_gqa_decode_tensor(
             }
             return 1;
             }
-            /* Not ready: fall through to the split/serial kernel below. */
+            /* Not ready: fall through to the serial kernel below. */
         }
 
-        const int split = ds4_gpu_mellum_attn_split_enabled() &&
-                          key_count > DS4_MELLUM_ATTN_MIN_KEYS;
-        const char *kernel_name = split ?
-            "kernel_mellum_attention_decode_gqa_split_f16" :
-            "kernel_mellum_attention_decode_gqa_f16";
-        if (split) {
-            if (!g_mellum_gqa_decode_split_pipeline) {
-                g_mellum_gqa_decode_split_pipeline =
-                    ds4_gpu_get_pipeline(kernel_name);
-            }
-        } else if (!g_mellum_gqa_decode_pipeline) {
+        /*
+         * Everything that does not go through head grouping -- short
+         * histories, and any GQA ratio the grouped kernel does not serve --
+         * runs the serial kernel, which is also the bitwise oracle.
+         */
+        const char *kernel_name = "kernel_mellum_attention_decode_gqa_f16";
+        if (!g_mellum_gqa_decode_pipeline) {
             g_mellum_gqa_decode_pipeline = ds4_gpu_get_pipeline(kernel_name);
         }
         id<MTLComputePipelineState> pipeline = ds4_gpu_hot_pipeline(
-            split ? g_mellum_gqa_decode_split_pipeline :
-                    g_mellum_gqa_decode_pipeline, kernel_name);
-        /*
-         * Which kernel ran, and whether any dispatch actually crossed the
-         * split threshold.  Reporting only on a new maximum keeps this to a
-         * handful of lines: a run that never prints a key_count above the
-         * threshold has not exercised the split path at all, however many
-         * times it was dispatched.
-         */
+            g_mellum_gqa_decode_pipeline, kernel_name);
+        /* Which kernel ran, reported only on a new maximum key_count: a run
+         * that never prints one above the threshold never left the serial
+         * path, however many times it was dispatched. */
         if (getenv("DS4_MELLUM_ATTN_TRACE")) {
             static uint32_t reported_max = 0;
             if (key_count > reported_max) {
@@ -35202,29 +35169,8 @@ int ds4_gpu_mellum_gqa_decode_tensor(
         [enc setBuffer:keybuf offset:ds4_gpu_tensor_offset(key_cache) atIndex:2];
         [enc setBuffer:valuebuf offset:ds4_gpu_tensor_offset(value_cache) atIndex:3];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
-        NSUInteger split_threads = DS4_MELLUM_SPLIT_THREADS;
-        if (split) {
-            /* One maximum, one sum and one head-dim vector per SIMD group. */
-            const NSUInteger scratch_floats =
-                (NSUInteger)DS4_MELLUM_SPLIT_SIMD_GROUPS * (2u + head_dim);
-            [enc setThreadgroupMemoryLength:scratch_floats * sizeof(float)
-                                    atIndex:0];
-            /*
-             * Test hook for the surplus-SIMD-group path.  The kernel absorbs
-             * an over-sized launch by giving the extra groups an empty key
-             * range rather than returning early, because a non-uniform return
-             * ahead of its threadgroup_barrier would be undefined.  Without a
-             * way to over-dispatch, that safety property is unverifiable.
-             */
-            if (getenv("DS4_MELLUM_ATTN_OVERDISPATCH")) {
-                const NSUInteger cap = pipeline.maxTotalThreadsPerThreadgroup;
-                const NSUInteger wanted = split_threads * 2u;
-                if (wanted <= cap) split_threads = wanted;
-            }
-        }
         [enc dispatchThreadgroups:MTLSizeMake(n_head, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(
-                 split ? split_threads : 32u, 1, 1)];
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Mellum GQA decode")) return 0;
     }
@@ -36205,18 +36151,6 @@ typedef struct {
  * (32 KiB at eight experts), which is at the device limit, so the pipeline is
  * allowed to fail and fall back rather than being assumed available.
  */
-static unsigned ds4_gpu_mellum_down_rowtile(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("DS4_MELLUM_DOWN_ROWTILE");
-        long v = (env && *env) ? strtol(env, NULL, 10) : 0;
-        cached = (v == 2 || v == 4) ? (int)v : 0;
-    }
-    return (unsigned)cached;
-}
-
-static id<MTLComputePipelineState> g_mellum_down_rowtile2_pipeline;
-static id<MTLComputePipelineState> g_mellum_down_rowtile4_pipeline;
 
 /*
  * Expert-major simdgroup MoE.  Cuts per-layer expert weight traffic from
@@ -36475,23 +36409,6 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
             g_mellum_q8_0_down_batch_f32_pipeline,
             "kernel_mellum_q8_0_down_batch_f32");
         if (!pair_pipeline || !down_pipeline) return 0;
-        unsigned down_rowtile = ds4_gpu_mellum_down_rowtile();
-        if (down_rowtile) {
-            const char *rt_name = (down_rowtile == 4)
-                ? "kernel_mellum_q8_0_down_batch_rowtile4_f32"
-                : "kernel_mellum_q8_0_down_batch_rowtile2_f32";
-            id<MTLComputePipelineState> rt = nil;
-            if (down_rowtile == 4) {
-                if (!g_mellum_down_rowtile4_pipeline)
-                    g_mellum_down_rowtile4_pipeline = ds4_gpu_get_pipeline(rt_name);
-                rt = ds4_gpu_hot_pipeline(g_mellum_down_rowtile4_pipeline, rt_name);
-            } else {
-                if (!g_mellum_down_rowtile2_pipeline)
-                    g_mellum_down_rowtile2_pipeline = ds4_gpu_get_pipeline(rt_name);
-                rt = ds4_gpu_hot_pipeline(g_mellum_down_rowtile2_pipeline, rt_name);
-            }
-            if (rt) down_pipeline = rt; else down_rowtile = 0;
-        }
         id<MTLComputePipelineState> gemm_pair_pipeline = nil;
         id<MTLComputePipelineState> gemm_down_pipeline = nil;
         id<MTLComputePipelineState> gemm_reduce_pipeline = nil;
@@ -36676,9 +36593,8 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
         [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:3];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
         [enc useResource:downbuf usage:MTLResourceUsageRead];
-        const NSUInteger rt_rows = down_rowtile ? down_rowtile : 1u;
-        [enc setThreadgroupMemoryLength:rt_rows * (NSUInteger)n_expert * 256u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((out_dim + rt_rows - 1u) / rt_rows, n_tokens, 1)
+        [enc setThreadgroupMemoryLength:(NSUInteger)n_expert * 256u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(out_dim, n_tokens, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Mellum Q8_0 batch routed MoE"))
