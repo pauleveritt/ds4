@@ -4694,9 +4694,9 @@ static void agent_json_escape(agent_buf *b, const char *s, size_t n) {
  * portion down to the emitter -- so trimming again here is a proven no-op for them (see
  * this task's report for the full verification), never a second, unwanted cut into
  * bytes the caller still expects to resume. */
-/* Monotonic microseconds since engine start, written onto every json-events
- * line (fork divergence #7). The provenance records the wall-clock start, so
- * absolute correlation with the trace's wall-clock stamps is one addition. */
+/* Monotonic microseconds (CLOCK_MONOTONIC, since boot), written onto every
+ * json-events line (fork divergence #7). Only deltas are meaningful — the
+ * provenance records the wall-clock start for absolute anchoring. */
 static void agent_buf_put_ts(agent_buf *b, const agent_worker *w) {
     (void)w;
     struct timespec ts;
