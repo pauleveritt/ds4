@@ -262,16 +262,25 @@ int ds4_gpu_mellum_attn_group_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_MELLUM_ATTN_GROUP");
-        cached = env && *env && strcmp(env, "0") != 0;
+        cached = !(env && *env && strcmp(env, "0") == 0);
     }
     return cached;
 }
+
+/*
+ * Both decode-attention accelerations are on by default and are switched off
+ * with an explicit "0".  They reassociate the softmax, so they cannot hold the
+ * bitwise decode-equals-prefill contract -- but only above
+ * DS4_MELLUM_ATTN_MIN_KEYS, below which the serial kernel still runs and the
+ * old arithmetic is preserved exactly.
+ */
+#define DS4_MELLUM_ATTN_MIN_KEYS 256u
 
 int ds4_gpu_mellum_attn_split_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_MELLUM_ATTN_SPLIT");
-        cached = env && *env && strcmp(env, "0") != 0;
+        cached = !(env && *env && strcmp(env, "0") == 0);
     }
     return cached;
 }
@@ -34113,7 +34122,8 @@ int ds4_gpu_mellum_gqa_decode_tensor(
          * arithmetic they have always had, which is the property the split
          * kernel advertises and this one should not quietly drop.
          */
-        if (ds4_gpu_mellum_attn_group_enabled() && key_count > 256u &&
+        if (ds4_gpu_mellum_attn_group_enabled() &&
+            key_count > DS4_MELLUM_ATTN_MIN_KEYS &&
             n_head == n_head_kv * DS4_MELLUM_GROUP_HEADS) {
             const uint32_t ncpsg = 32u;
             const uint32_t nwg = 32u;
@@ -34123,18 +34133,24 @@ int ds4_gpu_mellum_gqa_decode_tensor(
             const NSUInteger tmp_bytes =
                 nrows * head_dim * nwg * sizeof(float) +
                 nrows * 2u * nwg * sizeof(float);
-            if (!ds4_gpu_ensure_scratch_buffer(&g_flash_attn_tmp_buffer,
-                                               &g_flash_attn_tmp_bytes,
-                                               tmp_bytes,
-                                               "ds4_mellum_attn_group_tmp")) {
-                return 0;
-            }
             id<MTLComputePipelineState> group_pipeline =
                 ds4_gpu_get_pipeline("kernel_mellum_attention_decode_gqa8_split_f16");
             id<MTLComputePipelineState> reduce_pipeline =
                 ds4_gpu_get_flash_attn_reduce_pipeline((int32_t)head_dim,
                                                        (int32_t)nwg);
-            if (!group_pipeline || !reduce_pipeline) return 0;
+            /*
+             * This is the default path now, so a missing pipeline or a scratch
+             * allocation failure must degrade to the split kernel rather than
+             * fail the decode outright.  Anything that fails after work has
+             * been submitted still propagates.
+             */
+            const int grouped_ready =
+                group_pipeline != nil && reduce_pipeline != nil &&
+                ds4_gpu_ensure_scratch_buffer(&g_flash_attn_tmp_buffer,
+                                              &g_flash_attn_tmp_bytes,
+                                              tmp_bytes,
+                                              "ds4_mellum_attn_group_tmp") != 0;
+            if (grouped_ready) {
             int group_owned = 0;
             id<MTLCommandBuffer> group_cb =
                 ds4_gpu_command_buffer(&group_owned);
@@ -34178,9 +34194,12 @@ int ds4_gpu_mellum_gqa_decode_tensor(
                 return 0;
             }
             return 1;
+            }
+            /* Not ready: fall through to the split/serial kernel below. */
         }
 
-        const int split = ds4_gpu_mellum_attn_split_enabled();
+        const int split = ds4_gpu_mellum_attn_split_enabled() &&
+                          key_count > DS4_MELLUM_ATTN_MIN_KEYS;
         const char *kernel_name = split ?
             "kernel_mellum_attention_decode_gqa_split_f16" :
             "kernel_mellum_attention_decode_gqa_f16";
