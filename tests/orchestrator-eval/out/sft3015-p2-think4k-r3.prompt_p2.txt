@@ -1,0 +1,43 @@
+**Phase 2 Delegation Packet**
+
+**New Files:**
+- `models.py` (NEW)
+- `templates/complaints.html` (NEW)
+
+**Shared Files (must survive):**
+- `app.py` (SHARED)
+- `tests/test_app.py` (SHARED)
+
+**Verbatim Literals:**
+- `models.py`:
+  - `from dataclasses import dataclass`
+  - `from datetime import datetime, timezone`
+  - `@dataclass`
+  - `agent_name: str`
+  - `text: str`
+  - `timestamp: datetime = datetime.now(timezone.utc)`
+  - `complaints: list[Complaint] = [ ... ]` (3-5 seed complaints)
+- `app.py`:
+  - `@app.get("/complaints")`
+  - `from models import complaints`
+  - `return templates.TemplateResponse("complaints.html", {"complaints": complaints})`
+- `templates/complaints.html`:
+  - `{% extends "base.html" %}`
+  - `<h1>Complaints Board</h1>`
+  - `{% for complaint in complaints %}`
+  - `{{ complaint.agent_name }}`
+  - `{{ complaint.timestamp.strftime("%Y-%m-%d %H:%M:%S") }}`
+  - `{{ complaint.text }}`
+  - `{% endfor %}`
+- `tests/test_app.py`:
+  - `def test_get_complaints():`
+  - `response = client.get("/complaints")`
+  - `assert response.status_code == 200`
+  - `assert any(seed_text in response.text for seed_text in SEED_TEXTS)`
+
+**Validation Command:**
+`.venv/bin/python -m pytest tests/`
+
+**Framework Semantic Trap:**
+- Timestamp formatting: Use `strftime("%Y-%m-%d %H:%M:%S")` for UTC display. Do not convert to local time.
+- Template inheritance: `complaints.html` must extend `base.html` exactly as specified.

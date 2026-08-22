@@ -1,0 +1,29 @@
+**Phase 2 Delegation Packet**
+
+**NEW Files:**
+- `templates/complaints.html` (NEW)
+
+**SHARED Files:**
+- `app.py` (SHARED)
+  - Routes: `/` (existing), `/complaints` (GET), `/complaints` (POST)
+  - Imports: `datetime`, `timezone`
+  - Module-level storage: `complaints` list
+  - Seed data: 3-5 complaint dicts with `agent_name`, `text`, `timestamp` (UTC)
+  - Validation: `.venv/bin/python -m pytest tests/`
+- `tests/test_app.py` (SHARED)
+  - Tests: `test_home_page()`, `test_complaints_board()`, `test_submit_complaint()`
+  - Strings: "Complaints Board", "Submit Complaint", "Agent Name", "Text"
+  - Behavior: GET /complaints returns 200 with seed content
+
+**Exact Literals:**
+- Heading: `<h1>Complaints Board</h1>`
+- Form fields: `name="agent_name"`, `name="text"`
+- Submit button: `<button type="submit">Submit</button>`
+- Timestamp format: `%Y-%m-%d %H:%M:%S %Z`
+- Seed complaint example: `{"agent_name": "Alice", "text": "Scope creep never ends.", "timestamp": datetime(...)}`
+
+**Framework Trap:**  
+In-memory storage persists only for the app lifetime; complaints reset on restart. Use UTC timezone for all timestamps.
+
+**Validation Command:**  
+`.venv/bin/python -m pytest tests/`
