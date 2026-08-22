@@ -286,23 +286,10 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--metal-graph-test", "Compare first GPU-resident graph stages with CPU.");
     opt(fp, c, "--metal-graph-full-test", "Run the GPU-resident self-token graph across all layers.");
     opt(fp, c, "--metal-graph-prompt-test", "Compare CPU and GPU graph logits for the full prompt.");
-    opt(fp, c, "--mellum-layer0-probe", "Mellum diagnostic: replay the pinned layer-0 oracle fixture.");
-    opt(fp, c, "--mellum-layer0-probe-out FILE", "Write its 26 F32 layer outputs for oracle comparison.");
-    opt(fp, c, "--mellum-logits-probe", "Mellum diagnostic: replay the fixed fixture through final norm and output logits.");
-    opt(fp, c, "--mellum-logits-probe-out FILE", "Write its final raw F32 logits without selecting a token.");
-    opt(fp, c, "--mellum-logits-probe-top-k N", "Report N highest raw logits without sampling or emitting a token.");
-    opt(fp, c, "--mellum-true-prefill-probe", "Mellum inspect gate: compare the fixed layer-major batch against sequential raw logits.");
-    opt(fp, c, "--mellum-true-prefill-swa-probe", "Mellum inspect evidence: compare SWA-window+6 true-prefill chunks across the sliding-window boundary.");
-    opt(fp, c, "--mellum-all-layers-probe", "Mellum diagnostic: replay the fixture through all 28 layers.");
-    opt(fp, c, "--mellum-all-layers-probe-out FILE", "Write its final-token F32 output for oracle comparison.");
-    opt(fp, c, "--mellum-all-layers-trace-out FILE", "Write all 28 final-token F32 layer outputs for diagnosis.");
-    opt(fp, c, "--mellum-all-layers-attention-trace-out FILE", "Write all 28 final-token attention residuals for diagnosis.");
-    opt(fp, c, "--mellum-all-layers-qk-trace-out FILE", "Write all 28 final-token post-RoPE Q/K states for diagnosis.");
-    opt(fp, c, "--mellum-kv-layout-probe", "Allocate and release Mellum's per-layer F16 KV layout without evaluation.");
-    opt(fp, c, "--mellum-session-lifecycle-probe", "Create and release a Mellum layout-only session; token evaluation stays disabled.");
-    opt(fp, c, "--mellum-session-decode-probe", "Replay the fixed fixture through a session-local Mellum decode path; selection stays disabled.");
-    opt(fp, c, "--mellum-session-decode-probe-out FILE", "Write its raw F32 logits for oracle comparison without sampling or emitting a token.");
-    opt(fp, c, "--mellum-session-isolation-probe", "Interleave two Mellum decode sessions and require isolated, identical raw logits.");
+    opt(fp, c, "--mellum-diag NAME", "Run a Mellum diagnostic. Names: layer0, all-layers, kv-layout, session-lifecycle, session-decode, session-isolation, interactive-session, swa-boundary, resident-profile, true-prefill, true-prefill-swa, logits.");
+    opt(fp, c, "--mellum-diag-out FILE", "Where a diagnostic that emits raw F32 output writes it.");
+    opt(fp, c, "--mellum-diag-trace KIND=FILE", "Extra all-layers traces. KIND is layer, attention or qk.");
+    opt(fp, c, "--mellum-diag-top-k N", "For --mellum-diag logits: report N highest raw logits without sampling.");
     fputc('\n', fp);
 }
 

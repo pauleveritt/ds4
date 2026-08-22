@@ -245,7 +245,7 @@ See 5b for what it actually bought.
 
 ## 6. Prefill vs context — the decay curve
 
-`DS4_MELLUM_PROFILE_PREFILL_TOKENS=N ./ds4 --mellum-resident-profile`,
+`DS4_MELLUM_PROFILE_PREFILL_TOKENS=N ./ds4 --mellum-diag resident-profile`,
 cumulative prefill of N tokens from an empty cache, chunk 1024, 3 repeats.
 Marginal rates come from differencing adjacent cumulative times — that is the
 rate a session actually experiences at that depth.
@@ -280,7 +280,7 @@ shortest. **Attention, not MoE, is what dominates a long session.**
 
 Every previous decode measurement in this line of work, including the "decode
 is at parity with llama.cpp, do not touch it" note in the working journal,
-used `--mellum-resident-profile`, which calls
+used `--mellum-diag resident-profile`, which calls
 `ds4_mellum_decode_state_reset()` before each timed pass. **It measured decode
 from an empty cache only.** That is not a number any real session sees.
 
@@ -546,9 +546,9 @@ Mellum's 8x decode redundancy in section 7a, and the same fixes apply.
 This is the trap that cost the most time. **Three of the oracle probes run
 decode, not prefill:**
 
-- `--mellum-layer0-probe-out`
-- `--mellum-all-layers-probe-out`
-- `--mellum-logits-probe-out`
+- `--mellum-diag layer0 --mellum-diag-out`
+- `--mellum-diag all-layers --mellum-diag-out`
+- `--mellum-diag logits --mellum-diag-out`
 
 They call the `..._one_tensor` path, which `DS4_MELLUM_MOE_GEMM` **does not
 touch**. Run under the flag they return HEAD's numbers to every digit and look
@@ -556,8 +556,8 @@ like a perfect pass. They are not testing what you think.
 
 Use these instead — they exercise batched prefill:
 
-- `--mellum-true-prefill-probe`
-- `--mellum-true-prefill-swa-probe`
+- `--mellum-diag true-prefill`
+- `--mellum-diag true-prefill-swa`
 
 Measured under the GEMM flag:
 
@@ -629,7 +629,7 @@ resident profile (128.3 / 128.3 / 128.5 ms against 15% swings).
 End-to-end prefill and decode:
 
 ```bash
-DS4_MELLUM_MOE_GEMM=1 DS4_MELLUM_PROFILE_PREFILL_TOKENS=4096 DS4_MELLUM_PROFILE_DECODE_DEPTH=1024 ./ds4 --mellum-resident-profile --ctx 131072 --model <q8.gguf>
+DS4_MELLUM_MOE_GEMM=1 DS4_MELLUM_PROFILE_PREFILL_TOKENS=4096 DS4_MELLUM_PROFILE_DECODE_DEPTH=1024 ./ds4 --mellum-diag resident-profile --ctx 131072 --model <q8.gguf>
 ```
 
 Env knobs that exist:
@@ -778,7 +778,7 @@ batching is slower than running the same sequences serially.
 Mellum 2 has thinking and non-thinking modes, toggled **per request** through
 the chat template (`chat_template_kwargs: {"enable_thinking": false}` —
 `tests/orchestrator-eval/probe_any.py:11`), not chosen at load time. Every
-throughput figure here comes from `--mellum-resident-profile`, which pushes
+throughput figure here comes from `--mellum-diag resident-profile`, which pushes
 synthetic token IDs through the forward pass with no chat template, so the
 figures are mode-independent.
 
