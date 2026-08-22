@@ -636,6 +636,18 @@ struct ds4_metal_args_laguna_gqa3_decode {
     float    scale;
 };
 
+struct ds4_metal_args_mellum_gqa_group_decode {
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t cache_cap;
+    uint32_t key_start;
+    uint32_t key_count;
+    uint32_t nsg;
+    uint32_t nwg;
+    float    scale;
+};
+
 struct ds4_metal_args_mellum_gqa_decode {
     uint32_t n_head;
     uint32_t n_head_kv;
@@ -827,6 +839,142 @@ kernel void kernel_mellum_attention_decode_gqa_split_f16(
     oh[lane + 32u] = merged.y * inv_sum;
     oh[lane + 64u] = merged.z * inv_sum;
     oh[lane + 96u] = merged.w * inv_sum;
+}
+
+// Split-K removed the latency chain and left the kernel bandwidth-bound on the
+// traffic it issues -- but seven eighths of that traffic is redundant.  Mellum
+// runs 32 query heads over 4 KV heads, so eight query heads want the same K/V
+// row and, one threadgroup per query head, each fetched it separately.
+//
+// Here one threadgroup owns a whole KV head: it loads each row once and scores
+// it against all eight of that row's query heads.  Because that alone would
+// leave only n_head_kv threadgroups resident, the key range is also split over
+// nwg workgroups in z; the partials land in the generic FlashAttention layout
+// and kernel_flash_attn_ext_vec_reduce merges them, exactly as the Laguna
+// gqa3 path does three-wide.
+//
+// Scratch contract: DS4_MELLUM_GROUP_HEADS * nsg * (2 + head_dim) floats.
+#define DS4_MELLUM_GROUP_HEADS 8u
+kernel void kernel_mellum_attention_decode_gqa8_split_f16(
+        constant ds4_metal_args_mellum_gqa_group_decode &args,
+        device const float *q,
+        device const half  *key_cache,
+        device const half  *value_cache,
+        device float       *tmp,
+        threadgroup float  *scratch [[threadgroup(0)]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simd_group_u [[simdgroup_index_in_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    constexpr uint group = DS4_MELLUM_GROUP_HEADS;
+    const uint kv_head = tgpig.x;
+    const uint iwg = tgpig.z;
+    const uint simd_group = (uint)simd_group_u;
+    if (args.n_head_kv == 0u || args.head_dim != 128u || args.cache_cap == 0u ||
+        args.key_count == 0u || args.nsg == 0u || args.nwg == 0u ||
+        kv_head >= args.n_head_kv || simd_group >= args.nsg ||
+        iwg >= args.nwg || args.n_head != args.n_head_kv * group) {
+        return;
+    }
+    const uint head0 = kv_head * group;
+    const uint cache_width = args.n_head_kv * args.head_dim;
+    device const float *qbase = q + (uint64_t)head0 * args.head_dim;
+
+    float4 acc[group];
+    float  max_score[group];
+    float  score_sum[group];
+    for (uint h = 0u; h < group; h++) {
+        acc[h] = float4(0.0f);
+        max_score[h] = -INFINITY;
+        score_sum[h] = 0.0f;
+    }
+
+    const uint d0 = lane;
+    const uint first = iwg * args.nsg + simd_group;
+    const uint stride = args.nwg * args.nsg;
+    for (uint i = first; i < args.key_count; i += stride) {
+        const uint row = (uint)(((uint64_t)args.key_start + i) % args.cache_cap);
+        const uint64_t kv_base = (uint64_t)row * cache_width +
+            (uint64_t)kv_head * args.head_dim;
+        /* Loaded once, consumed by all eight heads.  This is the whole point. */
+        const float4 key = float4((float)key_cache[kv_base + d0],
+                                  (float)key_cache[kv_base + d0 + 32u],
+                                  (float)key_cache[kv_base + d0 + 64u],
+                                  (float)key_cache[kv_base + d0 + 96u]);
+        const float4 value = float4((float)value_cache[kv_base + d0],
+                                    (float)value_cache[kv_base + d0 + 32u],
+                                    (float)value_cache[kv_base + d0 + 64u],
+                                    (float)value_cache[kv_base + d0 + 96u]);
+        for (uint h = 0u; h < group; h++) {
+            device const float *qh = qbase + (uint64_t)h * args.head_dim;
+            const float4 query = float4(qh[d0], qh[d0 + 32u],
+                                        qh[d0 + 64u], qh[d0 + 96u]);
+            const float score = simd_sum(dot(query, key)) * args.scale;
+            const float next_max = max(max_score[h], score);
+            const float old_scale = max_score[h] == -INFINITY ? 0.0f :
+                exp(max_score[h] - next_max);
+            const float value_scale = exp(score - next_max);
+            score_sum[h] = score_sum[h] * old_scale + value_scale;
+            acc[h] = acc[h] * old_scale + value * value_scale;
+            max_score[h] = next_max;
+        }
+    }
+
+    threadgroup float *partial_max = scratch;
+    threadgroup float *partial_sum = partial_max + group * args.nsg;
+    threadgroup float *partial_value = partial_sum + group * args.nsg;
+    for (uint h = 0u; h < group; h++) {
+        const uint slot = h * args.nsg + simd_group;
+        if (lane == 0u) {
+            partial_max[slot] = max_score[h];
+            partial_sum[slot] = score_sum[h];
+        }
+        const uint base = slot * args.head_dim + lane;
+        partial_value[base]        = acc[h].x;
+        partial_value[base + 32u]  = acc[h].y;
+        partial_value[base + 64u]  = acc[h].z;
+        partial_value[base + 96u]  = acc[h].w;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group != 0u) return;
+
+    device float *stats = tmp +
+        (uint64_t)args.n_head * args.head_dim * args.nwg;
+    for (uint h = 0u; h < group; h++) {
+        const uint slot_base = h * args.nsg;
+        float global_max = partial_max[slot_base];
+        for (uint sg = 1u; sg < args.nsg; sg++) {
+            global_max = max(global_max, partial_max[slot_base + sg]);
+        }
+        float merged_sum = 0.0f;
+        float4 merged = float4(0.0f);
+        for (uint sg = 0u; sg < args.nsg; sg++) {
+            const uint slot = slot_base + sg;
+            const float weight = partial_sum[slot] > 0.0f ?
+                exp(partial_max[slot] - global_max) : 0.0f;
+            merged_sum += partial_sum[slot] * weight;
+            const uint base = slot * args.head_dim + lane;
+            merged.x += partial_value[base] * weight;
+            merged.y += partial_value[base + 32u] * weight;
+            merged.z += partial_value[base + 64u] * weight;
+            merged.w += partial_value[base + 96u] * weight;
+        }
+
+        const uint row = head0 + h;
+        const uint64_t row_base = (uint64_t)row * args.head_dim * args.nwg;
+        const uint dims[4] = {lane, lane + 32u, lane + 64u, lane + 96u};
+        const float outputs[4] = {merged.x, merged.y, merged.z, merged.w};
+        for (uint j = 0u; j < 4u; j++) {
+            const uint d = dims[j];
+            tmp[row_base + (d / 4u) * args.nwg * 4u + iwg * 4u + d % 4u] =
+                outputs[j];
+        }
+        if (lane == 0u) {
+            const uint64_t stat = (uint64_t)row * 2u * args.nwg + 2u * iwg;
+            stats[stat] = merged_sum;
+            stats[stat + 1u] = global_max;
+        }
+    }
 }
 
 // Mellum's layer-major prefill counterpart. The staged K/V buffers make all

@@ -250,6 +250,23 @@ static id<MTLComputePipelineState> g_mellum_gqa_decode_split_pipeline;
 #define DS4_MELLUM_SPLIT_SIMD_GROUPS 8u
 #define DS4_MELLUM_SPLIT_THREADS (DS4_MELLUM_SPLIT_SIMD_GROUPS * 32u)
 
+/*
+ * Head grouping evaluates every query head sharing a KV head in one
+ * threadgroup so each K/V row is fetched once instead of DS4_MELLUM_GROUP_HEADS
+ * times.  Must equal DS4_MELLUM_GROUP_HEADS in metal/laguna.metal, and only
+ * applies when n_head / n_head_kv is exactly this wide.
+ */
+#define DS4_MELLUM_GROUP_HEADS 8u
+
+int ds4_gpu_mellum_attn_group_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_MELLUM_ATTN_GROUP");
+        cached = env && *env && strcmp(env, "0") != 0;
+    }
+    return cached;
+}
+
 int ds4_gpu_mellum_attn_split_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -5540,6 +5557,19 @@ typedef struct {
     uint32_t nwg;
     float    scale;
 } ds4_gpu_laguna_gqa3_decode_args;
+
+/* Mirrors ds4_metal_args_mellum_gqa_group_decode in metal/laguna.metal. */
+typedef struct {
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t cache_cap;
+    uint32_t key_start;
+    uint32_t key_count;
+    uint32_t nsg;
+    uint32_t nwg;
+    float    scale;
+} ds4_gpu_mellum_gqa_group_decode_args;
 
 typedef struct {
     uint32_t n_tokens;
@@ -34069,6 +34099,79 @@ int ds4_gpu_mellum_gqa_decode_tensor(
          * once key_count passes 256, which costs the bitwise decode-equals-
          * prefill contract, so it stays opt-in.
          */
+        /*
+         * Head grouping supersedes plain split-K when the GQA ratio matches:
+         * it keeps the key-range split (over nwg workgroups rather than SIMD
+         * groups) and additionally fetches each K/V row once for the whole
+         * group.  Partials go through the generic FlashAttention reduce.
+         */
+        if (ds4_gpu_mellum_attn_group_enabled() &&
+            n_head == n_head_kv * DS4_MELLUM_GROUP_HEADS) {
+            const uint32_t ncpsg = 32u;
+            const uint32_t nwg = 32u;
+            const uint32_t nsg =
+                ds4_gpu_flash_attn_vec_nsg(key_count, nwg, ncpsg);
+            const NSUInteger nrows = (NSUInteger)n_head;
+            const NSUInteger tmp_bytes =
+                nrows * head_dim * nwg * sizeof(float) +
+                nrows * 2u * nwg * sizeof(float);
+            if (!ds4_gpu_ensure_scratch_buffer(&g_flash_attn_tmp_buffer,
+                                               &g_flash_attn_tmp_bytes,
+                                               tmp_bytes,
+                                               "ds4_mellum_attn_group_tmp")) {
+                return 0;
+            }
+            id<MTLComputePipelineState> group_pipeline =
+                ds4_gpu_get_pipeline("kernel_mellum_attention_decode_gqa8_split_f16");
+            id<MTLComputePipelineState> reduce_pipeline =
+                ds4_gpu_get_flash_attn_reduce_pipeline((int32_t)head_dim,
+                                                       (int32_t)nwg);
+            if (!group_pipeline || !reduce_pipeline) return 0;
+            int group_owned = 0;
+            id<MTLCommandBuffer> group_cb =
+                ds4_gpu_command_buffer(&group_owned);
+            if (!group_cb) return 0;
+            const ds4_gpu_mellum_gqa_group_decode_args group_args = {
+                .n_head = n_head, .n_head_kv = n_head_kv,
+                .head_dim = head_dim, .cache_cap = cache_cap,
+                .key_start = key_start, .key_count = key_count,
+                .nsg = nsg, .nwg = nwg, .scale = scale,
+            };
+            const NSUInteger group_shared_bytes =
+                (NSUInteger)DS4_MELLUM_GROUP_HEADS * nsg *
+                (2u + head_dim) * sizeof(float);
+            id<MTLComputeCommandEncoder> genc =
+                ds4_gpu_compute_encoder(group_cb);
+            [genc setComputePipelineState:group_pipeline];
+            [genc setBytes:&group_args length:sizeof(group_args) atIndex:0];
+            [genc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
+            [genc setBuffer:keybuf offset:ds4_gpu_tensor_offset(key_cache) atIndex:2];
+            [genc setBuffer:valuebuf offset:ds4_gpu_tensor_offset(value_cache) atIndex:3];
+            [genc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:4];
+            [genc setThreadgroupMemoryLength:group_shared_bytes atIndex:0];
+            [genc dispatchThreadgroups:MTLSizeMake(n_head_kv, 1, nwg)
+                 threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+            ds4_gpu_end_compute_encoder(group_cb, genc);
+
+            ds4_gpu_flash_attn_reduce_args reduce_args = {
+                .nrows = (int32_t)nrows,
+            };
+            id<MTLComputeCommandEncoder> renc =
+                ds4_gpu_compute_encoder(group_cb);
+            [renc setComputePipelineState:reduce_pipeline];
+            [renc setBytes:&reduce_args length:sizeof(reduce_args) atIndex:0];
+            [renc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:1];
+            [renc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:2];
+            [renc dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32u * nwg, 1, 1)];
+            ds4_gpu_end_compute_encoder(group_cb, renc);
+            if (!ds4_gpu_finish_command_buffer(group_cb, group_owned,
+                                               "Mellum GQA grouped decode")) {
+                return 0;
+            }
+            return 1;
+        }
+
         const int split = ds4_gpu_mellum_attn_split_enabled();
         const char *kernel_name = split ?
             "kernel_mellum_attention_decode_gqa_split_f16" :
