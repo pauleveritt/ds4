@@ -24,6 +24,7 @@ source. `swiftstar-integration` = `laguna-s2.1` + the patch set.
 | 4 | `--json-events` | `66c3de2`→`769bb9a` … `1a14a6c`→`5f7c666` (16) | the app needs a structured NDJSON wire (text/think/tool/status/ready/queued, `idx`, param `name`, finish `calls`) instead of scraping ANSI; documented at `docs/json-events.md` | upstream lands a structured events mode (flagship proposal #1); individual events can retire piecemeal as upstream lands them |
 | 5 | startup memory plan | `83501bb`→`a328fb5`, `8267745`→`53dd1a4` | the app must know the memory plan at startup to gate feasibility (P3/P4) before load | upstream exposes the memory plan via a first-class API |
 | 6 | integration structure (`swiftstar-integration` = `laguna-s2.1` + patch set) | — | the submodule must pin one branch carrying the model line + patches; fork hygiene, not an engine change | `laguna-s2.1` merges to `antirez/main` (then integration = `main` + patch set); ultimately the whole patch set lands upstream and the fork can be archived |
+| 7 | wire handshake + per-event timestamps | (this commit) | binding rule 7: the wire announces itself — a `hello` handshake is the first NDJSON line and every event carries a monotonic `ts`; a consumer refuses a mismatch loudly instead of misparsing a skewed wire | upstream lands a structured events mode with a version handshake and timestamps (flagship proposal #1); retires with #4 |
 
 ### Full original→new SHA mapping (cherry-pick order)
 

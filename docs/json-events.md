@@ -22,8 +22,14 @@ JSON object (NDJSON — one object per line, no line straddles two objects).
 Every object has a `"t"` field naming its kind:
 
 ```
-text | think | tool | status | ready | queued
+hello | text | think | tool | status | ready | queued
 ```
+
+The **first** non-blank line is always the `hello` handshake (see below).
+Every object carries a `"ts"` field — monotonic microseconds since engine
+start (`clock_gettime(CLOCK_MONOTONIC)`) — including the handshake. `ts` is
+present on every event kind; consumers that do not model a given kind ignore
+its `ts` along with the rest of the unmodelled line.
 
 This is enforced structurally, not just by convention: every internal
 emitter builds one full JSON object before writing anything, and a backstop
@@ -38,6 +44,19 @@ All string field bodies are escaped by the same routine: `"`, `\`, `\n`,
 `>= 0x80` are copied through untouched (see the invalid-UTF-8 quirk below).
 
 ## Event kinds
+
+### `hello`
+
+```json
+{"t":"hello","v":1,"caps":["status","ready","text","think","tool","queued","ts"],"ts":<µs>}
+```
+
+The version/capability handshake, emitted once as the first line when
+`--json-events` is active, before any other event. `v` is the wire format
+version (currently `1`); `caps` names the event kinds the engine may emit plus
+`"ts"` (per-event monotonic timestamps). A consumer that requires a capability
+not listed, or a version it does not know, must refuse loudly rather than
+continue on a wire it may misparse.
 
 ### `text`
 

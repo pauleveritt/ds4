@@ -32,7 +32,11 @@ The `idx`/`name`/`calls` fields and the fail-closed backstop are the parts
 worth keeping verbatim; the per-site gates are an implementation detail a
 upstream author may restructure. Acceptable to land piecemeal (e.g. `status`
 events first, tool events later) — the wire is forward-compatible via the
-`.ignored` unknown-type fallback.
+`.ignored` unknown-type fallback. Also land a version/capability handshake as
+the first NDJSON line (`{"t":"hello","v":…,"caps":[…],"ts":…}`) plus a
+monotonic `ts` field on every event — a supervisor must be able to refuse a
+wire it may misparse, and must be able to time states without a receive-time
+sidecar (SwiftStar divergence #7).
 
 ## Proposal #2 — A first-class interrupt for non-interactive mode
 

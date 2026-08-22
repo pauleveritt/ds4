@@ -4694,6 +4694,32 @@ static void agent_json_escape(agent_buf *b, const char *s, size_t n) {
  * portion down to the emitter -- so trimming again here is a proven no-op for them (see
  * this task's report for the full verification), never a second, unwanted cut into
  * bytes the caller still expects to resume. */
+/* Monotonic microseconds since engine start, written onto every json-events
+ * line (fork divergence #7). The provenance records the wall-clock start, so
+ * absolute correlation with the trace's wall-clock stamps is one addition. */
+static void agent_buf_put_ts(agent_buf *b, const agent_worker *w) {
+    (void)w;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    unsigned long long us = (unsigned long long)ts.tv_sec * 1000000ULL
+                          + (unsigned long long)(ts.tv_nsec / 1000);
+    char num[32];
+    snprintf(num, sizeof(num), ",\"ts\":%llu", us);
+    agent_buf_puts(b, num);
+}
+
+/* Version/capability handshake: the first line when --json-events is active
+ * (fork divergence #7; binding rule 7). A consumer refuses a mismatch loudly. */
+static void agent_emit_hello(agent_worker *w) {
+    agent_buf b = {0};
+    agent_buf_puts(&b, "{\"t\":\"hello\",\"v\":1,\"caps\":[\"status\",\"ready\","
+                       "\"text\",\"think\",\"tool\",\"queued\",\"ts\"]");
+    agent_buf_put_ts(&b, w);
+    agent_buf_puts(&b, "}\n");
+    char *line = agent_buf_take(&b);
+    if (line) { agent_publish_raw(w, line, strlen(line)); free(line); }
+}
+
 static void agent_emit_event_str(agent_worker *w, const char *kind,
                                  const char *s, size_t n) {
     agent_buf b = {0};
@@ -4701,7 +4727,9 @@ static void agent_emit_event_str(agent_worker *w, const char *kind,
     agent_buf_puts(&b, kind);
     agent_buf_puts(&b, "\",\"s\":\"");
     agent_json_escape(&b, s, agent_utf8_safe_len(s, n));
-    agent_buf_puts(&b, "\"}\n");
+    agent_buf_puts(&b, "\"");
+    agent_buf_put_ts(&b, w);
+    agent_buf_puts(&b, "}\n");
     char *line = agent_buf_take(&b);
     if (line) {
         agent_publish_raw(w, line, strlen(line));
@@ -4776,6 +4804,7 @@ static void agent_emit_tool_event(agent_worker *w, const char *phase, int idx,
         agent_json_escape(&b, s, agent_utf8_safe_len(s, n));
         agent_buf_puts(&b, "\"");
     }
+    agent_buf_put_ts(&b, w);
     agent_buf_puts(&b, "}\n");
     char *line = agent_buf_take(&b);
     if (line) { agent_publish_raw(w, line, strlen(line)); free(line); }
@@ -4788,7 +4817,9 @@ static void agent_emit_bare_event(agent_worker *w, const char *kind) {
     agent_buf b = {0};
     agent_buf_puts(&b, "{\"t\":\"");
     agent_buf_puts(&b, kind);
-    agent_buf_puts(&b, "\"}\n");
+    agent_buf_puts(&b, "\"");
+    agent_buf_put_ts(&b, w);
+    agent_buf_puts(&b, "}\n");
     char *line = agent_buf_take(&b);
     if (line) { agent_publish_raw(w, line, strlen(line)); free(line); }
 }
@@ -4811,6 +4842,7 @@ static void agent_emit_ready_event(agent_worker *w, const ds4_memory_plan *plan)
                  (unsigned long long)plan->planned_bytes);
         agent_buf_puts(&b, nums);
     }
+    agent_buf_put_ts(&b, w);
     agent_buf_puts(&b, "}\n");
     char *line = agent_buf_take(&b);
     if (line) { agent_publish_raw(w, line, strlen(line)); free(line); }
@@ -4889,7 +4921,9 @@ static void agent_emit_status_event(agent_worker *w, const agent_status *st) {
      * directly. */
     size_t error_len = agent_utf8_safe_len(st->error, strlen(st->error));
     agent_json_escape(&b, st->error, error_len);
-    agent_buf_puts(&b, "\"}\n");
+    agent_buf_puts(&b, "\"");
+    agent_buf_put_ts(&b, w);
+    agent_buf_puts(&b, "}\n");
     char *line = agent_buf_take(&b);
     if (line) { agent_publish_raw(w, line, strlen(line)); free(line); }
 }
@@ -14330,6 +14364,10 @@ static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
 static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     agent_worker worker;
     if (agent_worker_init(&worker, engine, cfg) != 0) return 1;
+
+    if (cfg->json_events) {
+        agent_emit_hello(&worker);  /* binding rule 7: the wire announces itself */
+    }
 
     const bool one_shot = cfg->gen.prompt != NULL;
     bool one_shot_submitted = false;
