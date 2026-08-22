@@ -3067,6 +3067,17 @@ kernel void kernel_mellum_q8_0_down_batch_f32(
  * decode paths are untouched and remain the bitwise oracle; this path is gated
  * on the llama.cpp envelopes, top-k ranking, and greedy agreement instead.
  *
+ * PRECONDITION: a token's selected experts must be distinct.  The bucket
+ * capacity is n_tokens, which bounds a bucket only if each token contributes at
+ * most one pair to it; the bitonic router guarantees this because it sorts an
+ * identity permutation, so the top-k are k distinct indices.  A caller that
+ * violated it would overflow a bucket, and bucket_build drops the overflowing
+ * pair -- an arbitrary member, since bucket order is atomic-race dependent --
+ * leaving that (token, slot) partial holding the previous layer's value with a
+ * valid expert id, which the slot reduction cannot detect.  If a future router
+ * or a CPU-side selection can produce duplicates, clear the staging buffer per
+ * layer (a ~75 MiB fill, about 1% of layer time) instead of relying on this.
+ *
  * Down output is scattered to per-(token, slot) staging and summed by
  * kernel_mellum_moe_slot_reduce_f32 in slot order.  Accumulating into moe_out
  * with float atomics would be faster and would make the result depend on
@@ -3074,11 +3085,11 @@ kernel void kernel_mellum_q8_0_down_batch_f32(
  */
 
 /* Dequantize R consecutive Q8_0 rows into threadgroup floats, cooperatively. */
-static inline void ds4_mellum_stage_q8_rows(threadgroup float *dst,
-                                            device const char *base,
+static inline void ds4_mellum_stage_q8_rows(device const char *base,
                                             uint64_t row_bytes,
                                             uint rows, uint dim,
-                                            uint tid, uint ntg) {
+                                            uint tid, uint ntg,
+                                            threadgroup float *dst) {
     const uint total = rows * dim;
     for (uint i = tid; i < total; i += ntg) {
         const uint r = i / dim;
@@ -3109,9 +3120,23 @@ static inline void mellum_down_grouped_impl(
     if (count == 0u) return;
 
     const uint K = args.mid_dim;
-    ds4_mellum_stage_q8_rows(wstage, down + down_offsets[expert] +
-                                 (uint64_t)row0 * args.down_row_bytes,
-                             args.down_row_bytes, R, K, tid, ntg);
+    /*
+     * Clamp the tile to the rows that exist.  out_dim is 2,304 and divisible by
+     * both tile widths today, so this never fires -- but staging R rows
+     * unconditionally would read past the last expert's region for a tail tile,
+     * which is out of bounds on the wrapped buffer rather than merely wasted.
+     */
+    device const char *wsrc = down + down_offsets[expert] +
+                             (uint64_t)row0 * args.down_row_bytes;
+    if (row0 + R <= args.out_dim) {
+        /* Compile-time row count: the staging loop specializes, which is worth
+         * ~40% of this kernel.  out_dim is 2,304 and divisible by both tile
+         * widths, so this is the only path taken today. */
+        ds4_mellum_stage_q8_rows(wsrc, args.down_row_bytes, R, K, tid, ntg, wstage);
+    } else {
+        ds4_mellum_stage_q8_rows(wsrc, args.down_row_bytes,
+                                 args.out_dim - row0, K, tid, ntg, wstage);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint p = simd_group; p < count; p += nsg) {
@@ -3244,12 +3269,12 @@ kernel void kernel_mellum_q8_0_pair_swiglu_gemm_f32(
     if (count == 0u) return;
 
     const uint K = args.in_dim;
-    ds4_mellum_stage_q8_rows(wstage, gate + gate_offsets[expert] +
+    ds4_mellum_stage_q8_rows(gate + gate_offsets[expert] +
                                  (uint64_t)row * args.gate_row_bytes,
-                             args.gate_row_bytes, 1u, K, tid, ntg);
-    ds4_mellum_stage_q8_rows(wstage + K, up + up_offsets[expert] +
+                             args.gate_row_bytes, 1u, K, tid, ntg, wstage);
+    ds4_mellum_stage_q8_rows(up + up_offsets[expert] +
                                  (uint64_t)row * args.up_row_bytes,
-                             args.up_row_bytes, 1u, K, tid, ntg);
+                             args.up_row_bytes, 1u, K, tid, ntg, wstage + K);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint p = simd_group; p < count; p += nsg) {
