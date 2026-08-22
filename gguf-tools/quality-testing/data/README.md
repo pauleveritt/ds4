@@ -8,8 +8,8 @@ safe to commit and use in release QA.
 - `laguna-openrouter-100`: 100 Laguna S 2.1 OpenRouter continuations. Poolside's
   endpoint does not expose output-token logprobs, so these support
   teacher-forced continuation scoring only.
-- `flash`: 100 DeepSeek V4 Flash official continuations with API top-logprob
-  slices.
+- `flash`: 100 DeepSeek V4 Flash 0731 continuations from the official DeepSeek
+  API, with API top-logprob slices.
 - `pro`: 100 DeepSeek V4 PRO official continuations with API top-logprob
   slices.
 - `laguna-xs21/general`: 100 Laguna XS 2.1 continuations captured locally

@@ -18,8 +18,8 @@ calling hosted APIs:
 - `data/laguna-openrouter-100`: 100 Laguna S 2.1 continuations collected
   through OpenRouter `poolside/laguna-s-2.1`. Poolside's endpoint does not
   expose output-token logprobs.
-- `data/flash`: 100 DeepSeek V4 Flash continuations collected from the official
-  DeepSeek API with `top_logprobs=20`.
+- `data/flash`: 100 DeepSeek V4 Flash 0731 continuations collected from the
+  official DeepSeek API with `top_logprobs=20`.
 - `data/pro`: 100 DeepSeek V4 PRO continuations collected from the official
   DeepSeek API with `top_logprobs=20`.
 - `data/laguna-xs21/general`: 100 Laguna XS 2.1 continuations (shared
@@ -41,13 +41,20 @@ full vocabulary logits.
 
 ## 2. Collect Official Continuations
 
+For the tracked DeepSeek V4 Flash 0731 fixture:
+
 ```sh
 export DEEPSEEK_API_KEY=...
 python3 gguf-tools/quality-testing/collect_official.py \
+  --model deepseek-v4-flash \
+  --endpoint https://api.deepseek.com/chat/completions \
   --prompts gguf-tools/quality-testing/prompts.jsonl \
   --out gguf-tools/quality-testing/data/flash \
   --count 100 \
-  --max-tokens 24
+  --max-tokens 24 \
+  --top-logprobs 20 \
+  --thinking disabled \
+  --reasoning-effort omit
 ```
 
 For GLM 5.2 through OpenRouter:
@@ -69,6 +76,9 @@ python3 gguf-tools/quality-testing/collect_official.py \
   --thinking omit \
   --reasoning-effort none
 ```
+
+Use one output directory per official model. For PRO through the official
+DeepSeek API:
 
 For Laguna S 2.1 through OpenRouter:
 
@@ -154,6 +164,12 @@ make -C gguf-tools quality-score
 
 The scorer links against the DS4 runtime and uses Metal by default.
 
+Build the optional llama.cpp control scorer with:
+
+```sh
+make -C gguf-tools quality-llama-score
+```
+
 ## 4. Score GGUF Variants
 
 ```sh
@@ -178,6 +194,19 @@ Use `data/flash/manifest.tsv` for Flash GGUFs,
 `data/laguna-xs21/webpy/manifest.tsv` for Laguna XS 2.1 GGUFs. The scorer and
 comparator do not care which model produced the manifest; the manifest path
 selects the continuation set.
+
+Add `--quality` to disable DS4's speed-oriented numerical shortcuts. For an
+independent llama.cpp comparison of a DeepSeek V4 GGUF, use the same manifest
+and the token-identical DS4 prompt renderer:
+
+```sh
+gguf-tools/quality-testing/score_llama \
+  /path/to/model.gguf \
+  gguf-tools/quality-testing/data/flash/manifest.tsv \
+  /tmp/llama.tsv \
+  4096 \
+  deepseek-ds4
+```
 
 For a full-residency vs SSD-streaming comparison, score the same model twice and
 add the streaming flags to one run:
