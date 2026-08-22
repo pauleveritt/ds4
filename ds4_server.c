@@ -13298,7 +13298,7 @@ int main(int argc, char **argv) {
         }
         cfg.engine.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
         if (skip_cuda) {
-            if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+            if (ds4_engine_open_for_resident_sessions(&engine, &cfg.engine) != 0) return 1;
         } else {
             const bool was_auto =
                 (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto")) ||
@@ -13312,7 +13312,7 @@ int main(int argc, char **argv) {
             if (ds4_engine_create_with_gpu_config(
                     &engine, &cfg.engine, &gpu_cfg) != 0) return 1;
         }
-    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+    } else if (ds4_engine_open_for_resident_sessions(&engine, &cfg.engine) != 0) {
         return 1;
     }
 

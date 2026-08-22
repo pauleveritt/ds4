@@ -60167,15 +60167,20 @@ static int engine_install_gpu_placement(ds4_engine *e);
 static int ds4_engine_open_internal(ds4_engine **out,
                                     const ds4_engine_options *opt,
                                     const ds4_gpu_config *gpu_cfg,
-                                    bool agent_owner);
+                                    bool resident_session_owner);
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     return ds4_engine_open_internal(out, opt, NULL, false);
 }
 
+int ds4_engine_open_for_resident_sessions(ds4_engine **out,
+                                          const ds4_engine_options *opt) {
+    return ds4_engine_open_internal(out, opt, NULL, true);
+}
+
 int ds4_engine_open_for_agent(ds4_engine **out,
                               const ds4_engine_options *opt) {
-    return ds4_engine_open_internal(out, opt, NULL, true);
+    return ds4_engine_open_for_resident_sessions(out, opt);
 }
 
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
@@ -60187,7 +60192,7 @@ int ds4_engine_create_with_gpu_config(ds4_engine **out,
 static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
                                      const ds4_gpu_config *gpu_cfg,
-                                     bool agent_owner) {
+                                     bool resident_session_owner) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
@@ -60252,7 +60257,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->placement_ctx_hint = opt->placement_ctx_hint;
     e->placement_session_count_hint = opt->placement_session_count_hint;
     e->share_session_prefill_workspace = opt->share_session_prefill_workspace;
-    e->mellum_interactive_sessions = agent_owner && !opt->inspect_only;
+    e->mellum_interactive_sessions =
+        resident_session_owner && !opt->inspect_only;
     ds4_acquire_instance_lock();
 
     if (opt->simulate_used_memory_bytes != 0 &&
@@ -60390,7 +60396,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         if (!e->mellum_interactive_sessions) {
             fprintf(stderr,
-                    "ds4: Mellum 2 resident sessions are currently available only in ds4-agent\n");
+                    "ds4: Mellum 2 resident sessions require a host that owns "
+                    "them (ds4-agent or ds4-server), not a diagnostic open\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -66487,6 +66494,8 @@ static bool ds4_sessions_eval_batch_metal_supported(
     const char *tp_batch = getenv("DS4_METAL_TP_SESSION_BATCH");
     if (!items || count < 2 || !e || e->backend != DS4_BACKEND_METAL ||
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA ||
+        /* No batched Mellum decode graph exists; it takes the ordered path. */
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM ||
         e->support_kind != DS4_SUPPORT_NONE ||
         (e->tp.active && tp_batch && strcmp(tp_batch, "0") == 0) ||
         getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
@@ -67265,11 +67274,6 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                 snprintf(err, errlen,
                          "decode batch item %d belongs to a different engine", i);
             }
-            return 1;
-        }
-        if (count > 1 && ds4_session_is_mellum(s)) {
-            if (err && errlen) snprintf(err, errlen,
-                                        "Mellum inspect sessions support only one-token eval");
             return 1;
         }
         if (items[i].token < 0 || items[i].token >= (int)DS4_N_VOCAB) {

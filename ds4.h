@@ -278,8 +278,17 @@ typedef struct {
 } ds4_session_payload_file;
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
-/* Agent-owned engines may opt into model-family session paths that are not
- * exposed by the generic CLI/server entry points yet. */
+/*
+ * Hosts that own resident, interactive sessions -- ds4-agent and ds4-server --
+ * open through this rather than ds4_engine_open, which is for one-shot and
+ * diagnostic use.  Some model families (Mellum) only expose their session path
+ * to such a host, because a resident session carries a KV cache and sampling
+ * state that a diagnostic open has no way to release correctly.
+ */
+int ds4_engine_open_for_resident_sessions(ds4_engine **out,
+                                          const ds4_engine_options *opt);
+
+/* Prior name for the same thing, kept for callers that predate the rename. */
 int ds4_engine_open_for_agent(ds4_engine **out,
                               const ds4_engine_options *opt);
 
