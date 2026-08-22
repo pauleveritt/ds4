@@ -72,6 +72,43 @@ Session prefill, measured on a real 1,030-token sync:
 **Quote ~355 t/s for a session, not the resident profile's 941** — the profile
 measures the kernels without session bookkeeping.
 
+## The 9.33 GiB selective artifact
+
+Q4_K expert gate/up on layers 0-21, Q8_0 everywhere else. Built by
+`tools/mellum/build-selective-artifact.sh`; kept at
+`~/models/mellum-thinking-TARGET.gguf`. ds4 loads and generates from it.
+
+Measured on this box against the Q8_0 model, arms interleaved, n=5 paired
+(read the pairs, not the medians -- the run drifted ~40% top to bottom):
+
+| | Q8_0 | selective | ratio |
+| --- | ---: | ---: | ---: |
+| Decode (isolated, equal load) | 124.3 t/s | 93.5 t/s | **0.75x** |
+| Session prefill, 6045 tokens | ~341 t/s (layer-major) | ~73 t/s (tokenwise) | **0.21x** |
+| Planned resident, ctx 16384 | 12.10 GiB | 9.40 GiB | -2.70 GiB |
+
+**Both speed numbers are worse, and neither is inherent to Q4_K.**
+
+- Decode is slow because Mellum dispatches `kernel_glm_q4_K_pair_swiglu_f32`
+  (`metal/moe.metal:509`) -- a scalar kernel: one strided thread per element,
+  per-element nibble and scale lookup, threadgroup tree reduction. A SIMD
+  variant, `glm_q4_K_pair_swiglu_simd_f32_impl` (`metal/moe.metal:1306`),
+  already exists and is what GLM uses. Selecting it is the obvious next win,
+  and is wiring rather than a new kernel. For contrast, llama.cpp measures
+  this same file's decode as 6.6% *faster* than Q8_0, so 0.75x is ds4's
+  kernel choice, not the artifact.
+- Prefill is slow because the expert-major batch kernel stages Q8_0 rows and
+  cannot run Q4_K, so these models take the tokenwise sync path.
+
+The memory win is real and is the reason the artifact exists: 9.40 GiB planned
+leaves ~6.6 GiB inside 16 GiB where Q8_0 leaves ~3.9 GiB.
+
+**16 GiB is still not demonstrated.** `--simulate-used-memory N` locks N GiB,
+so simulating a 16 GiB machine on this 128 GiB box means locking 112 -- and
+macOS refuses, failing at `104.00/112.00 GiB`. The tightest reachable
+simulation leaves ~24 GiB. Both models load there. Real 16 GiB hardware is the
+only way to answer this.
+
 ## Hosts
 
 - **`ds4-agent`** — one session per process, and `/tmp/ds4.lock` refuses a
@@ -149,7 +186,7 @@ find them in an old note, they are gone, not broken.
 2. **Some probes exercise decode, not prefill.** `--mellum-diag layer0`,
    `all-layers` and `logits` run the decode path. A prefill-only flag changes
    nothing in them, and they will report a clean pass regardless. Use
-   `true-prefill` or `swa-boundary` for prefill.
+   `true-prefill` for prefill -- but see trap 6 for `swa-boundary`.
 3. **Read interleaved ratios, never absolute times.** The same baseline has
    measured 128 ms and 323 ms depending on what else was running. Interleave
    the arms in one session and compare within it. n≥5, report the median.
@@ -184,3 +221,23 @@ find them in an old note, they are gone, not broken.
 
 Not recommended: the `simdgroup_float8x8` MoE rewrite. It improves the
 component that shrinks as context grows, and does nothing for decode.
+
+6. **`swa-boundary` goes vacuous on a Q4_K artifact.** It compares a tokenwise
+   decode fixture against `ds4_session_sync`. When the model takes the
+   tokenwise fallback both arms become the same computation, so it reports a
+   deviation of exactly `0.000000` and passes while validating nothing. Q8_0
+   still measures ~0.101. A perfect score here is the warning sign.
+7. **`resident-profile` cannot measure a Q4_K artifact.** It primes the cache
+   to depth through the batch prefill path, which refuses Q4_K, so decode
+   reports `resident profile decode failed`. Measure through `ds4-server` with
+   `DS4_MELLUM_SYNC_TRACE=1` instead; the trace names the path it took, which
+   is also how you prove which sync path ran.
+8. **`ds4-bench` refuses Mellum entirely** -- "resident sessions require a host
+   that owns them" -- so benchmark through `ds4-agent` or `ds4-server`.
+9. **A header change can silently corrupt `ds4_test`.** `Makefile:255` omitted
+   `ds4_gpu.h` from `ds4_test.o`'s dependencies, so adding a field to a shared
+   struct rebuilt `ds4_metal.o` but not the test, and the mismatched layouts
+   produced a suite that compiled, linked, ran, returned success, and reported
+   seven wrong values. Fixed, but check the dependency list before blaming your
+   own numerics.
+10. **`timeout(1)` is not on macOS.**
