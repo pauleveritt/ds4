@@ -35026,6 +35026,26 @@ typedef struct {
     ds4_gpu_tensor *up_offsets;
 } ds4_gpu_mellum_moe_group;
 
+/*
+ * Rows per threadgroup in the row-tiled Mellum down projection.  0 keeps the
+ * one-row batch kernel.  2 and 4 tile that many rows into a single tree
+ * reduction; 4 needs R * n_expert_used * 256 floats of threadgroup memory
+ * (32 KiB at eight experts), which is at the device limit, so the pipeline is
+ * allowed to fail and fall back rather than being assumed available.
+ */
+static unsigned ds4_gpu_mellum_down_rowtile(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_MELLUM_DOWN_ROWTILE");
+        long v = (env && *env) ? strtol(env, NULL, 10) : 0;
+        cached = (v == 2 || v == 4) ? (int)v : 0;
+    }
+    return (unsigned)cached;
+}
+
+static id<MTLComputePipelineState> g_mellum_down_rowtile2_pipeline;
+static id<MTLComputePipelineState> g_mellum_down_rowtile4_pipeline;
+
 static int ds4_gpu_mellum_grouped_moe_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -35216,6 +35236,23 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
             g_mellum_q8_0_down_batch_f32_pipeline,
             "kernel_mellum_q8_0_down_batch_f32");
         if (!pair_pipeline || !down_pipeline) return 0;
+        unsigned down_rowtile = ds4_gpu_mellum_down_rowtile();
+        if (down_rowtile) {
+            const char *rt_name = (down_rowtile == 4)
+                ? "kernel_mellum_q8_0_down_batch_rowtile4_f32"
+                : "kernel_mellum_q8_0_down_batch_rowtile2_f32";
+            id<MTLComputePipelineState> rt = nil;
+            if (down_rowtile == 4) {
+                if (!g_mellum_down_rowtile4_pipeline)
+                    g_mellum_down_rowtile4_pipeline = ds4_gpu_get_pipeline(rt_name);
+                rt = ds4_gpu_hot_pipeline(g_mellum_down_rowtile4_pipeline, rt_name);
+            } else {
+                if (!g_mellum_down_rowtile2_pipeline)
+                    g_mellum_down_rowtile2_pipeline = ds4_gpu_get_pipeline(rt_name);
+                rt = ds4_gpu_hot_pipeline(g_mellum_down_rowtile2_pipeline, rt_name);
+            }
+            if (rt) down_pipeline = rt; else down_rowtile = 0;
+        }
         id<MTLComputePipelineState> grouped_pipeline = nil;
         if (ds4_gpu_mellum_grouped_moe_enabled()) {
             if (!g_mellum_q8_0_pair_swiglu_grouped_f32_pipeline)
@@ -35298,8 +35335,9 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
         [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:3];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
         [enc useResource:downbuf usage:MTLResourceUsageRead];
-        [enc setThreadgroupMemoryLength:(NSUInteger)n_expert * 256u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(out_dim, n_tokens, 1)
+        const NSUInteger rt_rows = down_rowtile ? down_rowtile : 1u;
+        [enc setThreadgroupMemoryLength:rt_rows * (NSUInteger)n_expert * 256u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((out_dim + rt_rows - 1u) / rt_rows, n_tokens, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Mellum Q8_0 batch routed MoE"))
