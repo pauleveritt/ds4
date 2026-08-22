@@ -407,6 +407,89 @@ beats Laguna on both axes out to roughly 20K of context, and head grouping
 (section 7a) targets the 8x redundancy that accounts for most of what remains
 past that.
 
+## 8a. The Laguna decode baseline does not survive arithmetic
+
+**Do not treat "Laguna decode is flat 56–68 t/s at any context" as established.**
+It is the baseline the whole of section 8 compares against, and it almost
+certainly does not hold at the deep end.
+
+Laguna S 2.1 as ds4 implements it (`ds4.c:669`): 48 layers, of which **12 are
+full causal** with `cache_cap = ctx_size` and 36 are sliding with a 512 window
+(`ds4.c:47883`), `n_head_kv` 8, `head_dim` 128, f16 K and V. So KV bytes that
+must be read *every decode step*:
+
+| Context used | KV per step |
+| ---: | ---: |
+| 3,400 | 0.24 GB |
+| 20,700 | 1.09 GB |
+| 92,500 | **4.62 GB** |
+
+Going from 3.4K to 92.5K adds **4.38 GB per step**. A 60 t/s step is 16.7 ms.
+For decode to stay flat, that extra 4.38 GB would have to cost ~0 ms:
+
+| Assumed bandwidth | added ms | implied t/s at 92.5K |
+| ---: | ---: | ---: |
+| 400 GB/s | 10.9 | **36** |
+| 500 GB/s | 8.8 | **39** |
+| 800 GB/s (implausible) | 5.5 | 45 |
+
+So Laguna decode at 92.5K of *used* context should be somewhere near 36–45
+t/s, not 56–68. The most likely explanation is the same trap this brief
+documents for Mellum in section 7: the decode samples were taken at a large
+context *setting* (150,000) but modest actual *depth*. Context setting is not
+context used.
+
+**Consequence:** section 8's decode comparison likely flatters Laguna at the
+deep end and therefore understates Mellum's position there. Re-measure Laguna
+decode at controlled depth before quoting either.
+
+## 8b. Laguna's prefill decay — why it cannot be levelled off
+
+Investigated by reading `paul/laguna` at `1caa5e5`; nothing was run. Relevant
+because section 8 compares against it.
+
+Fitting per-token prefill time `t(P) = a + b·P` to the measured Laguna curve
+gives **a = 2.27 ms/token** and **b = 2.24e-4 ms per token per position**, and
+that two-parameter fit reproduces every measured point within ~10%. It implies:
+
+- A context-independent ceiling of **~440 t/s**.
+- Attention overtakes everything else at **P ≈ 10,100 tokens**.
+- Attention share: ~25% at 3.4K, 67% at 20.7K, 90% at 92.5K.
+
+**The decay is irreducible in kind.** 12 of Laguna's 48 layers are exact full
+causal attention with no sparsity, compression, or eviction, so prefilling N
+tokens contains a hard Θ(N²) term and marginal t/s must keep falling linearly
+with position. Every optimization below lowers the *constant* in front of N²
+— moving the knee right — and none removes it. Levelling off would require an
+approximation on the global layers (top-k, block-sparse, KV eviction). ds4 has
+that machinery for DeepSeek and **nothing analogous for Laguna**.
+
+What is nonetheless available, ranked:
+
+| Option | Difficulty | Effect |
+| --- | --- | --- |
+| Batch 4–8 keys per loop iteration in `gqa6`, amortizing `simd_sum` and `exp` | Low | ~1.3–1.8x on `b` |
+| Split-K across SIMD groups — the same fix as Mellum's `3c2b379` | Low–Med | breaks the serial latency chain |
+| Q-tile the kernel, staging K/V in threadgroup memory | Med | the structural fix, 2–4x on `b` |
+| Route global layers through real FlashAttention (`kernel_flash_attn_ext`) | Med–High | biggest ceiling, but dk128/dv128 is not instantiated and it needs a causal mask and a gate post-pass |
+
+Two things already ruled out by reading the code, worth recording so nobody
+re-investigates them:
+
+- **Chunk width is not the cause.** `prefill_cap` is a hard 16,384
+  (`ds4.c:47820`) and never shrinks with position or memory pressure. Note
+  also that `DS4_METAL_PREFILL_CHUNK` does *not* affect Laguna.
+- **The sliding window is already fully exploited.** SWA layers cap at 512 via
+  `cache_cap` (`ds4.c:47883`), and the 6-wide head grouping `gqa6` is already
+  selected on exactly the 12 global layers that decay. There is no unused
+  headroom of that kind.
+
+The interesting structural echo: Laguna's prefill kernel launches **one SIMD
+group per query** with no threadgroup memory, and each of a chunk's T tokens
+independently streams the whole P-row KV prefix — a **T-fold KV load
+amplification**, absorbed only by L2. That is the same class of defect as
+Mellum's 8x decode redundancy in section 7a, and the same fixes apply.
+
 ## 9. Quality gates — how to not get a false green
 
 This is the trap that cost the most time. **Three of the oracle probes run
@@ -482,7 +565,11 @@ Env knobs that exist:
 
 | Variable | Effect |
 | --- | --- |
-| `DS4_MELLUM_MOE_GEMM` | expert-major MoE prefill (default off) |
+| `DS4_MELLUM_MOE_GEMM` | expert-major MoE prefill (default off; **no-op in real sessions**, see §5a) |
+| `DS4_MELLUM_ATTN_GROUP` | head-grouped decode attention (**default ON**, set 0 to disable) |
+| `DS4_MELLUM_ATTN_SPLIT` | split-K decode attention (**default ON**, set 0 to disable) |
+| `DS4_MELLUM_ATTN_OVERDISPATCH` | test hook: over-size the split launch |
+| `DS4_MELLUM_ATTN_TRACE` | report the decode kernel chosen and max key_count |
 | `DS4_MELLUM_DOWN_ROWTILE` | row-tiled token-major down (default off) |
 | `DS4_MELLUM_PREFILL_CHUNK` | prefill chunk width |
 | `DS4_MELLUM_PROFILE_PREFILL_TOKENS` | profile prefill width, 64 .. 2^20 |
@@ -504,6 +591,82 @@ Env knobs that exist:
    only; a second process `exit(2)`s. **Do not override `DS4_LOCK_FILE`** —
    AGENT.md says it is intentional and there is kernel VM risk. `ds4_test
    --metal-kernels` needs the GPU but *not* the lock.
+
+## 12a. Distance to a shipped path — four gaps, not one
+
+Written after an adversarial review confirmed §5a. "Shipped" needs all four.
+
+1. **Decode: in the shipped path, and now on by default.** `commit 290005e`.
+   `ds4_mellum_decode_token` was always the real session path, so split-K and
+   head grouping were only ever an env var away from users. The default now
+   picks per `key_count`: grouped above 256 keys, split-K where the 8:1 GQA
+   ratio does not hold, serial at or below 256 so short histories keep their
+   exact arithmetic. Interleaved at depth 4,096: **29.1 -> 118.3 t/s**. **Done.**
+2. **Prefill: not in any path.** §5a. Medium-easy, ~1–2 days, plan in §13.
+3. **Reach: Mellum opens only under `ds4-agent`**, one session, and
+   `ds4_server.c` has zero Mellum references. Any parallel-agent harness is
+   blocked on this regardless of kernel speed. Days of plumbing; unscoped.
+4. **The branch itself.** `mellum-2.1-overnight` diverged from `main` at
+   `efdadd41`; main is **50 commits ahead**, including an upstream merge
+   carrying "Metal routed/indexed prefill acceleration, MXFP4" — which may
+   touch the same Metal dispatch surfaces, and may partly duplicate gap 2.
+   Nothing ships from a stale worktree branch, and the merge cost grows daily.
+
+Suggested order: 1 (done) -> 4 (rebase before divergence compounds, and to see
+whether upstream already did some of 2) -> 2 -> 3.
+
+## 12b. Batching, and what it would unlock
+
+Three distinct things get called batching. Verified state:
+
+| | batched prefill | concurrent sessions | fused batch decode |
+| --- | --- | --- | --- |
+| Laguna | yes, real multi-token graph | yes | **no** — excluded at `ds4.c:65348` |
+| Mellum | **no** — tokenwise | structurally yes, refused | **no** — refused at `ds4.c:66131` |
+
+Mellum's `sync_batch_tokens = 32` batches *command submission*, not tokens in a
+forward pass.
+
+For an agent harness running work in parallel:
+
+- **(a) Batched prefill** is nearly the whole prize and needs no cross-session
+  machinery. It is gap 2.
+- **(b) Concurrent multi-session** is mostly already possible — each session
+  allocates its own decode state and KV rings (`ds4.c:37089`), and the
+  isolation probe already interleaves two. ~160 MB/session at 8K ctx. But
+  sessions interleave **serially** on the GPU, so N agents *share* the
+  single-stream rate rather than multiplying it. Days of plumbing.
+- **(c) Fused batched decode** is a multi-week project with a real head start:
+  `bucket_build` already accepts an arbitrary (token, slot) set
+  (`moe.metal:739`), so B concurrent decode tokens bucket expert-major exactly
+  like a B-token prefill chunk. **The MoE half already exists.**
+
+Payoff shape, and it is not linear. Decode is bandwidth-bound on ~2.7 GB of
+weights per step. Batching amortizes attention and projection weights fully,
+but **not** expert weights, because different sequences route differently.
+With top-8 of 64: at B=8 you touch ~42 distinct experts (~1.5x better per
+token); at B=32 you touch ~63 (~4x), approaching the 64/8 = 8x ceiling
+asymptotically. So batching is **sublinear at small batch and strong at large**
+— worth little for one interactive user, worth a lot for a parallel harness.
+Sublinear means throughput rises *less than proportionally*, never that
+batching is slower than running the same sequences serially.
+
+## 12c. Thinking mode does not affect any number in this brief
+
+Mellum 2 has thinking and non-thinking modes, toggled **per request** through
+the chat template (`chat_template_kwargs: {"enable_thinking": false}` —
+`tests/orchestrator-eval/probe_any.py:11`), not chosen at load time. Every
+throughput figure here comes from `--mellum-resident-profile`, which pushes
+synthetic token IDs through the forward pass with no chat template, so the
+figures are mode-independent.
+
+Where mode matters is tokens emitted, and the effect is large: this repo's own
+eval spent 2,847/2,861/2,545 completion tokens with thinking against
+668/603/448 without, and scored 13.3 either way (11.3 vs 11.7 on the other
+task). **Thinking costs 3–4x the wall clock and bought nothing on either task
+shape**, so no-think is the right default for focused tasks. Note it also
+changes output *format*: the sft3015 snapshot's no-think mode emits
+`<tool_call>` JSON rather than fenced code.
 
 ## 13. Recommended order of work
 
