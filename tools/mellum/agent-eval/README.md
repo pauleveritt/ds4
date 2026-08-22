@@ -22,3 +22,13 @@ run never inherits files from the previous one.
 Classify canary failures rather than tuning the prompt against them: immediate
 EOS, prose, tool-shaped output missed by detection, or a valid decision not to
 call. The third class is a parser bug and the others are not.
+
+## Run identifiers
+
+Every script writes to `<label-dir>/<N>/`, where `N` increments from whatever
+already exists in that label's directory -- a rerun never overwrites a prior
+run. `<label-dir>/latest` symlinks to the newest, e.g.
+`/tmp/agentclinic-runs/p1-q8/latest` -> `3`. Compare two runs with:
+
+    diff /tmp/agentclinic-runs/p1-q8/1/.agentlogs/stdout.log \
+         /tmp/agentclinic-runs/p1-q8/2/.agentlogs/stdout.log

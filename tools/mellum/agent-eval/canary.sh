@@ -5,8 +5,13 @@ set -u
 LABEL=$1; MODEL=$2; N=$3
 W=~/projects/ds4/.claude/worktrees/mellum-2.1
 source /tmp/agentclinic-runs/metal_env.sh
-BASE=/tmp/agentclinic-runs/canary-$LABEL
-rm -rf $BASE; mkdir -p $BASE
+OUTER=/tmp/agentclinic-runs/canary-$LABEL
+mkdir -p "$OUTER"
+SEQ=$(( $(ls "$OUTER" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1) + 1 )) 2>/dev/null
+[ -z "$SEQ" ] && SEQ=1
+BASE="$OUTER/$SEQ"
+mkdir -p "$BASE"
+ln -sfn "$SEQ" "$OUTER/latest"
 cp $W/Makefile $BASE/Makefile
 cd $BASE
 for i in $(seq 1 $N); do

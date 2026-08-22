@@ -5,8 +5,13 @@ set -u
 ARM=$1; MODEL=$2
 W=~/projects/ds4/.claude/worktrees/mellum-2.1
 SRC=~/PycharmProjects/dlai-local-ai-course
-RUN=/tmp/agentclinic-runs/$ARM
-rm -rf $RUN; mkdir -p $RUN
+BASE=/tmp/agentclinic-runs/$ARM
+mkdir -p "$BASE"
+SEQ=$(( $(ls "$BASE" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1) + 1 )) 2>/dev/null
+[ -z "$SEQ" ] && SEQ=1
+RUN="$BASE/$SEQ"
+mkdir -p "$RUN"
+ln -sfn "$SEQ" "$BASE/latest"
 # Seed from tracked files only: no __pycache__, no prior tests/, no .codex.
 git -C $SRC archive HEAD | tar -x -C $RUN
 mkdir -p $RUN/.agentlogs
