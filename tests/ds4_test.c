@@ -2473,7 +2473,13 @@ static void test_metal_mellum_q8_q8_routed_moe(void) {
                     printf("ds4-test: Mellum batch-vs-decode token=%u mid_max_abs=%g "
                            "out_max_abs=%g\n", (unsigned)token, (double)mid_diff,
                            (double)out_diff);
-                    if (getenv("DS4_MELLUM_MOE_GEMM")) {
+                    /*
+                     * Ask the implementation which path ran rather than
+                     * re-deriving it from the environment: the default is not
+                     * "env unset means off", and a test that assumes so fails
+                     * the moment the default moves.
+                     */
+                    if (ds4_gpu_mellum_moe_gemm_enabled()) {
                         /*
                          * Expert-major reassociates, so it cannot be bitwise --
                          * but "not bitwise" is not "unchecked".  The observed
