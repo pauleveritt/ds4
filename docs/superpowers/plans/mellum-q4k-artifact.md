@@ -23,29 +23,21 @@ Pieces (1) and (2) are **landed and gated**. Piece (3) is not started.
 | 2b. Mellum-native Q4_K decode kernel | Done — decode 0.75x to 0.94x |
 | 3. Q4_K expert-major prefill | Not started; tokenwise fallback in place |
 
-Measured, interleaved, paired: decode **0.94x** Q8_0 (~117 vs ~123 t/s, after
-2b; it was 0.75x before), session prefill **0.21x** (~73 vs ~341 t/s), planned
-resident 9.40 vs 12.10 GiB. Decode is close to parity; prefill is the gap.
+Decode is close to parity, prefill is the gap — full ratios, methodology and
+the kernel story are in `MELLUM.md`'s "9.33 GiB selective artifact" section.
 
 ## Piece 2b: select the SIMD Q4_K kernel
 
 **This was not in the original brief and displaces piece (3) in priority.**
 
-Piece (2) wired decode to `kernel_glm_q4_K_pair_swiglu_f32`
-(`metal/moe.metal:509`), which is the naive kernel in that file: one strided
-thread per element, a per-element nibble extraction and scale lookup through
-`ds4_glm_q4_K_value`, then a threadgroup tree reduction. That is why ds4's
-Q4_K decode is ~25% *slower* than Q8_0 while llama.cpp measures the same file
-6.6% *faster*. The gap is ds4's kernel selection, not the quantization.
-
-`glm_q4_K_pair_swiglu_simd_f32_impl` (`metal/moe.metal:1306`) already exists
-and is what the GLM paths dispatch (`:1481`, `:1512`, `:1520`, `:1587`). This
-is the same shape of work piece (2) turned out to be — selection, not
-invention — and it targets decode, which dominates interactive agent latency.
-Do this before (3).
-
-Confirm the Q8_0 comparison arm is itself SIMD before drawing conclusions
-about the ratio.
+Piece (2) wired decode to the naive kernel in `metal/moe.metal`: one strided
+thread per element, a per-element nibble extraction and scale lookup, then a
+threadgroup tree reduction — why Q4_K decode was slower than Q8_0 rather than
+faster, as llama.cpp measures on the same file. The gap was kernel selection,
+not the quantization; landed as `kernel_mellum_q4_K_pair_swiglu_f32`, see
+`MELLUM.md`. This is the same shape of work piece (2) turned out to be —
+selection, not invention — and it targets decode, which dominates interactive
+agent latency. Did this before (3).
 
 The artifact is at `~/models/mellum-thinking-TARGET.gguf` (it was previously
 only in a session scratchpad). `tools/mellum/build-selective-artifact.sh`
@@ -190,41 +182,23 @@ documented literal.
    measurement route: `resident-profile` cannot prime a Q4_K cache and
    `ds4-bench` refuses Mellum, so this goes through `ds4-server` with
    `DS4_MELLUM_SYNC_TRACE=1`, whose trace also names the sync path taken.
-4. **Memory demonstrated, not asserted. Blocked — cannot be done here.**
-   `--simulate-used-memory N` locks N GiB, so simulating a 16 GiB machine on a
-   128 GiB box means locking **112**, not 16. (An earlier draft of this brief
-   said `--simulate-used-memory 16GB`, which locks 16 and leaves 112 free —
-   it would have passed for the wrong reason.) macOS refuses the 112 GiB lock,
-   failing at `104.00/112.00 GiB`, so the tightest reachable simulation leaves
-   ~24 GiB. Both models load and generate there, and the planner reports
-   9.40 GiB against Q8_0's 12.10 GiB at ctx 16384 — but that is planning
-   arithmetic, not memory pressure. **Only real 16 GiB hardware closes this.**
+4. **Memory demonstrated, not asserted. Blocked — cannot be done here.** See
+   `MELLUM.md` — "16 GiB is still not demonstrated." Only real 16 GiB
+   hardware closes this.
 5. `MELLUM.md` updated with the artifact's numbers and how to build it.
 
 ## Traps that have already cost time here
 
-- **`make -j8` does not build `ds4_test`**, and `make cpu` overwrites `ds4`,
-  `ds4-server`, `ds4-bench`, `ds4-eval` and `ds4-agent` with CPU builds.
-- **A header change can silently corrupt the test binary.** `Makefile:255`
-  omitted `ds4_gpu.h` from `ds4_test.o`'s dependencies. Adding a field to the
-  layer desc rebuilt `ds4_metal.o` but not `ds4_test.o`, and the mismatched
-  struct layouts produced a test that compiled, linked, ran, returned
-  *success*, and reported seven wrong values. Fixed — but this is the trap
-  family's worst form, because the failure looks like a numerics bug in your
-  own change.
-- **Four diagnostics can pass without testing what you changed** — `layer0`,
-  `all-layers` and `logits` run decode, not prefill; and `swa-boundary` goes
-  vacuous on a Q4_K artifact (above).
-- **Interleave measurement arms and read ratios.** The same baseline has
-  measured 128 ms and 323 ms depending on machine load.
-- **Context setting is not context used.** Decode figures need
-  `DS4_MELLUM_PROFILE_DECODE_DEPTH`.
+See `MELLUM.md`'s "Traps that have cost real time" for the general list
+(`make -j8`/`ds4_test`, the `Makefile:255` header-dependency bug, decode-only
+diagnostics, interleaving, context depth, `timeout(1)`). One trap specific to
+this artifact, not in that list:
+
 - **The eval prompts are inside the imatrix calibration set** for this
   artifact. Its quality scores are a regression check, not a benchmark. An
   out-of-sample suite — coding correctness, tool selection, long-context
   recall, patch success — is separate work, compared against ds4 Q8_0 rather
   than bitwise equality.
-- **`timeout` is not on macOS.** Use the harness, not `timeout(1)`.
 
 ## Naming fossils to clean up after (3)
 
