@@ -665,13 +665,21 @@ int ds4_gpu_mellum_q8_0_layer_decode_tensor(
            ds4_gpu_mellum_router_select_tensor(
                router_selected, router_weights, router_probs, router_logits,
                desc->n_expert, desc->n_expert_used) != 0 &&
-           ds4_gpu_mellum_q8_0_routed_moe_one_tensor(
-               moe_out, moe_mid, model_map, model_size, desc->gate_offset,
-               desc->up_offset, desc->down_offset, desc->gate_expert_bytes,
-               desc->gate_row_bytes, desc->down_expert_bytes,
-               desc->down_row_bytes, n_embd, desc->expert_mid_dim, n_embd,
-               router_selected, router_weights, desc->n_expert,
-               desc->n_expert_used, ffn_norm) != 0 &&
+           (desc->pair_type == DS4_METAL_TENSOR_Q4_K ?
+                ds4_gpu_mellum_routed_moe_one_tensor(
+                    moe_out, moe_mid, model_map, model_size, desc->gate_offset,
+                    desc->up_offset, desc->down_offset, desc->gate_expert_bytes,
+                    desc->gate_row_bytes, desc->down_expert_bytes,
+                    desc->down_row_bytes, n_embd, desc->expert_mid_dim, n_embd,
+                    router_selected, router_weights, desc->n_expert,
+                    desc->n_expert_used, ffn_norm) :
+                ds4_gpu_mellum_q8_0_routed_moe_one_tensor(
+                    moe_out, moe_mid, model_map, model_size, desc->gate_offset,
+                    desc->up_offset, desc->down_offset, desc->gate_expert_bytes,
+                    desc->gate_row_bytes, desc->down_expert_bytes,
+                    desc->down_row_bytes, n_embd, desc->expert_mid_dim, n_embd,
+                    router_selected, router_weights, desc->n_expert,
+                    desc->n_expert_used, ffn_norm)) != 0 &&
            ds4_gpu_add_tensor(out, attention_out, moe_out, n_embd) != 0;
 }
 int ds4_gpu_mellum_q8_0_layer_prefill_tensor(
@@ -695,6 +703,13 @@ int ds4_gpu_mellum_q8_0_layer_prefill_tensor(
         desc->expert_mid_dim == 0 || desc->n_expert == 0 ||
         desc->n_expert_used == 0 || desc->n_expert_used > desc->n_expert ||
         n_tokens > UINT32_MAX / desc->attention.n_embd) return 0;
+    /* Expert-major prefill stages Q8_0 rows.  Refuse Q4_K here rather than
+     * letting the batch kernel read K-quant bytes as Q8_0 blocks; callers
+     * route Q4_K models to the tokenwise path.  This is defence in depth --
+     * the batch kernel independently asserts Q8_0 row geometry, which is what
+     * catches any other type -- so it deliberately does not reject a
+     * zero-initialised desc, which several Q8_0 tests still build. */
+    if (desc->pair_type == DS4_METAL_TENSOR_Q4_K) return 0;
     const uint32_t n_embd = desc->attention.n_embd;
     const uint64_t hidden_bytes = (uint64_t)n_tokens * n_embd * sizeof(float);
     const uint64_t logits_bytes = (uint64_t)n_tokens * desc->n_expert * sizeof(float);

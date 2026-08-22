@@ -5412,10 +5412,48 @@ static void weights_validate_mellum_layout(
                              1, DS4_N_EMBD, 0, 0);
         tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32,
                              2, DS4_N_EMBD, DS4_N_EXPERT, 0);
-        tensor_expect_layout(l->ffn_gate_exps, DS4_TENSOR_Q8_0,
+        /* Selective artifacts spend fewer bits on the early layers, so gate/up
+         * may be Q4_K on some layers and Q8_0 on others within one file.  Read
+         * the type per layer rather than deciding once for the model: a
+         * model-wide "is this the Q4 build" flag is the wrong shape and does
+         * not survive the next recipe.
+         *
+         * Gate and up must agree within a layer.  The pair kernels read both
+         * through a single dispatch -- kernel_glm_q4_K_pair_swiglu_f32 casts
+         * both rows to block_q4_K -- so a layer that splits the two has no
+         * kernel to run on. */
+        const uint32_t layer_pair_type = l->ffn_gate_exps->type;
+        if (layer_pair_type != DS4_TENSOR_Q8_0 &&
+            layer_pair_type != DS4_TENSOR_Q4_K) {
+            fprintf(stderr,
+                    "ds4: Mellum routed experts for layer %u have unsupported "
+                    "type %s\n",
+                    il, tensor_type_name(layer_pair_type));
+            exit(1);
+        }
+        tensor_expect_layout(l->ffn_gate_exps, layer_pair_type,
                              3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_layout(l->ffn_up_exps, DS4_TENSOR_Q8_0,
+        tensor_expect_layout(l->ffn_up_exps, layer_pair_type,
                              3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        /* Down stays Q8_0.  This is a representability limit, not an oversight
+         * to be relaxed: the down input width is DS4_N_FF_EXP, which on Mellum
+         * is 896 and is not a multiple of the 256-element K-quant block.  A
+         * K-quant there cannot describe the tensor at all -- it is not merely
+         * lossier.  ds4 also does not execute Q5_0, the other type the official
+         * mixed artifacts reach for here. */
+        if (l->ffn_down_exps->type != DS4_TENSOR_Q8_0) {
+            fprintf(stderr,
+                    "ds4: Mellum routed down tensor for layer %u has type %s, "
+                    "but only Q8_0 is supported: the down input width %" PRIu64
+                    " is not a multiple of the %d-element K-quant block, so a "
+                    "K-quant here is unrepresentable rather than lower "
+                    "quality.\n",
+                    il,
+                    tensor_type_name(l->ffn_down_exps->type),
+                    (uint64_t)DS4_N_FF_EXP,
+                    QK_K);
+            exit(1);
+        }
         tensor_expect_layout(l->ffn_down_exps, DS4_TENSOR_Q8_0,
                              3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
     }
@@ -36761,6 +36799,12 @@ struct ds4_engine {
     uint32_t mellum_layer_start;
     uint32_t mellum_layer_end;
     bool mellum_decode_contract_ready;
+    /* Named for the capability, not the format that currently implies it:
+     * the expert-major batch prefill kernel stages Q8_0 rows, so any model it
+     * cannot stage takes the tokenwise sync path.  Q4_K gate/up is the only
+     * such case today; it will stop being so when a Q4_K expert-major kernel
+     * lands, and this flag should keep meaning what it says. */
+    bool mellum_batched_prefill_unsupported;
     bool mellum_interactive_sessions;
     ds4_mellum_decode_state *mellum_decode_state;
     ds4_mtp_weights mtp_weights;
@@ -36843,10 +36887,14 @@ static bool ds4_engine_bind_mellum_decode_contract(ds4_engine *e,
     if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
     if (layer_start >= DS4_N_LAYER || layer_end >= DS4_N_LAYER ||
         layer_end < layer_start) return false;
+    e->mellum_batched_prefill_unsupported = false;
     for (uint32_t il = layer_start; il <= layer_end; il++) {
         const ds4_layer_weights *src = &e->weights.layer[il];
         ds4_mellum_layer_decode_desc *dst = &e->mellum_layer[il];
         if (!weights_mellum_layer_has_required(src)) return false;
+        if (src->ffn_gate_exps->type == DS4_TENSOR_Q4_K) {
+            e->mellum_batched_prefill_unsupported = true;
+        }
         uint64_t gate_expert_bytes = 0;
         uint64_t down_expert_bytes = 0;
         if (!layer_gate_down_expert_bytes(src,
@@ -36907,9 +36955,17 @@ static bool ds4_mellum_q8_layer_desc(const ds4_engine                  *e,
         layer->attn_v->type != DS4_TENSOR_Q8_0 ||
         layer->attn_output->type != DS4_TENSOR_Q8_0 ||
         layer->router->type != DS4_TENSOR_F32 ||
-        layer->gate_experts->type != DS4_TENSOR_Q8_0 ||
-        layer->up_experts->type != DS4_TENSOR_Q8_0 ||
         layer->down_experts->type != DS4_TENSOR_Q8_0) {
+        return false;
+    }
+    /* Gate/up may be Q4_K on some layers and Q8_0 on others within one file,
+     * but the two must agree with each other: the pair kernel reads both
+     * through a single dispatch.  Down stays Q8_0 -- see
+     * weights_validate_mellum_layout for why a K-quant there is
+     * unrepresentable rather than merely lossier. */
+    const uint32_t pair_type = layer->gate_experts->type;
+    if ((pair_type != DS4_TENSOR_Q8_0 && pair_type != DS4_TENSOR_Q4_K) ||
+        layer->up_experts->type != pair_type) {
         return false;
     }
     const bool sliding = layer->sliding_attention;
@@ -36951,6 +37007,7 @@ static bool ds4_mellum_q8_layer_desc(const ds4_engine                  *e,
         .expert_mid_dim = DS4_N_FF_EXP,
         .n_expert = DS4_N_EXPERT,
         .n_expert_used = DS4_N_EXPERT_USED,
+        .pair_type = pair_type,
         .router_is_f32 = true,
     };
     return true;
@@ -62931,8 +62988,14 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
          */
         enum { sync_batch_min_tokens = 64 };
         /* rt->sync_batch is the escape hatch, and the only way to A/B the
-         * two sync paths against each other. */
-        if (rt->sync_batch && prompt->len - i >= sync_batch_min_tokens) {
+         * two sync paths against each other.
+         *
+         * Q4_K gate/up takes the tokenwise path unconditionally: the
+         * expert-major batch kernel stages Q8_0 rows and asserts Q8_0 block
+         * geometry, so it cannot run these weights.  Tokenwise is slower but
+         * correct, and it uses the decode MoE, which does handle Q4_K. */
+        if (rt->sync_batch && !s->engine->mellum_batched_prefill_unsupported &&
+            prompt->len - i >= sync_batch_min_tokens) {
             if (!s->engine->mellum_prefill_workspace) {
                 /*
                  * Always the full width, never the width of whichever prompt

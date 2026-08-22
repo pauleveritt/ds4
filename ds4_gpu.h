@@ -2548,6 +2548,12 @@ typedef struct {
     uint32_t expert_mid_dim;
     uint32_t n_expert;
     uint32_t n_expert_used;
+    /* Quantization of this layer's gate/up experts: Q8_0 or Q4_K, carried
+     * down from weight validation rather than re-derived at dispatch.  Gate
+     * and up always agree -- the pair kernel reads both in one dispatch.
+     * Values are GGUF type ids, so DS4_TENSOR_* and DS4_METAL_TENSOR_*
+     * agree numerically and either spelling reads correctly. */
+    uint32_t pair_type;
     bool     router_is_f32;
 } ds4_gpu_mellum_q8_0_layer_desc;
 
