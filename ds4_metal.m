@@ -238,6 +238,16 @@ static id<MTLComputePipelineState> g_mellum_moe_bucket_build_pipeline;
 static id<MTLComputePipelineState> g_mellum_router_select_one_pipeline;
 static id<MTLComputePipelineState> g_mellum_router_select_batch_pipeline;
 static id<MTLComputePipelineState> g_mellum_gqa_decode_pipeline;
+static id<MTLComputePipelineState> g_mellum_gqa_decode_split_pipeline;
+
+int ds4_gpu_mellum_attn_split_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_MELLUM_ATTN_SPLIT");
+        cached = env && *env && strcmp(env, "0") != 0;
+    }
+    return cached;
+}
 static id<MTLComputePipelineState> g_mellum_gqa_prefill_pipeline;
 static id<MTLComputePipelineState> g_glm_q2_k_addr_down_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_addr_down_f32_pipeline;
@@ -9765,6 +9775,7 @@ void ds4_gpu_cleanup(void) {
         g_mellum_router_select_one_pipeline = nil;
         g_mellum_router_select_batch_pipeline = nil;
         g_mellum_gqa_decode_pipeline = nil;
+        g_mellum_gqa_decode_split_pipeline = nil;
         g_mellum_gqa_prefill_pipeline = nil;
         g_glm_q2_k_addr_down_f32_pipeline = nil;
         g_glm_q4_k_addr_down_f32_pipeline = nil;
@@ -34041,12 +34052,44 @@ int ds4_gpu_mellum_gqa_decode_tensor(
             fprintf(stderr, "ds4: Metal Mellum GQA received undersized buffers\n");
             return 0;
         }
-        if (!g_mellum_gqa_decode_pipeline) {
-            g_mellum_gqa_decode_pipeline =
-                ds4_gpu_get_pipeline("kernel_mellum_attention_decode_gqa_f16");
+        /*
+         * The serial kernel spends its time in a latency chain, not on the
+         * memory bus, so striping the key range over eight SIMD groups is
+         * worth close to eight times at depth.  It reassociates the softmax
+         * once key_count passes 256, which costs the bitwise decode-equals-
+         * prefill contract, so it stays opt-in.
+         */
+        const int split = ds4_gpu_mellum_attn_split_enabled();
+        const char *kernel_name = split ?
+            "kernel_mellum_attention_decode_gqa_split_f16" :
+            "kernel_mellum_attention_decode_gqa_f16";
+        if (split) {
+            if (!g_mellum_gqa_decode_split_pipeline) {
+                g_mellum_gqa_decode_split_pipeline =
+                    ds4_gpu_get_pipeline(kernel_name);
+            }
+        } else if (!g_mellum_gqa_decode_pipeline) {
+            g_mellum_gqa_decode_pipeline = ds4_gpu_get_pipeline(kernel_name);
         }
         id<MTLComputePipelineState> pipeline = ds4_gpu_hot_pipeline(
-            g_mellum_gqa_decode_pipeline, "kernel_mellum_attention_decode_gqa_f16");
+            split ? g_mellum_gqa_decode_split_pipeline :
+                    g_mellum_gqa_decode_pipeline, kernel_name);
+        /*
+         * Which kernel ran, and whether any dispatch actually crossed the
+         * split threshold.  Reporting only on a new maximum keeps this to a
+         * handful of lines: a run that never prints a key_count above the
+         * threshold has not exercised the split path at all, however many
+         * times it was dispatched.
+         */
+        if (getenv("DS4_MELLUM_ATTN_TRACE")) {
+            static uint32_t reported_max = 0;
+            if (key_count > reported_max) {
+                reported_max = key_count;
+                fprintf(stderr,
+                        "ds4: Mellum decode attn kernel=%s pipeline=%s max_key_count=%u\n",
+                        kernel_name, pipeline ? "ok" : "MISSING", key_count);
+            }
+        }
         if (!pipeline) return 0;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -34063,8 +34106,14 @@ int ds4_gpu_mellum_gqa_decode_tensor(
         [enc setBuffer:keybuf offset:ds4_gpu_tensor_offset(key_cache) atIndex:2];
         [enc setBuffer:valuebuf offset:ds4_gpu_tensor_offset(value_cache) atIndex:3];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        if (split) {
+            /* 8 maxima + 8 sums + 8 head-dim partial vectors. */
+            const NSUInteger scratch_floats = 8u + 8u + 8u * head_dim;
+            [enc setThreadgroupMemoryLength:scratch_floats * sizeof(float)
+                                    atIndex:0];
+        }
         [enc dispatchThreadgroups:MTLSizeMake(n_head, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+             threadsPerThreadgroup:MTLSizeMake(split ? 256 : 32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Mellum GQA decode")) return 0;
     }

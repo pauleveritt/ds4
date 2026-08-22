@@ -2452,6 +2452,7 @@ int ds4_gpu_mellum_attention_decode_tensor(
 /* Diagnostic: whether Mellum prefill projections use the row-exact decode
  * kernel.  Reported by the profile so a measurement is self-describing. */
 int ds4_gpu_mellum_prefill_exact_projections_enabled(void);
+int ds4_gpu_mellum_attn_split_enabled(void);
 
 int ds4_gpu_mellum_attention_prefill_tensor(
         ds4_gpu_tensor                     *out,
