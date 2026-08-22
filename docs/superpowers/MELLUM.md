@@ -158,11 +158,31 @@ missing-bar typo. Recovery is deliberately narrow: the object must open the
 whole response (a brace mid-prose stays prose) and must name a registered tool,
 or it becomes a retryable error rather than a dispatch.
 
-**`--nothink` currently generates nothing.** With the `<think>\n\n</think>`
-prefill the model emits EOS immediately: 20/20 empty responses, zero generated
-tokens in the trace. That contradicts the general advice to prefer no-think for
-focused work, and it must be fixed before no-think can be used for agent runs.
-Until then, agent work needs thinking on.
+**`--nothink` produces empty output on this machine, and that is disputed.**
+Here it reproduces at 3/3 direct invocations, across `-c` values and with
+sampling passed explicitly, while `--think` works in the same command -- and it
+reproduces on a binary built from `8e9159e`, *before* any of the tool-call work,
+so it is not a regression from these commits. Another environment reports
+no-think working 3/3 on the same branch. Something environmental therefore
+differs and is unresolved; do not treat "no-think is broken" as a property of
+Mellum or of ds4 until a matched n=20 comparison settles it. Prefer no-think if
+it works for you: it is faster and cheaper. Reproduce with
+`tools/mellum/agent-eval/canary.sh`.
+
+**A bounded corrective nudge converts narration into work.**
+`DS4_AGENT_TOOL_NUDGE=N` (default 0) feeds one deterministic correction through
+the tool-result path when a turn executes nothing. On the AgentClinic task with
+the selective artifact, identical fresh workspaces:
+
+| | tool calls | rounds | max prompt | files |
+| --- | ---: | ---: | ---: | ---: |
+| before | 0 | 1 | 1,104 | 0/4 |
+| after (nudge=2, 1 used) | 8 | 10 | 6,079 | 2/4 |
+
+The code it then writes does not run: `from fastapi import RedirectResponse`
+is not a real symbol, so the module fails to import and the test suite errors
+at collection. The nudge buys attempts, not correctness. It lives in C only
+because the wire is not bidirectional yet; scaffolding belongs in the host.
 
 Still unproven: the autonomous loop. On the AgentClinic spec task the model
 narrates intent and produces no files, on Q4_K and Q8_0 alike. Protocol
