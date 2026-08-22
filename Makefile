@@ -1241,6 +1241,8 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-
 	# never reaches it.  Re-run the Metal kernel suite with it enabled: its
 	# batch-equals-decode checks are what hold grouped output bit-exact.
 	DS4_MELLUM_GROUPED_MOE=1 ./ds4_test --metal-kernels
+	DS4_MELLUM_MOE_GEMM=0 ./ds4_test --metal-kernels
+	DS4_MELLUM_DOWN_ROWTILE=1 ./ds4_test --metal-kernels
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args
