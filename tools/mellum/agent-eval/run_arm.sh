@@ -29,11 +29,16 @@ source /tmp/agentclinic-runs/metal_env.sh
 
 cd $RUN
 START=$SECONDS
-$W/ds4-agent --non-interactive ${EXTRA_ARGS:-} \
+$W/ds4-agent --non-interactive -n 8192 ${EXTRA_ARGS:-} \
   -m "$MODEL" -c 32768 \
   --trace $RUN/.agentlogs/trace.txt \
-  -p "$PROMPT" > $RUN/.agentlogs/stdout.log 2>&1
+  -p "$PROMPT" > $RUN/.agentlogs/stdout.log 2>&1 &
+AGENT_PID=$!
+( sleep 180; kill -TERM $AGENT_PID 2>/dev/null ) &
+WATCH_PID=$!
+wait $AGENT_PID
 RC=$?
+kill $WATCH_PID 2>/dev/null
 ELAPSED=$((SECONDS-START))
 
 # ---- deliverables: objective, not judged ----

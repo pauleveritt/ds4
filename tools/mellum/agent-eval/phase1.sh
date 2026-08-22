@@ -46,9 +46,20 @@ Fix any failure and re-run until it passes. Do not finish while it fails.'
 source /tmp/agentclinic-runs/metal_env.sh
 cd $RUN
 START=$SECONDS
-$W/ds4-agent --non-interactive -m "$MODEL" -c 32768 \
-  --trace $RUN/.agentlogs/trace.txt -p "$PROMPT" > $RUN/.agentlogs/stdout.log 2>&1
-RC=$?; ELAPSED=$((SECONDS-START))
+# No timeout(1) on macOS: run in the background, race a watcher against it,
+# and kill whichever process is still standing. 180s is the process wall-clock
+# cap; -n 8192 caps generation length per model call, which is what actually
+# bounds a rambling round -- the process timeout is the backstop if that fails.
+$W/ds4-agent --non-interactive -n 8192 -m "$MODEL" -c 32768 \
+  --trace $RUN/.agentlogs/trace.txt -p "$PROMPT" > $RUN/.agentlogs/stdout.log 2>&1 &
+AGENT_PID=$!
+( sleep 180; kill -TERM $AGENT_PID 2>/dev/null ) &
+WATCH_PID=$!
+wait $AGENT_PID
+RC=$?
+kill $WATCH_PID 2>/dev/null
+ELAPSED=$((SECONDS-START))
+[ $ELAPSED -ge 178 ] && echo "TIMED OUT after ${ELAPSED}s" >> $RUN/.agentlogs/stdout.log
 
 FILES=0; MISSING=""
 for f in app.py templates/base.html templates/home.html tests/test_app.py; do

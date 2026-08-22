@@ -1281,6 +1281,18 @@ static const char agent_glm_syntax_reminder[] =
     "<tool_call>$TOOL_NAME<arg_key>$PARAMETER_NAME</arg_key>"
     "<arg_value>$PARAMETER_VALUE</arg_value></tool_call>\n";
 
+/* Not GLM's <arg_key>/<arg_value> encoding.  A malformed Mellum call was
+ * observed being told to retry in GLM's syntax -- is_tagged covers both, and
+ * the caller used it as a stand-in for "is GLM" -- which the JSON parser then
+ * correctly rejected, burning the retry budget on a host bug rather than a
+ * model mistake. */
+static const char agent_mellum_syntax_reminder[] =
+    "Tool-call syntax reminder: JSON inside <tool_call> tags, not "
+    "<arg_key>/<arg_value>.\n"
+    "<tool_call>\n"
+    "{\"name\": \"$TOOL_NAME\", \"arguments\": {\"$PARAMETER_NAME\": \"$PARAMETER_VALUE\"}}\n"
+    "</tool_call>\n";
+
 #define AGENT_SYSTEM_PROMPT_REMINDER_TOKENS 50000
 
 static char *agent_build_system_prompt_reminder(ds4_engine *engine,
@@ -2244,7 +2256,65 @@ static void agent_mellum_tool_parse(agent_dsml_parser *p) {
  * called after every streamed byte: incomplete input leaves state unchanged
  * until enough bytes arrive, while malformed completed input switches to
  * AGENT_DSML_ERROR so the model gets a retryable tool error. */
+/* A tool call that never terminates is not a big call, it is a runaway.  One
+ * observed Mellum turn began a legitimate write of templates/base.html,
+ * invented Bootstrap SRI hashes, degenerated into repeated tokens, ran to
+ * roughly 26K output tokens without closing the call, and only stopped when
+ * context compaction failed -- losing the whole attempt including work already
+ * completed in earlier rounds.
+ *
+ * Capping the buffer converts that into an ordinary retryable tool error while
+ * the workspace and the earlier rounds survive.  The limit is generous: real
+ * file writes are large, and the failure mode being caught is unbounded, not
+ * merely big. */
+static size_t agent_tool_call_max_bytes(void) {
+    const char *v = getenv("DS4_AGENT_TOOL_CALL_MAX_BYTES");
+    if (v && v[0]) {
+        long n = atol(v);
+        if (n >= 4096) return (size_t)n;
+    }
+    return 65536;
+}
+
+/* Degeneration usually shows up as one short span repeating.  Checking only
+ * the tail keeps this O(1) per byte and catches the repeated-token case well
+ * before the size cap does. */
+static bool agent_dsml_tail_is_degenerate(const agent_dsml_parser *p) {
+    const size_t len = p->raw_len;
+    if (len < 512) return false;
+    for (size_t unit = 1; unit <= 16; unit++) {
+        /* 24 repeats is decisive for a multi-byte unit, but for a short one it
+         * fires on ordinary file content: 24 identical bytes is a markdown rule,
+         * an RST underline, a "====" banner, or a run of padding.  Requiring the
+         * repeated span to also reach 64 bytes keeps those legitimate -- a
+         * 30-dash rule survives -- while still stopping real degeneration within
+         * 64 bytes of onset, against a runaway that reached ~26K tokens. */
+        size_t repeats = (64 + unit - 1) / unit;
+        if (repeats < 24) repeats = 24;
+        const size_t span = unit * repeats;
+        if (len < span) break;
+        const char *tail = p->raw + len - span;
+        bool same = true;
+        for (size_t i = unit; i < span && same; i++)
+            if (tail[i] != tail[i % unit]) same = false;
+        if (same) return true;
+    }
+    return false;
+}
+
 static void agent_dsml_parse(agent_dsml_parser *p) {
+    if (p->state == AGENT_DSML_STRUCTURAL || p->state == AGENT_DSML_PARAM_VALUE) {
+        if (p->raw_len > agent_tool_call_max_bytes()) {
+            agent_dsml_set_error(p, "tool call exceeded the maximum size; "
+                                    "write smaller chunks");
+            return;
+        }
+        if (agent_dsml_tail_is_degenerate(p)) {
+            agent_dsml_set_error(p, "tool call degenerated into repeated "
+                                    "output and was stopped");
+            return;
+        }
+    }
     if (p->syntax == AGENT_TOOL_SYNTAX_MELLUM) {
         agent_mellum_tool_parse(p);
         return;
@@ -7507,6 +7577,73 @@ static void test_agent_mellum_prose_brace_is_not_a_call(void) {
     agent_dsml_parser_free(&p);
 }
 
+static void test_agent_mellum_runaway_is_stopped(void) {
+    /* Degeneration inside a legitimate write must become a retryable error,
+     * not run until context compaction fails and loses the whole attempt. */
+    static char big[9000];
+    size_t n = 0;
+    n += (size_t)snprintf(big + n, sizeof(big) - n,
+                          "<tool_call>\n{\"name\": \"write\", \"arguments\": "
+                          "{\"path\": \"templates/base.html\", \"content\": \"");
+    while (n < sizeof(big) - 8) { memcpy(big + n, "V5", 2); n += 2; }
+    big[n] = '\0';
+    const char *chunks[] = { big };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks, 1, &p, NULL);
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_ERROR);
+    AGENT_TEST_ASSERT(p.calls.len == 0);
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_large_write_still_allowed(void) {
+    /* The guard must not punish a big but legitimate file write. */
+    static char big[9000];
+    size_t n = (size_t)snprintf(big, sizeof(big),
+                                "<tool_call>\n{\"name\": \"write\", \"arguments\": "
+                                "{\"path\": \"templates/base.html\", \"content\": \"");
+    const char *filler = "<div class=\\\"row\\\">content line</div>\\n";
+    while (n < sizeof(big) - 200) {
+        size_t fl = strlen(filler);
+        memcpy(big + n, filler, fl); n += fl;
+    }
+    n += (size_t)snprintf(big + n, sizeof(big) - n, "\"}}\n</tool_call>");
+    big[n] = '\0';
+    const char *chunks[] = { big };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks, 1, &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "write"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_write_with_rule_still_allowed(void) {
+    /* A markdown rule is not degeneration.  At 24 repeats the detector stopped
+     * a legitimate README write the moment a 24-dash rule landed, ~880 bytes
+     * in; the span floor is what keeps ordinary punctuation runs writable.
+     * The filler above varies every line, so it never exercised this. */
+    static char big[9000];
+    size_t n = (size_t)snprintf(big, sizeof(big),
+                                "<tool_call>\n{\"name\": \"write\", \"arguments\": "
+                                "{\"path\": \"README.md\", \"content\": \"");
+    const char *filler = "# Project\\n\\nProse describing the thing at length. ";
+    while (n < sizeof(big) - 200) {
+        size_t fl = strlen(filler);
+        memcpy(big + n, filler, fl); n += fl;
+    }
+    memset(big + n, '-', 30); n += 30;      /* the rule that used to trip it */
+    n += (size_t)snprintf(big + n, sizeof(big) - n, "\"}}\n</tool_call>");
+    big[n] = '\0';
+    const char *chunks[] = { big };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks, 1, &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "write"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
 static void test_agent_mellum_recovers_after_thinking(void) {
     /* Observed verbatim in the n=20 canary: the model reasons, closes
      * </think>, then emits a bare object with a stray closing tag.  Thinking
@@ -7840,6 +7977,9 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_mellum_recovers_missing_open();
     test_agent_mellum_prose_brace_is_not_a_call();
     test_agent_mellum_unknown_tool_is_not_executed();
+    test_agent_mellum_runaway_is_stopped();
+    test_agent_mellum_large_write_still_allowed();
+    test_agent_mellum_write_with_rule_still_allowed();
     test_agent_mellum_recovers_after_thinking();
     test_agent_mellum_wrapper_after_prose_is_not_a_call();
     test_agent_mellum_bare_object_without_close();
@@ -9340,6 +9480,12 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
      * the tool result as a tool message, then ask the model to continue. */
     int nudges_used = 0;
     const int nudge_max = agent_tool_nudge_max();
+    /* An unbounded malformed-call loop is a host bug, not a model property:
+     * nothing previously stopped a turn from re-generating a broken tool call
+     * indefinitely.  Two corrections is enough for the model to recover from
+     * a genuine mistake; beyond that the turn ends rather than looping. */
+    int malformed_used = 0;
+    enum { AGENT_MALFORMED_RETRY_MAX = 2 };
     for (int tool_round = 0; ; tool_round++) {
         if (tool_round > 0 &&
             !agent_worker_compact_if_needed(w, "soft limit before tool continuation",
@@ -9440,6 +9586,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         bool got_tool = false;
         bool malformed_tool = false;
         bool early_tool_error = false;
+        bool length_truncated_tool = false;
         int generated = 0;
         double t0 = now_sec();
         pthread_mutex_lock(&w->mu);
@@ -9544,7 +9691,17 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                     dsml.state == AGENT_DSML_PARAM_VALUE))
         {
             malformed_tool = true;
+            /* generated >= max_tokens means the loop above stopped because it
+             * hit -n, not because the model chose to stop or produced broken
+             * syntax.  That is a host limit cutting the model off mid-call,
+             * not a mistake, and it reads very differently to the model: "you
+             * wrote invalid JSON" versus "you were cut off before you could
+             * finish valid JSON".  Still counts against the same retry
+             * ceiling -- it is still a round that produced nothing. */
+            length_truncated_tool = generated >= max_tokens;
             snprintf(dsml.error, sizeof(dsml.error),
+                     length_truncated_tool ? "tool call truncated at the "
+                     "generation limit before it closed" :
                      agent_tool_syntax_is_tagged(tool_syntax) ?
                      "incomplete tagged tool call" :
                      "incomplete DSML tool call");
@@ -9564,16 +9721,28 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 return 0;
             }
         }
+        if ((malformed_tool || early_tool_error) &&
+            ++malformed_used > AGENT_MALFORMED_RETRY_MAX)
+        {
+            agent_trace(w, "malformed tool call retries exhausted (%d)",
+                       malformed_used - 1);
+            agent_dsml_parser_free(&dsml);
+            agent_set_error(w, "too many malformed tool calls in a row");
+            return 1;
+        }
 
         char *tool_result;
+        /* Only a genuinely executed tool call is role="tool": that is the
+         * only case with a matching tool_call in the model's own history.
+         * The nudge, a preflight error, and a malformed-call error are all
+         * host corrections with no such match, so they go in as role="user" --
+         * see the append site below for what happens when they do not. */
+        bool host_correction = nudge_now || early_tool_error || malformed_tool;
         if (nudge_now) {
             tool_result = xstrdup(
-                "No tool was executed, so nothing has been read or written "
-                "yet. You have working file tools and a real workspace: the "
-                "files named in the request exist on disk and must be read "
-                "with the read tool before you can act on them. Do not "
-                "describe what you would do, and do not invent file "
-                "contents. Emit a tool call now.\n");
+                "Continue the original request. No tool has executed. If it "
+                "refers to workspace files or requests changes, call an "
+                "appropriate tool now. Do not discuss this correction.\n");
         } else if (early_tool_error) {
             agent_buf b = {0};
             agent_buf_puts(&b, "Tool error: ");
@@ -9582,6 +9751,12 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                            "edit old selector failed before new was generated");
             agent_buf_puts(&b, "\n");
             tool_result = agent_buf_take(&b);
+        } else if (malformed_tool && length_truncated_tool) {
+            tool_result = xstrdup(
+                "Your tool call reached the response limit before it closed, "
+                "so nothing was written. Retry with one concise, complete "
+                "canonical JSON tool call and no narration. Write only one "
+                "file.\n");
         } else if (malformed_tool) {
             agent_buf b = {0};
             agent_buf_puts(&b, agent_tool_syntax_is_tagged(tool_syntax) ?
@@ -9589,7 +9764,11 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                            "Tool error: invalid DSML tool call: ");
             agent_buf_puts(&b, dsml.error[0] ? dsml.error : "parse error");
             agent_buf_puts(&b, "\n");
-            agent_buf_puts(&b, agent_tool_syntax_is_tagged(tool_syntax) ?
+            /* Three encodings share "tagged" framing, so the reminder needs
+             * the real syntax, not the binary is_tagged check. */
+            agent_buf_puts(&b, tool_syntax == AGENT_TOOL_SYNTAX_MELLUM ?
+                           agent_mellum_syntax_reminder :
+                           agent_tool_syntax_is_tagged(tool_syntax) ?
                            agent_glm_syntax_reminder :
                            agent_dsml_syntax_reminder);
             tool_result = agent_buf_take(&b);
@@ -9636,7 +9815,14 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             }
         }
-        ds4_chat_append_message(w->engine, &w->transcript, "tool", tool_result);
+        /* The nudge is a host correction, not a tool's output -- appending it
+         * as role="tool" gives the model a tool_response with no matching
+         * tool_call anywhere in its own history.  Observed effect: instead of
+         * calling a tool, it reasons out loud about the anomalous message,
+         * often for many rounds, which is worse than the narration the nudge
+         * was meant to fix. role="user" is what a correction actually is. */
+        ds4_chat_append_message(w->engine, &w->transcript,
+                                host_correction ? "user" : "tool", tool_result);
         free(tool_result);
         agent_dsml_parser_free(&dsml);
 
