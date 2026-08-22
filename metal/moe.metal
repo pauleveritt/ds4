@@ -614,6 +614,107 @@ static inline float ds4_mellum_q8_0_row_dot4(ROW row, device const float *v,
 
 /* The pinned Mellum GGUF is an all-Q8_0 numerical oracle.  Do not reuse the
  * Q4_K pair kernel here: its packed scale/min representation is not Q8_0. */
+/* Q4_K companion to ds4_mellum_q8_0_pair_dot4.
+ *
+ * ds4_glm_q4_K_value unpacks the 6-bit packed scale/min pair once per
+ * *element*, but that pair is constant across each 32-element group, and a
+ * four-element chunk starting on a multiple of four never crosses a group
+ * boundary.  Hoisting the unpack out of the inner loop does the same
+ * arithmetic with a quarter of the scale work, and folding d*sm.x and
+ * dmin*sm.y keeps the per-element association identical to the scalar form
+ * -- (d*sm.x)*q - dmin*sm.y, then * xv -- so results are unchanged.
+ *
+ * Gate and up are walked together so each x[] load serves both rows. */
+static inline void ds4_mellum_q4_K_pair_dot4(device const block_q4_K *gate_row,
+                                             device const block_q4_K *up_row,
+                                             device const float *x,
+                                             uint in_dim, uint tid, uint ntg,
+                                             thread float &acc_gate,
+                                             thread float &acc_up) {
+    for (uint kb = tid * 4u; kb < in_dim; kb += ntg * 4u) {
+        const uint block = kb / QK_K;
+        const uint idx = kb - block * QK_K;
+        const uint group = idx >> 5u;
+        const uint l = idx & 31u;
+        device const block_q4_K *gb = gate_row + block;
+        device const block_q4_K *ub = up_row + block;
+        const uchar2 gsm = get_scale_min_k4_just2((int)group, 0, gb->scales);
+        const uchar2 usm = get_scale_min_k4_just2((int)group, 0, ub->scales);
+        const float gd = (float)gb->d * (float)gsm.x;
+        const float gm = (float)gb->dmin * (float)gsm.y;
+        const float ud = (float)ub->d * (float)usm.x;
+        const float um = (float)ub->dmin * (float)usm.y;
+        const uint byte_off = (group >> 1u) * 32u + l;
+        const uint shift = (group & 1u) * 4u;
+        for (uint j = 0; j < 4u; j++) {
+            const float xv = x[kb + j];
+            const uint gq = (gb->qs[byte_off + j] >> shift) & 0x0Fu;
+            const uint uq = (ub->qs[byte_off + j] >> shift) & 0x0Fu;
+            acc_gate += (gd * (float)gq - gm) * xv;
+            acc_up += (ud * (float)uq - um) * xv;
+        }
+    }
+}
+
+/* Mellum's Q4_K gate/up decode kernel.  Structurally identical to the Q8_0
+ * kernel below -- same 256-thread threadgroup reduction, same mid offset --
+ * so the two remain comparable; only the row type and dot helper differ.
+ * Replaces the use of kernel_glm_q4_K_pair_swiglu_f32, whose scalar inner
+ * loop made Q4_K decode measurably slower than Q8_0. */
+kernel void kernel_mellum_q4_K_pair_swiglu_f32(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *gate,
+        device const char *up,
+        device const float *x,
+        device const int32_t *selected,
+        device const float *weights,
+        device float *mid,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    const uint ntg = 256u;
+    const uint row = tgpig.x;
+    const uint slot = tgpig.y;
+    if (row >= args.mid_dim || slot >= args.n_expert_used) return;
+
+    const int expert = selected[slot];
+    const uint64_t mid_off = (uint64_t)slot * args.mid_dim + row;
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tid == 0u) mid[mid_off] = 0.0f;
+        return;
+    }
+
+    device const block_q4_K *gate_row =
+        (device const block_q4_K *)(gate +
+            (uint64_t)(uint)expert * args.gate_expert_bytes +
+            (uint64_t)row * args.gate_row_bytes);
+    device const block_q4_K *up_row =
+        (device const block_q4_K *)(up +
+            (uint64_t)(uint)expert * args.up_expert_bytes +
+            (uint64_t)row * args.up_row_bytes);
+
+    float acc_gate = 0.0f;
+    float acc_up = 0.0f;
+    ds4_mellum_q4_K_pair_dot4(gate_row, up_row, x, args.in_dim, tid, ntg,
+                              acc_gate, acc_up);
+
+    scratch[tid] = acc_gate;
+    scratch[ntg + tid] = acc_up;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+            scratch[ntg + tid] += scratch[ntg + tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        const float g = scratch[0];
+        mid[mid_off] = g / (1.0f + exp(-g)) * scratch[ntg] * weights[slot];
+    }
+}
+
 kernel void kernel_mellum_q8_0_pair_swiglu_f32(
         constant ds4_metal_glm_routed_moe_args &args,
         device const char *gate,

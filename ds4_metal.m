@@ -239,6 +239,7 @@ static id<MTLComputePipelineState> g_glm_q3_k_down_slots8_bound_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q3_k_down_addr_test_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_pair_swiglu_f32_pipeline;
+static id<MTLComputePipelineState> g_mellum_q4_K_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_down_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_pair_swiglu_batch_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_down_batch_f32_pipeline;
@@ -9865,6 +9866,7 @@ void ds4_gpu_cleanup(void) {
         g_glm_q3_k_down_addr_test_f32_pipeline = nil;
         g_glm_q4_k_down_f32_pipeline = nil;
         g_mellum_q8_0_pair_swiglu_f32_pipeline = nil;
+        g_mellum_q4_K_pair_swiglu_f32_pipeline = nil;
         g_mellum_q8_0_down_f32_pipeline = nil;
         g_mellum_q8_0_pair_swiglu_batch_f32_pipeline = nil;
         g_mellum_q8_0_down_batch_f32_pipeline = nil;

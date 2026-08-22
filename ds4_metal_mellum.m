@@ -951,9 +951,16 @@ int ds4_gpu_mellum_routed_moe_one_tensor(
             model_map, model_size, down_offset, down_bytes, &down_inner);
         if (!gatebuf || !upbuf || !downbuf) return 0;
 
+        /* Mellum's own Q4_K kernel, not GLM's: the GLM one unpacks the
+         * packed scale/min pair per element, which measured ~25% slower than
+         * this model's Q8_0 decode. */
+        if (!g_mellum_q4_K_pair_swiglu_f32_pipeline) {
+            g_mellum_q4_K_pair_swiglu_f32_pipeline =
+                ds4_gpu_get_pipeline("kernel_mellum_q4_K_pair_swiglu_f32");
+        }
         id<MTLComputePipelineState> pair_pipeline = ds4_gpu_hot_pipeline(
-            g_glm_q4_k_pair_swiglu_f32_pipeline,
-            "kernel_glm_q4_K_pair_swiglu_f32");
+            g_mellum_q4_K_pair_swiglu_f32_pipeline,
+            "kernel_mellum_q4_K_pair_swiglu_f32");
         if (!g_mellum_q8_0_down_f32_pipeline) {
             g_mellum_q8_0_down_f32_pipeline =
                 ds4_gpu_get_pipeline("kernel_mellum_q8_0_down_f32");

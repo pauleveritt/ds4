@@ -83,22 +83,25 @@ Measured on this box against the Q8_0 model, arms interleaved, n=5 paired
 
 | | Q8_0 | selective | ratio |
 | --- | ---: | ---: | ---: |
-| Decode (isolated, equal load) | 124.3 t/s | 93.5 t/s | **0.75x** |
+| Decode (isolated, equal load) | ~123 t/s | ~117 t/s | **0.94x** |
 | Session prefill, 6045 tokens | ~341 t/s (layer-major) | ~73 t/s (tokenwise) | **0.21x** |
 | Planned resident, ctx 16384 | 12.10 GiB | 9.40 GiB | -2.70 GiB |
 
-**Both speed numbers are worse, and neither is inherent to Q4_K.**
+Decode was 93.5 t/s (0.75x) until Mellum got its own Q4_K kernel.
+`kernel_glm_q4_K_pair_swiglu_f32` walks elements one at a time through
+`ds4_glm_q4_K_value`, which unpacks the 6-bit packed scale/min pair *per
+element* -- though that pair is constant across each 32-element group.
+`kernel_mellum_q4_K_pair_swiglu_f32` hoists the unpack out of the inner loop
+and walks gate and up together so each `x[]` load serves both rows. Same
+threadgroup reduction, same per-element association, bitwise-identical
+results, ~25% faster.
 
-- Decode is slow because Mellum dispatches `kernel_glm_q4_K_pair_swiglu_f32`
-  (`metal/moe.metal:509`) -- a scalar kernel: one strided thread per element,
-  per-element nibble and scale lookup, threadgroup tree reduction. A SIMD
-  variant, `glm_q4_K_pair_swiglu_simd_f32_impl` (`metal/moe.metal:1306`),
-  already exists and is what GLM uses. Selecting it is the obvious next win,
-  and is wiring rather than a new kernel. For contrast, llama.cpp measures
-  this same file's decode as 6.6% *faster* than Q8_0, so 0.75x is ds4's
-  kernel choice, not the artifact.
-- Prefill is slow because the expert-major batch kernel stages Q8_0 rows and
-  cannot run Q4_K, so these models take the tokenwise sync path.
+The residual ~6% is the inherent cost of nibble extraction, and is close to
+llama.cpp's own finding that Q4_K and Q8_0 land within a few percent here.
+
+Prefill is still slow because the expert-major batch kernel stages Q8_0 rows
+and cannot run Q4_K, so these models take the tokenwise sync path. That is the
+remaining piece.
 
 The memory win is real and is the reason the artifact exists: 9.40 GiB planned
 leaves ~6.6 GiB inside 16 GiB where Q8_0 leaves ~3.9 GiB.

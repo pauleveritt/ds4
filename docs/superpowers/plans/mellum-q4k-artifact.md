@@ -20,12 +20,12 @@ Pieces (1) and (2) are **landed and gated**. Piece (3) is not started.
 | --- | --- |
 | 1. Mixed-layout validation | Done |
 | 2. Q4_K expert gate/up in decode | Done — but wired to the *scalar* kernel |
-| 2b. Select the SIMD Q4_K kernel | **Not started; now the highest-value work** |
+| 2b. Mellum-native Q4_K decode kernel | Done — decode 0.75x to 0.94x |
 | 3. Q4_K expert-major prefill | Not started; tokenwise fallback in place |
 
-Measured, interleaved, n=5 paired: decode **0.75x** Q8_0 (93.5 vs 124.3 t/s),
-session prefill **0.21x** (~73 vs ~341 t/s), planned resident 9.40 vs
-12.10 GiB. The memory win landed; both speed numbers went the wrong way.
+Measured, interleaved, paired: decode **0.94x** Q8_0 (~117 vs ~123 t/s, after
+2b; it was 0.75x before), session prefill **0.21x** (~73 vs ~341 t/s), planned
+resident 9.40 vs 12.10 GiB. Decode is close to parity; prefill is the gap.
 
 ## Piece 2b: select the SIMD Q4_K kernel
 
