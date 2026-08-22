@@ -653,16 +653,49 @@ Written after an adversarial review confirmed §5a. "Shipped" needs all four.
    ratio does not hold, serial at or below 256 so short histories keep their
    exact arithmetic. Interleaved at depth 4,096: **29.1 -> 118.3 t/s**. **Done.**
 2. ~~Prefill: not in any path.~~ **Closed by `d6e4808`.**
-3. **Reach: Mellum opens only under `ds4-agent`**, one session, and
-   `ds4_server.c` has zero Mellum references. Any parallel-agent harness is
-   blocked on this regardless of kernel speed. Days of plumbing; unscoped.
+3. ~~Reach: Mellum opens only under `ds4-agent`.~~ **Closed by `31c8757`.**
+   See 12d.
 4. ~~The branch itself.~~ **Closed by `e3dd644`.** Main merged in; Mellum never
    existed on main, so the conflict surface was adjacency rather than
    semantics. An independent audit of all 320 files main touched found no lost
    work and no main-side regression; the two defects it did find were
    introduced by hand-resolution and are fixed in `58421ee`.
 
-Remaining: **gap 3 only.**
+**All four are closed.** What remains is throughput work, not reach work.
+
+### 12d. Mellum on ds4-server
+
+Three things blocked a parallel-agent harness and **none was a real dependency
+on the agent**:
+
+- The capability was gated on a parameter named `agent_owner`, which never
+  meant "is the agent" — it meant "this host owns resident sessions and can
+  release their KV and sampling state correctly". `ds4-server` qualifies.
+  Renamed to `ds4_engine_open_for_resident_sessions`; `ds4_engine_open_for_agent`
+  remains as a wrapper. Diagnostic opens are still refused.
+- `ds4_sessions_eval_batch` refused Mellum above one item, blocking the
+  server's coalescing decode worker. The refusal predated the ordered fallback
+  and was redundant — `ds4_session_eval` already routes decode-capable Mellum
+  sessions and rejects layout-only ones. Mellum now sits where Laguna sits:
+  excluded from the fused Metal batch (no batched decode graph exists), served
+  by the ordered sequential path.
+- Prompt sync, which gap 2 had already fixed.
+
+Verified by running it, not by reading: `ds4-server -c 8192 --batched-session 2`
+loads the Q8 model, reports two resident sessions, and answers. Two concurrent
+requests were served on separate slots with distinct, correct completions.
+
+**Two caveats that matter for a harness.** Sessions still interleave
+**serially** on the GPU, so N agents *share* the single-stream rate rather
+than multiplying it — genuine scaling needs fused batched decode (12b(c)),
+whose MoE half already exists. And what was verified is concurrency
+*correctness*, not aggregate throughput; there is still no measured N-session
+t/s figure.
+
+**Known gap:** `ds4_server.c` does not parse `chat_template_kwargs`, so
+`enable_thinking: false` is ignored and Mellum answers in thinking mode. On
+this repo's own eval that is 3–4x the output tokens for no measured quality
+gain (12c), which costs a many-session harness far more than a single user.
 
 ## 12b. Batching, and what it would unlock
 
@@ -728,7 +761,10 @@ changes output *format*: the sft3015 snapshot's no-think mode emits
    already-validated 4.9x into something users feel — and makes the headline
    number true.
 
-1. **Head-group the decode attention** (§7a). Split-K is done and banked
+1. **Parse `chat_template_kwargs` in `ds4_server.c`** (12d). Small, and worth
+   3–4x the output tokens on every request a harness makes.
+
+2. **Head-group the decode attention** (§7a). Split-K is done and banked
    (2.1–6.6x). What remains is an **8x redundant KV read**: all eight query
    heads sharing a KV head load the same row. The kernel is now bandwidth-bound
    on issued traffic (268–315 GB/s of ~400) while only a eighth of it is
