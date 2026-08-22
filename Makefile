@@ -436,10 +436,13 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
-	# The Mellum grouped (expert-major) MoE is env-gated, so the default run
-	# never reaches it.  Re-run the Metal kernel suite with it enabled: its
-	# batch-equals-decode checks are what hold grouped output bit-exact.
+	# Every Mellum acceleration is env-gated, so the default run above reaches
+	# none of them.  Re-run the Metal kernel suite once per gated path: the
+	# batch-equals-decode checks are what hold their output within bounds, and
+	# without these the accelerated paths ship untested.
 	DS4_MELLUM_GROUPED_MOE=1 ./ds4_test --metal-kernels
+	DS4_MELLUM_MOE_GEMM=1 ./ds4_test --metal-kernels
+	DS4_MELLUM_MOE_GEMM=1 DS4_MELLUM_DOWN_ROWTILE=1 ./ds4_test --metal-kernels
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args

@@ -999,9 +999,19 @@ static void test_metal_mellum_router_batch(void) {
     ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(logits);
 }
 
-static void test_metal_mellum_gqa_decode(void) {
+/*
+ * Parameterized by cache geometry so the same CPU reference can gate every
+ * decode-attention kernel.  Which one runs is chosen by key_count against the
+ * 256-key threshold, so a case below it exercises the serial kernel and a case
+ * above it exercises whichever accelerated kernel is enabled -- head-grouped by
+ * default, split-K when the GQA ratio does not suit grouping.  Both cases wrap
+ * the ring, because a wrapped cache is where indexing errors actually show up.
+ */
+static void test_metal_mellum_gqa_decode_case(uint32_t cache_cap,
+                                              uint32_t key_start,
+                                              uint32_t key_count,
+                                              float tolerance) {
     const uint32_t n_head = 32u, n_head_kv = 4u, head_dim = 128u;
-    const uint32_t cache_cap = 17u, key_start = 11u, key_count = 13u;
     const uint32_t cache_width = n_head_kv * head_dim;
     const uint64_t q_bytes = (uint64_t)n_head * head_dim * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)cache_cap * cache_width * sizeof(uint16_t);
@@ -1090,13 +1100,30 @@ static void test_metal_mellum_gqa_decode(void) {
             TEST_ASSERT(isfinite(out_host[i]));
             max_abs = fmaxf(max_abs, fabsf(out_host[i] - out_ref[i]));
         }
-        fprintf(stderr, "ds4-test: Mellum ungated GQA decode max_abs=%g\n", max_abs);
-        TEST_ASSERT(max_abs < 2.0e-5f);
+        fprintf(stderr,
+                "ds4-test: Mellum ungated GQA decode cap=%u start=%u keys=%u "
+                "max_abs=%g\n",
+                (unsigned)cache_cap, (unsigned)key_start, (unsigned)key_count,
+                max_abs);
+        TEST_ASSERT(max_abs < tolerance);
     }
     free(out_ref); free(out_host); free(value_host); free(key_host); free(q_host);
     ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(v); ds4_gpu_tensor_free(k);
     ds4_gpu_tensor_free(value_cache);
     ds4_gpu_tensor_free(key_cache); ds4_gpu_tensor_free(q);
+}
+
+static void test_metal_mellum_gqa_decode(void) {
+    /* Short history, wrapped: the serial kernel, which is the bitwise oracle. */
+    test_metal_mellum_gqa_decode_case(17u, 11u, 13u, 2.0e-5f);
+    /*
+     * Past the 256-key threshold and wrapped, so the default grouped kernel
+     * runs -- its cross-workgroup merge, its stats layout and its ring
+     * indexing are otherwise never reached by any test.  The looser bound is
+     * reassociation over 300 keys rather than 13, not a weaker claim: a
+     * dropped stripe or a mis-indexed row moves this by whole units.
+     */
+    test_metal_mellum_gqa_decode_case(1500u, 1400u, 300u, 2.0e-4f);
 }
 
 static void test_metal_mellum_gqa_prefill(void) {
@@ -2446,7 +2473,19 @@ static void test_metal_mellum_q8_q8_routed_moe(void) {
                     printf("ds4-test: Mellum batch-vs-decode token=%u mid_max_abs=%g "
                            "out_max_abs=%g\n", (unsigned)token, (double)mid_diff,
                            (double)out_diff);
-                    if (!getenv("DS4_MELLUM_MOE_GEMM")) {
+                    if (getenv("DS4_MELLUM_MOE_GEMM")) {
+                        /*
+                         * Expert-major reassociates, so it cannot be bitwise --
+                         * but "not bitwise" is not "unchecked".  The observed
+                         * spread on this fixture is 4e-6..8e-6; a bound three
+                         * orders above that still catches a dropped slot, a
+                         * stale partial or a mis-signed accumulator, all of
+                         * which move the result by whole units.
+                         */
+                        TEST_ASSERT(isfinite(mid_diff) && isfinite(out_diff));
+                        TEST_ASSERT(mid_diff < 1e-2f);
+                        TEST_ASSERT(out_diff < 1e-2f);
+                    } else {
                         TEST_ASSERT(mid_diff == 0.0f);
                         TEST_ASSERT(out_diff == 0.0f);
                     }

@@ -36801,6 +36801,17 @@ struct ds4_engine {
     bool metal_ready;
     bool mtp_ready;
     bool share_session_prefill_workspace;
+    /*
+     * One layer-major prefill workspace for the whole engine.  Sessions lease
+     * it for the duration of a sync rather than owning one each: at the
+     * sliding-window width it is ~130 MiB, so eight resident sessions would
+     * otherwise spend about a gigabyte on scratch that only one of them can be
+     * using -- prefill is serialized behind the GPU in-process, and the server
+     * serializes it explicitly.  Allocated at the full width on first use, so
+     * a session that happens to sync a short suffix first does not pin every
+     * later prompt to that chunk size.
+     */
+    struct ds4_mellum_prefill_scratch_s *mellum_prefill_workspace;
 #ifndef DS4_NO_GPU
     bool shared_prefill_workspace_ready;
     ds4_gpu_graph shared_prefill_workspace;
@@ -37200,15 +37211,6 @@ struct ds4_mellum_prefill_scratch_s;
 struct ds4_mellum_session_state {
     ds4_mellum_kv_layout kv;
     ds4_mellum_decode_state *decode;
-    /*
-     * Created on the first sync long enough to be worth it, then reused for
-     * the session's lifetime.  It is per-session rather than engine-owned
-     * because sessions are independent and nothing currently serializes two
-     * of them through one workspace; at a 1,024-token cap it costs on the
-     * order of 120 MB, which is the price of a second concurrent session and
-     * the reason to revisit this if many are ever resident at once.
-     */
-    struct ds4_mellum_prefill_scratch_s *prefill;
     uint32_t ctx_size;
     bool decode_enabled;
     bool interactive_enabled;
@@ -37774,10 +37776,6 @@ static ds4_mellum_session_state *ds4_mellum_session_state_create(
 
 static void ds4_mellum_session_state_free(ds4_mellum_session_state *state) {
     if (!state) return;
-    if (state->prefill) {
-        ds4_mellum_prefill_scratch_free(state->prefill);
-        free(state->prefill);
-    }
     ds4_mellum_decode_state_free(state->decode);
     ds4_mellum_kv_layout_free(&state->kv);
     free(state);
@@ -61500,6 +61498,11 @@ void ds4_engine_sampling_defaults(ds4_engine *e, float *temperature,
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
+    if (e->mellum_prefill_workspace) {
+        ds4_mellum_prefill_scratch_free(e->mellum_prefill_workspace);
+        free(e->mellum_prefill_workspace);
+        e->mellum_prefill_workspace = NULL;
+    }
     if (e->tp.active) {
         ds4_gpu_tp_shutdown();
         const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
@@ -64409,22 +64412,27 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             sync_batch_enabled = !(env && *env && strcmp(env, "0") == 0);
         }
         if (sync_batch_enabled && prompt->len - i >= sync_batch_min_tokens) {
-            if (!s->mellum->prefill) {
-                const uint32_t pending = (uint32_t)(prompt->len - i);
-                uint32_t cap = pending < DS4_N_SWA ? pending : DS4_N_SWA;
-                cap = ds4_mellum_probe_chunk(cap, DS4_N_SWA);
+            if (!s->engine->mellum_prefill_workspace) {
+                /*
+                 * Always the full width, never the width of whichever prompt
+                 * happened to arrive first.  Honour DS4_MELLUM_PREFILL_CHUNK
+                 * so the knob still tunes chunking and cancellation latency.
+                 */
+                const uint32_t cap =
+                    ds4_mellum_probe_chunk(DS4_N_SWA, DS4_N_SWA);
                 struct ds4_mellum_prefill_scratch_s *fresh =
                     xmalloc(sizeof(*fresh));
                 memset(fresh, 0, sizeof(*fresh));
                 if (ds4_mellum_prefill_scratch_create(fresh, cap)) {
-                    s->mellum->prefill = fresh;
+                    s->engine->mellum_prefill_workspace = fresh;
                 } else {
                     /* Fall back to tokenwise rather than failing the sync. */
                     ds4_mellum_prefill_scratch_free(fresh);
                     free(fresh);
                 }
             }
-            ds4_mellum_prefill_scratch *scratch = s->mellum->prefill;
+            ds4_mellum_prefill_scratch *scratch =
+                s->engine->mellum_prefill_workspace;
             while (scratch && i < prompt->len) {
                 /* Cancellation granularity is one chunk here, not one token. */
                 if (ds4_session_cancelled(s)) {
