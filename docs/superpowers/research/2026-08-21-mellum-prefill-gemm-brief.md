@@ -9,8 +9,11 @@ Everything below was measured on one Apple M5 Max unless stated.
 llama.cpp is now instruction-issue bound in one kernel, not bandwidth bound.
 **The one-line surprise:** decode, long believed to be at parity with
 llama.cpp, was only ever measured from an *empty cache*. At depth it collapses
-— 154.5 t/s at depth 0, **57.7 t/s at depth 1,024, 36.3 t/s at depth 4,096.**
-That is the most valuable open problem in this brief.
+**30x** — 154.5 t/s at depth 0, 57.7 at 1K, 15.9 at 16K, **5.1 t/s at 64K** —
+while the comparable Laguna S 2.1 holds 56–68 t/s flat at any depth. The
+sliding-window cap is provably honoured, so this is a per-key kernel
+inefficiency (~75x off bandwidth), not a scheduling bug. **That is the most
+valuable open problem in this brief, and it is bigger than the prefill work.**
 
 ---
 
@@ -201,13 +204,17 @@ A `DS4_MELLUM_PROFILE_DECODE_DEPTH` knob was added (this brief's only
 uncommitted code change, in `ds4.c`) to prime the cache with D tokens before
 the clock starts. The result:
 
-| Decode depth | no-head | t/s |
-| ---: | ---: | ---: |
-| 0 | 6.471 ms | **154.5** |
-| 1,024 | 17.322 ms | **57.7** |
-| 4,096 | 27.535 ms | **36.3** |
+| Decode depth | no-head | t/s | attention share of the step |
+| ---: | ---: | ---: | ---: |
+| 0 | 6.471 ms | **154.5** | 0% |
+| 1,024 | 17.322 ms | **57.7** | 63% |
+| 4,096 | 27.535 ms | **36.3** | 77% |
+| 16,384 | 62.999 ms | **15.9** | 90% |
+| 32,768 | 106.614 ms | **9.4** | 94% |
+| 65,536 | 196.128 ms | **5.1** | 97% |
 
-<!--DECODE_DEEP-->
+**30x from empty cache to 64K.** By 16K the step is 90% attention and the
+whole MoE effort of section 5 is touching a tenth of the cost.
 
 The empty-cache 154.5 t/s is what was being compared against llama.cpp's
 150–155 t/s. **The parity claim does not survive.** llama.cpp's 110–148 t/s
@@ -231,11 +238,29 @@ rewrite is 1–2 days for maybe 2x on short-prompt prefill; decode attention
 looks like a similar effort for a much larger win on the number users feel
 during generation.
 
-Note the sliding window makes a testable prediction: 21 of 28 layers cap their
-scan at 1,024 keys, so past depth 1,024 only the 7 full-attention layers should
-keep growing. Check the deep rows against that. If decay past 1,024 is steeper
-than 7/28 of linear, the sliding-window cap is not being honoured in the decode
-path, and that alone would be the bug.
+### The sliding-window cap is honoured — so that is not the bug
+
+The window makes a testable prediction: 21 of 28 layers cap their scan at 1,024
+keys, so past depth 1,024 only the 7 full-attention layers should keep growing.
+Fit a per-key-layer cost from the 0 -> 1,024 step (378.5 ns) and extrapolate
+both ways:
+
+| Depth | Measured | If cap honoured | If cap ignored | Fit vs honoured |
+| ---: | ---: | ---: | ---: | ---: |
+| 4,096 | 27.5 ms | 25.5 ms | 49.9 ms | 1.08x |
+| 16,384 | 63.0 ms | 58.0 ms | 180.1 ms | 1.09x |
+| 32,768 | 106.6 ms | 101.4 ms | 353.7 ms | 1.05x |
+| 65,536 | 196.1 ms | 188.2 ms | 700.9 ms | 1.04x |
+
+The cap-honoured model tracks within 4–9% across a 16x span; the cap-ignored
+model is off by 3.6x at depth 64K. **The sliding window is working correctly.**
+
+That rules out the cheap explanation and localizes the problem precisely: the
+cost is **378.5 ns per key-layer**, flat, at every depth. The scan length is
+right; the per-key cost is roughly 75x worse than it should be. This is a
+kernel efficiency problem in decode attention, not a scheduling or masking bug.
+Start by reading the decode attention kernel and asking why moving 2 KiB of KV
+costs 378 ns.
 
 ## 8. Comparison against Laguna S 2.1
 
@@ -262,12 +287,15 @@ its decay is slightly gentler. Laguna's golden fixture at 32,768 ctx bursts
 
 ### Decode
 
-| | Laguna S 2.1 | Mellum 2 on ds4 |
-| --- | --- | --- |
-| Shape vs context | **flat** | **decays sharply** |
-| Empty / early | 58–68 t/s | 154.5 t/s |
-| At ~1K | 56–68 t/s | 57.7 t/s |
-| At ~4K | 56–68 t/s | 36.3 t/s |
+| Depth | Laguna S 2.1 | Mellum 2 on ds4 | Mellum vs Laguna |
+| --- | --- | ---: | --- |
+| empty / early | 58–68 t/s | 154.5 t/s | **2.4x faster** |
+| ~1K | 56–68 t/s | 57.7 t/s | parity |
+| ~4K | 56–68 t/s | 36.3 t/s | 1.7x slower |
+| ~16K | 56–68 t/s | 15.9 t/s | **3.9x slower** |
+| ~32K | 56–68 t/s | 9.4 t/s | **6.6x slower** |
+| ~64K | 56–68 t/s | 5.1 t/s | **12x slower** |
+| **shape** | **flat** | **30x decay** | |
 
 **This is the headline of the comparison.** The user described Laguna's
 mechanism precisely: *"prefill collapses with context, decode barely moves —
@@ -276,8 +304,12 @@ that asymmetry is the core mechanism behind the ~7x slowdown."*
 **Mellum on ds4 does not have that asymmetry, and that is bad news, not good.**
 Laguna's flat decode is the *correct* behaviour and the thing that makes a long
 session usable. Mellum on ds4 wins the prefill comparison outright and then
-gives it all back during generation: by 4K of context it is already *below*
-Laguna's decode floor, and Laguna will still be at 56–68 t/s at 92K.
+gives it all back during generation. The crossover is at roughly 1K of context.
+Past that it falls away fast: 3.9x slower at 16K, 12x slower at 64K, while
+Laguna is still sitting at 56–68 t/s at 92K.
+
+Put plainly: on a short prompt Mellum on ds4 is the better experience on both
+axes. On a long session it is worse on the axis the user stares at.
 
 Section 7 argues that decay is a fixable implementation problem, not a property
 of the model. If it is fixed, Mellum on ds4 beats Laguna on both axes. Until it
@@ -383,11 +415,11 @@ Env knobs that exist:
 
 ## 13. Recommended order of work
 
-1. **Decode attention at depth** (§7). Largest measured gap, ~75x off
-   bandwidth on the incremental KV read, and it is the number a user feels
-   during generation. Start by checking whether the sliding-window cap is
-   honoured in the decode path — the 7/28 prediction in §7 is a cheap first
-   test that could turn the whole thing into a one-line fix.
+1. **Decode attention at depth** (§7). Largest measured gap by far: 30x decay
+   to 64K, ~75x off bandwidth on the incremental KV read, 90% of the step by
+   16K, and it is the number a user feels during generation. The sliding-window
+   cap is already confirmed honoured, so go straight to the per-key cost in the
+   decode attention kernel — 378.5 ns to move 2 KiB is the whole problem.
 2. **`simdgroup_float8x8` MoE rewrite**, F32 accumulation preserved (§5). 1–2
    days, closes prefill toward llama.cpp — but note §6: this buys less as
    context grows.
