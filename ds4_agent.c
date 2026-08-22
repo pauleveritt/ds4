@@ -325,8 +325,12 @@ typedef struct {
     bool dsml_in_think;
     bool dsml_in_think_reported;
     /* Any non-space byte already rendered as ordinary prose this turn.  Gates
-     * missing-opener recovery to a response that is nothing but the call. */
+     * recovery to a response that is nothing but the call. */
     bool saw_visible_output;
+    /* saw_visible_output as it stood when the current start-tag candidate
+     * began.  The '<' of the candidate sets saw_visible_output itself, so the
+     * live flag cannot answer "was there prose before this tag?". */
+    bool start_tail_after_prose;
     bool post_think_gap;
     bool tool_preflight_error;
     char tool_preflight_error_msg[256];
@@ -355,6 +359,28 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
                                     bool publish_progress,
                                     char *err, size_t err_len);
 static int agent_read_default_lines(agent_worker *w);
+
+/* Bounded corrective nudge.  Mellum reliably decides to call a tool on a
+ * direct request but often narrates intent on an open-ended task and stops.
+ * When set, a turn that ends having executed nothing gets one deterministic
+ * correction fed back through the ordinary tool-result path, then the loop
+ * continues.  Off by default: this is host-side scaffolding under evaluation,
+ * not settled behaviour, and it belongs in the host once the wire is
+ * bidirectional. */
+static int agent_tool_nudge_max(void) {
+    const char *v = getenv("DS4_AGENT_TOOL_NUDGE");
+    if (!v || !v[0]) return 0;
+    int n = atoi(v);
+    return n < 0 ? 0 : (n > 3 ? 3 : n);
+}
+/* Mellum tool-call recovery helpers, defined with the parser below but needed
+ * by agent_dsml_finish, which precedes it. */
+static const char *agent_json_skip_ws(const char *s, const char *end);
+static bool agent_json_scan_value(const char **sp, const char *end,
+                                  const char **val, size_t *val_len);
+static bool agent_mellum_parse_call_json(agent_dsml_parser *p,
+                                         const char *s, const char *end);
+static bool agent_mellum_tool_name_is_registered(const char *name);
 
 static agent_tool_syntax agent_tool_syntax_for_engine(ds4_engine *engine) {
     if (ds4_engine_is_glm_dsa(engine)) return AGENT_TOOL_SYNTAX_GLM;
@@ -1896,6 +1922,37 @@ static void agent_glm_tool_parse(agent_dsml_parser *p) {
 static void agent_dsml_finish(agent_dsml_parser *p) {
     if (!p || p->state == AGENT_DSML_DONE || p->state == AGENT_DSML_ERROR)
         return;
+
+    /* A bare object recovered without an opener often never gets a closing tag
+     * either, so nothing terminates it mid-stream.  At end of turn the buffer
+     * is final: if what remains is exactly one complete JSON object naming a
+     * registered tool, take it.  Anything less stays incomplete and the worker
+     * turns it into a retry. */
+    if (p->syntax == AGENT_TOOL_SYNTAX_MELLUM &&
+        p->state == AGENT_DSML_STRUCTURAL && !p->glm_after_call &&
+        p->parse_pos < p->raw_len)
+    {
+        const char *raw = p->raw;
+        const char *end = raw + p->raw_len;
+        const char *cur = agent_json_skip_ws(raw + p->parse_pos, end);
+        if (cur < end && *cur == '{') {
+            const char *scan = cur;
+            const char *val = NULL; size_t val_len = 0;
+            if (agent_json_scan_value(&scan, end, &val, &val_len) &&
+                agent_json_skip_ws(scan, end) == end &&
+                agent_mellum_parse_call_json(p, cur, scan) &&
+                agent_mellum_tool_name_is_registered(p->current.name))
+            {
+                agent_tool_calls_push(&p->calls, &p->current);
+                memset(&p->current, 0, sizeof(p->current));
+                p->parse_pos = (size_t)(scan - raw);
+                p->state = AGENT_DSML_DONE;
+                return;
+            }
+            agent_tool_call_free(&p->current);
+            memset(&p->current, 0, sizeof(p->current));
+        }
+    }
     if (!agent_tool_syntax_is_tagged(p->syntax) || !p->glm_after_call)
         return;
 
@@ -4166,10 +4223,15 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
         agent_stream_feed_dsml_byte(sr, c);
         return;
     }
+    const bool was_visible = sr->saw_visible_output;
     if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
         sr->saw_visible_output = true;
 
     if (sr->dsml_start_len || c == start[0]) {
+        /* Capture the state from *before* this byte: the '<' opening the
+         * candidate has already set saw_visible_output above. */
+        if (!sr->dsml_start_len)
+            sr->start_tail_after_prose = was_visible;
         if (sr->dsml_start_len < sizeof(sr->dsml_start_tail))
             sr->dsml_start_tail[sr->dsml_start_len++] = c;
         bool complete = false, implicit_invoke = false;
@@ -4184,8 +4246,17 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
                  * strict and simple.  Also accept a direct invoke opener as an
                  * implicit tool_calls block; the model often knows it wants a
                  * tool but forgets the outer wrapper. */
-                if (sr->syntax == AGENT_TOOL_SYNTAX_MELLUM &&
-                    sr->dsml_start_tail[1] == 't' && sr->dsml_start_len == 7) {
+                /* <tools> is recovery, not canonical syntax, so it carries
+                 * the same whole-response condition as a missing opener: a
+                 * wrapper appearing after prose is prose. <tool_call> is 11
+                 * bytes, <tools> is 7. */
+                bool wrong_wrapper = sr->syntax == AGENT_TOOL_SYNTAX_MELLUM &&
+                                     sr->dsml_start_len == 7;
+                if (wrong_wrapper && sr->start_tail_after_prose) {
+                    agent_stream_flush_start_tail(sr);
+                    return;
+                }
+                if (wrong_wrapper) {
                     agent_trace(sr->renderer->worker,
                                 "mellum tool recovered_wrong_wrapper");
                 }
@@ -4268,6 +4339,12 @@ static void agent_stream_text(agent_stream_renderer *sr, const char *text, size_
             renderer_write(sr->renderer, "\n", 1);
             sr->renderer->last_output_newline = true;
             sr->post_think_gap = true;
+            /* The answer starts here.  Recovery is gated on the call being the
+             * whole response, and for a thinking model "the response" is what
+             * follows </think> -- otherwise reasoning text disqualifies every
+             * call the model then emits without a wrapper, which is exactly
+             * the case observed in the canary. */
+            sr->saw_visible_output = false;
             i += strlen(think_close);
             continue;
         }
@@ -7430,6 +7507,70 @@ static void test_agent_mellum_prose_brace_is_not_a_call(void) {
     agent_dsml_parser_free(&p);
 }
 
+static void test_agent_mellum_recovers_after_thinking(void) {
+    /* Observed verbatim in the n=20 canary: the model reasons, closes
+     * </think>, then emits a bare object with a stray closing tag.  Thinking
+     * text must not disqualify it. */
+    const char *chunks[] = {
+        "<think>I should use the read tool with max_lines 1.</think>\n",
+        "{\"name\": \"read\", \"arguments\": {\"path\": \"Makefile\", \"max_lines\": 1}}\n</tool_call>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "read"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "path"), "Makefile"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_wrapper_after_prose_is_not_a_call(void) {
+    /* <tools> is recovery, so it carries the whole-response condition too.
+     * Prose that happens to mention the wrapper must stay prose. */
+    const char *chunks[] = {
+        "Use the wrapper like <tools>{\"name\": \"read\", \"arguments\": {\"path\": \"x\"}}</tools>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 0);
+    AGENT_TEST_ASSERT(strstr(out, "Use the wrapper like") != NULL);
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_bare_object_without_close(void) {
+    /* Recovered bare objects often never get a closing tag; finalization has
+     * to take a complete object or the call is silently lost. */
+    const char *chunks[] = {
+        "{\"name\": \"read\", \"arguments\": {\"path\": \"Makefile\"}}",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "read"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "path"), "Makefile"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_bare_object_incomplete_stays_incomplete(void) {
+    /* Truncated output must not be completed by guesswork. */
+    const char *chunks[] = {
+        "{\"name\": \"read\", \"arguments\": {\"path\": \"Make",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 0);
+    AGENT_TEST_ASSERT(p.state != AGENT_DSML_DONE);
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
 static void test_agent_mellum_unknown_tool_is_not_executed(void) {
     /* An unrecognised name means we misread the output.  Fail to a retry
      * rather than dispatch something the host cannot run. */
@@ -7699,6 +7840,10 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_mellum_recovers_missing_open();
     test_agent_mellum_prose_brace_is_not_a_call();
     test_agent_mellum_unknown_tool_is_not_executed();
+    test_agent_mellum_recovers_after_thinking();
+    test_agent_mellum_wrapper_after_prose_is_not_a_call();
+    test_agent_mellum_bare_object_without_close();
+    test_agent_mellum_bare_object_incomplete_stays_incomplete();
     test_agent_glm_stream_ignores_tool_inside_think();
     test_agent_glm_stream_greedy_sampling_boundaries();
     test_agent_dsml_stream_tool_call_chunked();
@@ -9193,6 +9338,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
      * real stopping conditions.  The transcript is the single source of truth:
      * after a DSML stanza completes we terminate that assistant message, append
      * the tool result as a tool message, then ask the model to continue. */
+    int nudges_used = 0;
+    const int nudge_max = agent_tool_nudge_max();
     for (int tool_round = 0; ; tool_round++) {
         if (tool_round > 0 &&
             !agent_worker_compact_if_needed(w, "soft limit before tool continuation",
@@ -9405,14 +9552,29 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
         agent_worker_append_assistant_turn_end(w);
 
+        bool nudge_now = false;
         if (!got_tool && !malformed_tool && !early_tool_error) {
-            agent_dsml_parser_free(&dsml);
-            agent_set_status(w, AGENT_WORKER_IDLE);
-            return 0;
+            if (nudges_used < nudge_max) {
+                nudges_used++;
+                nudge_now = true;
+                agent_trace(w, "tool nudge %d/%d", nudges_used, nudge_max);
+            } else {
+                agent_dsml_parser_free(&dsml);
+                agent_set_status(w, AGENT_WORKER_IDLE);
+                return 0;
+            }
         }
 
         char *tool_result;
-        if (early_tool_error) {
+        if (nudge_now) {
+            tool_result = xstrdup(
+                "No tool was executed, so nothing has been read or written "
+                "yet. You have working file tools and a real workspace: the "
+                "files named in the request exist on disk and must be read "
+                "with the read tool before you can act on them. Do not "
+                "describe what you would do, and do not invent file "
+                "contents. Emit a tool call now.\n");
+        } else if (early_tool_error) {
             agent_buf b = {0};
             agent_buf_puts(&b, "Tool error: ");
             agent_buf_puts(&b, stream.tool_preflight_error_msg[0] ?
