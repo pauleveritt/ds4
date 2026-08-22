@@ -207,19 +207,24 @@ the session path changed that: its prefill arm now genuinely goes through the
 batch kernels, it reads 0.019, and on the loose setting it **failed** its bound
 at 0.89 before the default was changed. It is a real gate for the first time.
 
-## 5d. The original finding, kept for context
+## 5d. The original finding — HISTORICAL, superseded by 5a and 5b
+
+**Everything in this section describes the state before `d6e4808`.** It is kept
+because it explains what the older numbers elsewhere in this brief mean. Where
+it says session prefill is tokenwise, that was true then and is not true now.
+Read 5b for current behaviour.
 
 **The batched prefill measured in this brief is not wired into any session
 path.** `ds4_mellum_prefill_chunks()` (`ds4.c:61802`) has exactly four callers
-and all four are the resident profile or probes. The real session path,
-`ds4_session_sync_internal` (`ds4.c:63315`), is tokenwise autoregressive and
-says so itself at `ds4.c:63327`:
+and all four were the resident profile or probes. The real session path,
+`ds4_session_sync_internal`, *was* tokenwise autoregressive and said so itself:
 
 > "This is still tokenwise autoregressive prefill, not the later multi-token
 > graph."
 
-Its `sync_batch_tokens = 32` batches *command submission*, not computation.
-Every kernel there runs with `n_tokens = 1`. Three consequences:
+Its `sync_batch_tokens = 32` batched *command submission*, not computation, so
+every kernel there ran with `n_tokens = 1`. Three consequences, all since
+addressed:
 
 1. **No user experienced 941 t/s.** A session prefilled at decode speed.
 2. **`DS4_MELLUM_MOE_GEMM` is a no-op for real sessions.** It only affects
@@ -573,12 +578,32 @@ The user's actual target. Status: **marginal, not settled.**
 
 - Q8_0 is 12.3 GiB. On a 16 GB machine that leaves ~3.7 GiB for the OS, KV
   cache, and everything else. Tight to infeasible at useful context.
-- The official Q4_K_M mix was verified tensor by tensor: **155 Q4_K, 141 F32,
-  15 Q6_K, 14 Q8_0, 14 Q5_0** (all `ffn_down_exps`). So ds4 needs real
-  **Q4_K, Q6_K, and Q5_0 kernels** — this is not a 14-tensor patch. That work
-  does not exist yet.
-- A 9.33 GiB selective-precision artifact is the proposed target and has not
-  been built.
+- **All Mellum validation to date is Q8-only** (`ds4.c:5373`). The Q4_K/Q8
+  primitive that exists has a synthetic test caller and no model-backed one.
+
+### Two different artifacts — do not conflate them
+
+Earlier drafts of this brief listed "Q4_K, Q6_K and Q5_0 kernels" as one piece
+of work. That is the shopping list for the *official* artifact, and it is the
+wrong one to start with.
+
+| | Official Q4_K_M, 7.52 GiB | Selective, 9.33 GiB |
+| --- | --- | --- |
+| Expert gate/up | Q4_K | Q4_K |
+| Expert down | Q5_0 | **kept Q8** |
+| Output head | Q6_K | **kept Q8** |
+| Control paths | Q4_K | **kept Q8** |
+| ds4 needs | Q4_K control paths, Q6_K output, Q5_0 down | **Q4_K expert gate/up only** |
+
+**Build the selective 9.33 GiB artifact first.** It matches the stated quality
+preference — it deliberately keeps Q8 where precision is cheap and matters —
+and it needs *one* new integration rather than three. Q6_K and Q5_0 are only
+required if byte-compatibility with the official GGUF becomes a goal, which it
+currently is not.
+
+Scope for the selective artifact: mixed-layout validation, Q4_K/Q8 decode
+dispatch, expert-major Q4_K prefill, artifact construction, and quality gates
+measured **relative to Q8** rather than in absolute terms.
 - ds4 has `--simulate-used-memory NGB`, which wires memory properly. **Use
   that.** A naive zero-filled ballast is compressible and macOS will squash it
   instead of the model, invalidating the test. (A homemade ballast also once
@@ -707,10 +732,10 @@ whose MoE half already exists. And what was verified is concurrency
 *correctness*, not aggregate throughput; there is still no measured N-session
 t/s figure.
 
-**Known gap:** `ds4_server.c` does not parse `chat_template_kwargs`, so
-`enable_thinking: false` is ignored and Mellum answers in thinking mode. On
-this repo's own eval that is 3–4x the output tokens for no measured quality
-gain (12c), which costs a many-session harness far more than a single user.
+~~**Known gap:** `ds4_server.c` does not parse `chat_template_kwargs`.~~
+**Closed by `6f41ba7`**, tested in `fef8e1c`. `enable_thinking: false` is
+honoured on both request shapes, and an explicit `thinking`/`think` field
+outranks it from either side of the JSON object.
 
 ## 12b. Batching, and what it would unlock
 
@@ -810,36 +835,51 @@ and which are scaffolding from a period when none of this reached a session.
 
 ## 13. Recommended order of work
 
-0. **Wire `ds4_mellum_prefill_chunks` into `ds4_session_sync`** (§5a). Medium-
-   easy, ~1–2 days, no new kernels: `ds4_mellum_prefill_tokens` already drives
-   the same `ds4_mellum_decode_state` a session owns, already caps chunks at
-   the sliding window, and already advances position and fills logits. Do it
-   with `DS4_MELLUM_PREFILL_EXACT` on first so the batch-vs-decode result
-   stays bit-identical, measure, then relax. This converts an already-built,
-   already-validated 4.9x into something users feel — and makes the headline
-   number true.
+Rewritten after an external review; the previous version listed finished work
+as pending and numbered itself twice. **Done** items are kept only so nobody
+re-derives them.
 
-1. ~~Parse `chat_template_kwargs`.~~ **Done, `6f41ba7`.**
+**Done:** prefill wired into the session path (`d6e4808`), decode split-K and
+head grouping shipped and defaulted (`3c2b379`, `ce757c7`, `290005e`),
+`ds4-server` hosting Mellum (`31c8757`), `chat_template_kwargs` (`6f41ba7`),
+merge from main (`e3dd644`), gates for the accelerated paths and an
+engine-owned workspace (`806603c`, `fef8e1c`).
 
-2. **Collapse the kernel and flag matrix** (12e). Grouped dominates split-K
-   everywhere measured, so one kernel, one flag and two reachable
-   configurations can go. Worth doing before anything else is layered on top,
-   and a good first task for a reviewer.
+1. **Collapse the flag matrix** (12e). Gates now exist for every reachable
+   decode configuration, so this can be done safely. Remove
+   `DS4_MELLUM_GROUPED_MOE` outright — it is superseded. Split-K,
+   `DS4_MELLUM_ATTN_OVERDISPATCH` and `DS4_MELLUM_DOWN_ROWTILE` are all
+   candidates to go with it. **Keep the serial attention kernel** as the
+   short-history bitwise oracle the probes compare against.
 
-3. **Head-group the decode attention** (§7a). Split-K is done and banked
-   (2.1–6.6x). What remains is an **8x redundant KV read**: all eight query
-   heads sharing a KV head load the same row. The kernel is now bandwidth-bound
-   on issued traffic (268–315 GB/s of ~400) while only a eighth of it is
-   useful. `kernel_laguna_attention_decode_gqa3_split_f16` is a working
-   three-wide version of exactly this. Cheaper than item 2 and, on current
-   evidence, worth more.
-2. **`simdgroup_float8x8` MoE rewrite**, F32 accumulation preserved (§5). 1–2
-   days, closes prefill toward llama.cpp — but note §6: this buys less as
-   context grows.
-3. **Q4_K / Q6_K / Q5_0 kernels**, then build and measure the 9.33 GiB
-   artifact under `--simulate-used-memory 16GB` (§10). This is the one that
-   actually answers the user's stated goal.
-4. Ship the resident Q8 path on 32 GB+ machines meanwhile; it works today.
+2. **Decide the production numerics policy.** Exact projections plus
+   expert-major GEMM is the candidate: 2.9x with 0.09% relative rms on logits,
+   comfortably inside the model's own 0.26% error against FP32. Its drift is
+   small but has only been measured on fixtures — **confirm with greedy
+   transcripts and the task eval at n>=3 before enabling it by default**. Keep
+   the bitwise configuration as a diagnostic oracle, not as a second product
+   personality to maintain.
+
+3. **Build the selective 9.33 GiB artifact** (§10). This is the stated goal and
+   it needs **Q4_K expert gate/up only** — not Q6_K, not Q5_0, which belong to
+   the official artifact and should not be started unless byte-compatibility
+   becomes a goal. Scope: mixed-layout validation, Q4_K/Q8 decode dispatch,
+   expert-major Q4_K prefill, artifact construction, Q8-relative quality gates.
+   Note all Mellum validation today is Q8-only (`ds4.c:5373`).
+
+4. **Register-cache the eight queries in the gqa8 inner loop.** The reload is
+   visible inside the key loop (`metal/laguna.metal:907`) and the kernel is
+   bandwidth-bound on issued traffic, so the headroom is real — but benchmark
+   register pressure, because 8 heads x (float4 + 2 scalars) is already 48
+   floats per lane. A bounded optimization, **not** the 16 GB deliverable.
+
+5. **Measure N-session throughput only if `ds4-server` is the intended host.**
+   `ds4-agent` remains single-session (12d), so that number does not by itself
+   answer an integrated-agent goal.
+
+**Deliberately not recommended:** the `simdgroup_float8x8` MoE rewrite. It
+improves the component that shrinks as context grows (§6), costs 1–2 days plus
+a new numerics story, and does nothing for decode.
 
 ## 14. Commit trail
 
@@ -857,3 +897,11 @@ and which are scaffolding from a period when none of this reached a session.
 | `3c2b379` | split-K decode attention |
 | `418dadf` | split-K hardening after review; curve to 64K |
 | `ce757c7` | head-grouped (gqa8) decode attention |
+| `0557a85` | corrected the record: prefill was in no session path |
+| `290005e` | faster decode attention made the default |
+| `e3dd644` | merge from main; `58421ee` fixed two hand-resolution defects |
+| `d6e4808` | **layer-major prefill wired into the session path** |
+| `31c8757` | `ds4-server` hosts Mellum; concurrent sessions verified |
+| `6f41ba7` | `chat_template_kwargs`, and a correction to `31c8757`'s claim |
+| `806603c` | gates for the accelerated paths; engine-owned workspace |
+| `fef8e1c` | `chat_template_kwargs` tests; server tests given a build rule |
