@@ -160,7 +160,54 @@ The remaining route is a `simdgroup_float8x8` rewrite, keeping F32
 accumulation. Estimated 1–2 days. That is the single highest-value prefill
 work item left, and it is what closes the band to llama.cpp's ~4,300 t/s.
 
-## 5a. READ THIS BEFORE QUOTING ANY PREFILL NUMBER
+## 5a. FIXED — but read this before quoting any prefill number
+
+**Resolved in `d6e4808`.** Layer-major prefill is now wired into
+`ds4_session_sync_internal`, so a session reaches the batch kernels. The
+history below is kept because it explains what the older numbers in this brief
+mean, and section 5b carries what a session actually gets.
+
+### 5b. What a session actually gets
+
+Measured on a real 1,030-token session sync via `DS4_MELLUM_SYNC_TRACE`,
+interleaved, two rounds:
+
+| Configuration | t/s | vs shipped | logits max_abs | layer 27 |
+| --- | ---: | ---: | ---: | --- |
+| tokenwise (what shipped before) | 120 | 1x | — | — |
+| layer-major, exact projections **(default)** | 162–173 | **1.4x** | 0.019 | **bitwise** |
+| layer-major, exact, `DS4_MELLUM_MOE_GEMM=1` | 351–358 | 2.9x | 0.101 | 0.906 |
+| layer-major, loose, `DS4_MELLUM_MOE_GEMM=1` | 528–530 | 4.4x | ~0.89 | 0.906 |
+
+**Do not read the 1.4x as disappointing, and do not read it as the point.**
+The MoE is ~96.8% of prefill cost, so layer-major batching alone barely moves
+it. What the wiring actually bought is that `DS4_MELLUM_MOE_GEMM` is reachable
+from a session **at all** — the 2.9x and 4.4x rows did not exist before, at
+any flag setting. The flag was a no-op for real work because the session path
+called the one-token MoE entry.
+
+**Exact projections are now the default** (`DS4_MELLUM_PREFILL_EXACT=0` opts
+out). Batched Q8 projections dequantize weights *and* activations to half,
+which against sequential decode over 1,030 tokens costs max_abs 0.89 on logits
+of scale 21.8. Exact brings that to 0.019 and makes the true-prefill probe
+bitwise — worst layer 0.0, where it read 0.286 before. It costs about half the
+throughput and is the right trade for a shipped session.
+
+**Still below the headline.** Even the loosest session configuration measures
+529 t/s against the 941 t/s the resident profile reports. Session bookkeeping
+and a 1,030-token span needing a second 6-token chunk account for part; a
+quieter machine accounts for the rest. **Quote 355 t/s for a realistic
+session, not 941.**
+
+### 5c. A probe stopped being tautological
+
+Section 9 records that the SWA boundary probe reported `max_abs=0` regardless
+of what decode did, because both of its arms ran decode. Wiring prefill into
+the session path changed that: its prefill arm now genuinely goes through the
+batch kernels, it reads 0.019, and on the loose setting it **failed** its bound
+at 0.89 before the default was changed. It is a real gate for the first time.
+
+## 5d. The original finding, kept for context
 
 **The batched prefill measured in this brief is not wired into any session
 path.** `ds4_mellum_prefill_chunks()` (`ds4.c:61802`) has exactly four callers
@@ -174,8 +221,7 @@ says so itself at `ds4.c:63327`:
 Its `sync_batch_tokens = 32` batches *command submission*, not computation.
 Every kernel there runs with `n_tokens = 1`. Three consequences:
 
-1. **No user experiences 941 t/s.** A session prefills at decode speed. A 4K
-   prompt takes tens of seconds where the layer-major path would take ~6 s.
+1. **No user experienced 941 t/s.** A session prefilled at decode speed.
 2. **`DS4_MELLUM_MOE_GEMM` is a no-op for real sessions.** It only affects
    `ds4_gpu_mellum_q8_0_routed_moe_batch_tensor`; the session path calls
    `..._routed_moe_one_tensor`. The flag changes nothing a user runs.
@@ -189,8 +235,8 @@ The decode numbers are **not** affected: `ds4_mellum_decode_token` is the real
 session path, so split-K and head grouping are user-visible. They currently
 also speed up session "prefill", because that is just decode in a loop.
 
-Wiring this in is assessed as medium-easy, roughly 1–2 days, and is the
-cheapest large win available in this codebase. See section 13.
+This was assessed as medium-easy and took well under the estimated 1–2 days.
+See 5b for what it actually bought.
 
 ## 6. Prefill vs context — the decay curve
 
@@ -565,7 +611,10 @@ Env knobs that exist:
 
 | Variable | Effect |
 | --- | --- |
-| `DS4_MELLUM_MOE_GEMM` | expert-major MoE prefill (default off; **no-op in real sessions**, see §5a) |
+| `DS4_MELLUM_MOE_GEMM` | expert-major MoE prefill (default off; **now reachable from a session**, worth 2.9x — see §5b) |
+| `DS4_MELLUM_PREFILL_EXACT` | row-exact prefill projections (**default ON** since `d6e4808`; 0 is faster and looser) |
+| `DS4_MELLUM_SYNC_BATCH` | 0 forces the old tokenwise session sync; the only way to A/B the two |
+| `DS4_MELLUM_SYNC_TRACE` | report which sync path ran, and its throughput |
 | `DS4_MELLUM_ATTN_GROUP` | head-grouped decode attention (**default ON**, set 0 to disable) |
 | `DS4_MELLUM_ATTN_SPLIT` | split-K decode attention (**default ON**, set 0 to disable) |
 | `DS4_MELLUM_ATTN_OVERDISPATCH` | test hook: over-size the split launch |
@@ -596,24 +645,24 @@ Env knobs that exist:
 
 Written after an adversarial review confirmed §5a. "Shipped" needs all four.
 
+0. **Prefill: wired in.** `commit d6e4808`. See 5b. **Done.**
 1. **Decode: in the shipped path, and now on by default.** `commit 290005e`.
    `ds4_mellum_decode_token` was always the real session path, so split-K and
    head grouping were only ever an env var away from users. The default now
    picks per `key_count`: grouped above 256 keys, split-K where the 8:1 GQA
    ratio does not hold, serial at or below 256 so short histories keep their
    exact arithmetic. Interleaved at depth 4,096: **29.1 -> 118.3 t/s**. **Done.**
-2. **Prefill: not in any path.** §5a. Medium-easy, ~1–2 days, plan in §13.
+2. ~~Prefill: not in any path.~~ **Closed by `d6e4808`.**
 3. **Reach: Mellum opens only under `ds4-agent`**, one session, and
    `ds4_server.c` has zero Mellum references. Any parallel-agent harness is
    blocked on this regardless of kernel speed. Days of plumbing; unscoped.
-4. **The branch itself.** `mellum-2.1-overnight` diverged from `main` at
-   `efdadd41`; main is **50 commits ahead**, including an upstream merge
-   carrying "Metal routed/indexed prefill acceleration, MXFP4" — which may
-   touch the same Metal dispatch surfaces, and may partly duplicate gap 2.
-   Nothing ships from a stale worktree branch, and the merge cost grows daily.
+4. ~~The branch itself.~~ **Closed by `e3dd644`.** Main merged in; Mellum never
+   existed on main, so the conflict surface was adjacency rather than
+   semantics. An independent audit of all 320 files main touched found no lost
+   work and no main-side regression; the two defects it did find were
+   introduced by hand-resolution and are fixed in `58421ee`.
 
-Suggested order: 1 (done) -> 4 (rebase before divergence compounds, and to see
-whether upstream already did some of 2) -> 2 -> 3.
+Remaining: **gap 3 only.**
 
 ## 12b. Batching, and what it would unlock
 
