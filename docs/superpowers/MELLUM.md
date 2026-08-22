@@ -114,48 +114,62 @@ only way to answer this.
 
 ## Tool calling in ds4-agent
 
-**Mellum does not emit tool calls today.** Three integration bugs were fixed
-and the model still answers in prose; treat agentic use as unproven.
+**Mellum calls tools.** An earlier revision of this document claimed it could
+not; that was wrong, and the error was methodological -- it concluded from
+three runs of a full spec-implementation task, which also demands planning and
+a long autonomous loop. A forced one-tool canary is the right instrument and
+separates protocol compliance from agent competence. Keep them as separate
+scores.
 
-What was wrong, and is now fixed:
+Forced canary, n=20, Q8_0, thinking on, JetBrains sampling: "read Makefile and
+report its first line".
+
+| Outcome | Runs |
+| --- | ---: |
+| canonical `<tool_call>` | 17 |
+| recovered (wrong wrapper) | 1 |
+| no call at all | 2 |
+| parse errors | 0 |
+| **tool actually executed** | **18/20** |
+
+Three integration bugs had to be fixed first:
 
 - `agent_tool_syntax_for_engine` had no Mellum branch, so Mellum fell through
-  to `AGENT_TOOL_SYNTAX_DSML` -- DeepSeek's markup, for which Mellum has no
-  tokens at all (its vocab has `<tool_call>`=29, `</tool_call>`=30,
-  `<tool_response>`=31, `<|im_start|>`=27, and zero DSML markers).
-- Because DSML is not "tagged", the tools prompt was tokenized by
-  `ds4_tokenize_rendered_chat` as raw text, so it arrived with no
-  `<|im_start|>system ... <|im_end|>` framing at all.
-- `ds4_engine_sampling_defaults` had no Mellum branch, leaving it at
-  temperature 1.0 / top_p 1.0 instead of JetBrains' 0.6 / 0.95 / top_k 20.
+  to `AGENT_TOOL_SYNTAX_DSML` -- DeepSeek markup for which it has no tokens
+  (its vocab has `<tool_call>`=29, `</tool_call>`=30, `<tool_response>`=31,
+  `<|im_start|>`=27, and zero DSML markers).
+- Because DSML is not "tagged", the tools prompt was tokenized as raw text and
+  arrived with no `<|im_start|>system ... <|im_end|>` framing at all.
+- `ds4_engine_sampling_defaults` had no Mellum branch, leaving temperature 1.0
+  / top_p 1.0 instead of JetBrains' 0.6 / 0.95 / top_k 20.
 
-Mellum's own chat template specifies Hermes-style calls -- a JSON object with
-`name` and `arguments` inside `<tool_call>` tags, the format vLLM serves with
+Mellum's chat template specifies Hermes-style calls -- JSON with `name` and
+`arguments` inside `<tool_call>` tags, what vLLM serves with
 `--tool-call-parser hermes` -- *not* GLM's `<arg_key>`/`<arg_value>`. Routing
-Mellum to the GLM syntax would have been worse than the bug: the GLM parser
-scans a tool name up to the next `<`, and JSON has none until `</tool_call>`,
-so it would push a call whose name is the entire payload, then loop on
-unknown-tool errors. `AGENT_TOOL_SYNTAX_MELLUM` and a JSON parser were added
-instead, covered by unit tests that need no GPU.
+Mellum to the GLM syntax would have been worse than the original bug: that
+parser scans a tool name up to the next `<`, and JSON has none until
+`</tool_call>`, so it would dispatch a call named after the entire payload.
 
-What is still unresolved: with a correct, ChatML-framed 4,302-character tools
-prompt confirmed in the token trace, the model narrates its intent and never
-emits `<tool_call>`. Measured on the AgentClinic spec task:
+**The model is reliable about deciding to call a tool and unreliable about the
+wrapper.** The detector therefore accepts `<tools>{...}</tools>` and a bare
+object that opens the response, seeding a canonical `<tool_call>` so the parser
+stays strict -- the same trick the DSML detector already used for its
+missing-bar typo. Recovery is deliberately narrow: the object must open the
+whole response (a brace mid-prose stays prose) and must name a registered tool,
+or it becomes a retryable error rather than a dispatch.
 
-| Arm | tool calls | files created |
-| --- | ---: | ---: |
-| Q4_K, thinking | 0 | 0/4 |
-| Q8_0, thinking | 0 | 0/4 |
-| Q4_K, `--nothink` | 0 | 0/4 |
+**`--nothink` currently generates nothing.** With the `<think>\n\n</think>`
+prefill the model emits EOS immediately: 20/20 empty responses, zero generated
+tokens in the trace. That contradicts the general advice to prefer no-think for
+focused work, and it must be fixed before no-think can be used for agent runs.
+Until then, agent work needs thinking on.
 
-**Q8_0 behaves identically, so this is not the selective artifact and not
-quantization.** `--nothink` visibly improves the framing ("Let me start by
-examining the files") without producing a call. Remaining suspects, untested:
-the second generic system message appended after the tools prompt; feeding
-tools through the chat template's own `tools` parameter rather than a
-hand-written prompt; and the plain possibility that a 12B-A2.5B
-completion-oriented model is weak at agentic tool use. Run the Q8_0 control
-before attributing any future tool-calling change to quantization.
+Still unproven: the autonomous loop. On the AgentClinic spec task the model
+narrates intent and produces no files, on Q4_K and Q8_0 alike. Protocol
+compliance is solved; agent competence at 2.5B active parameters is not, and
+host-side scaffolding is the more promising lever than further parser work.
+**Q8_0 behaves identically throughout, so none of this is the selective
+artifact.**
 
 ## Hosts
 

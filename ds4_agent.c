@@ -324,6 +324,9 @@ typedef struct {
     agent_dsml_marker_detector think_dsml;
     bool dsml_in_think;
     bool dsml_in_think_reported;
+    /* Any non-space byte already rendered as ordinary prose this turn.  Gates
+     * missing-opener recovery to a response that is nothing but the call. */
+    bool saw_visible_output;
     bool post_think_gap;
     bool tool_preflight_error;
     char tool_preflight_error_msg[256];
@@ -2060,7 +2063,11 @@ static bool agent_mellum_parse_call_json(agent_dsml_parser *p,
             char *name = NULL; size_t name_len = 0;
             s = agent_json_skip_ws(s, end);
             if (!agent_json_read_string(&s, end, &name, &name_len)) { free(key); return false; }
-            agent_tool_call_free(&p->current);
+            /* Replace only the name.  agent_tool_call_free would also drop the
+             * argument vector, which silently emptied every call that put
+             * "arguments" before "name" -- a legal JSON ordering the model
+             * does use. */
+            free(p->current.name);
             p->current.name = xstrndup(name, name_len);
             free(name);
             have_name = true;
@@ -2106,6 +2113,20 @@ static bool agent_mellum_parse_call_json(agent_dsml_parser *p,
     return have_name;
 }
 
+/* Recovery executes a call the model framed wrongly, so it must be a call we
+ * can actually run.  An unrecognised name means we misread the output, not
+ * that the model invented a tool -- fail it to a retry rather than dispatch. */
+static bool agent_mellum_tool_name_is_registered(const char *name) {
+    static const char *const known[] = {
+        "bash", "bash_status", "bash_stop", "read", "more", "write",
+        "edit", "search", "list", "google_search", "visit_page",
+    };
+    if (!name || !name[0]) return false;
+    for (size_t i = 0; i < sizeof(known)/sizeof(known[0]); i++)
+        if (!strcmp(name, known[i])) return true;
+    return false;
+}
+
 static void agent_mellum_tool_parse(agent_dsml_parser *p) {
     static const char start[] = "<tool_call>";
     static const char close[] = "</tool_call>";
@@ -2137,15 +2158,27 @@ static void agent_mellum_tool_parse(agent_dsml_parser *p) {
             return;
         }
 
-        const char *call_end = strstr(cur, close);
+        /* The detector seeds a canonical <tool_call> even when the model used
+         * <tools> or omitted the opener, so the close it eventually writes may
+         * not match.  Accept either, taking whichever arrives first. */
+        static const char close_alt[] = "</tools>";
+        const char *e1 = strstr(cur, close);
+        const char *e2 = strstr(cur, close_alt);
+        const char *call_end = (!e1 || (e2 && e2 < e1)) ? e2 : e1;
+        size_t close_len = (call_end == e2 && e2) ? sizeof(close_alt) - 1
+                                                  : sizeof(close) - 1;
         if (!call_end) return;  /* wait for the rest of the call */
         if (!agent_mellum_parse_call_json(p, cur, call_end)) {
-            agent_dsml_set_error(p, "malformed JSON in Mellum <tool_call>");
+            agent_dsml_set_error(p, "malformed JSON in Mellum tool call");
+            return;
+        }
+        if (!agent_mellum_tool_name_is_registered(p->current.name)) {
+            agent_dsml_set_error(p, "Mellum tool call names an unknown tool");
             return;
         }
         agent_tool_calls_push(&p->calls, &p->current);
         memset(&p->current, 0, sizeof(p->current));
-        p->parse_pos = (size_t)(call_end - raw) + sizeof(close) - 1;
+        p->parse_pos = (size_t)(call_end - raw) + close_len;
         p->glm_after_call = true;
     }
 }
@@ -3998,12 +4031,25 @@ static bool agent_stream_dsml_start_match(agent_tool_syntax syntax,
                                           bool *implicit_invoke) {
     if (agent_tool_syntax_is_tagged(syntax)) {
         static const char glm_call[] = "<tool_call>";
-        size_t form_len = sizeof(glm_call) - 1;
         *complete = false;
         *implicit_invoke = false;
+        size_t form_len = sizeof(glm_call) - 1;
         if (len <= form_len && memcmp(glm_call, tail, len) == 0) {
             *complete = len == form_len;
             return true;
+        }
+        /* Mellum reliably decides to call a tool but is unreliable about the
+         * wrapper: observed variants include <tools>{...}</tools> and a bare
+         * object.  Accept the wrapper here and seed the canonical opener, the
+         * same trick the DSML detector uses for its missing-bar typo, so the
+         * parser downstream stays strict. */
+        if (syntax == AGENT_TOOL_SYNTAX_MELLUM) {
+            static const char tools_open[] = "<tools>";
+            size_t alt_len = sizeof(tools_open) - 1;
+            if (len <= alt_len && memcmp(tools_open, tail, len) == 0) {
+                *complete = len == alt_len;
+                return true;
+            }
         }
         return false;
     }
@@ -4106,6 +4152,23 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
         return;
     }
 
+    /* Missing opener: Mellum sometimes emits the JSON object with no
+     * <tool_call> in front, occasionally closing with </tool_call> anyway.
+     * Recover only when the brace opens the whole response -- a brace in the
+     * middle of prose is prose.  agent_dsml_start seeds the canonical opener,
+     * so the parser never sees the irregular form. */
+    if (sr->syntax == AGENT_TOOL_SYNTAX_MELLUM && !sr->dsml_active &&
+        !sr->dsml_start_len && !sr->saw_visible_output && !sr->in_think &&
+        c == '{')
+    {
+        agent_trace(sr->renderer->worker, "mellum tool recovered_missing_open");
+        agent_stream_start_dsml(sr, sr->in_think);
+        agent_stream_feed_dsml_byte(sr, c);
+        return;
+    }
+    if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
+        sr->saw_visible_output = true;
+
     if (sr->dsml_start_len || c == start[0]) {
         if (sr->dsml_start_len < sizeof(sr->dsml_start_tail))
             sr->dsml_start_tail[sr->dsml_start_len++] = c;
@@ -4121,6 +4184,11 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
                  * strict and simple.  Also accept a direct invoke opener as an
                  * implicit tool_calls block; the model often knows it wants a
                  * tool but forgets the outer wrapper. */
+                if (sr->syntax == AGENT_TOOL_SYNTAX_MELLUM &&
+                    sr->dsml_start_tail[1] == 't' && sr->dsml_start_len == 7) {
+                    agent_trace(sr->renderer->worker,
+                                "mellum tool recovered_wrong_wrapper");
+                }
                 agent_stream_start_dsml(sr, sr->in_think);
                 if (sr->syntax == AGENT_TOOL_SYNTAX_DSML && implicit_invoke) {
                     for (size_t i = 0; i < sizeof(canonical_invoke) - 1; i++)
@@ -7304,6 +7372,79 @@ static void test_agent_mellum_stream_malformed_json(void) {
     agent_dsml_parser_free(&p);
 }
 
+static void test_agent_mellum_args_before_name(void) {
+    /* Legal JSON ordering the model actually produces.  This emptied the
+     * argument vector before the name handler stopped freeing the call. */
+    const char *chunks[] = {
+        "<tool_call>\n{\"arguments\": {\"path\": \"Makefile\"}, \"name\": \"read\"}\n</tool_call>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "read"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "path"), "Makefile"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_recovers_wrong_wrapper(void) {
+    const char *chunks[] = {
+        "<tools>{\"name\": \"read\", \"arguments\": {\"path\": \"Makefile\"}}</tools>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "read"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "path"), "Makefile"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_recovers_missing_open(void) {
+    const char *chunks[] = {
+        "{\"name\": \"read\", \"arguments\": {\"path\": \"Makefile\"}}\n</tool_call>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "read"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_prose_brace_is_not_a_call(void) {
+    /* The guard: recovery is for a response that IS the call.  A brace after
+     * prose must stay prose, or ordinary output containing JSON gets eaten. */
+    const char *chunks[] = {
+        "Here is the config: {\"name\": \"read\", \"arguments\": {\"path\": \"x\"}}\n",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 0);
+    AGENT_TEST_ASSERT(strstr(out, "Here is the config") != NULL);
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_unknown_tool_is_not_executed(void) {
+    /* An unrecognised name means we misread the output.  Fail to a retry
+     * rather than dispatch something the host cannot run. */
+    const char *chunks[] = {
+        "<tool_call>\n{\"name\": \"launch_missiles\", \"arguments\": {}}\n</tool_call>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_ERROR);
+    AGENT_TEST_ASSERT(p.calls.len == 0);
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
 static void test_agent_glm_stream_ignores_tool_inside_think(void) {
     const char *chunks[] = {
         "<think>plan <tool",
@@ -7553,6 +7694,11 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_mellum_stream_tool_call_escapes();
     test_agent_mellum_stream_two_calls();
     test_agent_mellum_stream_malformed_json();
+    test_agent_mellum_args_before_name();
+    test_agent_mellum_recovers_wrong_wrapper();
+    test_agent_mellum_recovers_missing_open();
+    test_agent_mellum_prose_brace_is_not_a_call();
+    test_agent_mellum_unknown_tool_is_not_executed();
     test_agent_glm_stream_ignores_tool_inside_think();
     test_agent_glm_stream_greedy_sampling_boundaries();
     test_agent_dsml_stream_tool_call_chunked();
