@@ -765,6 +765,49 @@ shape**, so no-think is the right default for focused tasks. Note it also
 changes output *format*: the sft3015 snapshot's no-think mode emits
 `<tool_call>` JSON rather than fenced code.
 
+## 12e. Complexity worth reviewing: three decode kernels and a 2x2 prefill matrix
+
+**Flagged for a reviewer specifically.** The performance work landed as
+opt-outs layered on opt-ins, and the configuration surface is now larger than
+the thing it configures. Nobody has audited whether all of it needs to exist.
+
+### Three decode-attention kernels, two flags, one threshold
+
+| Kernel | When it runs | Flag |
+| --- | --- | --- |
+| `kernel_mellum_attention_decode_gqa_f16` (serial) | `key_count <= 256`, or both accelerations off | — |
+| `kernel_mellum_attention_decode_gqa_split_f16` (split-K) | `key_count > 256` and the 8:1 GQA ratio does not hold | `DS4_MELLUM_ATTN_SPLIT=0` disables |
+| `kernel_mellum_attention_decode_gqa8_split_f16` (head-grouped) | `key_count > 256` and `n_head == n_head_kv * 8` | `DS4_MELLUM_ATTN_GROUP=0` disables |
+
+Three kernels, two env flags and a key-count threshold give **six reachable
+combinations**, and the test matrix is not covered at that width — the gates
+are run at the default and at full opt-out, not at the four in between.
+
+**The obvious simplification: grouped dominates split-K at every depth
+measured** (125.9 vs 122.7 t/s at 1K, 90.6 vs 67.0 at 16K, and grouped is
+never behind). Split-K exists only for a GQA ratio Mellum does not have. So
+either fold split-K into the grouped kernel as its `group == 1` case, or drop
+it and let non-8:1 ratios fall to serial. Either removes a kernel, a flag and
+two combinations. Split-K also has an over-dispatch safety path
+(`DS4_MELLUM_ATTN_OVERDISPATCH`) that exists only to make its own defensive
+branch testable — that goes too.
+
+The serial kernel should stay. It is the bitwise reference the short-history
+path depends on, and it is what the probes compare against.
+
+### A 2x2 prefill matrix
+
+`DS4_MELLUM_PREFILL_EXACT` x `DS4_MELLUM_MOE_GEMM` gives four configurations
+with materially different speed *and* accuracy (see 5b). Only two are
+defensible: the default (exact, no GEMM — bitwise at layer level) and
+exact+GEMM (2.9x, 0.09% relative rms). The loose configurations exist mostly
+because the flags were added independently, and `DS4_MELLUM_MOE_GEMM` was a
+no-op for sessions when it was written, so nobody had to decide.
+
+Add `DS4_MELLUM_SYNC_BATCH` and `DS4_MELLUM_SYNC_TRACE`, and Mellum now has
+**eight** environment switches. A reviewer should ask which are load-bearing
+and which are scaffolding from a period when none of this reached a session.
+
 ## 13. Recommended order of work
 
 0. **Wire `ds4_mellum_prefill_chunks` into `ds4_session_sync`** (§5a). Medium-
@@ -776,10 +819,14 @@ changes output *format*: the sft3015 snapshot's no-think mode emits
    already-validated 4.9x into something users feel — and makes the headline
    number true.
 
-1. **Parse `chat_template_kwargs` in `ds4_server.c`** (12d). Small, and worth
-   3–4x the output tokens on every request a harness makes.
+1. ~~Parse `chat_template_kwargs`.~~ **Done, `6f41ba7`.**
 
-2. **Head-group the decode attention** (§7a). Split-K is done and banked
+2. **Collapse the kernel and flag matrix** (12e). Grouped dominates split-K
+   everywhere measured, so one kernel, one flag and two reachable
+   configurations can go. Worth doing before anything else is layered on top,
+   and a good first task for a reviewer.
+
+3. **Head-group the decode attention** (§7a). Split-K is done and banked
    (2.1–6.6x). What remains is an **8x redundant KV read**: all eight query
    heads sharing a KV head load the same row. The kernel is now bandwidth-bound
    on issued traffic (268–315 GB/s of ~400) while only a eighth of it is
