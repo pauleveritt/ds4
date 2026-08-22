@@ -34105,7 +34105,15 @@ int ds4_gpu_mellum_gqa_decode_tensor(
          * groups) and additionally fetches each K/V row once for the whole
          * group.  Partials go through the generic FlashAttention reduce.
          */
-        if (ds4_gpu_mellum_attn_group_enabled() &&
+        /*
+         * Below the threshold the grouped path is all cost: it would dispatch
+         * a 32-workgroup kernel plus a 1024-thread reduce to score a handful
+         * of keys, and it reassociates the softmax where the serial kernel is
+         * still bitwise exact.  Short histories therefore keep the same
+         * arithmetic they have always had, which is the property the split
+         * kernel advertises and this one should not quietly drop.
+         */
+        if (ds4_gpu_mellum_attn_group_enabled() && key_count > 256u &&
             n_head == n_head_kv * DS4_MELLUM_GROUP_HEADS) {
             const uint32_t ncpsg = 32u;
             const uint32_t nwg = 32u;

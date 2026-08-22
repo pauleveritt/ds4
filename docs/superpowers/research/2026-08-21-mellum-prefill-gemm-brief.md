@@ -160,6 +160,38 @@ The remaining route is a `simdgroup_float8x8` rewrite, keeping F32
 accumulation. Estimated 1–2 days. That is the single highest-value prefill
 work item left, and it is what closes the band to llama.cpp's ~4,300 t/s.
 
+## 5a. READ THIS BEFORE QUOTING ANY PREFILL NUMBER
+
+**The batched prefill measured in this brief is not wired into any session
+path.** `ds4_mellum_prefill_chunks()` (`ds4.c:61802`) has exactly four callers
+and all four are the resident profile or probes. The real session path,
+`ds4_session_sync_internal` (`ds4.c:63315`), is tokenwise autoregressive and
+says so itself at `ds4.c:63327`:
+
+> "This is still tokenwise autoregressive prefill, not the later multi-token
+> graph."
+
+Its `sync_batch_tokens = 32` batches *command submission*, not computation.
+Every kernel there runs with `n_tokens = 1`. Three consequences:
+
+1. **No user experiences 941 t/s.** A session prefills at decode speed. A 4K
+   prompt takes tens of seconds where the layer-major path would take ~6 s.
+2. **`DS4_MELLUM_MOE_GEMM` is a no-op for real sessions.** It only affects
+   `ds4_gpu_mellum_q8_0_routed_moe_batch_tensor`; the session path calls
+   `..._routed_moe_one_tensor`. The flag changes nothing a user runs.
+3. **The Laguna prefill comparison in section 8 is not like-for-like.**
+   Laguna's `ds4_session_sync_internal` really does call
+   `laguna_graph_forward_batch` (`ds4.c:63474`), so Laguna's prefill numbers
+   are a shipped path. Mellum's are a lab capability. Section 8 is annotated
+   accordingly — do not quote it without that caveat.
+
+The decode numbers are **not** affected: `ds4_mellum_decode_token` is the real
+session path, so split-K and head grouping are user-visible. They currently
+also speed up session "prefill", because that is just decode in a loop.
+
+Wiring this in is assessed as medium-easy, roughly 1–2 days, and is the
+cheapest large win available in this codebase. See section 13.
+
 ## 6. Prefill vs context — the decay curve
 
 `DS4_MELLUM_PROFILE_PREFILL_TOKENS=N ./ds4 --mellum-resident-profile`,
@@ -318,6 +350,12 @@ harness. Treat the shapes as comparable and the absolute values as loose.
 
 ### Prefill
 
+**Not like-for-like — see section 5a.** Laguna's figures come from its real
+session path. Mellum's come from a probe harness with no session-path
+consumer, so the Mellum column is what the kernels *can* do, not what a user
+gets today. A Mellum session currently prefills at the decode rates in the
+next table.
+
 | Context depth | Laguna S 2.1 | Mellum 2 on ds4 (marginal) |
 | --- | ---: | ---: |
 | ~3.4K | 300–360 t/s | ~575 t/s |
@@ -328,8 +366,10 @@ harness. Treat the shapes as comparable and the absolute values as loose.
 | ~92.5K | 41–46 t/s | not measured |
 | **spread** | **~7x** (3.4K→92.5K) | **5.9x** (0→64K) |
 
-Mellum prefill is **~1.4–2.4x faster than Laguna at every depth measured**, and
-its decay is slightly gentler. Laguna's golden fixture at 32,768 ctx bursts
+Mellum's prefill *kernels* are ~1.4–2.4x faster than Laguna's shipped prefill
+at every depth measured, with slightly gentler decay — but Laguna's number is
+one a user gets and Mellum's is not, so this row is a statement about
+potential, not about the product. Laguna's golden fixture at 32,768 ctx bursts
 145–155 t/s early; Mellum's 16K–32K marginal is 236 t/s.
 
 ### Decode
@@ -467,6 +507,15 @@ Env knobs that exist:
 
 ## 13. Recommended order of work
 
+0. **Wire `ds4_mellum_prefill_chunks` into `ds4_session_sync`** (§5a). Medium-
+   easy, ~1–2 days, no new kernels: `ds4_mellum_prefill_tokens` already drives
+   the same `ds4_mellum_decode_state` a session owns, already caps chunks at
+   the sliding window, and already advances position and fills logits. Do it
+   with `DS4_MELLUM_PREFILL_EXACT` on first so the batch-vs-decode result
+   stays bit-identical, measure, then relax. This converts an already-built,
+   already-validated 4.9x into something users feel — and makes the headline
+   number true.
+
 1. **Head-group the decode attention** (§7a). Split-K is done and banked
    (2.1–6.6x). What remains is an **8x redundant KV read**: all eight query
    heads sharing a KV head load the same row. The kernel is now bandwidth-bound
@@ -494,4 +543,7 @@ Env knobs that exist:
 | `21c6c70` | float4 vectorization, 3.9x |
 | `75d438e` | tail-tile clamp; bucket-distinctness precondition |
 | `1f55c59` | prefill-width knob; recorded negative results |
-| *uncommitted* | `DS4_MELLUM_PROFILE_DECODE_DEPTH` in `ds4.c` (§7) |
+| `083bb88` | `DS4_MELLUM_PROFILE_DECODE_DEPTH`; decode measured at depth |
+| `3c2b379` | split-K decode attention |
+| `418dadf` | split-K hardening after review; curve to 64K |
+| `ce757c7` | head-grouped (gqa8) decode attention |
