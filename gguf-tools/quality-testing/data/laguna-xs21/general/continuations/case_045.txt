@@ -1,0 +1,1 @@
+Using a single large Metal buffer can be less efficient than multiple overlapping views due to several key factors related to memory management,

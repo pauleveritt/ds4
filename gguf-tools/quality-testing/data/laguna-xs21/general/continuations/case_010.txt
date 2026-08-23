@@ -1,0 +1,1 @@
+L'inserimento in un B-tree segue un processo strutturato per mantenere le proprietà

@@ -132,6 +132,12 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
  * we cannot reference ds4_tensor_range there — those stubs are guarded
  * by !DS4_NO_GPU below. */
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* Decode-island graph capture is CUDA-only; Metal decodes eagerly. */
+int ds4_gpu_decode_graphs_supported(void) { return 0; }
+int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { (void)key; return -1; }
+int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
+void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
+void ds4_gpu_decode_graphs_invalidate(void) {}
 int ds4_gpu_set_current_device(int logical_tier) { (void)logical_tier; return -1; }
 int ds4_gpu_set_current_device_fenced(int logical_tier) { (void)logical_tier; return -1; }
 void ds4_gpu_enable_q8_dequant_gemm(void) {}
@@ -475,67 +481,9 @@ enum {
     DS4_DFLASH_CACHE_CAP      = 512,
 };
 
-typedef enum {
-    DS4_MODEL_FAMILY_DEEPSEEK4 = 0,
-    DS4_MODEL_FAMILY_GLM_DSA   = 1,
-    DS4_MODEL_FAMILY_LAGUNA    = 2,
-} ds4_model_family;
-
-typedef enum {
-    DS4_VARIANT_FLASH = 0,
-    DS4_VARIANT_PRO   = 1,
-    DS4_VARIANT_GLM52 = 2,
-    DS4_VARIANT_LAGUNA_S21 = 3,
-} ds4_variant;
-
-typedef struct {
-    const char *name;
-    ds4_model_family family;
-    ds4_variant variant;
-    uint32_t n_layer;
-    uint32_t n_embd;
-    uint32_t n_vocab;
-    uint32_t n_head;
-    uint32_t n_head_kv;
-    uint32_t n_head_dim;
-    uint32_t n_value_dim;
-    uint32_t n_rot;
-    uint32_t n_out_group;
-    uint32_t n_lora_q;
-    uint32_t n_lora_o;
-    uint32_t n_expert;
-    uint32_t n_expert_used;
-    uint32_t n_expert_shared;
-    uint32_t n_ff_exp;
-    uint32_t n_ff_shared;
-    uint32_t n_ff_dense;
-    uint32_t n_hash_layer;
-    uint32_t n_swa;
-    uint32_t n_indexer_head;
-    uint32_t n_indexer_head_dim;
-    uint32_t n_indexer_top_k;
-    uint32_t n_hc;
-    uint32_t n_hc_sinkhorn_iter;
-    uint32_t n_nextn_predict;
-    uint32_t n_leading_dense;
-    uint32_t n_kv_lora;
-    uint32_t n_key_mla;
-    uint32_t n_value_mla;
-    uint32_t n_rot_swa;
-    float rms_eps;
-    float hc_eps;
-    float expert_weight_scale;
-    float swiglu_clamp_exp;
-    float rope_freq_base;
-    float rope_scale_factor;
-    float rope_yarn_beta_fast;
-    float rope_yarn_beta_slow;
-    float rope_yarn_attn_factor;
-    float rope_freq_base_swa;
-    float compress_rope_freq_base;
-    uint64_t context_length;
-    uint64_t rope_orig_ctx;
-} ds4_shape;
+/* ds4_model_family, ds4_variant, and ds4_shape live in ds4.h: tests link
+ * against ds4.o and need the type definitions plus the extern shape
+ * constants declared there to verify per-variant constants directly. */
 
 static const ds4_shape DS4_SHAPE_FLASH = {
     .name = "DeepSeek V4 Flash",
@@ -666,7 +614,7 @@ static const ds4_shape DS4_SHAPE_GLM52 = {
     .rope_orig_ctx = 1048576,
 };
 
-static const ds4_shape DS4_SHAPE_LAGUNA_S21 = {
+const ds4_shape DS4_SHAPE_LAGUNA_S21 = {
     .name = "Laguna S 2.1",
     .family = DS4_MODEL_FAMILY_LAGUNA,
     .variant = DS4_VARIANT_LAGUNA_S21,
@@ -674,6 +622,8 @@ static const ds4_shape DS4_SHAPE_LAGUNA_S21 = {
     .n_embd = 3072,
     .n_vocab = 100352,
     .n_head = 72,
+    .n_head_global = 48,
+    .n_head_swa = 72,
     .n_head_kv = 8,
     .n_head_dim = 128,
     .n_value_dim = 128,
@@ -698,6 +648,85 @@ static const ds4_shape DS4_SHAPE_LAGUNA_S21 = {
     .context_length = 262144,
     .rope_orig_ctx = 8192,
 };
+
+const ds4_shape DS4_SHAPE_LAGUNA_XS21 = {
+    .name = "Laguna XS 2.1",
+    .family = DS4_MODEL_FAMILY_LAGUNA,
+    .variant = DS4_VARIANT_LAGUNA_XS21,
+    .n_layer = 40,
+    .n_embd = 2048,
+    .n_vocab = 100352,
+    .n_head = 64,            /* majority/SWA value, mirrors S21's n_head=72 */
+    .n_head_global = 48,     /* head_count array [48,64,64,64] x10 */
+    .n_head_swa = 64,
+    .n_head_kv = 8,
+    .n_head_dim = 128,
+    .n_value_dim = 128,
+    .n_rot = 64,
+    .n_expert = 256,
+    .n_expert_used = 8,
+    .n_expert_shared = 1,
+    .n_ff_exp = 512,
+    .n_ff_shared = 512,
+    .n_ff_dense = 8192,
+    .n_swa = 512,
+    .n_leading_dense = 1,    /* 39 sparse layers, 9984 routed experts */
+    .n_rot_swa = 128,
+    .rms_eps = 1.0e-6f,
+    .expert_weight_scale = 2.5f,
+    .rope_freq_base = 500000.0f,
+    .rope_scale_factor = 32.0f,
+    .rope_yarn_beta_fast = 64.0f,
+    .rope_yarn_beta_slow = 1.0f,
+    .rope_yarn_attn_factor = 1.0f,
+    .rope_freq_base_swa = 10000.0f,
+    .context_length = 262144,
+    .rope_orig_ctx = 8192,
+};
+
+/* Loader-only in this step. Mellum's graph deliberately does not reuse the
+ * Laguna path: its all-sparse layers have no attention gate, router bias,
+ * leading dense block, or shared expert. */
+const ds4_shape DS4_SHAPE_MELLUM2 = {
+    .name = "Mellum 2",
+    .family = DS4_MODEL_FAMILY_MELLUM,
+    .variant = DS4_VARIANT_MELLUM2,
+    .n_layer = 28,
+    .n_embd = 2304,
+    .n_vocab = 98304,
+    .n_head = 32,
+    .n_head_global = 32,
+    .n_head_swa = 32,
+    .n_head_kv = 4,
+    .n_head_dim = 128,
+    .n_value_dim = 128,
+    .n_rot = 128,
+    .n_expert = 64,
+    .n_expert_used = 8,
+    .n_ff_dense = 7168,
+    .n_ff_exp = 896,
+    .n_swa = 1024,
+    .rms_eps = 1.0e-6f,
+    .expert_weight_scale = 1.0f,
+    .rope_freq_base = 500000.0f,
+    .rope_scale_factor = 16.0f,
+    .rope_yarn_beta_fast = 32.0f,
+    .rope_yarn_beta_slow = 1.0f,
+    .rope_yarn_attn_factor = 1.2772589f,
+    .rope_freq_base_swa = 500000.0f,
+    .context_length = 131072,
+    .rope_orig_ctx = 8192,
+};
+
+bool ds4_mellum_layer_uses_sliding_attention(uint32_t layer_index) {
+    return layer_index < DS4_SHAPE_MELLUM2.n_layer &&
+           (layer_index & 3u) != 3u;
+}
+
+bool ds4_mellum_layer_uses_yarn_rope(uint32_t layer_index) {
+    return layer_index < DS4_SHAPE_MELLUM2.n_layer &&
+           !ds4_mellum_layer_uses_sliding_attention(layer_index);
+}
 
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
@@ -808,9 +837,11 @@ static int g_ds4_lock_fd = -1;
  *   - Q4_K routed experts in the high-memory variant
  *   - Q5_K/Q6_K GLM routed experts
  *   - IQ2_XXS routed gate/up experts
+ *   - MXFP4 routed experts preserved from native checkpoints
  *   - Q8_K temporary activation blocks for dot products
  */
 #define QK_K 256
+#define QK_MXFP4 32
 
 typedef struct {
     uint8_t  scales[QK_K / 16];
@@ -859,6 +890,11 @@ typedef struct {
     uint16_t qs[QK_K / 8];
 } block_iq2_xxs;
 
+typedef struct {
+    uint8_t e;
+    uint8_t qs[QK_MXFP4 / 2];
+} block_mxfp4;
+
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
 DS4_STATIC_ASSERT(ds4_block_q3_k_size, sizeof(block_q3_K) == 110);
@@ -867,6 +903,7 @@ DS4_STATIC_ASSERT(ds4_block_q5_k_size, sizeof(block_q5_K) == 176);
 DS4_STATIC_ASSERT(ds4_block_q6_k_size, sizeof(block_q6_K) == 210);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
+DS4_STATIC_ASSERT(ds4_block_mxfp4_size, sizeof(block_mxfp4) == 17);
 
 typedef struct {
     uint32_t ctx_size;
@@ -2114,6 +2151,7 @@ static const gguf_type_info gguf_types[] = {
     [28] = {"f64",      1,   8},
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
+    [39] = {"mxfp4",   32,  17},
 };
 
 enum {
@@ -2130,6 +2168,7 @@ enum {
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
+    DS4_TENSOR_MXFP4    = 39,
 };
 
 typedef struct {
@@ -2421,6 +2460,10 @@ static void model_prefetch_cpu_mapping(const ds4_model *m) {
 /* Read the GGUF metadata table.  Values stay in the mmap; we store offsets so
  * later validation can decode only the keys it needs. */
 static void parse_metadata(ds4_model *m, ds4_cursor *c) {
+    /* n_kv comes from the header. Every entry consumes at least one byte in the
+     * file, so a count larger than the bytes remaining cannot be real; reject it
+     * before calloc so a tiny file can't request an enormous allocation. */
+    if (m->n_kv > c->size - c->pos) ds4_die("GGUF metadata count exceeds file size");
     m->kv = calloc((size_t)m->n_kv, sizeof(m->kv[0]));
     if (!m->kv) ds4_die("out of memory while allocating metadata table");
 
@@ -2451,6 +2494,10 @@ static void parse_metadata(ds4_model *m, ds4_cursor *c) {
 /* Read the tensor directory and convert relative GGUF offsets to absolute
  * mmap offsets.  Tensor bytes are still never copied here. */
 static void parse_tensors(ds4_model *m, ds4_cursor *c) {
+    /* As in parse_metadata: each tensor directory entry needs at least one byte
+     * in the file, so reject a count larger than the bytes remaining before the
+     * allocation. */
+    if (m->n_tensors > c->size - c->pos) ds4_die("GGUF tensor count exceeds file size");
     m->tensors = calloc((size_t)m->n_tensors, sizeof(m->tensors[0]));
     if (!m->tensors) ds4_die("out of memory while allocating tensor table");
 
@@ -2562,6 +2609,7 @@ static void print_size(uint64_t bytes) {
 #define DS4_DSPARK_MAX_TARGET_LAYERS 8
 #define DS4_DSPARK_MAX_STAGES 8
 #define DS4_DSPARK_MAX_BLOCK_SIZE 16
+#define DS4_SPEC_PREFIX_SLOTS 4
 
 typedef struct {
     uint32_t stages;
@@ -2794,6 +2842,16 @@ static void model_summary(const ds4_model *m) {
     if (!model_get_u32(m, "deepseek4.expert_group_used_count", &n_group_used)) {
         model_get_u32(m, "glm-dsa.expert_group_used_count", &n_group_used);
     }
+    if (ds4_streq(arch, "mellum")) {
+        model_get_u32(m, "mellum.block_count", &layers);
+        model_get_u64_compat(m, "mellum.context_length", &ctx_train);
+        model_get_u32(m, "mellum.attention.head_count", &n_head);
+        model_get_u32(m, "mellum.attention.head_count_kv", &n_head_kv);
+        model_get_u32(m, "mellum.attention.key_length", &head_dim);
+        model_get_u32(m, "mellum.attention.sliding_window", &n_swa);
+        model_get_u32(m, "mellum.expert_count", &n_expert);
+        model_get_u32(m, "mellum.expert_used_count", &n_expert_used);
+    }
 
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         tensor_bytes += m->tensors[i].bytes;
@@ -2983,6 +3041,11 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
                                               span_offsets, span_sizes, span_count)) {
             continue;
         }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (ds4_gpu_model_range_replaced(m->map, t->abs_offset, t->bytes)) {
+            continue;
+        }
+#endif
         spans[nspan++] = (accelerator_tensor_span){
             .off = t->abs_offset,
             .end = t->abs_offset + t->bytes,
@@ -3823,6 +3886,35 @@ static float ds4_vec_dot_q4_K_f32(int n, const block_q4_K *x, const float *y) {
     return sumf;
 }
 
+static inline float ds4_e8m0_to_f32(uint8_t e) {
+    const uint32_t bits = e == 0 ? 0x00400000u : (uint32_t)e << 23;
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static const float ds4_mxfp4_values[16] = {
+     0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+};
+
+static float ds4_vec_dot_mxfp4_f32(int n, const block_mxfp4 *x, const float *y) {
+    const int nb = n / QK_MXFP4;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ib++) {
+        const float d = ds4_e8m0_to_f32(x[ib].e);
+        const float *yb = y + (uint64_t)ib * QK_MXFP4;
+        for (int j = 0; j < QK_MXFP4 / 2; j++) {
+            const uint8_t q = x[ib].qs[j];
+            sumf += d * ds4_mxfp4_values[q & 0x0fu] * yb[j];
+            sumf += d * ds4_mxfp4_values[q >> 4] * yb[j + QK_MXFP4 / 2];
+        }
+    }
+
+    return sumf;
+}
+
 static float ds4_vec_dot_q5_K_f32(int n, const block_q5_K *x, const float *y) {
     const int nb = n / QK_K;
     float sumf = 0.0f;
@@ -4527,7 +4619,8 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
            type == DS4_TENSOR_Q3_K ||
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q5_K ||
-           type == DS4_TENSOR_Q6_K;
+           type == DS4_TENSOR_Q6_K ||
+           type == DS4_TENSOR_MXFP4;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
@@ -4539,6 +4632,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
     case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
     case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);
+    case DS4_TENSOR_MXFP4:   return sizeof(block_mxfp4);
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;
@@ -4594,7 +4688,7 @@ static bool streaming_layer_routed_expert_bytes(
     return true;
 }
 
-static DS4_MAYBE_UNUSED bool streaming_layer_gate_down_expert_bytes(
+static DS4_MAYBE_UNUSED bool layer_gate_down_expert_bytes(
         const ds4_layer_weights *layer,
         uint64_t               *gate_expert_bytes,
         uint64_t               *down_expert_bytes) {
@@ -4630,40 +4724,66 @@ static bool ds4_streaming_routed_expert_bytes(
     if (per_expert_bytes_out) *per_expert_bytes_out = 0;
     if (!weights || !per_expert_bytes_out) return false;
 
+    /* Mixed-precision models can put an outlier quant at the first routed
+     * layer owned by a distributed slice.  Choosing that first layer as the
+     * slab class makes every ordinary layer bypass the cache.  Use the most
+     * common local size class instead (ties retain the earliest class). */
+    uint64_t best_bytes = 0;
+    uint32_t best_count = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        if (streaming_layer_routed_expert_bytes(&weights->layer[il],
-                                                per_expert_bytes_out)) {
-            return true;
+        uint64_t candidate = 0;
+        if (!streaming_layer_routed_expert_bytes(&weights->layer[il],
+                                                 &candidate)) {
+            continue;
+        }
+        uint32_t count = 0;
+        for (uint32_t jl = 0; jl < DS4_N_LAYER; jl++) {
+            uint64_t bytes = 0;
+            if (streaming_layer_routed_expert_bytes(&weights->layer[jl],
+                                                    &bytes) &&
+                bytes == candidate) {
+                count++;
+            }
+        }
+        if (count > best_count) {
+            best_bytes = candidate;
+            best_count = count;
         }
     }
-    return false;
+    if (best_count == 0) return false;
+    *per_expert_bytes_out = best_bytes;
+    return true;
 }
 
 enum { DS4_STREAMING_PREFILL_HEADROOM_LAYERS = 2 };
 
-static bool ds4_streaming_max_routed_layer_bytes(
+static bool ds4_streaming_cacheable_expert_count(
         const ds4_weights *weights,
-        uint64_t          *layer_bytes_out) {
-    if (layer_bytes_out) *layer_bytes_out = 0;
-    if (!weights || !layer_bytes_out || DS4_N_EXPERT == 0) return false;
+        uint64_t          *experts_out,
+        uint32_t          *layers_out) {
+    if (experts_out) *experts_out = 0;
+    if (layers_out) *layers_out = 0;
+    if (!weights || !experts_out || DS4_N_EXPERT == 0) return false;
 
-    uint64_t max_bytes = 0;
+    uint64_t slab_bytes = 0;
+    if (!ds4_streaming_routed_expert_bytes(weights, &slab_bytes)) return false;
+
+    uint32_t layers = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         uint64_t per_expert_bytes = 0;
         if (!streaming_layer_routed_expert_bytes(&weights->layer[il],
                                                  &per_expert_bytes)) {
             continue;
         }
-        if (per_expert_bytes > UINT64_MAX / (uint64_t)DS4_N_EXPERT) {
-            return false;
-        }
-        const uint64_t layer_bytes =
-            per_expert_bytes * (uint64_t)DS4_N_EXPERT;
-        if (layer_bytes > max_bytes) max_bytes = layer_bytes;
+        if (per_expert_bytes == slab_bytes) layers++;
     }
 
-    if (max_bytes == 0) return false;
-    *layer_bytes_out = max_bytes;
+    if (layers == 0 ||
+        (uint64_t)layers > UINT64_MAX / (uint64_t)DS4_N_EXPERT) {
+        return false;
+    }
+    *experts_out = (uint64_t)layers * (uint64_t)DS4_N_EXPERT;
+    if (layers_out) *layers_out = layers;
     return true;
 }
 
@@ -4673,27 +4793,38 @@ static bool ds4_streaming_prefill_headroom_bytes(
     if (bytes_out) *bytes_out = 0;
     if (!weights || !bytes_out) return false;
 
-    uint64_t layer_bytes = 0;
-    if (!ds4_streaming_max_routed_layer_bytes(weights, &layer_bytes)) {
+    uint64_t per_expert_bytes = 0;
+    uint64_t cacheable_experts = 0;
+    uint32_t cacheable_layers = 0;
+    if (!ds4_streaming_routed_expert_bytes(weights, &per_expert_bytes) ||
+        !ds4_streaming_cacheable_expert_count(weights,
+                                              &cacheable_experts,
+                                              &cacheable_layers)) {
         return false;
     }
-    if (layer_bytes >
-        UINT64_MAX / (uint64_t)DS4_STREAMING_PREFILL_HEADROOM_LAYERS) {
+    (void)cacheable_experts;
+    const uint32_t reserve_layers =
+        cacheable_layers < DS4_STREAMING_PREFILL_HEADROOM_LAYERS ?
+        cacheable_layers : DS4_STREAMING_PREFILL_HEADROOM_LAYERS;
+    if (per_expert_bytes > UINT64_MAX / (uint64_t)DS4_N_EXPERT) {
         return false;
     }
+    const uint64_t layer_bytes =
+        per_expert_bytes * (uint64_t)DS4_N_EXPERT;
+    if (reserve_layers != 0 &&
+        layer_bytes > UINT64_MAX / (uint64_t)reserve_layers) return false;
 
-    *bytes_out =
-        layer_bytes * (uint64_t)DS4_STREAMING_PREFILL_HEADROOM_LAYERS;
+    *bytes_out = layer_bytes * (uint64_t)reserve_layers;
     return true;
 }
 
 /*
  * Mixed-precision ("boosted") GGUFs upcast a few layers' routed experts to a
  * bigger quant (e.g. Q4_K among IQ2 layers). The streaming expert cache is a
- * single-size-class slab allocator sized from the FIRST routed layer, so those
- * layers can never be served from it: they must read expert weights through the
- * mapped-model views instead. A layer is "uniform" iff its per-expert bytes
- * match the slab class.
+ * single-size-class slab allocator sized from the dominant local routed-layer
+ * size class, so other layers can never be served from it: they must read
+ * expert weights through the mapped-model views instead. A layer is "uniform"
+ * iff its per-expert bytes match the slab class.
  */
 static DS4_MAYBE_UNUSED bool weights_streaming_layer_experts_uniform(
         const ds4_weights *w,
@@ -4838,7 +4969,8 @@ static void tensor_expect_routed_expert(
 
 static bool weights_have_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
         return w && w->output_norm && w->output;
     }
     return w &&
@@ -4851,7 +4983,8 @@ static bool weights_have_output_head(const ds4_weights *w) {
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
         return w && (w->output_norm || w->output);
     }
     return w &&
@@ -4939,6 +5072,22 @@ static bool weights_laguna_layer_has_required(const ds4_layer_weights *l, uint32
            l->ffn_down_shexp;
 }
 
+static bool weights_mellum_layer_has_required(const ds4_layer_weights *l) {
+    return l &&
+           l->attn_norm &&
+           l->attn_q &&
+           l->attn_q_norm &&
+           l->attn_k &&
+           l->attn_k_norm &&
+           l->attn_v &&
+           l->attn_output &&
+           l->ffn_norm &&
+           l->ffn_gate_inp &&
+           l->ffn_gate_exps &&
+           l->ffn_up_exps &&
+           l->ffn_down_exps;
+}
+
 static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
     if (!l) return false;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -4946,6 +5095,9 @@ static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) 
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
         return weights_laguna_layer_has_required(l, il);
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        return weights_mellum_layer_has_required(l);
     }
     if (!l->hc_attn_fn ||
         !l->hc_attn_scale ||
@@ -5164,14 +5316,35 @@ static void weights_validate_laguna_layout(
 
         tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32,
                              1, DS4_N_EMBD, 0, 0);
+        /* Legacy-layout attention signal type differs by recipe: S 2.1's
+         * official Q4_K_M file keeps attn_q/k/gate/output in F16, while
+         * XS 2.1's official Q4_K_M file quantizes them to Q4_K. */
         const uint32_t attn_type =
-            signal_q8 ? DS4_TENSOR_Q8_0 : DS4_TENSOR_F16;
+            signal_q8 ? DS4_TENSOR_Q8_0 :
+            (DS4_MODEL_VARIANT == DS4_VARIANT_LAGUNA_XS21 ? DS4_TENSOR_Q4_K : DS4_TENSOR_F16);
         tensor_expect_layout(l->attn_q, attn_type,
                              2, DS4_N_EMBD, q_dim, 0);
         tensor_expect_layout(l->attn_k, attn_type,
                              2, DS4_N_EMBD, kv_dim, 0);
-        tensor_expect_layout(l->attn_v, attn_type,
-                             2, DS4_N_EMBD, kv_dim, 0);
+        /* XS 2.1's attn_v varies Q4_K/Q6_K per layer (moves together with
+         * ffn_down_exps/ffn_down_shexp, uncorrelated with SWA/global
+         * pattern) — tolerate both rather than expecting a fixed type. */
+        const bool attn_v_tolerant =
+            !signal_q8 && DS4_MODEL_VARIANT == DS4_VARIANT_LAGUNA_XS21;
+        if (attn_v_tolerant) {
+            const uint32_t attn_v_type = l->attn_v->type;
+            if (attn_v_type != DS4_TENSOR_Q4_K && attn_v_type != DS4_TENSOR_Q6_K) {
+                fprintf(stderr,
+                        "ds4: Laguna attn_v tensor for layer %u has unsupported type %s\n",
+                        il, tensor_type_name(attn_v_type));
+                exit(1);
+            }
+            tensor_expect_layout(l->attn_v, attn_v_type,
+                                 2, DS4_N_EMBD, kv_dim, 0);
+        } else {
+            tensor_expect_layout(l->attn_v, attn_type,
+                                 2, DS4_N_EMBD, kv_dim, 0);
+        }
         tensor_expect_layout(l->attn_gate, attn_type,
                              2, DS4_N_EMBD, n_head, 0);
         tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32,
@@ -5252,6 +5425,108 @@ static void weights_validate_laguna_layout(
     }
 }
 
+static void weights_validate_mellum_layout(
+        const ds4_weights *w,
+        uint32_t           layer_start,
+        uint32_t           layer_end,
+        bool               require_token_embd,
+        bool               require_output) {
+    if (!w) ds4_die("internal error: missing weights while validating Mellum layout");
+    if (layer_start >= DS4_N_LAYER) ds4_die("invalid first layer in Mellum weight layout validation");
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) {
+        ds4_die("invalid layer range in Mellum weight layout validation");
+    }
+
+    if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
+    if (w->token_embd) {
+        tensor_expect_layout(w->token_embd, DS4_TENSOR_Q8_0,
+                             2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+
+    const bool have_output = weights_have_output_head(w);
+    if (require_output && !have_output) ds4_die("required output head tensors are missing");
+    if (weights_have_partial_output_head(w) && !have_output) ds4_die("partial output head in GGUF");
+    if (have_output) {
+        tensor_expect_layout(w->output_norm, DS4_TENSOR_F32,
+                             1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(w->output, DS4_TENSOR_Q8_0,
+                             2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!weights_mellum_layer_has_required(l)) {
+            fprintf(stderr, "ds4: required Mellum tensors for layer %u are missing\n", il);
+            exit(1);
+        }
+        tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32,
+                             1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(l->attn_q, DS4_TENSOR_Q8_0,
+                             2, DS4_N_EMBD, q_dim, 0);
+        tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32,
+                             1, DS4_N_HEAD_DIM, 0, 0);
+        tensor_expect_layout(l->attn_k, DS4_TENSOR_Q8_0,
+                             2, DS4_N_EMBD, kv_dim, 0);
+        tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32,
+                             1, DS4_N_HEAD_DIM, 0, 0);
+        tensor_expect_layout(l->attn_v, DS4_TENSOR_Q8_0,
+                             2, DS4_N_EMBD, kv_dim, 0);
+        tensor_expect_layout(l->attn_output, DS4_TENSOR_Q8_0,
+                             2, q_dim, DS4_N_EMBD, 0);
+        tensor_expect_layout(l->ffn_norm, DS4_TENSOR_F32,
+                             1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32,
+                             2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+        /* Selective artifacts spend fewer bits on the early layers, so gate/up
+         * may be Q4_K on some layers and Q8_0 on others within one file.  Read
+         * the type per layer rather than deciding once for the model: a
+         * model-wide "is this the Q4 build" flag is the wrong shape and does
+         * not survive the next recipe.
+         *
+         * Gate and up must agree within a layer.  The pair kernels read both
+         * through a single dispatch -- kernel_glm_q4_K_pair_swiglu_f32 casts
+         * both rows to block_q4_K -- so a layer that splits the two has no
+         * kernel to run on. */
+        const uint32_t layer_pair_type = l->ffn_gate_exps->type;
+        if (layer_pair_type != DS4_TENSOR_Q8_0 &&
+            layer_pair_type != DS4_TENSOR_Q4_K) {
+            fprintf(stderr,
+                    "ds4: Mellum routed experts for layer %u have unsupported "
+                    "type %s\n",
+                    il, tensor_type_name(layer_pair_type));
+            exit(1);
+        }
+        tensor_expect_layout(l->ffn_gate_exps, layer_pair_type,
+                             3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_layout(l->ffn_up_exps, layer_pair_type,
+                             3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        /* Down stays Q8_0.  This is a representability limit, not an oversight
+         * to be relaxed: the down input width is DS4_N_FF_EXP, which on Mellum
+         * is 896 and is not a multiple of the 256-element K-quant block.  A
+         * K-quant there cannot describe the tensor at all -- it is not merely
+         * lossier.  ds4 also does not execute Q5_0, the other type the official
+         * mixed artifacts reach for here. */
+        if (l->ffn_down_exps->type != DS4_TENSOR_Q8_0) {
+            fprintf(stderr,
+                    "ds4: Mellum routed down tensor for layer %u has type %s, "
+                    "but only Q8_0 is supported: the down input width %" PRIu64
+                    " is not a multiple of the %d-element K-quant block, so a "
+                    "K-quant here is unrepresentable rather than lower "
+                    "quality.\n",
+                    il,
+                    tensor_type_name(l->ffn_down_exps->type),
+                    (uint64_t)DS4_N_FF_EXP,
+                    QK_K);
+            exit(1);
+        }
+        tensor_expect_layout(l->ffn_down_exps, DS4_TENSOR_Q8_0,
+                             3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+    }
+}
+
 static void weights_validate_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
@@ -5268,6 +5543,14 @@ static void weights_validate_layout(
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
         weights_validate_laguna_layout(w,
+                                       layer_start,
+                                       layer_end,
+                                       require_token_embd,
+                                       require_output);
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        weights_validate_mellum_layout(w,
                                        layer_start,
                                        layer_end,
                                        require_token_embd,
@@ -6060,11 +6343,18 @@ static void config_validate_glm_dsa_model(const ds4_model *m) {
 }
 
 static void config_validate_laguna_model(const ds4_model *m) {
-    g_ds4_shape = DS4_SHAPE_LAGUNA_S21;
+    const uint32_t n_layer = required_u32(m, "laguna.block_count");
+    if (n_layer == 48) {
+        g_ds4_shape = DS4_SHAPE_LAGUNA_S21;
+    } else if (n_layer == 40) {
+        g_ds4_shape = DS4_SHAPE_LAGUNA_XS21;
+    } else {
+        fprintf(stderr, "ds4: unsupported Laguna block_count %u\n", n_layer);
+        exit(1);
+    }
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
     memset(g_ds4_head_counts, 0, sizeof(g_ds4_head_counts));
 
-    const uint32_t n_layer = required_u32(m, "laguna.block_count");
     const uint64_t n_ctx = required_u64_compat(m, "laguna.context_length");
     const uint32_t n_embd = required_u32(m, "laguna.embedding_length");
     const uint32_t n_vocab = required_u32(m, "laguna.vocab_size");
@@ -6118,7 +6408,9 @@ static void config_validate_laguna_model(const ds4_model *m) {
             if (v <= 0) ds4_die("Laguna head-count metadata contains a non-positive value");
             got = (uint32_t)v;
         }
-        const uint32_t expected = (il % 4u) == 0 ? 48u : 72u;
+        const uint32_t expected = (il % 4u) == 0
+                ? g_ds4_shape.n_head_global
+                : g_ds4_shape.n_head_swa;
         if (got != expected) {
             fprintf(stderr,
                     "ds4: unexpected Laguna head count at layer %u: got %u, expected %u\n",
@@ -6165,6 +6457,91 @@ static void config_validate_laguna_model(const ds4_model *m) {
                        true);
 }
 
+static void config_validate_mellum_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_MELLUM2;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+    memset(g_ds4_head_counts, 0, sizeof(g_ds4_head_counts));
+
+    config_expect_u32("block_count",
+                      required_u32(m, "mellum.block_count"), DS4_N_LAYER);
+    config_expect_u64("context_length",
+                      required_u64_compat(m, "mellum.context_length"),
+                      DS4_CONTEXT_LENGTH);
+    config_expect_u32("embedding_length",
+                      required_u32(m, "mellum.embedding_length"), DS4_N_EMBD);
+    config_expect_u32("feed_forward_length",
+                      required_u32(m, "mellum.feed_forward_length"), DS4_N_FF_DENSE);
+    config_expect_u32("attention.head_count",
+                      required_u32(m, "mellum.attention.head_count"), DS4_N_HEAD);
+    config_expect_u32("attention.head_count_kv",
+                      required_u32(m, "mellum.attention.head_count_kv"), DS4_N_HEAD_KV);
+    config_expect_u32("attention.key_length",
+                      required_u32(m, "mellum.attention.key_length"), DS4_N_HEAD_DIM);
+    config_expect_u32("attention.value_length",
+                      required_u32(m, "mellum.attention.value_length"), DS4_N_VALUE_DIM);
+    config_expect_u32("expert_count",
+                      required_u32(m, "mellum.expert_count"), DS4_N_EXPERT);
+    config_expect_u32("expert_used_count",
+                      required_u32(m, "mellum.expert_used_count"), DS4_N_EXPERT_USED);
+    config_expect_u32("expert_feed_forward_length",
+                      required_u32(m, "mellum.expert_feed_forward_length"), DS4_N_FF_EXP);
+    config_expect_u32("attention.sliding_window",
+                      required_u32(m, "mellum.attention.sliding_window"), DS4_N_SWA);
+
+    ds4_array_ref sliding_pattern = {0};
+    if (!model_get_array(m, "mellum.attention.sliding_window_pattern", &sliding_pattern) ||
+        sliding_pattern.type != GGUF_VALUE_BOOL ||
+        sliding_pattern.len != DS4_N_LAYER) {
+        ds4_die("mellum.attention.sliding_window_pattern must be a bool array with one entry per layer");
+    }
+    ds4_cursor pattern_cursor = cursor_at(m, sliding_pattern.data_pos);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        bool is_sliding = false;
+        if (!cursor_read(&pattern_cursor, &is_sliding, sizeof(is_sliding))) {
+            ds4_die(pattern_cursor.error);
+        }
+        const bool expected_sliding = ds4_mellum_layer_uses_sliding_attention(il);
+        if (is_sliding != expected_sliding) {
+            fprintf(stderr,
+                    "ds4: unexpected Mellum sliding-window value at layer %u: got %s, expected %s\n",
+                    il, is_sliding ? "true" : "false",
+                    expected_sliding ? "true" : "false");
+            exit(1);
+        }
+    }
+
+    ds4_str rope_type = {0};
+    if (!model_get_string(m, "mellum.rope.scaling.type", &rope_type) ||
+        !ds4_streq(rope_type, "yarn")) {
+        ds4_die("Mellum requires rope.scaling.type=yarn");
+    }
+    config_expect_u64("rope.scaling.original_context_length",
+                      required_u64_compat(m,
+                                          "mellum.rope.scaling.original_context_length"),
+                      DS4_ROPE_ORIG_CTX);
+    config_expect_f32("rope.scaling.factor",
+                      required_f32(m, "mellum.rope.scaling.factor"),
+                      DS4_ROPE_SCALE_FACTOR);
+    config_expect_f32("rope.scaling.yarn_attn_factor",
+                      required_f32(m, "mellum.rope.scaling.yarn_attn_factor"),
+                      DS4_ROPE_YARN_ATTN_FACTOR);
+    config_expect_f32("rope.scaling.yarn_beta_fast",
+                      required_f32(m, "mellum.rope.scaling.yarn_beta_fast"),
+                      DS4_ROPE_YARN_BETA_FAST);
+    config_expect_f32("rope.scaling.yarn_beta_slow",
+                      required_f32(m, "mellum.rope.scaling.yarn_beta_slow"),
+                      DS4_ROPE_YARN_BETA_SLOW);
+    config_expect_f32("rope.freq_base",
+                      required_f32(m, "mellum.rope.freq_base"),
+                      DS4_ROPE_FREQ_BASE);
+    config_expect_f32("rope.freq_base_swa",
+                      required_f32(m, "mellum.rope.freq_base_swa"),
+                      DS4_ROPE_FREQ_BASE_SWA);
+    config_expect_f32("attention.layer_norm_rms_epsilon",
+                      required_f32(m, "mellum.attention.layer_norm_rms_epsilon"),
+                      DS4_RMS_EPS);
+}
+
 static void config_validate_model(const ds4_model *m) {
     ds4_str arch = {0};
     if (model_get_string(m, "general.architecture", &arch) && ds4_streq(arch, "glm-dsa")) {
@@ -6175,25 +6552,46 @@ static void config_validate_model(const ds4_model *m) {
         config_validate_laguna_model(m);
         return;
     }
+    if (arch.ptr && ds4_streq(arch, "mellum")) {
+        config_validate_mellum_model(m);
+        return;
+    }
     config_validate_deepseek4_model(m);
 }
 
-static void weights_bind_output(ds4_weights *w, const ds4_model *m, bool required) {
+static void weights_bind_output(
+        ds4_weights     *w,
+        const ds4_model *m,
+        bool             required,
+        bool             optional) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
         if (required) {
             w->output_norm = required_tensor(m, "output_norm.weight");
             w->output      = required_tensor(m, "output.weight");
+        } else if (optional) {
+            w->output_norm = model_find_tensor(m, "output_norm.weight");
+            w->output      = model_find_tensor(m, "output.weight");
         }
-        return;
-    }
-
-    if (required) {
+    } else if (required) {
         w->output_hc_base   = required_tensor(m, "output_hc_base.weight");
         w->output_hc_fn     = required_tensor(m, "output_hc_fn.weight");
         w->output_hc_scale  = required_tensor(m, "output_hc_scale.weight");
         w->output_norm      = required_tensor(m, "output_norm.weight");
         w->output           = required_tensor(m, "output.weight");
+    } else if (optional) {
+        w->output_hc_base   = model_find_tensor(m, "output_hc_base.weight");
+        w->output_hc_fn     = model_find_tensor(m, "output_hc_fn.weight");
+        w->output_hc_scale  = model_find_tensor(m, "output_hc_scale.weight");
+        w->output_norm      = model_find_tensor(m, "output_norm.weight");
+        w->output           = model_find_tensor(m, "output.weight");
+    }
+
+    if (optional &&
+        weights_have_partial_output_head(w) &&
+        !weights_have_output_head(w)) {
+        ds4_die("partial output head in GGUF");
     }
 }
 
@@ -6223,6 +6621,21 @@ static void weights_bind_laguna_layer(ds4_layer_weights *l, const ds4_model *m, 
     l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
     l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
     l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+}
+
+static void weights_bind_mellum_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    l->attn_norm     = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->attn_q        = required_tensorf(m, "blk.%u.attn_q.weight", il);
+    l->attn_q_norm   = required_tensorf(m, "blk.%u.attn_q_norm.weight", il);
+    l->attn_k        = required_tensorf(m, "blk.%u.attn_k.weight", il);
+    l->attn_k_norm   = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
+    l->attn_v        = required_tensorf(m, "blk.%u.attn_v.weight", il);
+    l->attn_output   = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    l->ffn_norm      = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+    l->ffn_gate_inp  = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+    l->ffn_gate_exps = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+    l->ffn_up_exps   = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+    l->ffn_down_exps = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
 }
 
 static void weights_bind_glm_dsa_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
@@ -6274,6 +6687,10 @@ static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
         weights_bind_laguna_layer(l, m, il);
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        weights_bind_mellum_layer(l, m, il);
         return;
     }
 
@@ -6331,7 +6748,8 @@ static void weights_bind(
         bool             load_slice,
         uint32_t         load_layer_start,
         uint32_t         load_layer_end,
-        bool             require_output) {
+        bool             require_output,
+        bool             optional_output) {
     memset(w, 0, sizeof(*w));
 
     uint32_t executable_layers = DS4_N_LAYER;
@@ -6350,6 +6768,7 @@ static void weights_bind(
         require_token_embd = start == 0;
     } else {
         require_output = true;
+        optional_output = false;
     }
 
     if (require_token_embd) {
@@ -6357,14 +6776,15 @@ static void weights_bind(
     } else {
         w->token_embd = model_find_tensor(m, "token_embd.weight");
     }
-    weights_bind_output(w, m, require_output);
+    weights_bind_output(w, m, require_output, optional_output);
 
     for (uint32_t il = start; il <= end; il++) {
         weights_bind_layer(&w->layer[il], m, il);
     }
     /* GLM nextn/MTP block(s): excluded from the executable pass but bound
      * so the drafter can run them. Only when the full model is loaded. */
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+    if (!load_slice &&
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
         start == 0 && end == executable_layers - 1u) {
         for (uint32_t il = executable_layers; il < DS4_N_LAYER; il++) {
             weights_bind_layer(&w->layer[il], m, il);
@@ -6450,7 +6870,8 @@ static void model_map_span_vec_include_one(ds4_model_map_span_vec *spans, const 
 
     uint64_t lo = UINT64_MAX, hi = 0;
     model_map_span_include_tensor(t, &lo, &hi, &spans->max_tensor_bytes);
-    const bool isolate = t->type == DS4_TENSOR_Q4_K &&
+    const bool isolate = (t->type == DS4_TENSOR_Q4_K ||
+                          t->type == DS4_TENSOR_MXFP4) &&
                          t->bytes >= q4_isolated_min_bytes;
     model_map_span_vec_append(spans, lo, hi, isolate);
 }
@@ -6595,6 +7016,7 @@ static bool glm_stream_resident_decode_layer_supported(
             l->ffn_gate_exps->type == DS4_TENSOR_Q4_K);
 }
 
+static uint32_t g_glm_streaming_full_resident_start;
 static uint32_t g_glm_streaming_full_resident_layers;
 
 static bool glm_stream_resident_decode_layer_enabled(
@@ -6602,7 +7024,9 @@ static bool glm_stream_resident_decode_layer_enabled(
         uint32_t                 il) {
     if (!glm_stream_resident_decode_layer_supported(l, il)) return false;
     return g_glm_streaming_full_resident_layers != 0 &&
-           il - DS4_N_LEADING_DENSE < g_glm_streaming_full_resident_layers;
+           il >= g_glm_streaming_full_resident_start &&
+           il - g_glm_streaming_full_resident_start <
+               g_glm_streaming_full_resident_layers;
 }
 
 static bool glm_stream_expert_cache_addr_layout_supported(
@@ -6649,7 +7073,7 @@ static DS4_MAYBE_UNUSED bool glm_stream_expert_cache_addr_supported(
 #else
     uint64_t gate_expert_bytes = 0;
     uint64_t down_expert_bytes = 0;
-    if (!streaming_layer_gate_down_expert_bytes(l,
+    if (!layer_gate_down_expert_bytes(l,
                                                 &gate_expert_bytes,
                                                 &down_expert_bytes)) {
         return false;
@@ -6707,11 +7131,47 @@ static bool glm_stream_decode_experts_are_streamed(
 }
 
 /*
+ * weights_streaming_layer_experts_uniform() compares per-expert BYTE SIZE
+ * against the pinned slab class and never inspects the quant type, but Metal's
+ * Laguna address-table streaming kernel (stream_eligible in
+ * ds4_gpu_laguna_routed_shared_moe_one_tensor, ds4_metal.m) only has Q4_K and
+ * Q6_K routed-down variants. Load-time layout validation admits four routed
+ * down types -- Q4_K, Q6_K, and (matching gate/up) Q3_K or Q2_K, see the
+ * layer_routed_type / down_supported checks near ds4.c:5150 -- so a layer can
+ * be uniform-by-bytes yet unservable by the kernel. Such a layer must stay in
+ * the resident span set: dropping it would leave it neither mapped nor cached,
+ * the silent-corruption shape Task 3 already hit once. Reporting it as
+ * not-servable here routes it to the same mapped-model fallback that
+ * off-slab-class layers already use -- correct, just not cache-accelerated.
+ */
+static bool laguna_decode_experts_cache_servable(const ds4_layer_weights *l) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) return true;
+    if (l->ffn_down_exps == NULL) return true;
+    return l->ffn_down_exps->type == DS4_TENSOR_Q3_K ||
+           l->ffn_down_exps->type == DS4_TENSOR_Q4_K ||
+           l->ffn_down_exps->type == DS4_TENSOR_Q6_K;
+}
+
+/*
  * Decode-time spans for one layer. The static set excludes routed expert
  * tensors only when the streaming expert-cache path can really serve them.
  * Boosted layers, mixed GLM quant layouts such as Q4 gate/up plus Q5 down, or
  * undersized expert caches fall back to direct model-range reads. Include
  * those expert tensors so cache-hit prefill extension and decode are covered.
+ *
+ * Laguna adds one family-specific term, laguna_decode_experts_cache_servable
+ * (see above): its fused decode kernel
+ * (ds4_gpu_laguna_routed_shared_moe_one_tensor) has address-table streaming
+ * variants for a Q4_K and a Q6_K routed down projection only, while the
+ * byte-size "uniform" test can also pass for the Q3_K/Q2_K routed layouts
+ * load-time validation accepts. Whichever type the FIRST sparse layer happens
+ * to be (Q6_K for XS 2.1's official Q4_K_M file) becomes the pinned slab class
+ * at startup (ds4_streaming_routed_expert_bytes in ds4_engine_open_internal),
+ * and only layers matching that exact byte signature are actually served from
+ * the cache at runtime (ds4_gpu_stream_expert_cache_note_expert_size in
+ * ds4_metal.m). Layers off that class -- or of a type the kernel has no
+ * variant for -- always fall back to wrapping the whole routed-expert tensor
+ * from the mapped model range, so they must stay in this static set.
  */
 static void model_map_span_vec_include_layer_decode(
         ds4_model_map_span_vec *spans,
@@ -6720,6 +7180,7 @@ static void model_map_span_vec_include_layer_decode(
     const ds4_layer_weights *l = &w->layer[il];
     model_map_span_vec_include_layer_decode_static(spans, l);
     if (!weights_streaming_layer_experts_uniform(w, il) ||
+        !laguna_decode_experts_cache_servable(l) ||
         (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
          !glm_stream_decode_experts_are_streamed(w, l, il)) ||
         glm_stream_resident_decode_layer_enabled(l, il)) {
@@ -6901,7 +7362,12 @@ static DS4_MAYBE_UNUSED bool weights_streaming_non_routed_bytes(
     if (!w || !bytes_out) return false;
 
     ds4_model_map_span_vec spans;
-    if (!weights_model_map_decode_static_spans(w, true, true, &spans)) {
+    const bool include_token =
+        weights_layer_has_required(&w->layer[0], 0);
+    if (!weights_model_map_decode_static_spans(w,
+                                               include_token,
+                                               weights_have_output_head(w),
+                                               &spans)) {
         return false;
     }
     *bytes_out = model_map_span_vec_total_bytes(&spans);
@@ -12865,6 +13331,43 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
     return cap;
 }
 
+/* Laguna's graph preallocates every batched activation at this width.  Keep
+ * the policy and the memory estimate together: previously the graph silently
+ * ignored --prefill-chunk while the estimate reported a one-token scratch. */
+static uint32_t laguna_graph_prefill_cap(uint32_t ctx_size,
+                                         uint32_t requested_chunk) {
+    if (ctx_size == 0) return 1;
+    uint32_t cap = requested_chunk != 0 ? requested_chunk : 16384u;
+    if (cap > ctx_size) cap = ctx_size;
+    return cap == 0 ? 1 : cap;
+}
+
+static uint64_t laguna_graph_scratch_bytes(uint32_t prefill_cap) {
+    const uint64_t f32 = sizeof(float);
+    const uint64_t embd = DS4_N_EMBD;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t ffn_max = DS4_N_FF_DENSE >
+        (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP ?
+        DS4_N_FF_DENSE : (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP;
+    const uint64_t per_row =
+        sizeof(uint32_t) +
+        8ull * embd * f32 +
+        2ull * q_dim * f32 +
+        2ull * kv_dim * f32 +
+        (uint64_t)DS4_N_HEAD * f32 +
+        3ull * ffn_max * f32 +
+        (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * f32 +
+        2ull * DS4_N_EXPERT * f32 +
+        (uint64_t)DS4_N_EXPERT_USED * (sizeof(int32_t) + sizeof(float)) +
+        2ull * kv_dim * sizeof(uint16_t);
+    const uint64_t fixed =
+        (uint64_t)DS4_N_EMBD * f32 +
+        (uint64_t)DS4_N_VOCAB * f32 +
+        sizeof(int32_t) + sizeof(float);
+    return (uint64_t)prefill_cap * per_row + fixed;
+}
+
 /* Allocate all CPU decode temporaries once.  This keeps generation deterministic
  * from the VM's point of view and makes accidental hot-loop malloc visible. */
 static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ctx_size) {
@@ -15128,7 +15631,8 @@ static bool glm_graph_gate_pair_type_supported(uint32_t gate_type, uint32_t up_t
             gate_type == DS4_TENSOR_Q2_K ||
             gate_type == DS4_TENSOR_Q3_K ||
             gate_type == DS4_TENSOR_Q4_K ||
-            gate_type == DS4_TENSOR_Q5_K);
+            gate_type == DS4_TENSOR_Q5_K ||
+            gate_type == DS4_TENSOR_MXFP4);
 }
 
 static bool glm_graph_down_type_supported(uint32_t down_type) {
@@ -15137,7 +15641,8 @@ static bool glm_graph_down_type_supported(uint32_t down_type) {
            down_type == DS4_TENSOR_Q3_K ||
            down_type == DS4_TENSOR_Q4_K ||
            down_type == DS4_TENSOR_Q5_K ||
-           down_type == DS4_TENSOR_Q6_K;
+           down_type == DS4_TENSOR_Q6_K ||
+           down_type == DS4_TENSOR_MXFP4;
 }
 
 static float glm_routed_moe_dot_f32(uint32_t type, int n, const uint8_t *row, const float *x) {
@@ -15155,6 +15660,9 @@ static float glm_routed_moe_dot_f32(uint32_t type, int n, const uint8_t *row, co
     }
     if (type == DS4_TENSOR_Q5_K || type == DS4_TENSOR_Q6_K) {
         return ds4_vec_dot_q5_q6_K_f32(type, n, row, x);
+    }
+    if (type == DS4_TENSOR_MXFP4) {
+        return ds4_vec_dot_mxfp4_f32(n, (const block_mxfp4 *)row, x);
     }
     ds4_die("GLM F32 routed-MoE reference encountered unsupported expert tensor type");
     return 0.0f;
@@ -15700,8 +16208,8 @@ typedef struct {
 
     /* Speculative decoding scratch.  MTP is allowed to mutate graph state only
      * if the target verifier can either commit it or restore the saved
-     * frontiers.  The prefix1 buffers are the cheap partial-accept state for the
-     * common N=2 case. */
+     * frontiers.  Prefix slots retain the intermediate frontiers of a tiny
+     * verifier block so partial accepts do not need target-model replay. */
     ds4_gpu_tensor *spec_attn_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_attn_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *spec_index_state_kv[DS4_MAX_LAYER];
@@ -15713,9 +16221,9 @@ typedef struct {
     ds4_gpu_tensor *spec_logits;
     uint32_t layer_n_comp[DS4_MAX_LAYER];
     uint32_t layer_n_index_comp[DS4_MAX_LAYER];
-    uint32_t spec_prefix1_n_comp[DS4_MAX_LAYER];
-    uint32_t spec_prefix1_n_index_comp[DS4_MAX_LAYER];
-    bool spec_capture_prefix1;
+    uint32_t spec_prefix_n_comp[DS4_SPEC_PREFIX_SLOTS][DS4_MAX_LAYER];
+    uint32_t spec_prefix_n_index_comp[DS4_SPEC_PREFIX_SLOTS][DS4_MAX_LAYER];
+    bool spec_capture_prefixes;
     uint32_t raw_cap;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
      * this worst-case size because ratio-4 indexer layers can still reach it. */
@@ -16147,6 +16655,23 @@ DS4_GPU_GRAPH_CLASS_P_ACCESSOR(directional_steering_dirs)
  * (g_n_gpus <= 1) callers no-op. Returns 0 on success. */
 
 #ifdef DS4_NO_GPU
+/* CPU-only builds do not include ds4_gpu.h: mirror the decode-graph key
+ * type and stub the capture API (always eager). */
+typedef struct ds4_decode_graph_key {
+    uint32_t il;
+    uint32_t island;
+    uint32_t variant;
+    uint32_t _pad;
+    void    *cur_hc;
+    void    *after_attn_hc;
+    void    *after_ffn_hc;
+    void    *attn_norm;
+} ds4_decode_graph_key;
+static inline int ds4_gpu_decode_graphs_supported(void) { return 0; }
+static inline int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) { (void)key; return -1; }
+static inline int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; return -1; }
+static inline void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
+static inline void ds4_gpu_decode_graphs_invalidate(void) {}
 static inline int ds4_gpu_set_current_device(int tier) { (void)tier; return 0; }
 static inline int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
                                             const ds4_gpu_tensor *src,
@@ -16389,6 +16914,9 @@ static void metal_graph_free_prefill_workspace(ds4_gpu_graph *g) {
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
+    /* Captured decode-island graphs bake this graph's buffer addresses
+     * into their kernel nodes; retire them before the buffers go away. */
+    ds4_gpu_decode_graphs_invalidate();
     /* free every Class P slot across all DS4_MAX_GPUS tier
      * slots. Unallocated slots are NULL and ds4_gpu_tensor_free(NULL) is a
      * no-op. The hc_pre / hc_post / hc_comb views must be freed BEFORE
@@ -17580,6 +18108,7 @@ static bool metal_graph_alloc_raw_cap(
                 "ds4: CUDA tensor parallelism requires an even multi-GPU placement; "
                 "have %d GPU tiers\n",
                 g_n_gpus);
+        metal_graph_free(g);
         return false;
     }
     if (g->cuda_tp_ep &&
@@ -17587,6 +18116,7 @@ static bool metal_graph_alloc_raw_cap(
          (DS4_N_EXPERT & 1u) != 0u)) {
         fprintf(stderr,
                 "ds4: CUDA tensor parallelism requires an even-expert DeepSeek model\n");
+        metal_graph_free(g);
         return false;
     }
     if (g->cuda_tp_ep) {
@@ -17609,6 +18139,7 @@ static bool metal_graph_alloc_raw_cap(
     g->prefill_cap = prefill_cap;
     uint32_t min_ratio = UINT32_MAX;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!weights_layer_has_required(&weights->layer[il], il)) continue;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
     }
@@ -17620,6 +18151,10 @@ static bool metal_graph_alloc_raw_cap(
         if (g->attn_comp_stage_cap < 2u) g->attn_comp_stage_cap = 2u;
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!weights_layer_has_required(&weights->layer[il], il)) {
+            g->layer_comp_cap[il] = 0;
+            continue;
+        }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) {
             g->layer_comp_cap[il] = 0;
@@ -17637,7 +18172,11 @@ static bool metal_graph_alloc_raw_cap(
     const uint64_t group_dim = (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
     const uint64_t routed_mid_dim = layer->ffn_gate_exps->dim[1];
-    const uint64_t vocab_dim = weights->output->dim[1];
+    /* Distributed coordinators do not normally own the output head. The
+     * logits workspace still has a fixed model-vocabulary shape, while the
+     * actual head is encoded only on a node that bound its tensors. */
+    const uint64_t vocab_dim =
+        weights->output ? weights->output->dim[1] : DS4_N_VOCAB;
     const uint64_t comp_width_max = 2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
         ? DS4_N_HEAD_DIM
         : DS4_N_INDEXER_HEAD_DIM);
@@ -17688,6 +18227,7 @@ static bool metal_graph_alloc_raw_cap(
                         "ds4: CUDA tensor parallelism expects layer homes in lower-half "
                         "tiers; placement already uses tier %d\n",
                         t);
+                metal_graph_free(g);
                 return false;
             }
         }
@@ -17723,6 +18263,10 @@ static bool metal_graph_alloc_raw_cap(
     }
     bool state_init_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        /* A distributed process owns only its bound layer slice. Persistent
+         * KV state must follow that ownership just like the model tensors;
+         * allocating every model layer here defeats split-model residency. */
+        if (!weights_layer_has_required(&weights->layer[il], il)) continue;
         /* per-layer Class L allocations land on the layer's
          * home tier. placement is NULL on single-tier / diagnostic paths
          * (all-tier-0); non-NULL on the engine path that opted into
@@ -17768,9 +18312,15 @@ static bool metal_graph_alloc_raw_cap(
                     ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
                 if (enable_prefix1_snapshot) {
                     g->spec_prefix1_attn_state_kv[il] =
-                        ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
+                        ds4_gpu_tensor_alloc_ptr_on(
+                                layer_tier,
+                                DS4_SPEC_PREFIX_SLOTS * attn_width * attn_rows *
+                                    sizeof(float));
                     g->spec_prefix1_attn_state_score[il] =
-                        ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
+                        ds4_gpu_tensor_alloc_ptr_on(
+                                layer_tier,
+                                DS4_SPEC_PREFIX_SLOTS * attn_width * attn_rows *
+                                    sizeof(float));
                 }
             }
             if (g->layer_attn_state_kv[il]) {
@@ -17798,9 +18348,15 @@ static bool metal_graph_alloc_raw_cap(
                         ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
                     if (enable_prefix1_snapshot) {
                         g->spec_prefix1_index_state_kv[il] =
-                            ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
+                            ds4_gpu_tensor_alloc_ptr_on(
+                                    layer_tier,
+                                    DS4_SPEC_PREFIX_SLOTS * index_width * index_rows *
+                                        sizeof(float));
                         g->spec_prefix1_index_state_score[il] =
-                            ds4_gpu_tensor_alloc_ptr_on(layer_tier, index_width * index_rows * sizeof(float));
+                            ds4_gpu_tensor_alloc_ptr_on(
+                                    layer_tier,
+                                    DS4_SPEC_PREFIX_SLOTS * index_width * index_rows *
+                                        sizeof(float));
                     }
                 }
                 if (g->layer_index_state_kv[il]) {
@@ -18018,6 +18574,7 @@ static bool metal_graph_alloc_raw_cap(
 
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
+        if (!weights_layer_has_required(&weights->layer[il], il)) continue;
         layer_cache_ok = g->layer_raw_cache[il] != NULL;
         if (layer_cache_ok && g->cuda_tp_attn_cache_dup) {
             layer_cache_ok = g->layer_raw_cache_tp[il] != NULL;
@@ -18584,6 +19141,46 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(
 #endif
 }
 
+static bool metal_graph_stream_prefill_batch_selected_addr_layer_supported(
+        const ds4_weights *weights,
+        uint32_t           il) {
+    if (!weights || il >= DS4_N_LAYER) return false;
+
+    const ds4_layer_weights *layer = &weights->layer[il];
+    if (!layer->ffn_gate_exps || !layer->ffn_up_exps ||
+        !layer->ffn_down_exps) {
+        return false;
+    }
+
+#ifdef DS4_ROCM_BUILD
+    const bool selected_iq2 =
+        glm_stream_selected_expert_cache_supported(layer, il);
+    const bool selected_q2 =
+        layer->ffn_gate_exps->type == DS4_TENSOR_Q2_K &&
+        layer->ffn_up_exps->type == DS4_TENSOR_Q2_K &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
+        glm_stream_expert_cache_addr_layout_supported(weights, layer, il);
+    return selected_iq2 || selected_q2;
+#elif defined(__APPLE__)
+    return DS4_N_EXPERT_USED == 6 &&
+           layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+           layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+           layer->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+#elif !defined(DS4_NO_GPU)
+    const bool q4 =
+        layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+        layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q4_K;
+    const bool iq2 =
+        layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+    return q4 || iq2;
+#else
+    return false;
+#endif
+}
+
 #ifdef DS4_ROCM_BUILD
 enum { DS4_ROCM_STREAM_PREFILL_FULL_LAYER_MIN_TOKENS = 1024 };
 enum { DS4_ROCM_STREAM_PREFILL_FULL_LAYER_MAX_SEED_TOKENS = 8 };
@@ -18629,7 +19226,7 @@ static bool rocm_graph_stream_layer_expert_bytes(
         const ds4_layer_weights  *layer,
         uint64_t                 *gate_expert_bytes,
         uint64_t                 *down_expert_bytes) {
-    return streaming_layer_gate_down_expert_bytes(layer,
+    return layer_gate_down_expert_bytes(layer,
                                                   gate_expert_bytes,
                                                   down_expert_bytes);
 }
@@ -20206,37 +20803,59 @@ static bool metal_graph_cuda_greedy_splitkv_may_engage(
     return metal_graph_cuda_splitkv_score_may_engage(g, pos);
 }
 
-/* Capture the verifier prefix after the first speculative token.
+/* Capture an intermediate verifier prefix.
  *
- * Exact MTP speculation is only profitable if partial accepts are cheap.  The
- * target verifier computes two draft tokens together; if only the first token
- * is accepted, replaying a one-token verifier throws away most of the gain.
- * For compressed-attention layers the mutable frontier is just the small
- * compressor state plus append counters, so we save that prefix-1 state while
- * the N=2 verifier is already stepping the compressor token by token.
+ * Speculation is only profitable if partial accepts are cheap. For compressed
+ * attention the mutable frontier is just the small compressor state plus append
+ * counters, so retain each intermediate state while the tiny verifier already
+ * steps the compressor token by token.
  *
  * Raw SWA rows are not captured here.  This graph uses a raw ring larger than
  * the 128-token logical SWA window, so writing speculative future rows does
  * not evict visible raw rows.  If the raw cache is ever reduced to a strict
  * 128-row ring, speculative raw rows must become shadow rows and be copied
  * into the ring only on commit. */
-static bool metal_graph_capture_prefix1_attn_state(ds4_gpu_graph *g, uint32_t il) {
-    if (!g->spec_capture_prefix1 || !g->spec_prefix1_attn_state_kv[il]) return true;
+static bool metal_graph_capture_prefix_attn_state(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       slot) {
+    if (!g->spec_capture_prefixes) return true;
+    /* Leading layers without an attention compressor (ratio 0) carry no
+     * frontier; mirror spec_frontier_snapshot/commit which skip them. */
+    if (ds4_layer_compress_ratio(il) == 0) return true;
+    if (slot >= DS4_SPEC_PREFIX_SLOTS ||
+        !g->spec_prefix1_attn_state_kv[il] ||
+        !g->spec_prefix1_attn_state_score[il]) {
+        return false;
+    }
     const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-    g->spec_prefix1_n_comp[il] = g->layer_n_comp[il];
-    return ds4_gpu_tensor_copy(g->spec_prefix1_attn_state_kv[il], 0,
+    const uint64_t offset = (uint64_t)slot * bytes;
+    g->spec_prefix_n_comp[slot][il] = g->layer_n_comp[il];
+    return ds4_gpu_tensor_copy(g->spec_prefix1_attn_state_kv[il], offset,
                                  g->layer_attn_state_kv[il], 0, bytes) != 0 &&
-           ds4_gpu_tensor_copy(g->spec_prefix1_attn_state_score[il], 0,
+           ds4_gpu_tensor_copy(g->spec_prefix1_attn_state_score[il], offset,
                                  g->layer_attn_state_score[il], 0, bytes) != 0;
 }
 
-static bool metal_graph_capture_prefix1_index_state(ds4_gpu_graph *g, uint32_t il) {
-    if (!g->spec_capture_prefix1 || !g->spec_prefix1_index_state_kv[il]) return true;
+static bool metal_graph_capture_prefix_index_state(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       slot) {
+    if (!g->spec_capture_prefixes) return true;
+    /* Index-compressor frontiers exist only on ratio-4 layers;
+     * mirror spec_frontier_snapshot/commit which skip the rest. */
+    if (ds4_layer_compress_ratio(il) != 4) return true;
+    if (slot >= DS4_SPEC_PREFIX_SLOTS ||
+        !g->spec_prefix1_index_state_kv[il] ||
+        !g->spec_prefix1_index_state_score[il]) {
+        return false;
+    }
     const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-    g->spec_prefix1_n_index_comp[il] = g->layer_n_index_comp[il];
-    return ds4_gpu_tensor_copy(g->spec_prefix1_index_state_kv[il], 0,
+    const uint64_t offset = (uint64_t)slot * bytes;
+    g->spec_prefix_n_index_comp[slot][il] = g->layer_n_index_comp[il];
+    return ds4_gpu_tensor_copy(g->spec_prefix1_index_state_kv[il], offset,
                                  g->layer_index_state_kv[il], 0, bytes) != 0 &&
-           ds4_gpu_tensor_copy(g->spec_prefix1_index_state_score[il], 0,
+           ds4_gpu_tensor_copy(g->spec_prefix1_index_state_score[il], offset,
                                  g->layer_index_state_score[il], 0, bytes) != 0;
 }
 
@@ -20805,7 +21424,25 @@ static bool metal_graph_use_streaming_iq2_cpu_router(void) {
            getenv("DS4_METAL_DISABLE_STREAMING_IQ2_CPU_ROUTER") == NULL;
 }
 
-static bool metal_graph_use_q4_selected_shared_overlap(void) {
+static bool metal_graph_use_q4_selected_shared_overlap(
+        const ds4_gpu_graph *g) {
+#ifdef DS4_ROCM_BUILD
+    /*
+     * ROCm SSD streaming maps only the selected routed experts, not the full
+     * Q4 expert table.  Stage that compact selection while the shared expert
+     * runs so decode reaches the existing pointer-backed MoE path.
+     *
+     * GLM owns a separate routed-MoE graph and must retain its validated
+     * selected-expert policy.
+     */
+    if (g &&
+        g->ssd_streaming &&
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA) {
+        return true;
+    }
+#else
+    (void)g;
+#endif
     static int cache = -1;
     return metal_graph_env_flag("DS4_METAL_Q4_SELECTED_OVERLAP_SHARED", &cache);
 }
@@ -20984,6 +21621,24 @@ static bool metal_graph_decode_iq2_selected_slots_expected(
                                   "DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS");
 }
 
+static bool metal_graph_decode_mxfp4_selected_slots_expected(
+        const ds4_gpu_graph     *g,
+        const ds4_layer_weights *layer) {
+    return g &&
+           g->ssd_streaming &&
+           !g->quality &&
+           layer->ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
+           layer->ffn_up_exps->type == DS4_TENSOR_MXFP4 &&
+           layer->ffn_down_exps->type == DS4_TENSOR_MXFP4 &&
+           DS4_N_EXPERT_USED == 6 &&
+           DS4_N_EXPERT >= 128 &&
+           !glm_graph_env_present("DS4_ROCM_MOE_WRITE_CLAMPED_ACT",
+                                  "DS4_METAL_MOE_WRITE_CLAMPED_ACT") &&
+           !glm_graph_env_present("DS4_ROCM_DISABLE_ROUTED_PAIR_SWIGLU_FUSION",
+                                  "DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") &&
+           getenv("DS4_METAL_DISABLE_MXFP4_SELECTED_EXPERT_VIEWS") == NULL;
+}
+
 static bool metal_graph_streaming_expert_cache_seed_layer_expected(
         const ds4_gpu_graph     *g,
         const ds4_layer_weights *layer) {
@@ -20995,7 +21650,23 @@ static bool metal_graph_streaming_expert_cache_seed_layer_expected(
         !layer->ffn_down_exps) {
         return false;
     }
-    if (metal_graph_decode_iq2_selected_slots_expected(g, layer)) return true;
+    if (metal_graph_decode_iq2_selected_slots_expected(g, layer) ||
+        metal_graph_decode_mxfp4_selected_slots_expected(g, layer)) return true;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
+        if (g->quality ||
+            layer->ffn_gate_exps->type != layer->ffn_up_exps->type ||
+            layer->ffn_gate_exps->type != layer->ffn_down_exps->type ||
+            DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT_USED > 8 ||
+            DS4_N_EXPERT < 128) {
+            return false;
+        }
+        /* P2.5 added Q3_K to Laguna's selected-expert cache kernels.  The
+         * hotlist seeder must use the same routed-triple eligibility or an
+         * XS 2.1 profile will load without placing any experts in the cache. */
+        const uint32_t type = layer->ffn_gate_exps->type;
+        return type == DS4_TENSOR_Q3_K || type == DS4_TENSOR_Q4_K ||
+               type == DS4_TENSOR_Q6_K;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
         !g->quality &&
         layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
@@ -21050,7 +21721,12 @@ static bool metal_graph_decode_cuda_selected_slots_expected(
         layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
         getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL;
-    return q4 || iq2;
+    const bool mxfp4 =
+        layer->ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
+        layer->ffn_up_exps->type == DS4_TENSOR_MXFP4 &&
+        layer->ffn_down_exps->type == DS4_TENSOR_MXFP4 &&
+        getenv("DS4_METAL_DISABLE_MXFP4_SELECTED_EXPERT_VIEWS") == NULL;
+    return q4 || iq2 || mxfp4;
 #else
     (void)g;
     (void)layer;
@@ -21286,6 +21962,99 @@ static uint32_t metal_graph_streaming_expert_preload_count(
     return preload;
 }
 
+#ifdef __APPLE__
+/* Layer-major prefill has already made this layer's weights GPU-visible.
+ * Preserve the built-in hot seed with model-to-cache blits before the next
+ * layer replaces those mapped views, rather than rereading it after prefill. */
+static bool metal_graph_seed_streaming_expert_cache_layer_from_mapped_hotlist(
+        ds4_gpu_graph     *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           il) {
+    const char *hotlist_path = glm_graph_env_value(
+            "DS4_ROCM_STREAMING_EXPERT_HOTLIST",
+            "DS4_METAL_STREAMING_EXPERT_HOTLIST");
+    if (!metal_graph_streaming_expert_hotlist_enabled(g) ||
+        !model || !weights || il >= DS4_N_LAYER ||
+        (hotlist_path && hotlist_path[0]) ||
+        (g_ds4_shape.variant != DS4_VARIANT_FLASH &&
+         g_ds4_shape.variant != DS4_VARIANT_PRO)) {
+        return true;
+    }
+
+    const ds4_layer_weights *layer = &weights->layer[il];
+    if (!metal_graph_streaming_expert_cache_seed_layer_expected(g, layer)) {
+        return true;
+    }
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    if (gate_row_bytes == 0 || down_row_bytes == 0 ||
+        layer->ffn_gate_exps->dim[1] > UINT64_MAX / gate_row_bytes ||
+        layer->ffn_down_exps->dim[1] > UINT64_MAX / down_row_bytes) {
+        fprintf(stderr,
+                "ds4: streaming resident hotlist seed byte size overflow at layer %u\n",
+                il);
+        return false;
+    }
+    const uint64_t gate_expert_bytes =
+        layer->ffn_gate_exps->dim[1] * gate_row_bytes;
+    const uint64_t down_expert_bytes =
+        layer->ffn_down_exps->dim[1] * down_row_bytes;
+    const uint32_t cache_budget =
+        ds4_gpu_stream_expert_cache_budget_for_expert_size(gate_expert_bytes,
+                                                            down_expert_bytes);
+    const uint32_t preload_count =
+        metal_graph_streaming_expert_preload_count(g, cache_budget);
+    if (preload_count == 0) return true;
+
+    const uint16_t (*hotlist)[2] = NULL;
+    uint32_t hotlist_count = 0;
+    if (g_ds4_shape.variant == DS4_VARIANT_FLASH) {
+        hotlist = ds4_default_streaming_hotlist_flash;
+        hotlist_count = ds4_default_streaming_hotlist_flash_count;
+    } else {
+        hotlist = ds4_default_streaming_hotlist_pro;
+        hotlist_count = ds4_default_streaming_hotlist_pro_count;
+    }
+    const uint32_t target_count = preload_count < hotlist_count ?
+        preload_count : hotlist_count;
+    if (ds4_gpu_stream_expert_cache_current_count() >= target_count) {
+        return true;
+    }
+
+    int32_t experts[DS4_MAX_EXPERT];
+    uint32_t priorities[DS4_MAX_EXPERT];
+    uint32_t n = 0;
+    uint32_t loaded = 0;
+    for (uint32_t i = 0;
+         i < hotlist_count && loaded < preload_count;
+         i++) {
+        const uint32_t hot_layer = hotlist[i][0];
+        const uint32_t hot_expert = hotlist[i][1];
+        if (hot_layer >= DS4_N_LAYER || hot_expert >= DS4_N_EXPERT) continue;
+        const uint32_t priority = preload_count - loaded;
+        loaded++;
+        if (hot_layer != il) continue;
+        if (n >= DS4_MAX_EXPERT) return false;
+        experts[n] = (int32_t)hot_expert;
+        priorities[n] = priority;
+        n++;
+    }
+    if (n == 0) return true;
+
+    const ds4_gpu_stream_expert_table table =
+        graph_stream_expert_table_make(model,
+                                       layer,
+                                       il,
+                                       gate_expert_bytes,
+                                       down_expert_bytes);
+    return ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(&table,
+                                                              experts,
+                                                              priorities,
+                                                              n) != 0;
+}
+#endif
+
 static bool metal_graph_decode_set_hash_selected_override(
         const ds4_model         *model,
         const ds4_layer_weights *layer,
@@ -21303,7 +22072,9 @@ static bool metal_graph_decode_set_hash_selected_override(
                                                       down_tensor_bytes);
     const bool iq2_selected =
         metal_graph_decode_iq2_selected_slots_expected(g, layer);
-    if (!q4_selected && !iq2_selected) {
+    const bool mxfp4_selected =
+        metal_graph_decode_mxfp4_selected_slots_expected(g, layer);
+    if (!q4_selected && !iq2_selected && !mxfp4_selected) {
         return true;
     }
 
@@ -22281,6 +23052,75 @@ static bool metal_graph_encode_decode_layer_phase(
         } \
     } while (0)
     const bool tp_ablate_hcpre = metal_graph_tp_ablate("hcpre");
+    /* Decode-island CUDA graph capture (design ported from the Entrpi/ds4
+     * batched-serving fork).  Two position-independent islands of the
+     * decode layer are captured and replayed: island 0 is the hc-pre
+     * stage (exactly the METAL_DECODE_LAYER_TO_QKV prefix), island 1 is
+     * the attention-output-to-layer-end tail (exactly the
+     * METAL_DECODE_LAYER_FROM_ATTN_TO_FFN suffix).  Everything a capture
+     * would freeze incorrectly -- TP, multi-tier, SSD streaming, debug
+     * dumps, stage profiling, expert profiling, reference kernels, the
+     * hash router's token argument -- disqualifies the layer and it runs
+     * eagerly, byte-identical to before.  A replayed graph re-runs the
+     * captured kernels byte-for-byte, so replay output is bit-identical
+     * to the eager encode it recorded. */
+    const bool decode_graphs_common_ok =
+        !g->placement &&
+        g->tp_world <= 1 &&
+        !g->cuda_tp_decode &&
+        !g->ssd_streaming &&
+        !g->materialize_ffn_out &&
+        !decode_stage_profile &&
+        !g_expert_profile.active &&
+        metal_graph_debug_get_config()->prefix == NULL &&
+        ds4_gpu_decode_graphs_supported() != 0;
+    const bool island_a_ok =
+        decode_graphs_common_ok &&
+        phase == METAL_DECODE_LAYER_FULL &&
+        !tp_ablate_hcpre &&
+        DS4_N_HC == 4 &&
+        !metal_graph_use_reference_hc_decode() &&
+        !metal_graph_use_reference_hc_norm_decode() &&
+        !metal_graph_hc_norm_fusion_check_enabled();
+    if (island_a_ok && ok) {
+        ds4_decode_graph_key isla_key;
+        memset(&isla_key, 0, sizeof(isla_key));
+        isla_key.il = il;
+        isla_key.island = 0u;
+        isla_key.cur_hc = (void *)metal_graph_cur_hc(g);
+        isla_key.after_attn_hc = (void *)metal_graph_after_attn_hc(g);
+        isla_key.after_ffn_hc = (void *)metal_graph_after_ffn_hc(g);
+        isla_key.attn_norm = (void *)metal_graph_attn_norm(g);
+        for (;;) {
+            const int isla_state = ds4_gpu_decode_graph_begin(&isla_key);
+            if (isla_state == 1) {
+                return metal_graph_encode_decode_layer_phase(
+                        g, model, layer, il, pos, raw_cache, raw_cap,
+                        raw_row, n_raw, token,
+                        METAL_DECODE_LAYER_FROM_ATTN_PRE_TO_FFN);
+            }
+            if (isla_state == 0) {
+                const bool isla_ok = metal_graph_encode_decode_layer_phase(
+                        g, model, layer, il, pos, raw_cache, raw_cap,
+                        raw_row, n_raw, token,
+                        METAL_DECODE_LAYER_TO_QKV);
+                if (!isla_ok) {
+                    /* Capture consumed no work; the entry is retired and
+                     * the retry runs the island eagerly. */
+                    ds4_gpu_decode_graph_abort(&isla_key);
+                    continue;
+                }
+                if (ds4_gpu_decode_graph_end(&isla_key) == 0) {
+                    return metal_graph_encode_decode_layer_phase(
+                            g, model, layer, il, pos, raw_cache, raw_cap,
+                            raw_row, n_raw, token,
+                            METAL_DECODE_LAYER_FROM_ATTN_PRE_TO_FFN);
+                }
+                continue;
+            }
+            break;      /* eager: disabled, warm pass, or retired entry */
+        }
+    }
     if (phase != METAL_DECODE_LAYER_FROM_ROUTER) {
     const bool fuse_hc_norm =
         DS4_N_HC == 4 &&
@@ -22374,6 +23214,8 @@ static bool metal_graph_encode_decode_layer_phase(
     if (!resume_after_qkv) {
     bool qkv_pair_projected = resume_after_qa_kv_raw;
     if (!resume_after_qa_kv_raw && ok && qkv_rms_fused &&
+        layer->attn_q_a->type == DS4_TENSOR_Q8_0 &&
+        layer->attn_kv->type == DS4_TENSOR_Q8_0 &&
         g->cuda_qkv_pair && !metal_graph_use_reference_qkv_pair_proj()) {
         qkv_pair_projected = ds4_gpu_matmul_q8_0_pair_tensor(
                 metal_graph_qr(g),
@@ -22388,20 +23230,30 @@ static bool metal_graph_encode_decode_layer_phase(
                 metal_graph_attn_norm(g),
                 1) != 0;
     }
-    if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) ok = ds4_gpu_matmul_q8_0_tensor(metal_graph_qr(g), model->map, model->size,
-                                                                     layer->attn_q_a->abs_offset,
-                                                                     DS4_N_EMBD, q_rank,
-                                                                     metal_graph_attn_norm(g), 1) != 0;
+    if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) {
+        ok = metal_graph_matmul_dense_quant_tensor(metal_graph_qr(g),
+                                                   model,
+                                                   layer->attn_q_a,
+                                                   DS4_N_EMBD,
+                                                   q_rank,
+                                                   metal_graph_attn_norm(g),
+                                                   1);
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", metal_graph_qr(g), q_rank, il, pos);
     }
     const bool kvnorm_dump = metal_graph_debug_wants("KVnorm", il, pos);
     bool kv_rope_fused = false;
     if (qkv_rms_fused) {
-        if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) ok = ds4_gpu_matmul_q8_0_tensor(metal_graph_kv_raw(g), model->map, model->size,
-                                                                         layer->attn_kv->abs_offset,
-                                                                         DS4_N_EMBD, DS4_N_HEAD_DIM,
-                                                                         metal_graph_attn_norm(g), 1) != 0;
+        if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) {
+            ok = metal_graph_matmul_dense_quant_tensor(metal_graph_kv_raw(g),
+                                                       model,
+                                                       layer->attn_kv,
+                                                       DS4_N_EMBD,
+                                                       DS4_N_HEAD_DIM,
+                                                       metal_graph_attn_norm(g),
+                                                       1);
+        }
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", metal_graph_kv_raw(g), DS4_N_HEAD_DIM, il, pos);
         }
@@ -23192,6 +24044,48 @@ static bool metal_graph_encode_decode_layer_phase(
         cuda_tp_attn &&
         !metal_graph_use_reference_attn_out_hc() &&
         g->cuda_tp_attn_out_hc_fuse;
+    /* Decode island 1: the attention-output-to-layer-end tail, which is
+     * position-independent (the hash router's token argument disqualifies
+     * layers with ffn_gate_tid2eid).  Capture and replay both go through
+     * the METAL_DECODE_LAYER_FROM_ATTN_TO_FFN phase, which encodes
+     * exactly this suffix; the phase check keeps the capture recursion
+     * from re-entering this block. */
+    const bool island_b_ok =
+        decode_graphs_common_ok &&
+        ok &&
+        (phase == METAL_DECODE_LAYER_FULL ||
+         phase == METAL_DECODE_LAYER_FROM_ATTN_PRE_TO_FFN) &&
+        fuse_attn_out_hc &&
+        !cuda_tp_attn &&
+        !cuda_tp_attn_heads_active &&
+        layer->ffn_gate_tid2eid == NULL;
+    if (island_b_ok) {
+        ds4_decode_graph_key islb_key;
+        memset(&islb_key, 0, sizeof(islb_key));
+        islb_key.il = il;
+        islb_key.island = 1u;
+        islb_key.cur_hc = (void *)metal_graph_cur_hc(g);
+        islb_key.after_attn_hc = (void *)metal_graph_after_attn_hc(g);
+        islb_key.after_ffn_hc = (void *)metal_graph_after_ffn_hc(g);
+        islb_key.attn_norm = (void *)metal_graph_attn_norm(g);
+        for (;;) {
+            const int islb_state = ds4_gpu_decode_graph_begin(&islb_key);
+            if (islb_state == 1) return ok;
+            if (islb_state == 0) {
+                const bool islb_ok = metal_graph_encode_decode_layer_phase(
+                        g, model, layer, il, pos, raw_cache, raw_cap,
+                        raw_row, n_raw, token,
+                        METAL_DECODE_LAYER_FROM_ATTN_TO_FFN);
+                if (!islb_ok) {
+                    ds4_gpu_decode_graph_abort(&islb_key);
+                    continue;
+                }
+                if (ds4_gpu_decode_graph_end(&islb_key) == 0) return true;
+                continue;
+            }
+            break;
+        }
+    }
     if (ok && cuda_tp_attn_requested && !cuda_tp_attn) {
         fprintf(stderr,
                 "ds4: CUDA decode TP cannot split attention output for tier %d "
@@ -23990,7 +24884,7 @@ static bool metal_graph_encode_decode_layer_phase(
      * needs the unfused gate/up/swiglu/down sequence. */
     const bool tp_split_shared = g->tp_world == 2;
     const bool q4_selected_shared_overlap =
-        metal_graph_use_q4_selected_shared_overlap() &&
+        metal_graph_use_q4_selected_shared_overlap(g) &&
         metal_graph_decode_q4_selected_slots_expected(g,
                                                       layer,
                                                       layer->ffn_gate_exps->bytes,
@@ -23998,6 +24892,9 @@ static bool metal_graph_encode_decode_layer_phase(
     const bool iq2_selected_shared_overlap =
         metal_graph_use_iq2_selected_shared_overlap(g) &&
         metal_graph_decode_iq2_selected_slots_expected(g, layer);
+    const bool mxfp4_selected_shared_overlap =
+        metal_graph_use_iq2_selected_shared_overlap(g) &&
+        metal_graph_decode_mxfp4_selected_slots_expected(g, layer);
     const bool cuda_selected_shared_overlap =
         metal_graph_use_cuda_selected_shared_overlap(g) &&
         metal_graph_decode_cuda_selected_slots_expected(g, layer);
@@ -24010,10 +24907,13 @@ static bool metal_graph_encode_decode_layer_phase(
         getenv("DS4_MOE_REPLAY_SELECTED_IDS") == NULL &&
         (q4_selected_shared_overlap ||
          iq2_selected_shared_overlap ||
+         mxfp4_selected_shared_overlap ||
          cuda_selected_shared_overlap);
     const bool async_selected_load =
         overlap_selected_shared &&
         ((iq2_selected_shared_overlap &&
+          metal_graph_use_iq2_selected_async_load(g)) ||
+         (mxfp4_selected_shared_overlap &&
           metal_graph_use_iq2_selected_async_load(g)) ||
          cuda_selected_shared_overlap);
     const bool selected_readahead_shared_delay =
@@ -25281,14 +26181,13 @@ static bool metal_graph_output_logits_head_matmul(
             }
         }
     } else if (ok && !(g->cuda_tp_ep && g->cuda_tp_output)) {
-        ok = ds4_gpu_matmul_q8_0_tensor(logits,
-                                        model->map,
-                                        model->size,
-                                        weights->output->abs_offset,
-                                        DS4_N_EMBD,
-                                        vocab_dim,
-                                        output_norm,
-                                        head_rows) != 0;
+        ok = metal_graph_matmul_dense_quant_tensor(logits,
+                                                   model,
+                                                   weights->output,
+                                                   DS4_N_EMBD,
+                                                   vocab_dim,
+                                                   output_norm,
+                                                   head_rows);
     } else if (ok) {
         /* The expert-parallel cache stores only output vocabulary shards, so
          * a single-device full-head fallback would access uncached weights. */
@@ -27184,6 +28083,21 @@ static bool metal_graph_hc_rms_scale_project(
                n_tokens,
                DS4_RMS_EPS) != 0;
 #else
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    if (weight->type == DS4_TENSOR_F16 &&
+        ds4_gpu_matmul_f16_rms_fold_tensor(
+            out,
+            model->map,
+            model->size,
+            weight->abs_offset,
+            in_dim,
+            2u * DS4_N_HC + DS4_N_HC * DS4_N_HC,
+            x,
+            n_tokens,
+            DS4_RMS_EPS)) {
+        return true;
+    }
+#endif
     bool ok = ds4_gpu_rms_norm_plain_rows_tensor(
                   norm_scratch,
                   x,
@@ -27782,30 +28696,57 @@ static bool metal_graph_encode_layer_attention_batch(
                                           (uint64_t)n_tokens * q_dim, il, pos0);
         }
         DS4_METAL_PROFILE_Q_STAGE("q_b");
-        if (ok) ok = ds4_gpu_head_rms_norm_tensor(tp_q ? tp_q : metal_graph_batch_q(g),
-                                                    tp_rows,
-                                                    DS4_N_HEAD,
-                                                    DS4_N_HEAD_DIM,
-                                                    DS4_RMS_EPS) != 0;
-        if (ok) {
+        const bool q_norm_debug =
+            metal_graph_debug_wants("Qnorm", il, pos0);
+        bool q_norm_rope_fused = false;
+        if (ok && !q_norm_debug) {
+            q_norm_rope_fused = ds4_gpu_head_rms_norm_rope_tail_tensor(
+                tp_q ? tp_q : metal_graph_batch_q(g),
+                tp_rows,
+                DS4_N_HEAD,
+                DS4_N_HEAD_DIM,
+                DS4_N_ROT,
+                pos0 + tp_row0,
+                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                false,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                DS4_ROPE_YARN_BETA_FAST,
+                DS4_ROPE_YARN_BETA_SLOW,
+                DS4_RMS_EPS) != 0;
+        }
+        if (ok && !q_norm_rope_fused) {
+            ok = ds4_gpu_head_rms_norm_tensor(
+                tp_q ? tp_q : metal_graph_batch_q(g),
+                tp_rows,
+                DS4_N_HEAD,
+                DS4_N_HEAD_DIM,
+                DS4_RMS_EPS) != 0;
+        }
+        if (ok && !q_norm_rope_fused) {
             metal_graph_debug_dump_tensor("Qnorm", metal_graph_batch_q(g),
                                           (uint64_t)n_tokens * q_dim, il, pos0);
         }
         DS4_METAL_PROFILE_Q_STAGE("head_norm");
-        if (ok) ok = ds4_gpu_rope_tail_tensor(tp_q ? tp_q : metal_graph_batch_q(g),
-                                                tp_rows,
-                                                DS4_N_HEAD,
-                                                DS4_N_HEAD_DIM,
-                                                DS4_N_ROT,
-                                                pos0 + tp_row0,
-                                                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
-                                                false,
-                                                freq_base,
-                                                freq_scale,
-                                                ext_factor,
-                                                attn_factor,
-                                                DS4_ROPE_YARN_BETA_FAST,
-                                                DS4_ROPE_YARN_BETA_SLOW) != 0;
+        if (ok && !q_norm_rope_fused) {
+            ok = ds4_gpu_rope_tail_tensor(
+                tp_q ? tp_q : metal_graph_batch_q(g),
+                tp_rows,
+                DS4_N_HEAD,
+                DS4_N_HEAD_DIM,
+                DS4_N_ROT,
+                pos0 + tp_row0,
+                compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                false,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                DS4_ROPE_YARN_BETA_FAST,
+                DS4_ROPE_YARN_BETA_SLOW) != 0;
+        }
         if (ok) {
             metal_graph_debug_dump_tensor("Qcur", metal_graph_batch_q(g),
                                           (uint64_t)n_tokens * q_dim, il, pos0);
@@ -28097,6 +29038,7 @@ static bool metal_graph_encode_layer_attention_batch(
         } else {
             const bool aligned_chunk =
                 getenv("DS4_CUDA_NO_COMPRESSOR_PREFILL_BATCH") == NULL &&
+                !g->spec_capture_prefixes &&
                 (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
             if (aligned_chunk) {
                 const uint32_t comp_before = g->layer_n_comp[il];
@@ -28263,7 +29205,10 @@ static bool metal_graph_encode_layer_attention_batch(
                     }
                     if (ok && emit) g->layer_n_comp[il]++;
                     if (comp_counts) comp_counts[t] = g->layer_n_comp[il];
-                    if (ok && t == 0) ok = metal_graph_capture_prefix1_attn_state(g, il);
+                    if (ok && t + 1u < n_tokens &&
+                        t < DS4_SPEC_PREFIX_SLOTS) {
+                        ok = metal_graph_capture_prefix_attn_state(g, il, t);
+                    }
                     ds4_gpu_tensor_free(sc_view);
                     ds4_gpu_tensor_free(kv_view);
                 }
@@ -28416,6 +29361,7 @@ static bool metal_graph_encode_layer_attention_batch(
             } else {
                 const bool aligned_chunk =
                     getenv("DS4_CUDA_NO_COMPRESSOR_PREFILL_BATCH") == NULL &&
+                    !g->spec_capture_prefixes &&
                     (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
                 if (aligned_chunk) {
                     const uint32_t index_before = g->layer_n_index_comp[il];
@@ -28555,7 +29501,10 @@ static bool metal_graph_encode_layer_attention_batch(
                         }
                         if (ok && emit) g->layer_n_index_comp[il]++;
                         if (index_counts) index_counts[t] = g->layer_n_index_comp[il];
-                        if (ok && t == 0) ok = metal_graph_capture_prefix1_index_state(g, il);
+                        if (ok && t + 1u < n_tokens &&
+                            t < DS4_SPEC_PREFIX_SLOTS) {
+                            ok = metal_graph_capture_prefix_index_state(g, il, t);
+                        }
                         ds4_gpu_tensor_free(sc_view);
                         ds4_gpu_tensor_free(kv_view);
                     }
@@ -30117,12 +31066,13 @@ static bool metal_graph_eval_token_raw_swa(
 
 static bool metal_graph_streaming_decode_prefill_wide_default(
         const ds4_weights *weights) {
-    return DS4_MODEL_VARIANT == DS4_VARIANT_FLASH &&
-           weights &&
-           DS4_N_LAYER > 0 &&
-           weights->layer[0].ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
-           weights->layer[0].ffn_up_exps->type == DS4_TENSOR_Q4_K &&
-           weights->layer[0].ffn_down_exps->type == DS4_TENSOR_Q4_K;
+    if (DS4_MODEL_VARIANT != DS4_VARIANT_FLASH || !weights || DS4_N_LAYER == 0) {
+        return false;
+    }
+    const uint32_t type = weights->layer[0].ffn_gate_exps->type;
+    return (type == DS4_TENSOR_Q4_K || type == DS4_TENSOR_MXFP4) &&
+           weights->layer[0].ffn_up_exps->type == type &&
+           weights->layer[0].ffn_down_exps->type == type;
 }
 
 static uint32_t metal_graph_streaming_decode_prefill_max_tokens(
@@ -31919,11 +32869,18 @@ static bool metal_graph_eval_dspark_stage_block(
     return ok;
 }
 
+static bool metal_graph_eval_dspark_final_hidden(
+        ds4_gpu_graph            *g,
+        const ds4_model          *dspark_model,
+        const ds4_dspark_weights *dw,
+        bool                      commands_open);
+
 static bool metal_graph_eval_dspark_stage_chain(
         ds4_gpu_graph            *g,
         const ds4_model          *dspark_model,
         const ds4_dspark_weights *dw,
         uint32_t                  pos,
+        bool                      encode_final_hidden,
         uint32_t                 *completed_stages,
         uint32_t                 *cache_start_out,
         uint32_t                 *cache_rows_out) {
@@ -31996,6 +32953,11 @@ static bool metal_graph_eval_dspark_stage_chain(
             break;
         }
         if (completed_stages) *completed_stages = stage + 1u;
+    }
+    /* Final hidden rows consume only the last stage's GPU output. Keep them in
+     * this command buffer when the CPU confidence precheck will need them. */
+    if (ok && encode_final_hidden) {
+        ok = metal_graph_eval_dspark_final_hidden(g, dspark_model, dw, true);
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     if (suspended_expert_sharding) {
@@ -32281,7 +33243,8 @@ static bool metal_graph_eval_dspark_base_logits(
 static bool metal_graph_eval_dspark_final_hidden(
         ds4_gpu_graph            *g,
         const ds4_model          *dspark_model,
-        const ds4_dspark_weights *dw) {
+        const ds4_dspark_weights *dw,
+        bool                      commands_open) {
     if (!g || !dspark_model || !dw ||
         dw->n_stages == 0 ||
         dw->n_stages > DS4_DSPARK_MAX_STAGES ||
@@ -32353,7 +33316,7 @@ static bool metal_graph_eval_dspark_final_hidden(
 
     bool ok = stage_output_hc && output_pre && output_weights &&
               output_embd && output_norm;
-    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    if (ok && !commands_open) ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(metal_graph_batch_flat_hc(g),
                                                      stage_output_hc,
                                                      (uint32_t)hc_dim,
@@ -32387,8 +33350,8 @@ static bool metal_graph_eval_dspark_final_hidden(
                                                       DS4_N_EMBD,
                                                       draft,
                                                       DS4_RMS_EPS) != 0;
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    if (!ok) (void)ds4_gpu_synchronize();
+    if (ok && !commands_open) ok = ds4_gpu_end_commands() != 0;
+    if (!ok && !commands_open) (void)ds4_gpu_synchronize();
 
     ds4_gpu_tensor_free(output_norm);
     ds4_gpu_tensor_free(output_embd);
@@ -33393,6 +34356,7 @@ static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     metal_graph_dspark_cache_reset(g);
     metal_graph_dspark_capture_invalidate(g);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!g->layer_raw_cache[il]) continue;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -33940,6 +34904,9 @@ static bool metal_graph_prefill_layer_major(
     memset(&rocm_full_layer_load, 0, sizeof(rocm_full_layer_load));
 #endif
     if (g->ssd_streaming && DS4_N_LAYER > 0) {
+        const bool layer_selected_addr =
+            batch_selected_addr &&
+            metal_graph_stream_prefill_batch_selected_addr_layer_supported(weights, 0);
         if (layer_prepare) {
             if (!metal_graph_stream_prepare_start_if_needed(g,
                                                             model,
@@ -33949,13 +34916,13 @@ static bool metal_graph_prefill_layer_major(
                                                             layer_madvise,
                                                             layer_pread,
                                                             layer_readahead,
-                                                            batch_selected_addr,
+                                                            layer_selected_addr,
                                                             layer_prepare_slots,
                                                             layer_prepare_ahead)) {
                 return false;
             }
         } else {
-            if (batch_selected_addr) {
+            if (layer_selected_addr) {
                 metal_graph_stream_readahead_layer_decode(model, weights, 0);
             } else {
                 metal_graph_stream_readahead_layer(model, weights, 0);
@@ -34011,6 +34978,9 @@ static bool metal_graph_prefill_layer_major(
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         double layer_elapsed = 0.0;
+        const bool layer_selected_addr =
+            batch_selected_addr &&
+            metal_graph_stream_prefill_batch_selected_addr_layer_supported(weights, il);
         if (layer_prepare &&
             !metal_graph_stream_prepare_join_layer(g,
                                                    model,
@@ -34020,7 +34990,7 @@ static bool metal_graph_prefill_layer_major(
                                                    layer_madvise,
                                                    layer_pread,
                                                    layer_readahead,
-                                                   batch_selected_addr,
+                                                   layer_selected_addr,
                                                    layer_prepare_slots,
                                                    layer_prepare_ahead)) {
             ok = false;
@@ -34055,7 +35025,7 @@ static bool metal_graph_prefill_layer_major(
 #endif
         if (g->ssd_streaming) {
             g->streaming_static_decode_map_current = false;
-            bool decode_only_map = batch_selected_addr;
+            bool decode_only_map = layer_selected_addr;
 #ifdef DS4_ROCM_BUILD
             decode_only_map = decode_only_map || rocm_full_layer_stream_prefill;
 #endif
@@ -34073,15 +35043,21 @@ static bool metal_graph_prefill_layer_major(
                 for (uint32_t ahead = 1; ahead <= layer_prepare_ahead; ahead++) {
                     if (il + ahead >= DS4_N_LAYER) break;
                     started_future = true;
+                    const uint32_t future_il = il + ahead;
+                    const bool future_selected_addr =
+                        batch_selected_addr &&
+                        metal_graph_stream_prefill_batch_selected_addr_layer_supported(
+                            weights,
+                            future_il);
                     if (!metal_graph_stream_prepare_start_if_needed(g,
                                                                     model,
                                                                     weights,
-                                                                    il + ahead,
+                                                                    future_il,
                                                                     n_tokens,
                                                                     layer_madvise,
                                                                     layer_pread,
                                                                     layer_readahead,
-                                                                    batch_selected_addr,
+                                                                    future_selected_addr,
                                                                     layer_prepare_slots,
                                                                     layer_prepare_ahead)) {
                         ok = false;
@@ -34093,7 +35069,12 @@ static bool metal_graph_prefill_layer_major(
                     metal_graph_stream_readahead_output(model, weights);
                 }
             } else if (!layer_prepare && il + 1 < DS4_N_LAYER) {
-                if (batch_selected_addr) {
+                const bool next_selected_addr =
+                    batch_selected_addr &&
+                    metal_graph_stream_prefill_batch_selected_addr_layer_supported(
+                        weights,
+                        il + 1);
+                if (next_selected_addr) {
                     metal_graph_stream_readahead_layer_decode(model, weights, il + 1);
                 } else {
                     metal_graph_stream_readahead_layer(model, weights, il + 1);
@@ -34155,6 +35136,15 @@ static bool metal_graph_prefill_layer_major(
             if (ok) ok = metal_graph_capture_prefill_seed_router_selected(g,
                                                                           il,
                                                                           n_tokens);
+#ifdef __APPLE__
+            if (ok && !layer_selected_addr) {
+                ok = metal_graph_seed_streaming_expert_cache_layer_from_mapped_hotlist(
+                        g,
+                        model,
+                        weights,
+                        il);
+            }
+#endif
             const double t_ffn_encoded = now_sec();
             if (ok) ok = ds4_gpu_end_commands() != 0;
             const double t_ffn_done = now_sec();
@@ -34205,6 +35195,15 @@ static bool metal_graph_prefill_layer_major(
             if (ok) ok = metal_graph_capture_prefill_seed_router_selected(g,
                                                                           il,
                                                                           n_tokens);
+#ifdef __APPLE__
+            if (ok && !layer_selected_addr) {
+                ok = metal_graph_seed_streaming_expert_cache_layer_from_mapped_hotlist(
+                        g,
+                        model,
+                        weights,
+                        il);
+            }
+#endif
             const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
             if (ok) ok = ds4_gpu_end_commands() != 0;
             const double t_done = (profile || throttle) ? now_sec() : 0.0;
@@ -34241,6 +35240,11 @@ static bool metal_graph_prefill_layer_major(
             layer_prepare &&
             !layer_prepare_overlap) {
             if (il + 1 < DS4_N_LAYER) {
+                const bool next_selected_addr =
+                    batch_selected_addr &&
+                    metal_graph_stream_prefill_batch_selected_addr_layer_supported(
+                        weights,
+                        il + 1);
                 if (!metal_graph_stream_prepare_start_if_needed(g,
                                                                 model,
                                                                 weights,
@@ -34249,7 +35253,7 @@ static bool metal_graph_prefill_layer_major(
                                                                 layer_madvise,
                                                                 layer_pread,
                                                                 layer_readahead,
-                                                                batch_selected_addr,
+                                                                next_selected_addr,
                                                                 layer_prepare_slots,
                                                                 layer_prepare_ahead)) {
                     ok = false;
@@ -34307,6 +35311,17 @@ static bool metal_graph_prefill_layer_major(
     if (show_progress) fputc('\n', stderr);
     metal_graph_stream_prefill_selected_profile_summary(g);
 #ifdef DS4_ROCM_BUILD
+    /*
+     * The final layer can use its fully mapped prefill table after the
+     * asynchronous selected-expert loader has already queued a resident-cache
+     * batch.  Drain that completed batch before hotlist seeding starts another
+     * read-pool job set, otherwise both callers wait forever for ownership of
+     * the single ROCm streaming read pool.
+     */
+    if (g->ssd_streaming &&
+        !ds4_gpu_stream_expert_cache_finish_pending_batch()) {
+        return false;
+    }
     (void)ds4_gpu_stream_expert_cache_release_layer_cache();
     if (g->ssd_streaming) ds4_gpu_release_q8_f16_cache();
 #endif
@@ -34659,8 +35674,10 @@ static bool metal_graph_verify_suffix_tops_impl(
                                                          n_tokens);
     if (!ok) return false;
 
-    const bool saved_capture = g->spec_capture_prefix1;
-    g->spec_capture_prefix1 = capture_prefix1 && n_tokens == 2;
+    const bool saved_capture = g->spec_capture_prefixes;
+    g->spec_capture_prefixes =
+        capture_prefix1 && n_tokens > 1u &&
+        n_tokens <= DS4_SPEC_PREFIX_SLOTS + 1u;
     const char *split_head_env = getenv("DS4_DSPARK_VERIFY_SPLIT_HEAD");
     const bool fuse_head =
         !split_head_env || !split_head_env[0] ||
@@ -34750,7 +35767,7 @@ static bool metal_graph_verify_suffix_tops_impl(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
-    g->spec_capture_prefix1 = saved_capture;
+    g->spec_capture_prefixes = saved_capture;
     if (!ok && dspark_capture_active) {
         metal_graph_dspark_capture_invalidate(g);
     }
@@ -34895,7 +35912,7 @@ static bool metal_graph_verify_decode2_exact(
     ds4_gpu_tensor *saved_cur_by_tier[DS4_MAX_GPUS] = {0};
     ds4_gpu_tensor *saved_after_by_tier[DS4_MAX_GPUS] = {0};
     const int saved_active_tier = g->active_tier;
-    const bool saved_capture = g->spec_capture_prefix1;
+    const bool saved_capture = g->spec_capture_prefixes;
 
     bool ok = true;
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
@@ -34940,7 +35957,7 @@ static bool metal_graph_verify_decode2_exact(
                                                DS4_N_EMBD,
                                                DS4_N_HC) != 0;
 
-    g->spec_capture_prefix1 = true;
+    g->spec_capture_prefixes = true;
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const uint32_t pos0 = start;
@@ -34977,8 +35994,8 @@ static bool metal_graph_verify_decode2_exact(
                                              metal_graph_raw_span_for_batch(g, pos0, 1),
                                              token0);
         if (!ok) break;
-        ok = metal_graph_capture_prefix1_attn_state(g, il) &&
-             metal_graph_capture_prefix1_index_state(g, il);
+        ok = metal_graph_capture_prefix_attn_state(g, il, 0) &&
+             metal_graph_capture_prefix_index_state(g, il, 0);
         if (!ok) break;
 
         g->cur_hc_by_tier[this_tier] = cur1_by_tier[this_tier];
@@ -35004,7 +36021,7 @@ static bool metal_graph_verify_decode2_exact(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
-    g->spec_capture_prefix1 = saved_capture;
+    g->spec_capture_prefixes = saved_capture;
 
     if (ok) {
         ok = metal_graph_set_active_tier_no_copy(g, cur_tier);
@@ -35082,7 +36099,7 @@ static bool metal_graph_verify_decode2_exact(
             }
         }
     }
-    g->spec_capture_prefix1 = saved_capture;
+    g->spec_capture_prefixes = saved_capture;
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
         g->cur_hc_by_tier[t] = saved_cur_by_tier[t];
         g->after_ffn_hc_by_tier[t] = saved_after_by_tier[t];
@@ -35234,12 +36251,6 @@ static uint32_t glm_graph_full_indexer_layer_count_range(uint32_t layer_start,
         if (glm_graph_layer_uses_full_indexer(il)) n++;
     }
     return n;
-}
-
-static uint32_t glm_graph_full_indexer_layer_count(uint32_t normal_layers) {
-    return normal_layers ?
-        glm_graph_full_indexer_layer_count_range(0, normal_layers - 1u) :
-        0;
 }
 
 static uint64_t glm_graph_full_kv_cache_elem_bytes(void) {
@@ -35587,13 +36598,21 @@ static uint64_t glm_graph_workspace_bytes_for_cap(
     return bytes;
 }
 
-static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
+static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap_slice(
         uint32_t ctx,
         uint32_t work_ctx,
         uint32_t compact_cap,
-        bool     ssd_streaming) {
+        bool     ssd_streaming,
+        uint32_t layer_start,
+        uint32_t layer_end) {
     ds4_context_memory m = {0};
     const uint32_t normal_layers = glm_graph_normal_layer_count();
+    if (normal_layers == 0 || layer_start >= normal_layers ||
+        layer_end < layer_start) {
+        return m;
+    }
+    if (layer_end >= normal_layers) layer_end = normal_layers - 1u;
+    const uint32_t layer_count = layer_end - layer_start + 1u;
     if (compact_cap > ctx) compact_cap = ctx;
 
     const bool expanded_kv = glm_graph_expanded_kv_cache_enabled(ssd_streaming);
@@ -35607,7 +36626,7 @@ static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
     m.prefill_cap = batch_rows;
     m.raw_cap = expanded_kv ? work_ctx : 0;
     if (expanded_kv) {
-        m.raw_bytes = (uint64_t)normal_layers *
+        m.raw_bytes = (uint64_t)layer_count *
                       work_ctx *
                       ((uint64_t)DS4_N_HEAD * (DS4_N_KEY_MLA + DS4_N_VALUE_MLA)) *
                       glm_graph_full_kv_cache_elem_bytes();
@@ -35620,12 +36639,32 @@ static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
         m.comp_cap = compact_cap;
         m.compressed_bytes =
             glm_graph_compact_cache_bytes_for_cap(
-                    normal_layers,
-                    glm_graph_full_indexer_layer_count(normal_layers),
+                    layer_count,
+                    glm_graph_full_indexer_layer_count_range(layer_start,
+                                                             layer_end),
                     compact_cap);
     }
     m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
     return m;
+}
+
+static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
+        uint32_t ctx,
+        uint32_t work_ctx,
+        uint32_t compact_cap,
+        bool     ssd_streaming) {
+    const uint32_t normal_layers = glm_graph_normal_layer_count();
+    if (normal_layers == 0) {
+        const ds4_context_memory empty = {0};
+        return empty;
+    }
+    return glm_graph_context_memory_estimate_for_compact_cap_slice(
+            ctx,
+            work_ctx,
+            compact_cap,
+            ssd_streaming,
+            0,
+            normal_layers - 1u);
 }
 
 ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
@@ -35660,24 +36699,8 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
                 m.raw_bytes += (uint64_t)cap * kv_row_bytes;
             }
 
-            const uint64_t q_dim =
-                (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
-            const uint64_t kv_dim =
-                (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
-            const uint64_t ffn_max = DS4_N_FF_DENSE >
-                (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP ?
-                DS4_N_FF_DENSE :
-                (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP;
-            uint64_t scratch_f32 = 9ull * DS4_N_EMBD +
-                                   2ull * q_dim +
-                                   2ull * kv_dim +
-                                   DS4_N_HEAD +
-                                   3ull * ffn_max +
-                                   (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP +
-                                   2ull * DS4_N_EXPERT +
-                                   2ull * DS4_N_EXPERT_USED +
-                                   DS4_N_VOCAB;
-            m.scratch_bytes = scratch_f32 * sizeof(float);
+            m.prefill_cap = laguna_graph_prefill_cap(ctx, prefill_chunk);
+            m.scratch_bytes = laguna_graph_scratch_bytes(m.prefill_cap);
             m.total_bytes = m.raw_bytes + m.scratch_bytes;
             return m;
         }
@@ -36090,6 +37113,8 @@ struct ds4_vocab {
     int arg_value_start_id;
     int arg_value_end_id;
     int dsml_id;
+    int im_start_id;
+    int im_end_id;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
 };
@@ -36112,11 +37137,53 @@ typedef struct {
     bool active;
 } ds4_engine_tp_state;
 
+typedef struct {
+    const ds4_tensor *attn_norm;
+    const ds4_tensor *attn_q;
+    const ds4_tensor *attn_q_norm;
+    const ds4_tensor *attn_k;
+    const ds4_tensor *attn_k_norm;
+    const ds4_tensor *attn_v;
+    const ds4_tensor *attn_output;
+    const ds4_tensor *ffn_norm;
+    const ds4_tensor *router;
+    const ds4_tensor *gate_experts;
+    const ds4_tensor *up_experts;
+    const ds4_tensor *down_experts;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    /* Zero means the session context; nonzero values are sliding windows. */
+    uint32_t kv_window;
+    bool sliding_attention;
+} ds4_mellum_layer_decode_desc;
+
+/* Private, inspect-only storage for the first reusable Mellum decode graph.
+ * This is deliberately distinct from ds4_session and the shared KV store:
+ * until the output head and session semantics are validated, no normal engine
+ * execution path may consume it. */
+typedef struct ds4_mellum_decode_state ds4_mellum_decode_state;
+typedef struct ds4_mellum_session_state ds4_mellum_session_state;
+
 struct ds4_engine {
     ds4_model model;
     ds4_model mtp_model;
     ds4_vocab vocab;
     ds4_weights weights;
+    /* Bound once from the canonical GGUF names. The first Mellum graph will
+     * consume these descriptors rather than re-deriving layouts from generic
+     * Laguna/GLM layer state. */
+    ds4_mellum_layer_decode_desc mellum_layer[DS4_MAX_LAYER];
+    uint32_t mellum_layer_start;
+    uint32_t mellum_layer_end;
+    bool mellum_decode_contract_ready;
+    /* Named for the capability, not the format that currently implies it:
+     * the expert-major batch prefill kernel stages Q8_0 rows, so any model it
+     * cannot stage takes the tokenwise sync path.  Q4_K gate/up is the only
+     * such case today; it will stop being so when a Q4_K expert-major kernel
+     * lands, and this flag should keep meaning what it says. */
+    bool mellum_batched_prefill_unsupported;
+    bool mellum_interactive_sessions;
+    ds4_mellum_decode_state *mellum_decode_state;
     ds4_mtp_weights mtp_weights;
     ds4_dspark_weights dspark_weights;
     ds4_dflash_weights dflash_weights;
@@ -36163,6 +37230,17 @@ struct ds4_engine {
     bool mtp_ready;
     bool dflash_ready;
     bool share_session_prefill_workspace;
+    /*
+     * One layer-major prefill workspace for the whole engine.  Sessions lease
+     * it for the duration of a sync rather than owning one each: at the
+     * sliding-window width it is ~130 MiB, so eight resident sessions would
+     * otherwise spend about a gigabyte on scratch that only one of them can be
+     * using -- prefill is serialized behind the GPU in-process, and the server
+     * serializes it explicitly.  Allocated at the full width on first use, so
+     * a session that happens to sync a short suffix first does not pin every
+     * later prompt to that chunk size.
+     */
+    struct ds4_mellum_prefill_scratch_s *mellum_prefill_workspace;
 #ifndef DS4_NO_GPU
     bool shared_prefill_workspace_ready;
     ds4_gpu_graph shared_prefill_workspace;
@@ -36184,7 +37262,799 @@ struct ds4_engine {
      * Zero / negative = legacy 4096 fallback (single-tier paths and any
      * caller that doesn't set the option observe the prior behavior). */
     int            placement_ctx_hint;
+    int            placement_session_count_hint;
 };
+
+static bool ds4_engine_bind_mellum_decode_contract(ds4_engine *e,
+                                                    uint32_t layer_start,
+                                                    uint32_t layer_end) {
+    if (!e || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM) return true;
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_start >= DS4_N_LAYER || layer_end >= DS4_N_LAYER ||
+        layer_end < layer_start) return false;
+    e->mellum_batched_prefill_unsupported = false;
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *src = &e->weights.layer[il];
+        ds4_mellum_layer_decode_desc *dst = &e->mellum_layer[il];
+        if (!weights_mellum_layer_has_required(src)) return false;
+        if (src->ffn_gate_exps->type == DS4_TENSOR_Q4_K) {
+            e->mellum_batched_prefill_unsupported = true;
+        }
+        uint64_t gate_expert_bytes = 0;
+        uint64_t down_expert_bytes = 0;
+        if (!layer_gate_down_expert_bytes(src,
+                                                     &gate_expert_bytes,
+                                                     &down_expert_bytes)) {
+            return false;
+        }
+        const uint64_t up_row_bytes = routed_expert_row_bytes(src->ffn_up_exps);
+        if (src->ffn_up_exps->dim[1] > UINT64_MAX / up_row_bytes) {
+            return false;
+        }
+        const uint64_t up_expert_bytes = src->ffn_up_exps->dim[1] * up_row_bytes;
+        if (gate_expert_bytes != up_expert_bytes) return false;
+
+        const bool sliding_attention =
+            ds4_mellum_layer_uses_sliding_attention(il);
+
+        *dst = (ds4_mellum_layer_decode_desc) {
+            .attn_norm = src->attn_norm,
+            .attn_q = src->attn_q,
+            .attn_q_norm = src->attn_q_norm,
+            .attn_k = src->attn_k,
+            .attn_k_norm = src->attn_k_norm,
+            .attn_v = src->attn_v,
+            .attn_output = src->attn_output,
+            .ffn_norm = src->ffn_norm,
+            .router = src->ffn_gate_inp,
+            .gate_experts = src->ffn_gate_exps,
+            .up_experts = src->ffn_up_exps,
+            .down_experts = src->ffn_down_exps,
+            .gate_expert_bytes = gate_expert_bytes,
+            .down_expert_bytes = down_expert_bytes,
+            .kv_window = sliding_attention ? DS4_N_SWA : 0u,
+            .sliding_attention = sliding_attention,
+        };
+    }
+    e->mellum_layer_start = layer_start;
+    e->mellum_layer_end = layer_end;
+    e->mellum_decode_contract_ready = true;
+    return true;
+}
+
+#ifndef DS4_NO_GPU
+/* Construct the diagnostic Q8 layer contract once per real Mellum layer.
+ * The full-attention phase deliberately differs from the preceding three
+ * sliding layers in both its YaRN arguments and its unbounded KV policy. */
+static bool ds4_mellum_q8_layer_desc(const ds4_engine                  *e,
+                                     uint32_t                           il,
+                                     ds4_gpu_mellum_q8_0_layer_desc    *out) {
+    if (!e || !out || il >= DS4_N_LAYER) return false;
+    const ds4_mellum_layer_decode_desc *layer = &e->mellum_layer[il];
+    if (!layer->attn_norm || !layer->attn_q || !layer->attn_q_norm ||
+        !layer->attn_k || !layer->attn_k_norm || !layer->attn_v ||
+        !layer->attn_output || !layer->ffn_norm || !layer->router ||
+        !layer->gate_experts || !layer->up_experts || !layer->down_experts ||
+        layer->attn_q->type != DS4_TENSOR_Q8_0 ||
+        layer->attn_k->type != DS4_TENSOR_Q8_0 ||
+        layer->attn_v->type != DS4_TENSOR_Q8_0 ||
+        layer->attn_output->type != DS4_TENSOR_Q8_0 ||
+        layer->router->type != DS4_TENSOR_F32 ||
+        layer->down_experts->type != DS4_TENSOR_Q8_0) {
+        return false;
+    }
+    /* Gate/up may be Q4_K on some layers and Q8_0 on others within one file,
+     * but the two must agree with each other: the pair kernel reads both
+     * through a single dispatch.  Down stays Q8_0 -- see
+     * weights_validate_mellum_layout for why a K-quant there is
+     * unrepresentable rather than merely lossier. */
+    const uint32_t pair_type = layer->gate_experts->type;
+    if ((pair_type != DS4_TENSOR_Q8_0 && pair_type != DS4_TENSOR_Q4_K) ||
+        layer->up_experts->type != pair_type) {
+        return false;
+    }
+    const bool sliding = layer->sliding_attention;
+    *out = (ds4_gpu_mellum_q8_0_layer_desc) {
+        .attention = {
+            .attn_norm_offset = layer->attn_norm->abs_offset,
+            .q_offset = layer->attn_q->abs_offset,
+            .q_norm_offset = layer->attn_q_norm->abs_offset,
+            .k_offset = layer->attn_k->abs_offset,
+            .k_norm_offset = layer->attn_k_norm->abs_offset,
+            .v_offset = layer->attn_v->abs_offset,
+            .output_offset = layer->attn_output->abs_offset,
+            .n_embd = DS4_N_EMBD,
+            .n_head = DS4_N_HEAD,
+            .n_head_kv = DS4_N_HEAD_KV,
+            .head_dim = DS4_N_HEAD_DIM,
+            .n_rot = DS4_N_ROT,
+            .n_ctx_orig = DS4_ROPE_ORIG_CTX,
+            .rms_eps = DS4_RMS_EPS,
+            .freq_base = sliding ? DS4_ROPE_FREQ_BASE_SWA : DS4_ROPE_FREQ_BASE,
+            .freq_scale = sliding ? 1.0f : 1.0f / DS4_ROPE_SCALE_FACTOR,
+            .rope_ext_factor = sliding ? 0.0f : 1.0f,
+            /* glm_rope_yarn applies YaRN's 1 + 0.1 log(factor) mscale
+             * internally. Mellum's metadata value is that effective factor,
+             * so passing it here would apply it twice. */
+            .rope_attn_factor = 1.0f,
+            .yarn_beta_fast = sliding ? 0.0f : DS4_ROPE_YARN_BETA_FAST,
+            .yarn_beta_slow = sliding ? 0.0f : DS4_ROPE_YARN_BETA_SLOW,
+        },
+        .ffn_norm_offset = layer->ffn_norm->abs_offset,
+        .router_offset = layer->router->abs_offset,
+        .gate_offset = layer->gate_experts->abs_offset,
+        .up_offset = layer->up_experts->abs_offset,
+        .down_offset = layer->down_experts->abs_offset,
+        .gate_expert_bytes = layer->gate_expert_bytes,
+        .gate_row_bytes = routed_expert_row_bytes(layer->gate_experts),
+        .down_expert_bytes = layer->down_expert_bytes,
+        .down_row_bytes = routed_expert_row_bytes(layer->down_experts),
+        .expert_mid_dim = DS4_N_FF_EXP,
+        .n_expert = DS4_N_EXPERT,
+        .n_expert_used = DS4_N_EXPERT_USED,
+        .pair_type = pair_type,
+        .router_is_f32 = true,
+    };
+    return true;
+}
+
+static bool ds4_mellum_write_atomic(const char *path,
+                                    const void *data,
+                                    uint64_t    bytes) {
+    if (!path || !path[0] || !data || bytes == 0 || bytes > SIZE_MAX) return false;
+    static const char suffix[] = ".tmp.XXXXXX";
+    const size_t path_len = strlen(path);
+    char *tmp_path = xmalloc(path_len + sizeof(suffix));
+    snprintf(tmp_path, path_len + sizeof(suffix), "%s%s", path, suffix);
+    const int fd = mkstemp(tmp_path);
+    FILE *fp = fd < 0 ? NULL : fdopen(fd, "wb");
+    bool ok = false;
+    if (fp) {
+        const size_t written = fwrite(data, 1, (size_t)bytes, fp);
+        const int close_rc = fclose(fp);
+        ok = written == bytes && close_rc == 0;
+    } else if (fd >= 0) {
+        close(fd);
+    }
+    if (ok) ok = rename(tmp_path, path) == 0;
+    if (!ok) unlink(tmp_path);
+    free(tmp_path);
+    return ok;
+}
+#endif
+
+
+
+#ifndef DS4_NO_GPU
+typedef struct {
+    uint32_t cache_cap[DS4_MAX_LAYER];
+    ds4_gpu_tensor *key_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *value_cache[DS4_MAX_LAYER];
+} ds4_mellum_kv_layout;
+
+static void ds4_mellum_kv_layout_free(ds4_mellum_kv_layout *layout) {
+    if (!layout) return;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(layout->value_cache[il]);
+        ds4_gpu_tensor_free(layout->key_cache[il]);
+    }
+    memset(layout, 0, sizeof(*layout));
+}
+
+static bool ds4_mellum_kv_layout_alloc(const ds4_engine *e,
+                                       ds4_mellum_kv_layout *layout,
+                                       uint32_t ctx_size,
+                                       uint64_t *total_bytes) {
+    if (total_bytes) *total_bytes = 0;
+    if (!e || !layout || ctx_size == 0) return false;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    if (kv_dim == 0 || (uint64_t)ctx_size > UINT64_MAX / kv_dim /
+                                          sizeof(uint16_t)) {
+        return false;
+    }
+    uint64_t total = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t cap = e->mellum_layer[il].sliding_attention
+            ? DS4_N_SWA : ctx_size;
+        const uint64_t cache_bytes = (uint64_t)cap * kv_dim * sizeof(uint16_t);
+        if (cache_bytes > (UINT64_MAX - total) / 2u) {
+            ds4_mellum_kv_layout_free(layout);
+            return false;
+        }
+        layout->cache_cap[il] = cap;
+        layout->key_cache[il] = ds4_gpu_tensor_alloc(cache_bytes);
+        layout->value_cache[il] = ds4_gpu_tensor_alloc(cache_bytes);
+        if (!layout->key_cache[il] || !layout->value_cache[il]) {
+            ds4_mellum_kv_layout_free(layout);
+            return false;
+        }
+        total += 2u * cache_bytes;
+    }
+    if (total_bytes) *total_bytes = total;
+    return true;
+}
+
+struct ds4_mellum_prefill_scratch_s;
+
+struct ds4_mellum_session_state {
+    ds4_mellum_kv_layout kv;
+    ds4_mellum_decode_state *decode;
+    uint32_t ctx_size;
+    bool decode_enabled;
+    bool interactive_enabled;
+};
+
+typedef struct {
+    uint32_t id;
+    float logit;
+} ds4_mellum_logit_rank;
+
+static bool ds4_mellum_print_logits_top_k(FILE         *out,
+                                          const float  *logits,
+                                          uint64_t      vocab_dim,
+                                          uint32_t      top_k) {
+    if (!out || !logits || top_k == 0 || vocab_dim == 0) return false;
+    if (top_k > vocab_dim) top_k = (uint32_t)vocab_dim;
+    ds4_mellum_logit_rank *top = xmalloc((size_t)top_k * sizeof(*top));
+    for (uint32_t i = 0; i < top_k; i++) {
+        top[i].id = UINT32_MAX;
+        top[i].logit = -FLT_MAX;
+    }
+    for (uint64_t id = 0; id < vocab_dim; id++) {
+        const float logit = logits[id];
+        if (!isfinite(logit)) {
+            free(top);
+            fprintf(stderr, "ds4: Mellum logits probe produced a non-finite logit\n");
+            return false;
+        }
+        uint32_t slot = 0;
+        while (slot < top_k &&
+               (logit < top[slot].logit ||
+                (logit == top[slot].logit && id > top[slot].id))) {
+            slot++;
+        }
+        if (slot == top_k) continue;
+        for (uint32_t j = top_k - 1u; j > slot; j--) top[j] = top[j - 1u];
+        top[slot] = (ds4_mellum_logit_rank) { .id = (uint32_t)id, .logit = logit };
+    }
+    fprintf(out, "Mellum logits probe top-%u=", top_k);
+    for (uint32_t i = 0; i < top_k; i++) {
+        fprintf(out, "%s%u:%.7f", i ? "," : "", top[i].id, top[i].logit);
+    }
+    fputc('\n', out);
+    free(top);
+    return true;
+}
+
+static bool ds4_mellum_logits_are_finite(const float *logits,
+                                         uint64_t     vocab_dim) {
+    if (!logits) return false;
+    for (uint64_t id = 0; id < vocab_dim; id++) {
+        if (!isfinite(logits[id])) return false;
+    }
+    return true;
+}
+
+struct ds4_mellum_decode_state {
+    ds4_gpu_mellum_q8_0_layer_desc desc[DS4_MAX_LAYER];
+    uint32_t cache_cap[DS4_MAX_LAYER];
+    uint32_t full_cache_cap;
+    uint32_t position;
+    ds4_gpu_tensor *key_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *value_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *hidden;
+    ds4_gpu_tensor *layer_out;
+    ds4_gpu_tensor *attention_out;
+    ds4_gpu_tensor *attention_norm;
+    ds4_gpu_tensor *q;
+    ds4_gpu_tensor *k;
+    ds4_gpu_tensor *v;
+    ds4_gpu_tensor *heads;
+    ds4_gpu_tensor *projected;
+    ds4_gpu_tensor *ffn_norm;
+    ds4_gpu_tensor *router_logits;
+    ds4_gpu_tensor *router_selected;
+    ds4_gpu_tensor *router_weights;
+    ds4_gpu_tensor *router_probs;
+    ds4_gpu_tensor *moe_mid;
+    ds4_gpu_tensor *moe_out;
+    ds4_gpu_tensor *output_norm;
+    ds4_gpu_tensor *logits;
+    float *hidden_cpu;
+};
+
+/* Workspace for a layer-major batch. It deliberately owns no KV cache: the
+ * caller supplies the per-layer rings from a decode state, which is what lets
+ * the same workspace serve both the diagnostic probes that compare against the
+ * sequential path and a live session's prefill. */
+typedef struct ds4_mellum_prefill_scratch_s {
+    uint32_t cap;
+    ds4_gpu_tensor *tokens;
+    ds4_gpu_tensor *hidden;
+    ds4_gpu_tensor *layer_out;
+    ds4_gpu_tensor *attention_out;
+    ds4_gpu_tensor *attention_norm;
+    ds4_gpu_tensor *q;
+    ds4_gpu_tensor *k;
+    ds4_gpu_tensor *v;
+    ds4_gpu_tensor *heads;
+    ds4_gpu_tensor *projected;
+    ds4_gpu_tensor *staged_key;
+    ds4_gpu_tensor *staged_value;
+    ds4_gpu_tensor *ffn_norm;
+    ds4_gpu_tensor *router_logits;
+    ds4_gpu_tensor *router_selected;
+    ds4_gpu_tensor *router_weights;
+    ds4_gpu_tensor *router_probs;
+    ds4_gpu_tensor *moe_mid;
+    ds4_gpu_tensor *moe_out;
+} ds4_mellum_prefill_scratch;
+
+static void ds4_mellum_prefill_scratch_free(ds4_mellum_prefill_scratch *scratch) {
+    if (!scratch) return;
+    ds4_gpu_tensor_free(scratch->moe_out); ds4_gpu_tensor_free(scratch->moe_mid);
+    ds4_gpu_tensor_free(scratch->router_probs); ds4_gpu_tensor_free(scratch->router_weights);
+    ds4_gpu_tensor_free(scratch->router_selected); ds4_gpu_tensor_free(scratch->router_logits);
+    ds4_gpu_tensor_free(scratch->ffn_norm); ds4_gpu_tensor_free(scratch->staged_value);
+    ds4_gpu_tensor_free(scratch->staged_key); ds4_gpu_tensor_free(scratch->projected);
+    ds4_gpu_tensor_free(scratch->heads); ds4_gpu_tensor_free(scratch->v);
+    ds4_gpu_tensor_free(scratch->k); ds4_gpu_tensor_free(scratch->q);
+    ds4_gpu_tensor_free(scratch->attention_norm); ds4_gpu_tensor_free(scratch->attention_out);
+    ds4_gpu_tensor_free(scratch->layer_out); ds4_gpu_tensor_free(scratch->hidden);
+    ds4_gpu_tensor_free(scratch->tokens);
+    memset(scratch, 0, sizeof(*scratch));
+}
+
+static bool ds4_mellum_prefill_scratch_create(ds4_mellum_prefill_scratch *scratch,
+                                              uint32_t                    cap) {
+    if (!scratch || cap == 0) return false;
+    memset(scratch, 0, sizeof(*scratch));
+    const uint64_t embd_bytes = (uint64_t)cap * DS4_N_EMBD * sizeof(float);
+    const uint64_t q_bytes = (uint64_t)cap * DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)cap * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t mid_bytes = (uint64_t)cap * DS4_N_EXPERT_USED *
+        DS4_N_FF_EXP * sizeof(float);
+#define DS4_MELLUM_PREFILL_ALLOC(name, bytes) \
+    do { scratch->name = ds4_gpu_tensor_alloc(bytes); } while (0)
+    DS4_MELLUM_PREFILL_ALLOC(tokens, (uint64_t)cap * sizeof(int32_t));
+    DS4_MELLUM_PREFILL_ALLOC(hidden, embd_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(layer_out, embd_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(attention_out, embd_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(attention_norm, embd_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(q, q_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(k, kv_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(v, kv_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(heads, q_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(projected, embd_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(staged_key, (uint64_t)cap * DS4_N_HEAD_KV *
+                             DS4_N_HEAD_DIM * sizeof(uint16_t));
+    DS4_MELLUM_PREFILL_ALLOC(staged_value, (uint64_t)cap * DS4_N_HEAD_KV *
+                             DS4_N_HEAD_DIM * sizeof(uint16_t));
+    DS4_MELLUM_PREFILL_ALLOC(ffn_norm, embd_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(router_logits, (uint64_t)cap * DS4_N_EXPERT * sizeof(float));
+    DS4_MELLUM_PREFILL_ALLOC(router_selected, (uint64_t)cap * DS4_N_EXPERT_USED * sizeof(int32_t));
+    DS4_MELLUM_PREFILL_ALLOC(router_weights, (uint64_t)cap * DS4_N_EXPERT_USED * sizeof(float));
+    DS4_MELLUM_PREFILL_ALLOC(router_probs, (uint64_t)cap * DS4_N_EXPERT * sizeof(float));
+    DS4_MELLUM_PREFILL_ALLOC(moe_mid, mid_bytes);
+    DS4_MELLUM_PREFILL_ALLOC(moe_out, embd_bytes);
+#undef DS4_MELLUM_PREFILL_ALLOC
+    const bool ok = scratch->tokens && scratch->hidden && scratch->layer_out &&
+        scratch->attention_out && scratch->attention_norm && scratch->q &&
+        scratch->k && scratch->v && scratch->heads && scratch->projected &&
+        scratch->staged_key && scratch->staged_value && scratch->ffn_norm &&
+        scratch->router_logits && scratch->router_selected && scratch->router_weights &&
+        scratch->router_probs && scratch->moe_mid && scratch->moe_out;
+    if (!ok) {
+        ds4_mellum_prefill_scratch_free(scratch);
+        return false;
+    }
+    scratch->cap = cap;
+    return true;
+}
+
+static void ds4_mellum_decode_state_free(ds4_mellum_decode_state *state) {
+    if (!state) return;
+    ds4_gpu_tensor_free(state->logits); ds4_gpu_tensor_free(state->output_norm);
+    ds4_gpu_tensor_free(state->moe_out); ds4_gpu_tensor_free(state->moe_mid);
+    ds4_gpu_tensor_free(state->router_probs); ds4_gpu_tensor_free(state->router_weights);
+    ds4_gpu_tensor_free(state->router_selected); ds4_gpu_tensor_free(state->router_logits);
+    ds4_gpu_tensor_free(state->ffn_norm); ds4_gpu_tensor_free(state->projected);
+    ds4_gpu_tensor_free(state->heads); ds4_gpu_tensor_free(state->v);
+    ds4_gpu_tensor_free(state->k); ds4_gpu_tensor_free(state->q);
+    ds4_gpu_tensor_free(state->attention_norm); ds4_gpu_tensor_free(state->attention_out);
+    ds4_gpu_tensor_free(state->layer_out); ds4_gpu_tensor_free(state->hidden);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(state->value_cache[il]);
+        ds4_gpu_tensor_free(state->key_cache[il]);
+    }
+    free(state->hidden_cpu);
+    free(state);
+}
+
+static ds4_mellum_decode_state *ds4_mellum_decode_state_create(
+        const ds4_engine *e,
+        uint32_t          full_cache_cap) {
+    if (!e || full_cache_cap == 0) return false;
+    ds4_mellum_decode_state *state = xcalloc(1, sizeof(*state));
+    const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t q_bytes = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t mid_bytes =
+        (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float);
+    bool ok = ds4_gpu_set_model_map(e->model.map, e->model.size) != 0;
+
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (!ds4_mellum_q8_layer_desc(e, il, &state->desc[il])) {
+            fprintf(stderr, "ds4: Mellum graph found unsupported tensor types at layer %u\n", il);
+            ok = false;
+            break;
+        }
+        state->cache_cap[il] = e->mellum_layer[il].sliding_attention
+            ? DS4_N_SWA : full_cache_cap;
+        const uint64_t cache_bytes = (uint64_t)state->cache_cap[il] *
+            DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
+        state->key_cache[il] = ds4_gpu_tensor_alloc(cache_bytes);
+        state->value_cache[il] = ds4_gpu_tensor_alloc(cache_bytes);
+        if (!state->key_cache[il] || !state->value_cache[il]) ok = false;
+    }
+#define DS4_MELLUM_STATE_ALLOC(name, bytes) \
+    do { state->name = ds4_gpu_tensor_alloc(bytes); if (!state->name) ok = false; } while (0)
+    DS4_MELLUM_STATE_ALLOC(hidden, embd_bytes);
+    DS4_MELLUM_STATE_ALLOC(layer_out, embd_bytes);
+    DS4_MELLUM_STATE_ALLOC(attention_out, embd_bytes);
+    DS4_MELLUM_STATE_ALLOC(attention_norm, embd_bytes);
+    DS4_MELLUM_STATE_ALLOC(q, q_bytes);
+    DS4_MELLUM_STATE_ALLOC(k, kv_bytes);
+    DS4_MELLUM_STATE_ALLOC(v, kv_bytes);
+    DS4_MELLUM_STATE_ALLOC(heads, q_bytes);
+    DS4_MELLUM_STATE_ALLOC(projected, embd_bytes);
+    DS4_MELLUM_STATE_ALLOC(ffn_norm, embd_bytes);
+    DS4_MELLUM_STATE_ALLOC(router_logits, DS4_N_EXPERT * sizeof(float));
+    DS4_MELLUM_STATE_ALLOC(router_selected, DS4_N_EXPERT_USED * sizeof(int32_t));
+    DS4_MELLUM_STATE_ALLOC(router_weights, DS4_N_EXPERT_USED * sizeof(float));
+    DS4_MELLUM_STATE_ALLOC(router_probs, DS4_N_EXPERT * sizeof(float));
+    DS4_MELLUM_STATE_ALLOC(moe_mid, mid_bytes);
+    DS4_MELLUM_STATE_ALLOC(moe_out, embd_bytes);
+#undef DS4_MELLUM_STATE_ALLOC
+    state->hidden_cpu = xmalloc((size_t)embd_bytes);
+    state->full_cache_cap = full_cache_cap;
+    if (!ok) {
+        fprintf(stderr, "ds4: Mellum inspect graph allocation failed\n");
+        ds4_mellum_decode_state_free(state);
+        return NULL;
+    }
+    return state;
+}
+
+static bool ds4_engine_mellum_decode_state_prepare(ds4_engine *e,
+                                                    uint32_t    full_cache_cap) {
+    if (!e || full_cache_cap == 0) return false;
+    ds4_mellum_decode_state *state = e->mellum_decode_state;
+    if (state && state->full_cache_cap == full_cache_cap) return true;
+    ds4_mellum_decode_state_free(state);
+    e->mellum_decode_state = ds4_mellum_decode_state_create(e, full_cache_cap);
+    return e->mellum_decode_state != NULL;
+}
+
+static bool ds4_mellum_decode_output_prepare(
+        const ds4_engine       *e,
+        ds4_mellum_decode_state *state) {
+    if (!state || !e->weights.output_norm || !e->weights.output ||
+        e->weights.output_norm->type != DS4_TENSOR_F32 ||
+        e->weights.output_norm->ndim != 1 ||
+        e->weights.output_norm->dim[0] != DS4_N_EMBD ||
+        e->weights.output->type != DS4_TENSOR_Q8_0 ||
+        e->weights.output->ndim != 2 ||
+        e->weights.output->dim[0] != DS4_N_EMBD ||
+        e->weights.output->dim[1] == 0 ||
+        e->weights.output->dim[1] > UINT64_MAX / sizeof(float)) {
+        fprintf(stderr, "ds4: Mellum logits probe requires an F32 output norm and Q8_0 output head\n");
+        return false;
+    }
+    if (state->output_norm && state->logits) return true;
+    ds4_gpu_tensor_free(state->logits);
+    ds4_gpu_tensor_free(state->output_norm);
+    state->logits = NULL;
+    state->output_norm = NULL;
+    state->output_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    state->logits = ds4_gpu_tensor_alloc(e->weights.output->dim[1] * sizeof(float));
+    if (state->output_norm && state->logits) return true;
+    fprintf(stderr, "ds4: Mellum logits probe output allocation failed\n");
+    ds4_gpu_tensor_free(state->logits);
+    ds4_gpu_tensor_free(state->output_norm);
+    state->logits = NULL;
+    state->output_norm = NULL;
+    return false;
+}
+
+static bool ds4_mellum_prefill_tokens(
+        const ds4_engine                  *e,
+        ds4_mellum_decode_state           *state,
+        ds4_mellum_prefill_scratch        *scratch,
+        const int                         *tokens,
+        uint32_t                           n_tokens,
+        ds4_gpu_tensor                     *layer_trace_gpu,
+        ds4_gpu_tensor                     *attention_trace_gpu,
+        bool                               compute_logits) {
+    if (!e || !state || !scratch || !tokens || n_tokens == 0 ||
+        n_tokens > scratch->cap || n_tokens > DS4_N_SWA ||
+        n_tokens > state->full_cache_cap ||
+        state->position > state->full_cache_cap - n_tokens ||
+        ds4_gpu_commands_active() || !e->weights.token_embd ||
+        e->weights.token_embd->type != DS4_TENSOR_Q8_0) {
+        return false;
+    }
+    if (layer_trace_gpu && ds4_gpu_tensor_bytes(layer_trace_gpu) <
+        (uint64_t)DS4_N_LAYER * DS4_N_EMBD * sizeof(float)) return false;
+    if (attention_trace_gpu && ds4_gpu_tensor_bytes(attention_trace_gpu) <
+        (uint64_t)DS4_N_LAYER * DS4_N_EMBD * sizeof(float)) return false;
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        if (tokens[i] < 0 || (uint32_t)tokens[i] >= DS4_N_VOCAB) return false;
+    }
+    const uint32_t pos0 = state->position;
+    const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    bool batch_started = false;
+    bool ok = ds4_gpu_tensor_write(scratch->tokens, 0, tokens,
+                                   (uint64_t)n_tokens * sizeof(int32_t)) != 0;
+    if (ok) batch_started = ds4_gpu_begin_commands() != 0;
+    ok = ok && batch_started;
+    ds4_gpu_tensor *current = scratch->hidden;
+    ds4_gpu_tensor *next = scratch->layer_out;
+    if (ok) ok = ds4_gpu_embed_tokens_q8_0_tensor(
+        current, scratch->tokens, e->model.map, e->model.size,
+        e->weights.token_embd->abs_offset, DS4_N_VOCAB, n_tokens,
+        DS4_N_EMBD) != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = ds4_gpu_mellum_q8_0_layer_prefill_tensor(
+            next, scratch->attention_out, scratch->attention_norm,
+            scratch->q, scratch->k, scratch->v, scratch->heads,
+            scratch->projected, state->key_cache[il], state->value_cache[il],
+            scratch->staged_key, scratch->staged_value, scratch->ffn_norm,
+            scratch->router_logits, scratch->router_selected,
+            scratch->router_weights, scratch->router_probs, scratch->moe_mid,
+            scratch->moe_out, e->model.map, e->model.size, &state->desc[il],
+            current, pos0, n_tokens, state->cache_cap[il]) != 0;
+        if (ok && layer_trace_gpu) {
+            ok = ds4_gpu_tensor_copy(
+                layer_trace_gpu, (uint64_t)il * embd_bytes, next,
+                (uint64_t)(n_tokens - 1u) * embd_bytes, embd_bytes) != 0;
+        }
+        if (ok && attention_trace_gpu) {
+            ok = ds4_gpu_tensor_copy(
+                attention_trace_gpu, (uint64_t)il * embd_bytes,
+                scratch->attention_out, (uint64_t)(n_tokens - 1u) * embd_bytes,
+                embd_bytes) != 0;
+        }
+        ds4_gpu_tensor *tmp = current;
+        current = next;
+        next = tmp;
+    }
+    ds4_gpu_tensor *last = NULL;
+    if (ok && compute_logits) {
+        last = ds4_gpu_tensor_view(current, (uint64_t)(n_tokens - 1u) * embd_bytes,
+                                   embd_bytes);
+        const uint64_t vocab_dim = e->weights.output ? e->weights.output->dim[1] : 0;
+        ok = last && state->output_norm && state->logits && vocab_dim != 0 &&
+             ds4_gpu_rms_norm_weight_tensor(
+                 state->output_norm, last, e->model.map, e->model.size,
+                 e->weights.output_norm->abs_offset, DS4_N_EMBD,
+                 DS4_RMS_EPS) != 0 &&
+             ds4_gpu_matmul_q8_0_tensor(
+                 state->logits, e->model.map, e->model.size,
+                 e->weights.output->abs_offset, DS4_N_EMBD, vocab_dim,
+                 state->output_norm, 1) != 0;
+    }
+    ds4_gpu_tensor_free(last);
+    const bool batch_ok = !batch_started || ds4_gpu_end_commands() != 0;
+    if (!ok || !batch_ok) return false;
+    state->position += n_tokens;
+    return true;
+}
+
+static void ds4_mellum_decode_state_reset(ds4_mellum_decode_state *state) {
+    if (state) state->position = 0;
+}
+
+static bool ds4_mellum_decode_token(const ds4_engine       *e,
+                                    ds4_mellum_decode_state *state,
+                                    int                     token,
+                                    float                  *final_cpu,
+                                    float                  *layer_trace,
+                                    float                  *attention_trace,
+                                    float                  *qk_trace,
+                                    ds4_gpu_tensor         *layer_trace_gpu,
+                                    ds4_gpu_tensor         *attention_trace_gpu,
+                                    float                  *logits_cpu,
+                                    bool                    compute_logits,
+                                    bool                    allow_existing_batch) {
+    if (!state || state->position >= state->full_cache_cap) return false;
+    const uint32_t pos = state->position;
+    const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t q_bytes = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+    const uint32_t q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint32_t qk_trace_stride = q_dim + DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    if (token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+
+    /* The fixed oracle captures per-layer tensors, so it intentionally keeps
+     * the old synchronous readback schedule below.  Normal session decode has
+     * no need to expose an intermediate activation: keep it on the GPU and
+     * submit the whole layer stack plus output head as one command batch. */
+    const bool capture_intermediate = final_cpu || layer_trace ||
+                                      attention_trace || qk_trace;
+    if (layer_trace_gpu && ds4_gpu_tensor_bytes(layer_trace_gpu) <
+        (uint64_t)DS4_N_LAYER * embd_bytes) return false;
+    if (attention_trace_gpu && ds4_gpu_tensor_bytes(attention_trace_gpu) <
+        (uint64_t)DS4_N_LAYER * embd_bytes) return false;
+    if (!capture_intermediate) {
+        ds4_gpu_tensor *current = state->hidden;
+        ds4_gpu_tensor *next = state->layer_out;
+        const bool use_existing_batch =
+            allow_existing_batch && ds4_gpu_commands_active();
+        if (use_existing_batch && logits_cpu) return false;
+        bool batch_started = false;
+        bool ok = e->weights.token_embd &&
+                  e->weights.token_embd->type == DS4_TENSOR_Q8_0;
+        if (ok && !use_existing_batch) batch_started = ds4_gpu_begin_commands() != 0;
+        if (use_existing_batch) batch_started = true;
+        ok = ok && batch_started;
+        if (ok) ok = ds4_gpu_embed_token_q8_0_tensor(
+            current, e->model.map, e->model.size,
+            e->weights.token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)token,
+            DS4_N_EMBD) != 0;
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            const uint32_t cache_cap = state->cache_cap[il];
+            const bool sliding = e->mellum_layer[il].sliding_attention;
+            const uint32_t key_start = sliding && pos + 1u > cache_cap
+                ? pos + 1u - cache_cap : 0u;
+            const uint32_t key_count = pos - key_start + 1u;
+            ok = ds4_gpu_mellum_q8_0_layer_decode_tensor(
+                next, state->attention_out, state->attention_norm,
+                state->q, state->k, state->v, state->heads, state->projected,
+                state->key_cache[il], state->value_cache[il], state->ffn_norm,
+                state->router_logits, state->router_selected, state->router_weights,
+                state->router_probs, state->moe_mid, state->moe_out, e->model.map,
+                e->model.size, &state->desc[il], current, pos, cache_cap,
+                key_start, key_count) != 0;
+            if (ok && layer_trace_gpu) {
+                ok = ds4_gpu_tensor_copy(
+                    layer_trace_gpu, (uint64_t)il * embd_bytes, next, 0,
+                    embd_bytes) != 0;
+            }
+            if (ok && attention_trace_gpu) {
+                ok = ds4_gpu_tensor_copy(
+                    attention_trace_gpu, (uint64_t)il * embd_bytes,
+                    state->attention_out, 0, embd_bytes) != 0;
+            }
+            ds4_gpu_tensor *tmp = current;
+            current = next;
+            next = tmp;
+        }
+        if (ok && (logits_cpu || compute_logits)) {
+            if (!state->output_norm || !state->logits) {
+                ok = false;
+            } else {
+                const uint64_t vocab_dim = e->weights.output->dim[1];
+                ok = ds4_gpu_rms_norm_weight_tensor(
+                         state->output_norm, current, e->model.map,
+                         e->model.size, e->weights.output_norm->abs_offset,
+                         DS4_N_EMBD, DS4_RMS_EPS) != 0 &&
+                     ds4_gpu_matmul_q8_0_tensor(
+                         state->logits, e->model.map, e->model.size,
+                         e->weights.output->abs_offset, DS4_N_EMBD, vocab_dim,
+                         state->output_norm, 1) != 0;
+            }
+        }
+        /* End even after an encoder failure: it releases the batch command
+         * buffer and makes any already encoded work safe to reclaim. */
+        const bool batch_ok = use_existing_batch ||
+                              (!batch_started || ds4_gpu_end_commands() != 0);
+        ok = ok && batch_ok;
+        if (ok && logits_cpu) {
+            ok = ds4_gpu_tensor_read(state->logits, 0, logits_cpu,
+                                     e->weights.output->dim[1] * sizeof(float)) != 0;
+        }
+        if (ok) state->position++;
+        return ok;
+    }
+
+    embed_token_any(&e->model, &e->weights, token, state->hidden_cpu);
+    bool ok = ds4_gpu_tensor_write(state->hidden, 0, state->hidden_cpu, embd_bytes) != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const uint32_t cache_cap = state->cache_cap[il];
+        const bool sliding = e->mellum_layer[il].sliding_attention;
+        const uint32_t key_start = sliding && pos + 1u > cache_cap
+            ? pos + 1u - cache_cap : 0u;
+        const uint32_t key_count = pos - key_start + 1u;
+        ok = ds4_gpu_mellum_q8_0_layer_decode_tensor(
+            state->layer_out, state->attention_out, state->attention_norm,
+            state->q, state->k, state->v, state->heads, state->projected,
+            state->key_cache[il], state->value_cache[il], state->ffn_norm,
+            state->router_logits, state->router_selected, state->router_weights,
+            state->router_probs, state->moe_mid, state->moe_out, e->model.map,
+            e->model.size, &state->desc[il], state->hidden, pos, cache_cap,
+            key_start, key_count) != 0;
+        if (!ok) break;
+        if (layer_trace) ok = ds4_gpu_tensor_read(
+            state->layer_out, 0, layer_trace + (uint64_t)il * DS4_N_EMBD,
+            embd_bytes) != 0;
+        if (ok && attention_trace) ok = ds4_gpu_tensor_read(
+            state->attention_out, 0, attention_trace + (uint64_t)il * DS4_N_EMBD,
+            embd_bytes) != 0;
+        if (ok && qk_trace) {
+            float *qk_row = qk_trace + (uint64_t)il * qk_trace_stride;
+            ok = ds4_gpu_tensor_read(state->q, 0, qk_row, q_bytes) != 0 &&
+                 ds4_gpu_tensor_read(state->k, 0, qk_row + q_dim, kv_bytes) != 0;
+        }
+        if (ok && il + 1u < DS4_N_LAYER) {
+            ok = ds4_gpu_tensor_read(state->layer_out, 0, state->hidden_cpu,
+                                     embd_bytes) != 0 &&
+                 ds4_gpu_tensor_write(state->hidden, 0, state->hidden_cpu,
+                                      embd_bytes) != 0;
+        }
+    }
+    if (ok && final_cpu) ok = ds4_gpu_tensor_read(state->layer_out, 0,
+                                                    final_cpu, embd_bytes) != 0;
+    if (ok && logits_cpu) {
+        if (!state->output_norm || !state->logits) {
+            ok = false;
+        } else {
+            const uint64_t vocab_dim = e->weights.output->dim[1];
+            ok = ds4_gpu_rms_norm_weight_tensor(
+                     state->output_norm, state->layer_out, e->model.map,
+                     e->model.size, e->weights.output_norm->abs_offset,
+                     DS4_N_EMBD, DS4_RMS_EPS) != 0 &&
+                 ds4_gpu_matmul_q8_0_tensor(
+                     state->logits, e->model.map, e->model.size,
+                     e->weights.output->abs_offset, DS4_N_EMBD, vocab_dim,
+                     state->output_norm, 1) != 0 &&
+                 ds4_gpu_tensor_read(state->logits, 0, logits_cpu,
+                                     vocab_dim * sizeof(float)) != 0;
+        }
+    }
+    if (ok) state->position++;
+    return ok;
+}
+
+static ds4_mellum_session_state *ds4_mellum_session_state_create(
+        const ds4_engine *e,
+        uint32_t          ctx_size,
+        bool              decode_enabled,
+        bool              interactive_enabled) {
+    ds4_mellum_session_state *state = xcalloc(1, sizeof(*state));
+    state->ctx_size = ctx_size;
+    state->decode_enabled = decode_enabled;
+    state->interactive_enabled = interactive_enabled;
+    if (decode_enabled) {
+        state->decode = ds4_mellum_decode_state_create(e, ctx_size);
+        if (!state->decode ||
+            !ds4_mellum_decode_output_prepare(e, state->decode)) {
+            ds4_mellum_decode_state_free(state->decode);
+            free(state);
+            return NULL;
+        }
+        return state;
+    }
+    if (!ds4_mellum_kv_layout_alloc(e, &state->kv, ctx_size, NULL)) {
+        free(state);
+        return NULL;
+    }
+    return state;
+}
+
+static void ds4_mellum_session_state_free(ds4_mellum_session_state *state) {
+    if (!state) return;
+    ds4_mellum_decode_state_free(state->decode);
+    ds4_mellum_kv_layout_free(&state->kv);
+    free(state);
+}
+#endif
+
+
+
+
+
+
 
 static uint64_t ds4_engine_dynamic_expert_cache_bytes(
         const ds4_engine *e) {
@@ -36219,11 +38089,36 @@ static void ds4_engine_print_startup_memory(
         int               ctx_size) {
     if (!e || ctx_size <= 0) return;
 
-    const ds4_context_memory mem =
-        ds4_context_memory_estimate_with_prefill_mode(e->backend,
-                                                      ctx_size,
-                                                      e->prefill_chunk,
-                                                      e->ssd_streaming);
+    ds4_context_memory mem;
+#ifndef DS4_NO_GPU
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+        e->distributed.role != DS4_DISTRIBUTED_NONE &&
+        e->distributed.layers.set) {
+        const uint32_t normal_layers = glm_graph_normal_layer_count();
+        const uint32_t layer_end = e->distributed.layers.has_output ?
+            (normal_layers ? normal_layers - 1u : 0u) :
+            e->distributed.layers.end;
+        const uint32_t ctx = (uint32_t)ctx_size;
+        const uint32_t work_ctx =
+            glm_graph_full_attention_cap(ctx, e->ssd_streaming);
+        const uint32_t compact_cap =
+            glm_graph_compact_cache_initial_cap(ctx, work_ctx);
+        mem = glm_graph_context_memory_estimate_for_compact_cap_slice(
+                ctx,
+                work_ctx,
+                compact_cap,
+                e->ssd_streaming,
+                e->distributed.layers.start,
+                layer_end);
+    } else {
+#endif
+        mem = ds4_context_memory_estimate_with_prefill_mode(e->backend,
+                                                            ctx_size,
+                                                            e->prefill_chunk,
+                                                            e->ssd_streaming);
+#ifndef DS4_NO_GPU
+    }
+#endif
     const uint64_t kv_bytes =
         ds4_add_sat_u64(mem.raw_bytes, mem.compressed_bytes);
     const uint64_t dynamic_expert_cache_bytes =
@@ -36900,6 +38795,12 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
         bpe_tokenize_text_laguna(vocab, text, out);
         return;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        /* llama.cpp's `mellum2` pre-tokenizer uses the StarCoder/GPT-2
+         * expression with an individual-digit branch. */
+        bpe_tokenize_text_glm4_segment(vocab, text, strlen(text), 1, out);
+        return;
+    }
 
     const uint64_t len = strlen(text);
     uint64_t pos = 0;
@@ -37020,6 +38921,9 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         table_put(&vocab->merge_rank, merge, (int)i);
     }
 
+    vocab->im_start_id = -1;
+    vocab->im_end_id = -1;
+
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
             vocab->bos_id = vocab_lookup_optional(vocab, "<sop>");
@@ -37074,6 +38978,36 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         return;
     }
 
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id) ||
+            !model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id)) {
+            ds4_die("Mellum tokenizer is missing BOS/EOS token metadata");
+        }
+        vocab->im_start_id = vocab_lookup(vocab, "<|im_start|>");
+        vocab->im_end_id = vocab_lookup(vocab, "<|im_end|>");
+        if (vocab->im_end_id != vocab->eos_id) {
+            ds4_die("Mellum tokenizer EOS metadata must name <|im_end|>");
+        }
+        vocab->eot_id = vocab->im_end_id;
+        vocab->system_id = -1;
+        vocab->user_id = -1;
+        vocab->assistant_id = -1;
+        vocab->observation_id = -1;
+        vocab->sop_id = -1;
+        vocab->think_start_id = vocab_lookup(vocab, "<think>");
+        vocab->think_end_id = vocab_lookup(vocab, "</think>");
+        vocab->tool_call_start_id = -1;
+        vocab->tool_call_end_id = -1;
+        vocab->tool_response_start_id = -1;
+        vocab->tool_response_end_id = -1;
+        vocab->arg_key_start_id = -1;
+        vocab->arg_key_end_id = -1;
+        vocab->arg_value_start_id = -1;
+        vocab->arg_value_end_id = -1;
+        vocab->dsml_id = -1;
+        return;
+    }
+
     vocab->bos_id       = vocab_lookup(vocab, "<｜begin▁of▁sentence｜>");
     vocab->eos_id       = vocab_lookup(vocab, "<｜end▁of▁sentence｜>");
     vocab->system_id    = -1;
@@ -37106,6 +39040,7 @@ static void vocab_free(ds4_vocab *vocab) {
  * marker, and either <think> or </think> depending on the requested mode.  Max
  * thinking is only a prompt prefix: the model still enters through <think>. */
 static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) return;
     token_vec_push(out, vocab->bos_id);
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && vocab->sop_id >= 0)
         token_vec_push(out, vocab->sop_id);
@@ -37167,6 +39102,22 @@ static void laguna_chat_append_wrapped(const ds4_vocab *vocab,
     free(rendered);
 }
 
+static void mellum_chat_append_wrapped(const ds4_vocab *vocab,
+                                       token_vec       *out,
+                                       const char      *role,
+                                       const char      *content) {
+    if (!content) content = "";
+    if (vocab->im_start_id < 0 || vocab->im_end_id < 0) {
+        ds4_die("this tokenizer does not provide Mellum ChatML markers");
+    }
+    token_vec_push(out, vocab->im_start_id);
+    bpe_tokenize_text(vocab, role, out);
+    bpe_tokenize_text(vocab, "\n", out);
+    bpe_tokenize_text(vocab, content, out);
+    token_vec_push(out, vocab->im_end_id);
+    bpe_tokenize_text(vocab, "\n", out);
+}
+
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
@@ -37188,6 +39139,22 @@ static void encode_chat_prompt(
         token_vec_push(out, vocab->assistant_id);
         token_vec_push(out, ds4_think_mode_enabled(think_mode) ?
                        vocab->think_start_id : vocab->think_end_id);
+        return;
+    }
+
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        if (system && system[0]) {
+            mellum_chat_append_wrapped(vocab, out, "system", system);
+        }
+        mellum_chat_append_wrapped(vocab, out, "user", prompt ? prompt : "");
+        token_vec_push(out, vocab->im_start_id);
+        bpe_tokenize_text(vocab, "assistant\n", out);
+        if (!ds4_think_mode_enabled(think_mode)) {
+            token_vec_push(out, vocab->think_start_id);
+            bpe_tokenize_text(vocab, "\n\n", out);
+            token_vec_push(out, vocab->think_end_id);
+            bpe_tokenize_text(vocab, "\n\n", out);
+        }
         return;
     }
 
@@ -37245,6 +39212,8 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         {"<assistant>",            vocab->assistant_id},
         {"</assistant>",           vocab->eot_id},
         {"<|observation|>",        vocab->observation_id},
+        {"<|im_start|>",           vocab->im_start_id},
+        {"<|im_end|>",             vocab->im_end_id},
         {"<think>",                vocab->think_start_id},
         {"</think>",               vocab->think_end_id},
         {"<tool_call>",            vocab->tool_call_start_id},
@@ -37404,6 +39373,31 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (!role) role = "user";
     if (!content) content = "";
 
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+            /* Mellum's template collects consecutive tool responses into one
+             * user turn. The single-message API emits the equivalent wrapper. */
+            token_vec_push(tokens, vocab->im_start_id);
+            bpe_tokenize_text(vocab, "user\n<tool_response>\n", tokens);
+            bpe_tokenize_text(vocab, content, tokens);
+            bpe_tokenize_text(vocab, "\n</tool_response>", tokens);
+            token_vec_push(tokens, vocab->im_end_id);
+            bpe_tokenize_text(vocab, "\n", tokens);
+        } else if (!strcmp(role, "assistant")) {
+            token_vec_push(tokens, vocab->im_start_id);
+            bpe_tokenize_text(vocab, "assistant\n", tokens);
+            tokenize_rendered_chat_vocab(vocab, content, tokens);
+            token_vec_push(tokens, vocab->im_end_id);
+            bpe_tokenize_text(vocab, "\n", tokens);
+        } else {
+            mellum_chat_append_wrapped(vocab, tokens,
+                                       (!strcmp(role, "system") || !strcmp(role, "developer"))
+                                           ? "system" : "user",
+                                       content);
+        }
+        return;
+    }
+
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
         if (!strcmp(role, "system") || !strcmp(role, "developer")) {
             laguna_chat_append_wrapped(vocab, tokens, "<system>", content, "</system>");
@@ -37469,6 +39463,17 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        token_vec_push(tokens, e->vocab.im_start_id);
+        bpe_tokenize_text(&e->vocab, "assistant\n", tokens);
+        if (!ds4_think_mode_enabled(think_mode)) {
+            token_vec_push(tokens, e->vocab.think_start_id);
+            bpe_tokenize_text(&e->vocab, "\n\n", tokens);
+            token_vec_push(tokens, e->vocab.think_end_id);
+            bpe_tokenize_text(&e->vocab, "\n\n", tokens);
+        }
+        return;
+    }
     token_vec_push(tokens, e->vocab.assistant_id);
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
         !ds4_think_mode_enabled(think_mode)) {
@@ -37484,6 +39489,9 @@ void ds4_chat_append_assistant_end(ds4_engine *e, ds4_tokens *tokens) {
     if (!e || !tokens) return;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
         token_vec_push(tokens, e->vocab.eot_id);
+        bpe_tokenize_text(&e->vocab, "\n", tokens);
+    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        token_vec_push(tokens, e->vocab.im_end_id);
         bpe_tokenize_text(&e->vocab, "\n", tokens);
     } else if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA) {
         token_vec_push(tokens, e->vocab.eos_id);
@@ -38457,11 +40465,13 @@ static uint64_t glm_graph_streaming_active_model_bytes(
     uint64_t max_bytes = 0;
     ds4_model_map_span_vec spans;
 
-    if (weights_model_map_token_spans(weights, &spans)) {
+    if (weights_layer_has_required(&weights->layer[0], 0) &&
+        weights_model_map_token_spans(weights, &spans)) {
         max_bytes = model_map_span_vec_total_bytes(&spans);
         free(spans.v);
     }
-    if (weights_model_map_output_spans(weights, &spans)) {
+    if (weights_have_output_head(weights) &&
+        weights_model_map_output_spans(weights, &spans)) {
         const uint64_t bytes = model_map_span_vec_total_bytes(&spans);
         if (bytes > max_bytes) max_bytes = bytes;
         free(spans.v);
@@ -38582,11 +40592,19 @@ static bool glm_graph_memory_guard_for_compact_cap(
 
     const uint32_t work_ctx =
         glm_graph_full_attention_cap(ctx_size, ssd_streaming);
-    const ds4_context_memory mem =
-        glm_graph_context_memory_estimate_for_compact_cap(ctx_size,
-                                                          work_ctx,
-                                                          compact_cap,
-                                                          ssd_streaming);
+    const ds4_context_memory mem = load_slice ?
+        glm_graph_context_memory_estimate_for_compact_cap_slice(
+                ctx_size,
+                work_ctx,
+                compact_cap,
+                ssd_streaming,
+                layer_start,
+                layer_end) :
+        glm_graph_context_memory_estimate_for_compact_cap(
+                ctx_size,
+                work_ctx,
+                compact_cap,
+                ssd_streaming);
     const uint64_t graph_bytes = mem.total_bytes;
     const uint64_t model_bytes =
         glm_graph_model_bytes_for_guard(model,
@@ -38602,8 +40620,22 @@ static bool glm_graph_memory_guard_for_compact_cap(
 
     const double fraction =
         glm_graph_env_double("DS4_GLM_MEMORY_GUARD_FRACTION", 0.99, 0.50, 1.00);
-    const double default_reserve_gib =
+    double default_reserve_gib =
         glm_graph_memory_guard_default_reserve_gib(budget_base, model_bytes);
+#ifdef DS4_ROCM_BUILD
+    if (load_slice && !ssd_streaming) {
+        /* The original fixed reserve protects Metal's shared host/GPU heap.
+         * A resident ROCm layer slice already accounts its exact model spans
+         * and owned graph state above. Keep proportional backend headroom for
+         * driver and temporary allocations without rejecting viable UMA
+         * slices merely because the heap is smaller than a high-memory Mac. */
+        double rocm_reserve_gib = glm_graph_bytes_to_gib(budget_base) / 16.0;
+        if (rocm_reserve_gib < 8.0) rocm_reserve_gib = 8.0;
+        if (rocm_reserve_gib < default_reserve_gib) {
+            default_reserve_gib = rocm_reserve_gib;
+        }
+    }
+#endif
     const double reserve_gib =
         glm_graph_env_double("DS4_GLM_MEMORY_GUARD_RESERVE_GB",
                              default_reserve_gib,
@@ -39095,6 +41127,25 @@ static bool glm_graph_layer_uses_generic_routed_moe(
            l->ffn_up_exps &&
            l->ffn_down_exps &&
            l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS;
+}
+
+static bool glm_tp_validate_ownership_kernels(
+        const ds4_weights *weights,
+        uint32_t          *bad_layer,
+        uint32_t          *bad_type) {
+    if (!weights) return false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        if (!l->ffn_gate_exps) continue;
+        if (glm_graph_layer_uses_generic_routed_moe(l) ||
+            l->ffn_gate_exps->type == DS4_TENSOR_Q2_K) {
+            continue;
+        }
+        if (bad_layer) *bad_layer = il;
+        if (bad_type) *bad_type = l->ffn_gate_exps->type;
+        return false;
+    }
+    return true;
 }
 
 static bool glm_graph_stream_map_token(
@@ -40029,7 +42080,7 @@ static bool glm_graph_alloc_slice(
                                                  g->layer_end);
     if (g->ctx_size > g->ctx_cap) {
         fprintf(stderr,
-                "ds4: GLM Metal session ctx=%u (model max=%u); "
+                "ds4: GLM session ctx=%u (model max=%u); "
                 "full-attention prefill/work cap=%u; compact indexed decode is used beyond the cap\n",
                 g->ctx_size,
                 glm_graph_model_context_limit(),
@@ -40111,6 +42162,13 @@ static bool glm_graph_alloc_slice(
         fprintf(stderr,
                 "ds4: GLM graph using compact DSA KV only; expanded full-attention KV cache is skipped\n");
     }
+#ifdef DS4_ROCM_BUILD
+    if (glm_graph_env_truthy(
+            getenv("DS4_ROCM_GLM_LAYER_SLICE_TOKEN_DECODE"))) {
+        fprintf(stderr,
+                "ds4: ROCm GLM one-token layer slices use the optimized token graph\n");
+    }
+#endif
     if (g->compact_cache_cap != 0) {
         const uint64_t compact_kv_total =
             (uint64_t)g->layer_count * (compact_kv_lora_bytes + compact_k_rope_bytes);
@@ -40139,7 +42197,7 @@ static bool glm_graph_alloc_slice(
     do { \
         (var) = ds4_gpu_tensor_alloc((bytes_)); \
         if (!(var)) { \
-            fprintf(stderr, "ds4: GLM Metal graph could not allocate %s\n", #var); \
+            fprintf(stderr, "ds4: GLM graph could not allocate %s\n", #var); \
             ok = false; \
         } \
     } while (0)
@@ -42153,7 +44211,7 @@ static bool glm_graph_seed_streaming_expert_cache_from_prefill(
 
         uint64_t gate_expert_bytes = 0;
         uint64_t down_expert_bytes = 0;
-        if (!streaming_layer_gate_down_expert_bytes(layer,
+        if (!layer_gate_down_expert_bytes(layer,
                                                     &gate_expert_bytes,
                                                     &down_expert_bytes)) {
             fprintf(stderr,
@@ -42667,6 +44725,13 @@ static bool glm_graph_encode_ffn_batch(
                                                   pos0,
                                                   n_tokens,
                                                   stage_t0);
+    if (ok) {
+        metal_graph_debug_dump_tensor("glm_ffn_norm",
+                                      g->batch_ffn_norm,
+                                      (uint64_t)n_tokens * DS4_N_EMBD,
+                                      il,
+                                      pos0);
+    }
     if (!ok) return false;
 
     if (il < DS4_N_LEADING_DENSE) {
@@ -42810,6 +44875,28 @@ static bool glm_graph_encode_ffn_batch(
                                                   pos0,
                                                   n_tokens,
                                                   stage_t0);
+    if (ok) {
+        metal_graph_debug_dump_tensor("glm_ffn_router_logits",
+                                      g->batch_router_logits,
+                                      (uint64_t)n_tokens * DS4_N_EXPERT,
+                                      il,
+                                      pos0);
+        metal_graph_debug_dump_tensor("glm_ffn_router_probs",
+                                      g->batch_router_probs,
+                                      (uint64_t)n_tokens * DS4_N_EXPERT,
+                                      il,
+                                      pos0);
+        metal_graph_debug_dump_i32_tensor("glm_ffn_router_selected",
+                                          g->batch_router_selected,
+                                          (uint64_t)n_tokens * DS4_N_EXPERT_USED,
+                                          il,
+                                          pos0);
+        metal_graph_debug_dump_tensor("glm_ffn_router_weights",
+                                      g->batch_router_weights,
+                                      (uint64_t)n_tokens * DS4_N_EXPERT_USED,
+                                      il,
+                                      pos0);
+    }
     if (ok) ok = glm_graph_profile_router_selection_batch(g,
                                                           l,
                                                           il,
@@ -42984,8 +45071,22 @@ static bool glm_graph_encode_ffn_batch(
                                                   pos0,
                                                   n_tokens,
                                                   stage_t0);
+    if (ok) {
+        metal_graph_debug_dump_tensor("glm_ffn_routed_out",
+                                      g->batch_ffn_out,
+                                      (uint64_t)n_tokens * DS4_N_EMBD,
+                                      il,
+                                      pos0);
+    }
     if (ok && !shared_done) DS4_GLM_ENCODE_FFN_BATCH_SHARED();
 #undef DS4_GLM_ENCODE_FFN_BATCH_SHARED
+    if (ok) {
+        metal_graph_debug_dump_tensor("glm_ffn_shared_out",
+                                      g->batch_attn_out,
+                                      (uint64_t)n_tokens * DS4_N_EMBD,
+                                      il,
+                                      pos0);
+    }
     if (ok && !glm_graph_disable_add3_residual()) {
         ok = ds4_gpu_add3_tensor(next,
                                  after_attn,
@@ -43010,6 +45111,13 @@ static bool glm_graph_encode_ffn_batch(
                                                   pos0,
                                                   n_tokens,
                                                   stage_t0);
+    if (ok) {
+        metal_graph_debug_dump_tensor("glm_ffn_next",
+                                      next,
+                                      (uint64_t)n_tokens * DS4_N_EMBD,
+                                      il,
+                                      pos0);
+    }
     return ok;
 }
 
@@ -47740,6 +49848,12 @@ typedef struct {
     uint32_t prefill_cap;
     uint64_t scratch_bytes;
     uint64_t kv_bytes;
+    /* Recorded at alloc time; not currently consumed here (both prefill and
+     * decode unconditionally (re)install the static decode span set below,
+     * which is a cheap no-op once the map already covers it -- see
+     * laguna_graph_forward_token / laguna_graph_forward_batch). Kept for
+     * visibility/future use rather than threading it back out. */
+    bool     ssd_streaming;
 
     ds4_gpu_tensor *tokens;
     ds4_gpu_tensor *cur;
@@ -47831,14 +49945,18 @@ static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
     memset(g, 0, sizeof(*g));
 }
 
-static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
+static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g,
+                               uint32_t              ctx_size,
+                               uint32_t              prefill_chunk,
+                               bool                  ssd_streaming) {
     if (!g || ctx_size == 0 || ctx_size > DS4_CONTEXT_LENGTH ||
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) {
         return false;
     }
     memset(g, 0, sizeof(*g));
     g->ctx_size = ctx_size;
-    g->prefill_cap = ctx_size < 16384u ? ctx_size : 16384u;
+    g->prefill_cap = laguna_graph_prefill_cap(ctx_size, prefill_chunk);
+    g->ssd_streaming = ssd_streaming;
 
     const uint64_t f32 = sizeof(float);
     const uint64_t rows = g->prefill_cap;
@@ -49083,6 +51201,30 @@ static bool laguna_graph_forward_token(
         return false;
     }
 
+    /* Under --ssd-streaming the engine starts with only the token-embedding
+     * tensor mapped (see the "initial ... model map restricted to token
+     * embedding" startup log). Every non-routed tensor (attn/dense/router
+     * weights for every layer, output) must be mapped before this function
+     * touches them, or the very first attention-norm read dies with "Metal
+     * model range ... is not covered by mapped model views". Routed-expert
+     * tensors stay excluded when their layer is servable from the streaming
+     * expert cache (weights_streaming_layer_experts_uniform), matching the
+     * eligibility check in ds4_gpu_laguna_routed_shared_moe_one_tensor; a
+     * boosted/off-slab-class layer's routed tensors are still included here
+     * so its mapped-model fallback path has real bytes to read. In resident
+     * (non-streaming) mode the whole file is already mapped, so this is a
+     * cheap no-op (ds4_gpu_model_views_cover_spans short-circuits). */
+    ds4_model_map_span_vec laguna_decode_spans;
+    if (weights_model_map_decode_static_spans(weights, true, true,
+                                              &laguna_decode_spans)) {
+        const bool spans_ok = metal_graph_install_model_spans(
+                model, &laguna_decode_spans, "Laguna static decode");
+        free(laguna_decode_spans.v);
+        if (!spans_ok) return false;
+    } else {
+        return false;
+    }
+
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
         ok = ds4_gpu_embed_token_quant_tensor(g->cur,
@@ -49142,7 +51284,7 @@ static bool laguna_graph_forward_token(
                         DS4_N_HEAD_KV * DS4_N_HEAD_DIM,
                         n_head,
                         g->attn_norm) != 0;
-            } else {
+            } else if (l->attn_q->type == DS4_TENSOR_Q8_0) {
 #ifdef DS4_ROCM_BUILD
                 ok = ds4_gpu_matmul_q8_0_pair_decode_preq8_tensor(
                         g->q,
@@ -49192,6 +51334,23 @@ static bool laguna_graph_forward_token(
                         g->attn_norm,
                         1) != 0;
 #endif
+            } else {
+                /* XS 2.1 legacy attention: attn_q/k/gate are Q4_K, attn_v is
+                 * Q4_K or Q6_K per layer. Neither the F16 fused kernel nor
+                 * the Q8_0 paired kernel applies; dispatch each projection
+                 * individually through the generic type-dispatching helper
+                 * (same one used for FFN weights above and by the batch/
+                 * prefill path for these same Q/K/V/gate projections). */
+                ok = laguna_graph_matmul(g->q, model, l->attn_q, g->attn_norm, 1);
+                if (ok) {
+                    ok = laguna_graph_matmul(g->k, model, l->attn_k, g->attn_norm, 1);
+                }
+                if (ok) {
+                    ok = laguna_graph_matmul(g->v, model, l->attn_v, g->attn_norm, 1);
+                }
+                if (ok) {
+                    ok = laguna_graph_matmul(g->gate, model, l->attn_gate, g->attn_norm, 1);
+                }
             }
         }
         if (ok) {
@@ -49396,6 +51555,7 @@ static bool laguna_graph_forward_token(
                         DS4_N_EXPERT_USED,
                         g->shared_selected,
                         g->shared_weight,
+                        il,
                         g->ffn_norm) != 0;
             } else if (ok) {
                 ok = ds4_gpu_glm_routed_moe_one_tensor(
@@ -49424,7 +51584,12 @@ static bool laguna_graph_forward_token(
                         DS4_N_EXPERT_USED,
                         il,
                         g->ffn_norm,
-                        true) != 0;
+                        /* force_resident=false: let the shared GLM-template
+                         * kernel use the streaming address-table path when
+                         * ssd-streaming is active and this layer's types
+                         * qualify; it falls back to a plain mapped-model
+                         * read otherwise (byte-identical output). */
+                        false) != 0;
                 if (ok) {
                     ok = ds4_gpu_shared_mid_swiglu_q8_0_tensor(
                             g->ffn_mid,
@@ -49620,6 +51785,30 @@ static bool laguna_graph_forward_batch(
         (n_tokens > DS4_DFLASH_BLOCK_SIZE ||
          !laguna_graph_ensure_spec_scratch(g))) {
         return false;
+    }
+
+    /* Unlike decode's ds4_gpu_laguna_routed_shared_moe_one_tensor (which has
+     * a streaming address-table path), the batch routed-MoE kernel used
+     * below (ds4_gpu_glm_routed_moe_batch_tensor) always wraps the WHOLE
+     * routed-expert tensor from the mapped model range -- it ignores its own
+     * force_resident argument. So prefill needs every layer's routed
+     * experts resident, not just the decode-narrowed set that
+     * laguna_graph_forward_token installs. This widens back out to the full
+     * per-layer span set (a no-op in resident mode, same short-circuit as
+     * forward_token). Laguna does not implement GLM's windowed
+     * partial-resident prefill (deferred perf work); this is simpler and
+     * always correct, at the cost of prefill needing the whole file mapped
+     * while streaming. */
+    {
+        ds4_model_map_span_vec laguna_prefill_spans;
+        if (!weights_model_map_spans(weights, 0, DS4_N_LAYER - 1u, true,
+                                     &laguna_prefill_spans)) {
+            return false;
+        }
+        const bool spans_ok = metal_graph_install_model_spans(
+                model, &laguna_prefill_spans, "Laguna streaming prefill");
+        free(laguna_prefill_spans.v);
+        if (!spans_ok) return false;
     }
 
     bool ok = true;
@@ -50246,6 +52435,10 @@ static int generate_laguna_metal_argmax(
         const token_vec   *prompt,
         int                n_predict,
         int                ctx_size,
+        bool               ssd_streaming,
+        bool               ssd_streaming_cold,
+        uint32_t           ssd_streaming_preload_experts,
+        uint32_t           prefill_chunk,
         ds4_token_emit_fn  emit,
         ds4_generation_done_fn done,
         void              *emit_ud,
@@ -50256,7 +52449,8 @@ static int generate_laguna_metal_argmax(
         return 1;
     }
     ds4_laguna_gpu_graph g;
-    if (!laguna_graph_alloc(&g, (uint32_t)ctx_size)) return 1;
+    if (!laguna_graph_alloc(&g, (uint32_t)ctx_size, prefill_chunk,
+                            ssd_streaming)) return 1;
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     bool ok = true;
     const double prefill_t0 = now_sec();
@@ -50279,6 +52473,18 @@ static int generate_laguna_metal_argmax(
                                         prompt->len);
         i += (int)n;
         if (progress) progress(progress_ud, "prefill_chunk", i, prompt->len);
+    }
+    if (ok && ssd_streaming) {
+        /* Seed after prefill: prefill itself populates an LRU cache, so an
+         * earlier seed is churned away before first-token decode.  This is
+         * also where the shared graph path applies its hotlist. */
+        ds4_gpu_graph seed_graph;
+        memset(&seed_graph, 0, sizeof(seed_graph));
+        seed_graph.ssd_streaming = true;
+        seed_graph.ssd_streaming_cold = ssd_streaming_cold;
+        seed_graph.streaming_preload_experts = ssd_streaming_preload_experts;
+        ok = metal_graph_seed_streaming_expert_cache_from_hotlist(
+                &seed_graph, model, weights);
     }
     const double prefill_t1 = now_sec();
 
@@ -50309,6 +52515,11 @@ static int generate_laguna_metal_argmax(
                 (double)prompt->len / (prefill_t1 - prefill_t0) : 0.0,
             decode_t1 > decode_t0 ?
                 (double)generated / (decode_t1 - decode_t0) : 0.0);
+    /* Surface the shared streaming expert cache's hit/miss counters the same
+     * way GLM's generation path does (ds4_gpu_print_memory_report), so
+     * --ssd-streaming runs always show cache effectiveness without needing
+     * the separate DS4_METAL_MEMORY_REPORT opt-in GLM uses elsewhere. */
+    if (ssd_streaming) ds4_gpu_print_memory_report("before Laguna graph free");
     free(logits);
     laguna_graph_free(&g);
     return ok ? 0 : 1;
@@ -50389,6 +52600,10 @@ static int generate_metal_graph_raw_swa(
                                             prompt,
                                             n_predict,
                                             ctx_size,
+                                            ssd_streaming,
+                                            ssd_streaming_cold,
+                                            ssd_streaming_preload_experts,
+                                            prefill_chunk,
                                             emit,
                                             done,
                                             emit_ud,
@@ -50680,6 +52895,16 @@ static bool engine_glm_layer_uses_full_indexer(uint32_t il) {
     return il >= 6u && ((il - 6u) % 4u) == 0u;
 }
 
+static uint32_t engine_placement_session_count(const ds4_engine *e) {
+    return e && e->placement_session_count_hint > 1
+        ? (uint32_t)e->placement_session_count_hint : 1u;
+}
+
+static size_t engine_size_mul_sat(size_t bytes, uint32_t count) {
+    if (count != 0u && bytes > SIZE_MAX / count) return SIZE_MAX;
+    return bytes * count;
+}
+
 /* GLM keeps one compact DSA row for every logical context position. These
  * caches are allocated on the same tier as their transformer layer, so they
  * must be priced per layer by the multi-GPU packer. */
@@ -50784,8 +53009,10 @@ static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
         const ds4_context_memory mem =
             glm_graph_context_memory_estimate_for_compact_cap(
                     ctx, work_ctx, compact_cap, ssd_streaming);
-        return mem.scratch_bytes > SIZE_MAX ?
+        const size_t scratch = mem.scratch_bytes > SIZE_MAX ?
             SIZE_MAX : (size_t)mem.scratch_bytes;
+        return engine_size_mul_sat(scratch,
+                                   engine_placement_session_count(e));
     }
 #endif
 
@@ -51191,6 +53418,7 @@ typedef struct ds4_dspark_spec_stats {
 struct ds4_session {
     ds4_engine *engine;
     bool speculative_enabled;
+    ds4_mellum_session_state *mellum;
     ds4_dist_session *distributed;
     uint64_t tp_session_id;
 #ifndef DS4_NO_GPU
@@ -51329,11 +53557,13 @@ static uint32_t ds4_dspark_scheduler_min_avg_milli(void) {
 }
 
 static uint32_t ds4_dspark_scheduler_max_ms_per_accept_milli(void) {
-    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_MAX_MS_PER_ACCEPT_MILLI", 28000);
+    return ds4_dspark_env_u32(
+            "DS4_DSPARK_SCHEDULER_MAX_MS_PER_ACCEPT_MILLI", 0);
 }
 
 static uint32_t ds4_dspark_scheduler_max_extra_saved_ratio_milli(void) {
-    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_MAX_EXTRA_SAVED_RATIO_MILLI", 1000);
+    return ds4_dspark_env_u32(
+            "DS4_DSPARK_SCHEDULER_MAX_EXTRA_SAVED_RATIO_MILLI", 0);
 }
 
 static uint32_t ds4_dspark_scheduler_break_even_window(void) {
@@ -51358,6 +53588,13 @@ static uint32_t ds4_dspark_scheduler_tail_min_tokens(void) {
 
 static float ds4_dspark_scheduler_cold_low_confidence_threshold(void) {
     return (float)ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_COLD_LOW_CONFIDENCE_MILLI", 500) / 1000.0f;
+}
+
+/* Timing-sensitive scheduling changes which arithmetic path advances a token.
+ * Keep it opt-in so greedy DSpark output is reproducible across runs. */
+static bool ds4_dspark_scheduler_timing_enabled(void) {
+    return ds4_dspark_scheduler_max_ms_per_accept_milli() != 0 ||
+           ds4_dspark_scheduler_max_extra_saved_ratio_milli() != 0;
 }
 
 static void ds4_session_dspark_scheduler_reset(ds4_session *s) {
@@ -52108,6 +54345,77 @@ static bool ds4_session_is_cpu(const ds4_session *s) {
     return s && s->engine && s->engine->backend == DS4_BACKEND_CPU;
 }
 
+static bool ds4_session_is_mellum(const ds4_session *s) {
+    return s && s->mellum != NULL;
+}
+
+static bool ds4_session_is_mellum_layout_only(const ds4_session *s) {
+#ifndef DS4_NO_GPU
+    return ds4_session_is_mellum(s) && !s->mellum->decode_enabled;
+#else
+    (void)s;
+    return false;
+#endif
+}
+
+static bool ds4_session_is_mellum_decode_only(const ds4_session *s) {
+#ifndef DS4_NO_GPU
+    return ds4_session_is_mellum(s) && s->mellum->decode_enabled;
+#else
+    (void)s;
+    return false;
+#endif
+}
+
+/* A normal Mellum session deliberately has a smaller surface than the other
+ * model families: it can run the validated one-token decoder and select its
+ * resulting logits, but it has no generic graph, persistent KV, or batched
+ * prefill state.  Probe sessions retain their decode-only boundary. */
+static bool ds4_session_is_mellum_interactive(const ds4_session *s) {
+#ifndef DS4_NO_GPU
+    return ds4_session_is_mellum(s) && s->mellum->decode_enabled &&
+           s->mellum->interactive_enabled;
+#else
+    (void)s;
+    return false;
+#endif
+}
+
+static bool ds4_session_reject_mellum_layout_only(const ds4_session *s,
+                                                  char              *err,
+                                                  size_t             errlen) {
+    if (!ds4_session_is_mellum_layout_only(s)) return false;
+    if (err && errlen) {
+        snprintf(err, errlen,
+                 "Mellum session is layout-only; token evaluation is not enabled");
+    }
+    return true;
+}
+
+static bool ds4_session_reject_mellum_unsupported(const ds4_session *s,
+                                                   char              *err,
+                                                   size_t             errlen) {
+    if (!ds4_session_is_mellum(s)) return false;
+    if (err && errlen) {
+        snprintf(err, errlen,
+                 "Mellum session does not support this operation in inspect mode");
+    }
+    return true;
+}
+
+static bool ds4_session_reject_mellum_noninteractive(const ds4_session *s,
+                                                      char              *err,
+                                                      size_t             errlen) {
+    if (!ds4_session_is_mellum(s) || ds4_session_is_mellum_interactive(s)) {
+        return false;
+    }
+    if (err && errlen) {
+        snprintf(err, errlen,
+                 "Mellum token selection is available only to interactive sessions");
+    }
+    return true;
+}
+
 static void ds4_session_dspark_capture_invalidate(ds4_session *s) {
 #ifndef DS4_NO_GPU
     if (!s) return;
@@ -52241,6 +54549,7 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
     if (!s || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end))
         return 0;
+    if (ds4_session_is_mellum(s)) return 0;
     if (ds4_session_is_cpu(s)) return 0;
     if (ds4_session_is_laguna(s)) return 0;
     if (ds4_session_is_glm(s)) {
@@ -52310,6 +54619,7 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
 int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen) {
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     if (!s || !fp || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload save");
@@ -52552,6 +54862,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    const int *tokens, uint32_t n_tokens,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen) {
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     if (!s || !fp || !tokens ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload load");
@@ -53130,39 +55441,46 @@ static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s) {
     return ok;
 }
 
-/* Commit the prefix-1 state captured by the N=2 speculative verifier.
+/* Commit an intermediate state captured by a tiny speculative verifier.
  *
- * The verifier has already advanced every layer through both draft tokens.  On
- * a one-token accept the append-only compressed caches can keep the second
- * speculative row as invisible garbage, but the compressor frontiers and row
- * counters must be rewound to the exact state after draft[0].  This is the
- * cheap partial-accept path: copy a few small per-layer frontiers instead of
- * restoring the whole prefix and replaying a one-token target decode. */
-static bool spec_frontier_commit_prefix1(ds4_session *s) {
+ * Append-only cache rows beyond the accepted prefix can remain as invisible
+ * garbage. Only compressor frontiers and row counters need rewinding. */
+static bool spec_frontier_commit_prefix(ds4_session *s, uint32_t prefix_len) {
+    if (!s || prefix_len == 0 || prefix_len > DS4_SPEC_PREFIX_SLOTS) {
+        return false;
+    }
+    const uint32_t slot = prefix_len - 1u;
     ds4_gpu_graph *g = &s->graph;
     bool ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
 
-        g->layer_n_comp[il] = g->spec_prefix1_n_comp[il];
+        g->layer_n_comp[il] = g->spec_prefix_n_comp[slot][il];
         const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+        const uint64_t aoff = (uint64_t)slot * ab;
         ok = ds4_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
-                                   g->spec_prefix1_attn_state_kv[il], 0, ab) != 0 &&
+                                   g->spec_prefix1_attn_state_kv[il], aoff, ab) != 0 &&
              ds4_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
-                                   g->spec_prefix1_attn_state_score[il], 0, ab) != 0;
+                                   g->spec_prefix1_attn_state_score[il], aoff, ab) != 0;
         if (ok && ratio == 4) {
-            g->layer_n_index_comp[il] = g->spec_prefix1_n_index_comp[il];
+            g->layer_n_index_comp[il] =
+                g->spec_prefix_n_index_comp[slot][il];
             const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+            const uint64_t ioff = (uint64_t)slot * ib;
             ok = ds4_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
-                                       g->spec_prefix1_index_state_kv[il], 0, ib) != 0 &&
+                                       g->spec_prefix1_index_state_kv[il], ioff, ib) != 0 &&
                  ds4_gpu_tensor_copy(g->layer_index_state_score[il], 0,
-                                       g->spec_prefix1_index_state_score[il], 0, ib) != 0;
+                                       g->spec_prefix1_index_state_score[il], ioff, ib) != 0;
         }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     return ok;
+}
+
+static bool spec_frontier_commit_prefix1(ds4_session *s) {
+    return spec_frontier_commit_prefix(s, 1);
 }
 
 static void session_greedy_splitkv_reset(ds4_session *s) {
@@ -53174,8 +55492,13 @@ static void session_greedy_splitkv_reset(ds4_session *s) {
 }
 #endif
 
+bool ds4_session_supports_payload(ds4_session *s) {
+    return s && !ds4_session_is_mellum(s);
+}
+
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
+    if (ds4_session_is_mellum(s)) return 0;
     if (s->distributed) return 0;
     if (ds4_session_is_laguna(s)) {
 #ifdef DS4_NO_GPU
@@ -53265,6 +55588,7 @@ void ds4_session_payload_file_free(ds4_session_payload_file *payload) {
 
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen) {
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     if (!out) {
         payload_set_err(err, errlen, "invalid session payload staging request");
         return 1;
@@ -53318,6 +55642,7 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
 }
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
@@ -53710,6 +56035,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -54399,6 +56725,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 }
 
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen) {
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     if (!s || !snap) {
         payload_set_err(err, errlen, "invalid session snapshot save");
         return 1;
@@ -54442,6 +56769,7 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
 }
 
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     if (!s || !snap || !snap->ptr || snap->len == 0) {
         payload_set_err(err, errlen, "invalid session snapshot load");
         return 1;
@@ -54496,6 +56824,28 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
     return 0;
 }
 
+int ds4_dump_chat_tokenization(const char     *model_path,
+                               const char     *system,
+                               const char     *prompt,
+                               ds4_think_mode  think_mode,
+                               FILE           *fp) {
+    ds4_model model;
+    ds4_vocab vocab;
+    token_vec tokens = {0};
+
+    if (!fp) fp = stdout;
+    model_open(&model, model_path, false, false);
+    config_validate_model(&model);
+    vocab_load(&vocab, &model);
+    encode_chat_prompt(&vocab, system, prompt ? prompt : "", think_mode, &tokens);
+
+    dump_tokens_fp(fp, &vocab, &tokens);
+    token_vec_free(&tokens);
+    vocab_free(&vocab);
+    model_close(&model);
+    return 0;
+}
+
 #ifndef DS4_NO_GPU
 static bool imatrix_read_text_file(const char *path, char **out, size_t *len_out) {
     *out = NULL;
@@ -54538,6 +56888,16 @@ static char *imatrix_trim_block(char *p, char *end) {
     while (end > p && isspace((unsigned char)end[-1])) end--;
     *end = '\0';
     return p;
+}
+
+static char *imatrix_find_marker(char *dataset, char *cursor, const char *marker) {
+    const size_t marker_len = strlen(marker);
+    char *p = cursor;
+    while ((p = strstr(p, marker)) != NULL) {
+        if (p == dataset || p[-1] == '\n') return p;
+        p += marker_len;
+    }
+    return NULL;
 }
 #endif
 
@@ -54608,7 +56968,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     const char *marker_lit = "===== DS4_IMATRIX_PROMPT";
     while (*cursor) {
         char *start = cursor;
-        char *marker = strstr(cursor, marker_lit);
+        char *marker = imatrix_find_marker(dataset, cursor, marker_lit);
         if (marker) {
             char *nl = strchr(marker, '\n');
             if (!nl) break;
@@ -54617,7 +56977,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
             break;
         }
 
-        char *next = strstr(start, marker_lit);
+        char *next = imatrix_find_marker(dataset, start, marker_lit);
         char *end = next ? next : dataset + dataset_len;
         char saved = *end;
         char *prompt_text = imatrix_trim_block(start, end);
@@ -54879,6 +57239,11 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
+    if (ds4_session_is_mellum(s)) {
+        if (ds4_session_reject_mellum_noninteractive(s, err, errlen) ||
+            ds4_session_eval(s, token, err, errlen) != 0) return -1;
+        return ds4_session_argmax(s);
+    }
     if (ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
@@ -57388,12 +59753,31 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
 
     uint64_t per_expert_bytes = 0;
     if (!ds4_streaming_routed_expert_bytes(&e->weights, &per_expert_bytes)) {
+        /* A valid distributed GLM slice can contain only the leading dense
+         * layers. It has no routed weights to stream or cache. */
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+            e->distributed.role != DS4_DISTRIBUTED_NONE &&
+            e->distributed.layers.set) {
+            fprintf(stderr,
+                    "ds4: SSD streaming layer slice has no routed experts; "
+                    "expert cache disabled\n");
+            e->ssd_streaming_cache_experts = 0;
+            e->ssd_streaming_cache_bytes = 0;
+            return true;
+        }
         fprintf(stderr,
                 "ds4: SSD streaming auto cache could not measure routed expert size\n");
         return false;
     }
 
-    const uint64_t max_model_experts = (uint64_t)DS4_N_LAYER * (uint64_t)DS4_N_EXPERT;
+    uint64_t max_model_experts = 0;
+    if (!ds4_streaming_cacheable_expert_count(&e->weights,
+                                              &max_model_experts,
+                                              NULL)) {
+        fprintf(stderr,
+                "ds4: SSD streaming auto cache could not count local cacheable experts\n");
+        return false;
+    }
     ds4_ssd_cache_plan plan;
     if (!ds4_ssd_auto_cache_plan(recommended,
                                  non_routed_bytes,
@@ -57439,9 +59823,24 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
             glm_graph_full_attention_cap(guard_ctx, true);
         const uint32_t compact_cap =
             glm_graph_compact_cache_initial_cap(guard_ctx, work_ctx);
-        const ds4_context_memory graph_mem =
-            glm_graph_context_memory_estimate_for_compact_cap(
+        ds4_context_memory graph_mem;
+        if (e->distributed.role != DS4_DISTRIBUTED_NONE &&
+            e->distributed.layers.set) {
+            const uint32_t normal_layers = glm_graph_normal_layer_count();
+            const uint32_t layer_end = e->distributed.layers.has_output ?
+                (normal_layers ? normal_layers - 1u : 0u) :
+                e->distributed.layers.end;
+            graph_mem = glm_graph_context_memory_estimate_for_compact_cap_slice(
+                    guard_ctx,
+                    work_ctx,
+                    compact_cap,
+                    true,
+                    e->distributed.layers.start,
+                    layer_end);
+        } else {
+            graph_mem = glm_graph_context_memory_estimate_for_compact_cap(
                     guard_ctx, work_ctx, compact_cap, true);
+        }
         uint64_t active_model_bytes =
             glm_graph_streaming_active_model_bytes(&e->weights);
         if (non_routed_bytes > active_model_bytes) {
@@ -57554,24 +59953,36 @@ static uint32_t ds4_glm_streaming_normal_layer_count(void) {
 }
 
 static uint32_t ds4_glm_streaming_supported_resident_prefix_layers(
-        const ds4_weights *weights) {
+        const ds4_weights *weights,
+        uint32_t          *layer_start_out) {
+    if (layer_start_out) *layer_start_out = 0;
     if (!weights) return 0;
     const uint32_t normal_layers = ds4_glm_streaming_normal_layer_count();
     if (normal_layers <= DS4_N_LEADING_DENSE) return 0;
 
+    uint32_t layer_start = DS4_N_LEADING_DENSE;
+    while (layer_start < normal_layers &&
+           !glm_stream_resident_decode_layer_supported(
+                   &weights->layer[layer_start], layer_start)) {
+        layer_start++;
+    }
+    if (layer_start == normal_layers) return 0;
+
     uint32_t n = 0;
-    for (uint32_t il = DS4_N_LEADING_DENSE; il < normal_layers; il++) {
+    for (uint32_t il = layer_start; il < normal_layers; il++) {
         if (!glm_stream_resident_decode_layer_supported(&weights->layer[il],
                                                         il)) {
             break;
         }
         n++;
     }
+    if (layer_start_out) *layer_start_out = layer_start;
     return n;
 }
 
 static bool ds4_glm_streaming_resident_prefix_bytes(
         const ds4_weights *weights,
+        uint32_t           layer_start,
         uint32_t           layers,
         uint64_t          *bytes_out) {
     if (bytes_out) *bytes_out = 0;
@@ -57579,7 +59990,7 @@ static bool ds4_glm_streaming_resident_prefix_bytes(
 
     uint64_t total = 0;
     for (uint32_t i = 0; i < layers; i++) {
-        const uint32_t il = DS4_N_LEADING_DENSE + i;
+        const uint32_t il = layer_start + i;
         if (!glm_stream_resident_decode_layer_supported(&weights->layer[il],
                                                         il)) {
             return false;
@@ -57602,6 +60013,7 @@ static bool ds4_glm_streaming_resident_prefix_bytes(
 
 static uint32_t ds4_glm_streaming_auto_full_layers(
         const ds4_weights *weights,
+        uint32_t           layer_start,
         uint32_t           supported_layers,
         uint64_t           total_budget_bytes) {
     if (!weights || supported_layers == 0 || total_budget_bytes == 0) {
@@ -57616,7 +60028,10 @@ static uint32_t ds4_glm_streaming_auto_full_layers(
     uint32_t best = 0;
     for (uint32_t n = 1; n <= supported_layers; n++) {
         uint64_t bytes = 0;
-        if (!ds4_glm_streaming_resident_prefix_bytes(weights, n, &bytes)) {
+        if (!ds4_glm_streaming_resident_prefix_bytes(weights,
+                                                     layer_start,
+                                                     n,
+                                                     &bytes)) {
             break;
         }
         if (bytes > target_bytes) break;
@@ -57626,6 +60041,7 @@ static uint32_t ds4_glm_streaming_auto_full_layers(
 }
 
 static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
+    g_glm_streaming_full_resident_start = 0;
     g_glm_streaming_full_resident_layers = 0;
 #ifdef DS4_NO_GPU
     (void)e;
@@ -57647,21 +60063,54 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
 
     uint64_t per_expert_bytes = 0;
     const bool need_expert_bytes =
+        e->ssd_streaming_cache_experts != 0 ||
         e->ssd_streaming_cache_bytes != 0 ||
         (glm_full_layer_streaming && !e->ssd_streaming_full_layers_set) ||
         e->ssd_streaming_full_layers != 0;
     if (need_expert_bytes &&
         !ds4_streaming_routed_expert_bytes(&e->weights,
                                            &per_expert_bytes)) {
+        const bool no_routed_slice =
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+            e->distributed.role != DS4_DISTRIBUTED_NONE &&
+            e->distributed.layers.set;
+        if (no_routed_slice &&
+            e->ssd_streaming_cache_experts == 0 &&
+            e->ssd_streaming_cache_bytes == 0 &&
+            e->ssd_streaming_full_layers == 0) {
+            return true;
+        }
         fprintf(stderr,
                 "ds4: SSD streaming could not measure routed expert size\n");
         return false;
+    }
+    uint64_t max_cache_experts_u64 = 0;
+    if (need_expert_bytes &&
+        !ds4_streaming_cacheable_expert_count(&e->weights,
+                                              &max_cache_experts_u64,
+                                              NULL)) {
+        fprintf(stderr,
+                "ds4: SSD streaming could not count local cacheable experts\n");
+        return false;
+    }
+    const uint32_t max_cache_experts = max_cache_experts_u64 > UINT32_MAX ?
+        UINT32_MAX : (uint32_t)max_cache_experts_u64;
+    if (e->ssd_streaming_cache_bytes == 0 &&
+        max_cache_experts != 0 &&
+        e->ssd_streaming_cache_experts > max_cache_experts) {
+        fprintf(stderr,
+                "ds4: SSD streaming expert cache capped from %u to %u "
+                "experts cacheable by this layer slice\n",
+                e->ssd_streaming_cache_experts,
+                max_cache_experts);
+        e->ssd_streaming_cache_experts = max_cache_experts;
     }
 
     uint32_t full_layers = 0;
     uint64_t full_layers_bytes = 0;
     bool full_layers_auto = false;
     uint32_t supported = 0;
+    uint32_t supported_start = 0;
     uint64_t total_cache_bytes = e->ssd_streaming_cache_bytes;
     uint64_t prefill_headroom_bytes = 0;
     uint64_t budget_after_prefill_headroom = total_cache_bytes;
@@ -57675,7 +60124,7 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
         if (prefill_headroom_bytes >= total_cache_bytes) {
             fprintf(stderr,
                     "ds4: --ssd-streaming-cache-experts byte budget %.2f GiB "
-                    "is too small: two routed prefill layers need %.2f GiB\n",
+                    "is too small: routed prefill headroom needs %.2f GiB\n",
                     (double)total_cache_bytes / 1073741824.0,
                     (double)prefill_headroom_bytes / 1073741824.0);
             return false;
@@ -57686,7 +60135,8 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
     e->ssd_streaming_prefill_headroom_bytes = prefill_headroom_bytes;
     if (glm_full_layer_streaming) {
         supported =
-            ds4_glm_streaming_supported_resident_prefix_layers(&e->weights);
+            ds4_glm_streaming_supported_resident_prefix_layers(
+                    &e->weights, &supported_start);
         if (!e->ssd_streaming_full_layers_set &&
             e->ssd_streaming_cache_bytes != 0) {
             /*
@@ -57703,6 +60153,7 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
                 e->ssd_streaming_full_layers =
                     ds4_glm_streaming_auto_full_layers(
                             &e->weights,
+                            supported_start,
                             supported,
                             budget_after_prefill_headroom);
             }
@@ -57712,8 +60163,9 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
 
     if (e->ssd_streaming_full_layers != 0) {
         const uint32_t requested = e->ssd_streaming_full_layers;
-        const uint32_t supported =
-            ds4_glm_streaming_supported_resident_prefix_layers(&e->weights);
+        supported =
+            ds4_glm_streaming_supported_resident_prefix_layers(
+                    &e->weights, &supported_start);
         full_layers = requested < supported ? requested : supported;
         if (full_layers != requested) {
             fprintf(stderr,
@@ -57742,6 +60194,7 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
             while (full_layers != 0) {
                 uint64_t bytes = 0;
                 if (!ds4_glm_streaming_resident_prefix_bytes(&e->weights,
+                                                             supported_start,
                                                              full_layers,
                                                              &bytes)) {
                     fprintf(stderr,
@@ -57766,6 +60219,7 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
             }
         } else if (full_layers != 0 &&
                    !ds4_glm_streaming_resident_prefix_bytes(&e->weights,
+                                                            supported_start,
                                                             full_layers,
                                                             &full_layers_bytes)) {
             fprintf(stderr,
@@ -57786,11 +60240,14 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
         }
 
         uint64_t budget_expert_bytes = 0;
-        const uint32_t budget =
+        uint32_t budget =
             ds4_streaming_cache_experts_for_byte_budget(
                     &e->weights,
                     dynamic_cache_bytes,
                     &budget_expert_bytes);
+        if (max_cache_experts != 0 && budget > max_cache_experts) {
+            budget = max_cache_experts;
+        }
         if (budget == 0 || budget_expert_bytes == 0) {
             fprintf(stderr,
                     "ds4: --ssd-streaming-cache-experts byte budget is too small or invalid for this model\n");
@@ -57859,6 +60316,7 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
 
     e->ssd_streaming_full_layers = full_layers;
     e->ssd_streaming_full_layer_bytes = full_layers_bytes;
+    g_glm_streaming_full_resident_start = supported_start;
     g_glm_streaming_full_resident_layers = full_layers;
     return true;
 #endif
@@ -58214,6 +60672,9 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
      * is accounted separately (see engine_per_tier_graph_overhead_bytes
      * and its pre-subtract in engine_classify_multi_tier). */
     const int est_ctx = (e->placement_ctx_hint > 0) ? e->placement_ctx_hint : 4096;
+    const uint32_t session_count =
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ?
+        engine_placement_session_count(e) : 1u;
     ds4_context_memory mem =
         ds4_context_memory_estimate_with_prefill(DS4_BACKEND_CUDA,
                                                  est_ctx,
@@ -58223,15 +60684,20 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
          * re-derived per layer so placement follows the active model's
          * allocation geometry. */
         for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
-            out[il + 1] +=
+            const size_t per_session =
                 DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ?
                 engine_glm_per_layer_kv_bytes_planner(il, est_ctx) :
                 engine_per_layer_kv_bytes_planner(il, est_ctx,
                                                   e->prefill_chunk);
+            const size_t cache_bytes =
+                engine_size_mul_sat(per_session, session_count);
+            out[il + 1] = out[il + 1] > SIZE_MAX - cache_bytes ?
+                SIZE_MAX : out[il + 1] + cache_bytes;
         }
     } else {
         /* Fallback: 128 MiB per layer as a static estimate. */
-        const size_t fallback_per_layer = (size_t)128ull * 1024ull * 1024ull;
+        const size_t fallback_per_layer = engine_size_mul_sat(
+                (size_t)128ull * 1024ull * 1024ull, session_count);
         for (uint32_t i = 1; i <= DS4_N_LAYER; i++) out[i] += fallback_per_layer;
     }
     return 0;
@@ -59066,6 +61532,7 @@ static int ds4_test_make_engine(
     memset(eng, 0, sizeof(*eng));
     eng->model.fd = -1;
     eng->placement_ctx_hint = placement_ctx_hint;
+    eng->placement_session_count_hint = 1;
     eng->model.n_tensors = (uint64_t)(n_tensors > 0 ? n_tensors : 0);
     if (n_tensors <= 0) return 0;
     eng->model.tensors = calloc((size_t)n_tensors,
@@ -59188,6 +61655,23 @@ uint32_t ds4_test_planner_raw_cap(int ctx_size, uint32_t prefill_cap) {
     return engine_planner_raw_cap(ctx_size, prefill_cap);
 }
 
+uint32_t ds4_test_laguna_prefill_cap(uint32_t ctx_size,
+                                     uint32_t prefill_chunk) {
+    return laguna_graph_prefill_cap(ctx_size, prefill_chunk);
+}
+
+uint64_t ds4_test_laguna_scratch_bytes(uint32_t prefill_cap) {
+    return laguna_graph_scratch_bytes(prefill_cap);
+}
+
+uint64_t ds4_test_laguna_xs21_scratch_bytes(uint32_t prefill_cap) {
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_LAGUNA_XS21;
+    const uint64_t bytes = laguna_graph_scratch_bytes(prefill_cap);
+    g_ds4_shape = saved;
+    return bytes;
+}
+
 size_t ds4_test_per_tier_graph_overhead_bytes_with_prefill(
         int placement_ctx_hint,
         uint32_t prefill_chunk) {
@@ -59234,6 +61718,32 @@ size_t ds4_test_compute_entry_bytes_sum(
             tensors, n_tensors, placement_ctx_hint, 0);
 }
 
+size_t ds4_test_compute_glm_entry_bytes_sum_with_sessions(
+        const ds4_test_fake_tensor *tensors,
+        int n_tensors,
+        int placement_ctx_hint,
+        int placement_session_count_hint) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_GLM52;
+    ds4_engine eng;
+    if (ds4_test_make_engine(&eng, tensors, n_tensors,
+                             placement_ctx_hint) != 0) {
+        g_ds4_shape = saved_shape;
+        return 0;
+    }
+    eng.placement_session_count_hint = placement_session_count_hint;
+    size_t entry_bytes[DS4_MAX_LAYER + 2];
+    size_t sum = 0;
+    if (engine_compute_entry_bytes(&eng, entry_bytes) == 0) {
+        for (uint32_t i = 0; i < (uint32_t)DS4_N_LAYER + 2u; i++) {
+            sum += entry_bytes[i];
+        }
+    }
+    free(eng.model.tensors);
+    g_ds4_shape = saved_shape;
+    return sum;
+}
+
 size_t ds4_test_glm_per_layer_kv_bytes(uint32_t layer, int ctx_size) {
     const ds4_shape saved_shape = g_ds4_shape;
     g_ds4_shape = DS4_SHAPE_GLM52;
@@ -59262,21 +61772,33 @@ static int engine_install_dspark_support_cache(ds4_engine *e);
 static int engine_install_gpu_placement(ds4_engine *e);
 static int ds4_engine_open_internal(ds4_engine **out,
                                     const ds4_engine_options *opt,
-                                    const ds4_gpu_config *gpu_cfg);
+                                    const ds4_gpu_config *gpu_cfg,
+                                    bool resident_session_owner);
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
-    return ds4_engine_open_internal(out, opt, NULL);
+    return ds4_engine_open_internal(out, opt, NULL, false);
+}
+
+int ds4_engine_open_for_resident_sessions(ds4_engine **out,
+                                          const ds4_engine_options *opt) {
+    return ds4_engine_open_internal(out, opt, NULL, true);
+}
+
+int ds4_engine_open_for_agent(ds4_engine **out,
+                              const ds4_engine_options *opt) {
+    return ds4_engine_open_for_resident_sessions(out, opt);
 }
 
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
                                        const ds4_engine_options *opt,
                                        const struct ds4_gpu_config *gpu_cfg) {
-    return ds4_engine_open_internal(out, opt, gpu_cfg);
+    return ds4_engine_open_internal(out, opt, gpu_cfg, false);
 }
 
 static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
-                                     const ds4_gpu_config *gpu_cfg) {
+                                     const ds4_gpu_config *gpu_cfg,
+                                     bool resident_session_owner) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
@@ -59335,7 +61857,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->dspark_confidence_threshold_set) {
         e->dspark_confidence_threshold = opt->dspark_confidence_threshold;
     } else {
-        e->dspark_confidence_threshold = 0.9f;
+        e->dspark_confidence_threshold = 0.7f;
     }
     if (opt->cuda_tensor_parallel &&
         (opt->backend != DS4_BACKEND_CUDA || !gpu_cfg ||
@@ -59375,7 +61897,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     e->placement_ctx_hint = opt->placement_ctx_hint;
+    e->placement_session_count_hint = opt->placement_session_count_hint;
     e->share_session_prefill_workspace = opt->share_session_prefill_workspace;
+    e->mellum_interactive_sessions =
+        resident_session_owner && !opt->inspect_only;
     ds4_acquire_instance_lock();
 
     if (opt->simulate_used_memory_bytes != 0 &&
@@ -59390,17 +61915,19 @@ static int ds4_engine_open_internal(ds4_engine **out,
     uint32_t load_layer_start = opt->load_layer_start;
     uint32_t load_layer_end = opt->load_layer_end;
     bool load_output = opt->load_output;
+    bool load_output_optional = false;
     if (opt->distributed.role != DS4_DISTRIBUTED_NONE &&
         opt->distributed.layers.set)
     {
         load_slice = true;
         load_layer_start = opt->distributed.layers.start;
-        load_layer_end =
-            (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA &&
-             opt->distributed.layers.has_output) ?
-                UINT32_MAX :
-                opt->distributed.layers.end;
+        load_layer_end = opt->distributed.layers.end;
         load_output = opt->distributed.layers.has_output;
+        /* A coordinator may need to apply the output head locally when the
+         * last worker advertises N:M rather than N:output. Bind it when the
+         * local GGUF contains it, without requiring split GGUFs to do so. */
+        load_output_optional =
+            opt->distributed.role == DS4_DISTRIBUTED_COORDINATOR;
     }
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
@@ -59408,6 +61935,20 @@ static int ds4_engine_open_internal(ds4_engine **out,
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
+    if (load_slice && load_layer_end == UINT32_MAX) {
+        const uint32_t normal_layers = ds4_model_normal_layer_count();
+        if (normal_layers == 0) {
+            fprintf(stderr, "ds4: model reports no executable transformer layers\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        load_layer_end = normal_layers - 1u;
+    }
+    if (e->distributed.role != DS4_DISTRIBUTED_NONE &&
+        e->distributed.layers.set) {
+        e->distributed.layers.end = load_layer_end;
+    }
     if (e->cuda_tensor_parallel &&
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
         fprintf(stderr,
@@ -59442,7 +61983,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
                  load_slice,
                  load_layer_start,
                  load_layer_end,
-                 load_output);
+                 load_output,
+                 load_output_optional);
+    const uint32_t bound_layer_start = load_slice ? load_layer_start : 0u;
+    const uint32_t bound_layer_end = load_slice ? load_layer_end : UINT32_MAX;
+    if (!ds4_engine_bind_mellum_decode_contract(e,
+                                                bound_layer_start,
+                                                bound_layer_end)) {
+        fprintf(stderr, "ds4: failed to construct Mellum decode layer descriptors\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
 
     /* TP always maps one contiguous routed-expert half per rank. Decide
      * immediately after binding so memory guards account only the bytes this
@@ -59452,6 +62004,22 @@ static int ds4_engine_open_internal(ds4_engine **out,
         opt->tp.role != DS4_TP_NONE &&
         !e->ssd_streaming;
     const int tp_shard_rank = opt->tp.role == DS4_TP_WORKER ? 1 : 0;
+    if (tp_shard && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        uint32_t bad_layer = 0;
+        uint32_t bad_type = 0;
+        if (!glm_tp_validate_ownership_kernels(&e->weights,
+                                               &bad_layer,
+                                               &bad_type)) {
+            fprintf(stderr,
+                    "ds4: GLM tensor parallelism lacks ownership-aware "
+                    "kernels for routed expert type %u in layer %u\n",
+                    bad_type,
+                    bad_layer);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+    }
     g_tp_shard_model_bytes = 0;
     if (tp_shard) {
         ds4_model_map_span_vec shard_spans;
@@ -59463,6 +62031,42 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
     }
 #endif
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        if (opt->inspect_only) {
+            *out = e;
+            return 0;
+        }
+        if (!e->mellum_interactive_sessions) {
+            fprintf(stderr,
+                    "ds4: Mellum 2 resident sessions require a host that owns "
+                    "them (ds4-agent or ds4-server), not a diagnostic open\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->backend != DS4_BACKEND_METAL) {
+            fprintf(stderr,
+                    "ds4: Mellum 2 inference currently requires --metal\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->ssd_streaming) {
+            fprintf(stderr,
+                    "ds4: Mellum 2 does not yet support --ssd-streaming\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
+            opt->tp.role != DS4_TP_NONE || gpu_cfg) {
+            fprintf(stderr,
+                    "ds4: Mellum 2 does not yet support layer slicing, distributed inference, tensor parallelism, or multi-GPU placement\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
         if (opt->inspect_only) {
             *out = e;
@@ -59502,9 +62106,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        if (e->ssd_streaming) {
+        if (e->ssd_streaming && DS4_MODEL_VARIANT != DS4_VARIANT_LAGUNA_XS21) {
             fprintf(stderr,
-                    "ds4: --ssd-streaming is not implemented for Laguna S 2.1 yet\n");
+                    "ds4: --ssd-streaming for Laguna is only supported "
+                    "for Laguna XS 2.1\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -59518,18 +62123,26 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+        if (opt->prefill_chunk != 0 &&
+            DS4_MODEL_VARIANT != DS4_VARIANT_LAGUNA_XS21) {
+            fprintf(stderr,
+                    "ds4: --prefill-chunk for Laguna is only supported "
+                    "for Laguna XS 2.1\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         if ((opt->directional_steering_file &&
              opt->directional_steering_file[0]) ||
             opt->directional_steering_attn != 0.0f ||
             opt->directional_steering_ffn != 0.0f ||
             e->power_percent < 100 ||
-            opt->prefill_chunk != 0 ||
             (opt->mtp_path && opt->mtp_path[0]) ||
             opt->dspark || opt->glm_mtp || opt->first_token_test) {
             fprintf(stderr,
                     "ds4: Laguna S 2.1 currently supports the standard local "
-                    "graph path only (no steering, power cap, custom "
-                    "prefill chunk, MTP/DSpark, or first-token diagnostic)\n");
+                    "graph path only (no steering, power cap, MTP/DSpark, "
+                    "or first-token diagnostic)\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -59588,15 +62201,27 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         bool glm_backend_supported = ds4_backend_uses_graph(e->backend);
 #ifdef DS4_ROCM_BUILD
-        if (e->backend == DS4_BACKEND_CUDA && !e->ssd_streaming) {
+        const bool rocm_full_model_requires_streaming =
+            e->backend == DS4_BACKEND_CUDA &&
+            !e->ssd_streaming &&
+            !load_slice;
+        if (rocm_full_model_requires_streaming) {
             glm_backend_supported = false;
         }
 #endif
         if (!glm_backend_supported) {
 #ifdef DS4_ROCM_BUILD
-            fprintf(stderr,
-                    "ds4: GLM 5.2 ROCm inference requires --ssd-streaming; "
-                    "use --inspect or --cpu --first-token-test for CPU diagnostics\n");
+            if (rocm_full_model_requires_streaming) {
+                fprintf(stderr,
+                        "ds4: full-model GLM 5.2 ROCm inference requires "
+                        "--ssd-streaming; distributed layer slices can run "
+                        "fully resident\n");
+            } else {
+                fprintf(stderr,
+                        "ds4: GLM 5.2 inference requires the ROCm graph "
+                        "backend; use --inspect or --cpu --first-token-test "
+                        "for CPU diagnostics\n");
+            }
 #else
             fprintf(stderr,
                     "ds4: GLM 5.2 inference requires the Metal or CUDA graph "
@@ -59617,7 +62242,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                                  load_layer_start,
                                                  load_layer_end,
                                                  load_layer_start == 0,
-                                                 load_output,
+                                                 load_output ||
+                                                     (load_output_optional &&
+                                                      weights_have_output_head(
+                                                              &e->weights)),
                                                  guard_ctx) :
                     glm_graph_memory_guard(&e->model,
                                            &e->weights,
@@ -59897,6 +62525,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
             }
             e->metal_ready = true;
             ds4_gpu_set_quality(e->quality);
+#ifdef DS4_ROCM_BUILD
+            /*
+             * The ROCm Q8 decode selector must know that a multi-tier model
+             * is GLM before any layer dispatch.  The single-tier path sets
+             * the same model-family state below.
+             */
+            ds4_gpu_set_glm_model(
+                    DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
+#endif
             (void)ds4_gpu_set_model_fd(e->model.fd);
 
             if (engine_install_gpu_placement(e) != 0) {
@@ -59948,7 +62585,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     load_slice,
                     load_layer_start,
                     load_layer_end,
-                    load_output,
+                    load_output ||
+                        (load_output_optional &&
+                         weights_have_output_head(&e->weights)),
                     opt->context_size,
                     "after GLM streaming cache budget")) {
             ds4_engine_close(e);
@@ -60015,13 +62654,23 @@ static int ds4_engine_open_internal(ds4_engine **out,
             }
         }
         (void)ds4_gpu_set_model_fd(e->model.fd);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (e->backend == DS4_BACKEND_CUDA &&
+            !load_slice && !tp_shard && !e->ssd_streaming) {
+            (void)ds4_gpu_build_derived_artifacts(e->model.map,
+                                                  e->model.size,
+                                                  opt->model_path);
+        }
+#endif
         int model_map_ok = 0;
         uint64_t *load_offsets = NULL;
         uint64_t *load_sizes = NULL;
         uint32_t load_span_count = 0;
         if (e->ssd_streaming) {
             const bool map_output = load_slice &&
-                                    load_output;
+                                    (load_output ||
+                                     (load_output_optional &&
+                                      weights_have_output_head(&e->weights)));
             ds4_model_map_span_vec spans;
             bool spans_ok = false;
             if (load_slice) {
@@ -60029,7 +62678,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         &e->weights,
                         load_layer_start,
                         load_layer_end,
-                        true,
+                        load_layer_start == 0,
                         map_output,
                         &spans);
             } else {
@@ -60063,8 +62712,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     snprintf(load_end, sizeof(load_end), "%u", load_layer_end);
                 }
                 fprintf(stderr,
-                        "ds4: SSD streaming initial %s model map restricted to token + non-routed layers %u:%s (%u spans, %.2f GiB tensor span)\n",
+                        "ds4: SSD streaming initial %s model map restricted to "
+                        "%snon-routed layers %u:%s (%u spans, %.2f GiB tensor span)\n",
                         ds4_backend_name(e->backend),
+                        load_layer_start == 0 ? "token + " : "",
                         load_layer_start,
                         load_end,
                         spans.len,
@@ -60084,7 +62735,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                                         spans.max_tensor_bytes);
             free(spans.v);
         } else if (load_slice) {
-            const bool map_output = load_output;
+            const bool map_output =
+                load_output ||
+                (load_output_optional &&
+                 weights_have_output_head(&e->weights));
             char load_end[32];
             if (map_output && load_layer_end == UINT32_MAX) {
                 snprintf(load_end, sizeof(load_end), "output");
@@ -60542,6 +63196,11 @@ bool ds4_engine_is_laguna(ds4_engine *e) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA;
 }
 
+bool ds4_engine_is_mellum(ds4_engine *e) {
+    (void)e;
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM;
+}
+
 const char *ds4_engine_default_system_prompt(ds4_engine *e) {
     (void)e;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
@@ -60568,12 +63227,25 @@ void ds4_engine_sampling_defaults(ds4_engine *e, float *temperature,
         *top_k = 20;
         *top_p = 0.95f;
         *min_p = 0.05f;
+    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        /* JetBrains' published sampling for Mellum 2. Without this it ran at
+         * the generic temperature 1.0 / top_p 1.0, which is a poor setting for
+         * a model expected to emit well-formed JSON tool calls. */
+        *temperature = 0.6f;
+        *top_p = 0.95f;
+        *top_k = 20;
+        *min_p = 0.0f;
     }
 }
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
+    if (e->mellum_prefill_workspace) {
+        ds4_mellum_prefill_scratch_free(e->mellum_prefill_workspace);
+        free(e->mellum_prefill_workspace);
+        e->mellum_prefill_workspace = NULL;
+    }
     if (e->tp.active) {
         ds4_gpu_tp_shutdown();
         const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
@@ -60595,12 +63267,20 @@ void ds4_engine_close(ds4_engine *e) {
     }
 #endif
     ds4_expert_profile_close();
+#ifndef DS4_NO_GPU
+    ds4_mellum_decode_state_free(e->mellum_decode_state);
+    e->mellum_decode_state = NULL;
+#endif
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
     if (e->mtp_model.map) model_close(&e->mtp_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
+    if (e->shared_prefill_workspace_ready) {
+        metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
+        e->shared_prefill_workspace_ready = false;
+    }
     ds4_gpu_cleanup();
 #endif
     if (e->dflash_f16_map && e->dflash_f16_map_size != 0) {
@@ -60741,6 +63421,42 @@ static int ds4_session_tp_register(ds4_session *s) {
     return 1;
 }
 
+static int ds4_mellum_session_create(ds4_session **out, ds4_engine *e,
+                                     int ctx_size, bool decode_enabled,
+                                     bool interactive_enabled) {
+#ifdef DS4_NO_GPU
+    (void)out;
+    (void)e;
+    (void)ctx_size;
+    (void)decode_enabled;
+    (void)interactive_enabled;
+    return 1;
+#else
+    if (!out || !e || ctx_size <= 0 ||
+        !e->mellum_decode_contract_ready ||
+        !ds4_backend_uses_graph(e->backend)) return 1;
+    ds4_session *s = xcalloc(1, sizeof(*s));
+    s->engine = e;
+    s->ctx_size = ctx_size;
+    s->mellum = ds4_mellum_session_state_create(
+        e, (uint32_t)ctx_size, decode_enabled, interactive_enabled);
+    if (!s->mellum) {
+        fprintf(stderr, "ds4: Mellum session allocation failed\n");
+        free(s);
+        return 1;
+    }
+    if (decode_enabled) {
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    }
+    if (interactive_enabled) {
+        s->sample_probs =
+            xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+    }
+    *out = s;
+    return 0;
+#endif
+}
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
@@ -60774,13 +63490,19 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 #ifdef DS4_NO_GPU
     return 1;
 #else
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        return ds4_mellum_session_create(
+            out, e, ctx_size, e->mellum_interactive_sessions,
+            e->mellum_interactive_sessions);
+    }
     if (!ds4_backend_uses_graph(e->backend) || !e->metal_ready) return 1;
 
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
-        if (!laguna_graph_alloc(&s->laguna_graph, (uint32_t)ctx_size)) {
+        if (!laguna_graph_alloc(&s->laguna_graph, (uint32_t)ctx_size,
+                                e->prefill_chunk, e->ssd_streaming)) {
             free(s);
             return 1;
         }
@@ -61080,8 +63802,23 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     ds4_session_print_dspark_stats(s);
+    /* The CLI's default single-shot generation path runs entirely through
+     * ds4_session_create/sync/eval, not generate_laguna_metal_argmax, so
+     * this is where a --ssd-streaming Laguna run gets to show the shared
+     * streaming expert cache's hit/miss counters (silently a no-op when
+     * nothing was ever streamed, per ds4_gpu_print_memory_report's own
+     * zero-check). */
+    if (s->engine && s->engine->ssd_streaming && ds4_session_is_laguna(s)) {
+        ds4_gpu_print_memory_report("before Laguna session free");
+    }
 #endif
     ds4_dist_session_free(s->distributed);
+#ifndef DS4_NO_GPU
+    if (ds4_session_is_mellum(s)) {
+        ds4_mellum_session_state_free(s->mellum);
+        s->mellum = NULL;
+    } else
+#endif
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
@@ -61131,6 +63868,145 @@ void ds4_session_free(ds4_session *s) {
     free(s);
 }
 
+
+
+
+
+static bool ds4_mellum_session_decode_fixture(ds4_session *session,
+                                              const int   *tokens,
+                                              uint32_t     n_tokens,
+                                              char        *err,
+                                              size_t       errlen) {
+    for (uint32_t pos = 0; pos < n_tokens; pos++) {
+        if (ds4_session_eval(session, tokens[pos], err, errlen) != 0) return false;
+    }
+    return true;
+}
+
+
+
+typedef struct {
+    int completed;
+    int cancel_after;
+} ds4_mellum_sync_cancel_probe;
+
+static void ds4_mellum_sync_cancel_progress(void *ud, const char *event,
+                                             int current, int total) {
+    (void)total;
+    ds4_mellum_sync_cancel_probe *probe = ud;
+    if (probe && event && !strcmp(event, "prefill_chunk")) {
+        probe->completed = current;
+    }
+}
+
+static bool ds4_mellum_sync_cancelled(void *ud) {
+    const ds4_mellum_sync_cancel_probe *probe = ud;
+    return probe && probe->completed >= probe->cancel_after;
+}
+
+
+
+
+
+#ifndef DS4_NO_GPU
+static bool ds4_mellum_prefill_chunks(const ds4_engine           *e,
+                                      ds4_mellum_decode_state    *state,
+                                      ds4_mellum_prefill_scratch *scratch,
+                                      const int                  *tokens,
+                                      uint32_t                    n_tokens,
+                                      uint32_t                    max_chunk,
+                                      ds4_gpu_tensor             *layer_trace_gpu,
+                                      ds4_gpu_tensor             *attention_trace_gpu);
+static uint32_t ds4_mellum_probe_chunk(uint32_t fallback, uint32_t max_chunk);
+
+static bool ds4_mellum_resident_prefill_pass(
+        const ds4_engine *e, ds4_mellum_decode_state *state,
+        ds4_mellum_prefill_scratch *scratch, const int *tokens,
+        uint32_t n_tokens, uint32_t chunk, double *elapsed) {
+    ds4_mellum_decode_state_reset(state);
+    const double t0 = now_sec();
+    if (!ds4_mellum_prefill_chunks(e, state, scratch, tokens, n_tokens, chunk,
+                                   NULL, NULL)) return false;
+    *elapsed = now_sec() - t0;
+    return true;
+}
+
+/*
+ * `prime_n` tokens are prefilled before the clock starts, so decode can be
+ * timed at depth rather than only from an empty cache.  Decode cost is
+ * dominated by the KV read, which grows with position, and the flat-versus-
+ * decaying shape of that curve is the thing a long session actually feels.
+ */
+static bool ds4_mellum_resident_profile_pass(
+        const ds4_engine *e, ds4_mellum_decode_state *state,
+        const int *tokens, int n_tokens, bool compute_logits, double *elapsed,
+        ds4_mellum_prefill_scratch *prime_scratch, const int *prime_tokens,
+        uint32_t prime_n, uint32_t prime_chunk) {
+    ds4_mellum_decode_state_reset(state);
+    if (prime_n > 0 &&
+        !ds4_mellum_prefill_chunks(e, state, prime_scratch, prime_tokens,
+                                   prime_n, prime_chunk, NULL, NULL)) {
+        return false;
+    }
+    const double t0 = now_sec();
+    for (int i = 0; i < n_tokens; i++) {
+        if (!ds4_mellum_decode_token(e, state, tokens[i], NULL, NULL, NULL,
+                                     NULL, NULL, NULL, NULL, compute_logits, false)) {
+            return false;
+        }
+    }
+    *elapsed = now_sec() - t0;
+    return true;
+}
+#endif
+
+
+
+#ifndef DS4_NO_GPU
+/*
+ * Split one prefill into fixed-size chunks.  Traces are captured on the final
+ * chunk only: they describe the last token, which is the row every Mellum
+ * oracle compares.
+ */
+static bool ds4_mellum_prefill_chunks(const ds4_engine           *e,
+                                      ds4_mellum_decode_state    *state,
+                                      ds4_mellum_prefill_scratch *scratch,
+                                      const int                  *tokens,
+                                      uint32_t                    n_tokens,
+                                      uint32_t                    max_chunk,
+                                      ds4_gpu_tensor             *layer_trace_gpu,
+                                      ds4_gpu_tensor             *attention_trace_gpu) {
+    if (!e || !state || !scratch || !tokens || n_tokens == 0 ||
+        max_chunk == 0 || max_chunk > scratch->cap) return false;
+    for (uint32_t offset = 0; offset < n_tokens;) {
+        uint32_t chunk = n_tokens - offset;
+        if (chunk > max_chunk) chunk = max_chunk;
+        const bool last = offset + chunk == n_tokens;
+        if (!ds4_mellum_prefill_tokens(e, state, scratch, tokens + offset,
+                                       chunk, last ? layer_trace_gpu : NULL,
+                                       last ? attention_trace_gpu : NULL,
+                                       last)) return false;
+        offset += chunk;
+    }
+    return true;
+}
+
+/*
+ * Diagnostic chunk size for the prefill probes.  Unset keeps the historical
+ * single-batch behaviour; 1 makes every projection use the decode matvec, which
+ * separates layer-major graph semantics from batched-kernel precision.
+ */
+static uint32_t ds4_mellum_probe_chunk(uint32_t fallback, uint32_t max_chunk) {
+    const uint32_t chunk = ds4_mellum_runtime_get()->prefill_chunk;
+    if (chunk == 0u || chunk > max_chunk) return fallback;
+    return chunk;
+}
+#endif
+
+
+
+
+
 int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen) {
     if (!s || !s->distributed) {
         if (errlen) snprintf(err, errlen, "session is not a distributed coordinator");
@@ -61150,6 +64026,7 @@ bool ds4_session_is_distributed(ds4_session *s) {
 
 int ds4_session_set_power(ds4_session *s, int power_percent) {
     if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
+    if (ds4_session_is_mellum(s)) return 1;
 #ifndef DS4_NO_GPU
     if ((ds4_session_is_glm(s) || ds4_session_is_laguna(s)) &&
         power_percent != 100) {
@@ -61232,6 +64109,7 @@ int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
     }
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     ds4_session_invalidate(s);
     if (ds4_session_is_cpu(s)) {
         session_cpu_reset_cache(s);
@@ -61327,6 +64205,7 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
         if (errlen) snprintf(err, errlen, "invalid output-head hidden-state input");
         return 1;
     }
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
 
     ds4_engine *e = s->engine;
     if (!weights_have_output_head(&e->weights)) {
@@ -61625,6 +64504,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
     }
+    if (ds4_session_reject_mellum_unsupported(s, err, errlen)) return 1;
     const uint32_t executable_layers = ds4_model_normal_layer_count();
     if (executable_layers == 0 ||
         layer_start > layer_end ||
@@ -61700,6 +64580,13 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
 
         const uint64_t hidden_dim = DS4_N_EMBD;
+#ifdef DS4_ROCM_BUILD
+        const bool rocm_layer_slice_token_decode =
+            glm_graph_env_truthy(
+                    getenv("DS4_ROCM_GLM_LAYER_SLICE_TOKEN_DECODE"));
+#else
+        const bool rocm_layer_slice_token_decode = false;
+#endif
         uint32_t done = 0;
         while (done < n_tokens) {
             const uint32_t pos = pos0 + done;
@@ -61710,11 +64597,13 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             bool ok = false;
 
             /*
-             * Raw decode starts from a token embedding. Continuation slices
-             * receive a hidden vector from the previous node, so use the
-             * batch-equivalent path even for a single token.
+             * The token graph accepts both embeddings and inter-node hidden
+             * states. Keep the resident ROCm continuation path opt-in until
+             * remote output and timing tests validate it across GLM quants.
              */
-            if (remaining == 1 && pos > 0 && !input_hc && !output_hc) {
+            if (remaining == 1 && pos > 0 &&
+                ((!input_hc && !output_hc) ||
+                 rocm_layer_slice_token_decode)) {
                 float *chunk_logits = output_logits ? logits : NULL;
                 ok = glm_graph_forward_token(g,
                                              &e->model,
@@ -62026,7 +64915,12 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     if (g->ssd_streaming) {
         for (uint32_t il = layer_start; ok && il <= layer_end; il++) {
             g->streaming_static_decode_map_current = false;
-            ok = batch_selected_addr ?
+            const bool layer_selected_addr =
+                batch_selected_addr &&
+                metal_graph_stream_prefill_batch_selected_addr_layer_supported(
+                    &e->weights,
+                    il);
+            ok = layer_selected_addr ?
                  metal_graph_stream_map_layer_decode(&e->model, &e->weights, il) :
                  metal_graph_stream_map_layer(&e->model, &e->weights, il);
             if (ok) ok = ds4_gpu_begin_commands() != 0;
@@ -62138,6 +65032,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    if (ds4_session_is_mellum(s) &&
+        ds4_session_reject_mellum_noninteractive(s, err, errlen)) return 1;
     const bool mirror = ds4_session_tp_leader(s);
     if (mirror && prompt && prompt->len > 0) {
         if (!ds4_tp_send_sync(s->engine->tp.ctx, s->tp_session_id,
@@ -62223,6 +65119,160 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                      s->logits,
                                      err,
                                      errlen);
+    }
+    if (ds4_session_is_mellum(s)) {
+#ifdef DS4_NO_GPU
+        snprintf(err, errlen, "Mellum decode requires Metal support");
+        return 1;
+#else
+        int start = 0;
+        if (s->checkpoint_valid && prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            start = s->checkpoint.len;
+        } else {
+            ds4_session_invalidate(s);
+        }
+        ds4_mellum_decode_state *state = s->mellum->decode;
+        int i = start;
+        const ds4_mellum_runtime *rt = ds4_mellum_runtime_get();
+        /* Which path actually ran, and how fast, under DS4_MELLUM_SYNC_TRACE. */
+        const bool sync_trace = rt->sync_trace != 0;
+        const double sync_t0 = sync_trace ? now_sec() : 0.0;
+        int sync_batched_tokens = 0;
+        /*
+         * Layer-major prefill, for spans long enough to pay for the workspace.
+         * The tokenwise loop below evaluates one token per kernel launch, so a
+         * long prompt used to sync at decode speed no matter how fast the
+         * batch kernels were; this is the path that lets a session actually
+         * reach them.
+         *
+         * Short spans stay tokenwise deliberately.  Extending a checkpoint by
+         * a turn is the common case, it does not repay a ~120 MB allocation,
+         * and keeping it on the sequential path preserves the decode
+         * arithmetic those syncs have always produced.
+         *
+         * ds4_mellum_prefill_tokens opens its own command batch and refuses to
+         * run inside one, so this loop must not wrap it in begin/end commands
+         * the way the tokenwise path does.
+         */
+        enum { sync_batch_min_tokens = 64 };
+        /* rt->sync_batch is the escape hatch, and the only way to A/B the
+         * two sync paths against each other.
+         *
+         * Q4_K gate/up takes the tokenwise path unconditionally: the
+         * expert-major batch kernel stages Q8_0 rows and asserts Q8_0 block
+         * geometry, so it cannot run these weights.  Tokenwise is slower but
+         * correct, and it uses the decode MoE, which does handle Q4_K. */
+        if (rt->sync_batch && !s->engine->mellum_batched_prefill_unsupported &&
+            prompt->len - i >= sync_batch_min_tokens) {
+            if (!s->engine->mellum_prefill_workspace) {
+                /*
+                 * Always the full width, never the width of whichever prompt
+                 * happened to arrive first.  Honour DS4_MELLUM_PREFILL_CHUNK
+                 * so the knob still tunes chunking and cancellation latency.
+                 */
+                const uint32_t cap =
+                    ds4_mellum_probe_chunk(DS4_N_SWA, DS4_N_SWA);
+                struct ds4_mellum_prefill_scratch_s *fresh =
+                    xmalloc(sizeof(*fresh));
+                memset(fresh, 0, sizeof(*fresh));
+                if (ds4_mellum_prefill_scratch_create(fresh, cap)) {
+                    s->engine->mellum_prefill_workspace = fresh;
+                } else {
+                    /* Fall back to tokenwise rather than failing the sync. */
+                    ds4_mellum_prefill_scratch_free(fresh);
+                    free(fresh);
+                }
+            }
+            ds4_mellum_prefill_scratch *scratch =
+                s->engine->mellum_prefill_workspace;
+            while (scratch && i < prompt->len) {
+                /* Cancellation granularity is one chunk here, not one token. */
+                if (ds4_session_cancelled(s)) {
+                    snprintf(err, errlen, "interrupted");
+                    s->checkpoint_valid = s->checkpoint.len != 0;
+                    return DS4_SESSION_SYNC_INTERRUPTED;
+                }
+                uint32_t chunk = (uint32_t)(prompt->len - i);
+                if (chunk > scratch->cap) chunk = scratch->cap;
+                const bool last = i + (int)chunk == prompt->len;
+                if (!ds4_mellum_prefill_tokens(s->engine, state, scratch,
+                                               prompt->v + i, chunk,
+                                               NULL, NULL, last)) {
+                    snprintf(err, errlen, "Mellum layer-major prefill failed");
+                    ds4_session_invalidate(s);
+                    return 1;
+                }
+                for (uint32_t j = 0; j < chunk; j++) {
+                    token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
+                }
+                i += (int)chunk;
+                sync_batched_tokens += (int)chunk;
+                if (s->progress) {
+                    s->progress(s->progress_ud, "prefill_chunk", i,
+                                prompt->len);
+                }
+            }
+        }
+        /* Tokenwise remainder: a short span, or anything the batch path could
+         * not take.  Batching bounded runs removes host submission waits while
+         * retaining the established decode arithmetic and KV update order. */
+        static const int sync_batch_tokens = 32;
+        for (; i < prompt->len;) {
+            const int end = prompt->len - i > sync_batch_tokens ?
+                i + sync_batch_tokens : prompt->len;
+            const bool batch_started = ds4_gpu_begin_commands() != 0;
+            bool ok = batch_started;
+            bool interrupted = false;
+            for (; ok && i < end; i++) {
+                if (ds4_session_cancelled(s)) {
+                    interrupted = true;
+                    break;
+                }
+                const bool last = i + 1 == prompt->len;
+                ok = ds4_mellum_decode_token(
+                    s->engine, state, prompt->v[i], NULL, NULL, NULL, NULL,
+                    NULL, NULL, NULL, last, true);
+                if (!ok) break;
+                token_vec_push(&s->checkpoint, prompt->v[i]);
+                if (s->progress) {
+                    s->progress(s->progress_ud, "prefill_chunk", i + 1,
+                                prompt->len);
+                }
+            }
+            const bool batch_ok = !batch_started || ds4_gpu_end_commands() != 0;
+            if (!ok || !batch_ok) {
+                snprintf(err, errlen, "Mellum sequential prefill batch failed");
+                ds4_session_invalidate(s);
+                return 1;
+            }
+            if (interrupted) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = s->checkpoint.len != 0;
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+        }
+        if (sync_trace && prompt->len > start) {
+            const double elapsed = now_sec() - sync_t0;
+            fprintf(stderr,
+                    "ds4: Mellum sync tokens=%d path=%s %.1fms %.1ft/s\n",
+                    prompt->len - start,
+                    sync_batched_tokens ? (sync_batched_tokens == prompt->len - start ?
+                        "layer-major" : "mixed") : "tokenwise",
+                    elapsed * 1000.0,
+                    (double)(prompt->len - start) / elapsed);
+        }
+        if (start < prompt->len &&
+            ds4_gpu_tensor_read(state->logits, 0, s->logits,
+                                s->engine->weights.output->dim[1] * sizeof(float)) == 0) {
+            snprintf(err, errlen, "Mellum sequential prefill logits read failed");
+            ds4_session_invalidate(s);
+            return 1;
+        }
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+#endif
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
@@ -63230,11 +66280,14 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 }
 
 int ds4_session_argmax(ds4_session *s) {
+    if (!s || (ds4_session_is_mellum(s) &&
+               !ds4_session_is_mellum_interactive(s)) || !s->logits) return -1;
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
-    if (!s || !s->logits) return -1;
+    if (!s || (ds4_session_is_mellum(s) &&
+               !ds4_session_is_mellum_interactive(s)) || !s->logits) return -1;
     int best = -1;
     float best_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -63260,6 +66313,9 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    if (!s || (ds4_session_is_mellum(s) &&
+               !ds4_session_is_mellum_interactive(s)) || !s->logits ||
+        !s->sample_probs) return -1;
     if (!s->engine->dflash_ready || !s->speculative_enabled) {
         return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                                   top_p, min_p, rng, s->sample_probs);
@@ -63273,7 +66329,9 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
-    if (!s || !out || k <= 0) return 0;
+    if (!s || (ds4_session_is_mellum(s) &&
+               !ds4_session_is_mellum_interactive(s)) || !s->logits ||
+        !out || k <= 0) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
@@ -63310,7 +66368,9 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 }
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
-    if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
+    if (!s || (ds4_session_is_mellum(s) &&
+               !ds4_session_is_mellum_interactive(s)) || !s->logits ||
+        !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
 
     float max_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -63332,13 +66392,15 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 }
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
-    if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
+    if (!s || ds4_session_is_mellum_layout_only(s) || !s->logits ||
+        !out || cap < (int)DS4_N_VOCAB) return 0;
     memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
     return (int)DS4_N_VOCAB;
 }
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
-    if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
+    if (!s || ds4_session_is_mellum(s) || !s->logits ||
+        !logits || n != (int)DS4_N_VOCAB) return 1;
     memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     return 0;
 }
@@ -63451,7 +66513,9 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
     const float confidence_threshold = s->engine->dspark_confidence_threshold;
     const bool stats_enabled = ds4_dspark_stats_enabled();
     const bool scheduler_enabled = ds4_dspark_scheduler_enabled();
-    const bool time_enabled = stats_enabled || scheduler_enabled;
+    const bool time_enabled =
+        stats_enabled ||
+        (scheduler_enabled && ds4_dspark_scheduler_timing_enabled());
     const double stats_t0 = time_enabled ? now_sec() : 0.0;
 #define DS4_DSPARK_PROP_T0() (stats_enabled ? now_sec() : 0.0)
 #define DS4_DSPARK_PROP_ADD(field_, t0_) do {                              \
@@ -63589,12 +66653,18 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
         uint32_t stage_cache_rows = 0;
         const double chain_t0 = DS4_DSPARK_PROP_T0();
         bool stage_chain_ok = false;
+        const bool fuse_final_hidden =
+            stage_chain_ready &&
+            !probe_log &&
+            confidence_threshold > 0.0f &&
+            dspark_confidence_probe_ready(dw);
         if (stage_chain_ready) {
             stage_chain_ok =
                 metal_graph_eval_dspark_stage_chain(&s->graph,
                                                 &s->engine->mtp_model,
                                                 dw,
                                                 pos,
+                                                fuse_final_hidden,
                                                 &stage_chain_done,
                                                 &stage_cache_start,
                                                 &stage_cache_rows);
@@ -63624,9 +66694,11 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
         if (runtime_confidence_precheck) {
             const double hidden_t0 = DS4_DSPARK_PROP_T0();
             const bool hidden_ok =
+                fuse_final_hidden ||
                 metal_graph_eval_dspark_final_hidden(&s->graph,
                                                      &s->engine->mtp_model,
-                                                     dw);
+                                                     dw,
+                                                     false);
             DS4_DSPARK_PROP_ADD(propose_hidden_ms, hidden_t0);
             bool conf0_ok = false;
             if (hidden_ok) {
@@ -64181,7 +67253,9 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     const bool dspark_target_timing =
         e->support_kind == DS4_SUPPORT_DSPARK &&
-        (ds4_dspark_stats_enabled() || ds4_dspark_scheduler_enabled());
+        (ds4_dspark_stats_enabled() ||
+         (ds4_dspark_scheduler_enabled() &&
+          ds4_dspark_scheduler_timing_enabled()));
     const double target_t0 = dspark_target_timing ? now_sec() : 0.0;
     if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
                                         (uint32_t)token,
@@ -64256,7 +67330,43 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
     return rc;
 }
 
+#ifndef DS4_NO_GPU
+static int ds4_session_eval_mellum_decode(ds4_session *s, int token,
+                                          char *err, size_t errlen) {
+    if (!s || !s->engine || !s->mellum || !s->mellum->decode || !s->logits ||
+        token < 0 || (uint32_t)token >= DS4_N_VOCAB) {
+        if (err && errlen) snprintf(err, errlen, "invalid Mellum decode session or token");
+        return 1;
+    }
+    ds4_mellum_decode_state *state = s->mellum->decode;
+    if (s->checkpoint.len < 0 || (uint32_t)s->checkpoint.len >= (uint32_t)s->ctx_size ||
+        state->position != (uint32_t)s->checkpoint.len) {
+        if (err && errlen) snprintf(err, errlen, "Mellum decode session position is invalid");
+        return 1;
+    }
+    if (!ds4_mellum_decode_token(s->engine, state, token, NULL, NULL, NULL,
+                                 NULL, NULL, NULL, s->logits, false, false)) {
+        if (err && errlen) snprintf(err, errlen, "Mellum inspect decode failed");
+        ds4_session_invalidate(s);
+        return 1;
+    }
+    token_vec_push(&s->checkpoint, token);
+    s->checkpoint_valid = true;
+    return 0;
+}
+#endif
+
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+    if (ds4_session_is_mellum_decode_only(s)) {
+#ifdef DS4_NO_GPU
+        (void)token;
+        if (err && errlen) snprintf(err, errlen, "Mellum decode requires Metal support");
+        return 1;
+#else
+        return ds4_session_eval_mellum_decode(s, token, err, errlen);
+#endif
+    }
+    if (ds4_session_reject_mellum_layout_only(s, err, errlen)) return 1;
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
     if (s && s->engine && s->engine->support_kind == DS4_SUPPORT_DSPARK) {
@@ -64274,6 +67384,8 @@ static bool ds4_sessions_eval_batch_metal_supported(
     const char *tp_batch = getenv("DS4_METAL_TP_SESSION_BATCH");
     if (!items || count < 2 || !e || e->backend != DS4_BACKEND_METAL ||
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA ||
+        /* No batched Mellum decode graph exists; it takes the ordered path. */
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM ||
         e->support_kind != DS4_SUPPORT_NONE ||
         (e->tp.active && tp_batch && strcmp(tp_batch, "0") == 0) ||
         getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
@@ -64309,7 +67421,7 @@ static bool metal_graph_native_session_batch_shared_supported(
         !items || count < 2 || !e || e->tp.active ||
         e->support_kind != DS4_SUPPORT_NONE ||
         metal_graph_use_reference_shared_down_hc() ||
-        metal_graph_use_q4_selected_shared_overlap() ||
+        metal_graph_use_q4_selected_shared_overlap(NULL) ||
         metal_graph_use_pro_q4_cpu_router() ||
         getenv("DS4_METAL_ENABLE_Q8_DECODE_EXACT_VIEWS") != NULL) {
         return false;
@@ -65115,6 +68227,11 @@ int ds4_sessions_eval_batch_with_prefill(
         if (err && errlen) snprintf(err, errlen, "invalid mixed model batch");
         return 1;
     }
+    if (ds4_session_is_mellum(prefill_session)) {
+        if (err && errlen) snprintf(err, errlen,
+                                    "Mellum inspect sessions do not support prefill");
+        return 1;
+    }
     if (!prefill_session->checkpoint_valid ||
         prefill_prompt->len <= prefill_session->checkpoint.len ||
         prefill_prompt->len > prefill_session->ctx_size ||
@@ -65181,7 +68298,9 @@ static int ds4_session_eval_dspark_speculative_argmax(
     const bool stats_enabled = s && ds4_dspark_stats_enabled();
     const bool scheduler_enabled = s && ds4_dspark_scheduler_enabled();
     const double stats_t0 =
-        (stats_enabled || scheduler_enabled) ? now_sec() : 0.0;
+        (stats_enabled ||
+         (scheduler_enabled && ds4_dspark_scheduler_timing_enabled()))
+            ? now_sec() : 0.0;
 #define DS4_DSPARK_STATS_FINISH() do {                                      \
         if (stats_enabled) {                                                \
             s->dspark_stats.total_ms += (now_sec() - stats_t0) * 1000.0;    \
@@ -65323,7 +68442,9 @@ static int ds4_session_eval_dspark_speculative_argmax(
                                             &s->checkpoint,
                                             (uint32_t)start,
                                             (uint32_t)draft_n,
-                                            false,
+                                            draft_n > 1 &&
+                                                draft_n <=
+                                                    (int)DS4_SPEC_PREFIX_SLOTS + 1,
                                             true,
                                             row_tops,
                                             NULL,
@@ -65349,57 +68470,10 @@ static int ds4_session_eval_dspark_speculative_argmax(
         }
     }
 
-    bool final_logits_ok = false;
-    if (ok && commit_drafts == draft_n) {
-        const double read_t0 = stats_enabled ? now_sec() : 0.0;
-        final_logits_ok =
-            metal_graph_read_spec_logits_row(&s->graph,
-                                             (uint32_t)(draft_n - 1),
-                                             row_logits);
-        if (stats_enabled) {
-            s->dspark_stats.verify_read_ms += (now_sec() - read_t0) * 1000.0;
-        }
-    }
-
-    if (ok && commit_drafts == draft_n && final_logits_ok) {
-        if (tp_verify_sent &&
-            !ds4_tp_send_verify_commit(e->tp.ctx, 1, 0)) {
-            snprintf(err, errlen, "tp: verify commit send failed");
-            s->checkpoint_valid = false;
-            spec_frontier_free(&frontier);
-            DS4_DSPARK_STATS_FINISH();
-            return -1;
-        }
-        memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-        int emitted_drafts = 0;
-        for (int i = 0; i < draft_n && n_accept < accepted_cap; i++) {
-            accepted[n_accept++] = drafts[i];
-            emitted_drafts++;
-            if (drafts[i] == eos_token) break;
-        }
-        s->checkpoint_valid = true;
-        ds4_session_dspark_capture_note_checkpoint(s);
-        if (stats_enabled) {
-            s->dspark_stats.full_accepts++;
-            s->dspark_stats.accepted_draft_tokens += (uint64_t)emitted_drafts;
-            ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist,
-                                      (uint32_t)emitted_drafts);
-        }
-        ds4_session_dspark_scheduler_note(
-                s,
-                (uint32_t)emitted_drafts,
-                false,
-                DS4_DSPARK_SCHED_EXTRA_MS());
-        if (spec_log) {
-            fprintf(stderr,
-                    "ds4: DSpark spec accept drafted=%d accepted=%d\n",
-                    draft_n,
-                    n_accept);
-        }
-        spec_frontier_free(&frontier);
-        DS4_DSPARK_STATS_FINISH();
-        return n_accept;
-    }
+    /* Batch verification and ordinary decode update compressor state with
+     * different kernels. Restore the pre-verify frontier and replay every
+     * accepted draft through ordinary decode, including partial accepts, so
+     * speculative decoding retains the target model's greedy token stream. */
 
     if (verifier_may_have_mutated) {
         s->checkpoint.len = start;
@@ -68009,14 +71083,19 @@ static bool metal_graph_eval_mixed_prefill_decode(
             metal_graph_prefill_tokens(g), prompt, start, prefill_rows);
     if (ok) {
         int32_t *tokens = malloc((size_t)decode_count * sizeof(*tokens));
-        if (!tokens) return false;
-        for (int i = 0; i < decode_count; i++) tokens[i] = decode_items[i].token;
-        ok = ds4_gpu_tensor_write(
-                metal_graph_prefill_tokens(g),
-                (uint64_t)prefill_rows * sizeof(int32_t),
-                tokens,
-                (uint64_t)decode_count * sizeof(*tokens)) != 0;
-        free(tokens);
+        if (!tokens) {
+            ok = false;
+        } else {
+            for (int i = 0; i < decode_count; i++) {
+                tokens[i] = decode_items[i].token;
+            }
+            ok = ds4_gpu_tensor_write(
+                    metal_graph_prefill_tokens(g),
+                    (uint64_t)prefill_rows * sizeof(int32_t),
+                    tokens,
+                    (uint64_t)decode_count * sizeof(*tokens)) != 0;
+            free(tokens);
+        }
     }
     if (ok) {
         ok = metal_graph_warmup_prefill_kernels(
@@ -68166,10 +71245,12 @@ static bool metal_graph_eval_mixed_prefill_decode(
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const int prefill_src_tier = g->active_tier;
-    ds4_gpu_tensor *saved_prefill_cur = NULL;
+    ds4_gpu_tensor *saved_prefill_cur =
+        prefill_src_tier >= 0 && prefill_src_tier < DS4_MAX_GPUS
+            ? g->cur_hc_by_tier[prefill_src_tier] : NULL;
     ds4_gpu_tensor *last_prefill_hc = NULL;
+    if (ok && !saved_prefill_cur) ok = false;
     if (ok) {
-        saved_prefill_cur = g->cur_hc_by_tier[prefill_src_tier];
         last_prefill_hc = metal_graph_tensor_row_view(
                 metal_graph_batch_cur_hc(g), prefill_rows - 1u, hc_dim);
         ok = last_prefill_hc != NULL;
@@ -68187,7 +71268,9 @@ static bool metal_graph_eval_mixed_prefill_decode(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
-    g->cur_hc_by_tier[prefill_src_tier] = saved_prefill_cur;
+    if (saved_prefill_cur) {
+        g->cur_hc_by_tier[prefill_src_tier] = saved_prefill_cur;
+    }
     ds4_gpu_tensor_free(last_prefill_hc);
     g->batch_token_offset = 0;
 
@@ -68912,6 +71995,11 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
+    if (ds4_session_is_mellum(s)) {
+        if (err && errlen) snprintf(err, errlen,
+                                    "Mellum inspect sessions do not support token selection");
+        return -1;
+    }
     if (s->distributed) {
         if (!accepted) return 0;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
@@ -69190,15 +72278,28 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     }
 
     /*
-     * The useful N=2 verifier is the tiny batch path: it verifies two target
-     * positions in one layer-major pass and commits prefix-1 directly on a
-     * partial accept.  Like the rest of the non-quality Metal path, it may pick
-     * a different greedy token when batched reductions perturb nearly-tied
-     * logits.  --quality / DS4_MTP_STRICT selects the exact decode verifier,
-     * which preserves the one-token target stream but is not a speed win.
+     * Metal normally benefits from the tiny-batch verifier: it checks two
+     * target positions in one layer-major pass and commits prefix-1 directly
+     * on a partial accept. Like the rest of the non-quality Metal path, it may
+     * pick a different greedy token when batched reductions perturb nearly
+     * tied logits.
+     *
+     * ROCm is different. Its DeepSeek one-token graph uses the prequantized Q8
+     * decode kernels, while the generic N=2 batch graph uses full-F32
+     * activations and loses the paired and HC-expand decode fusions. Running
+     * the exact two-row verifier reuses those Q8 kernels and is faster.
+     * DS4_MTP_BATCH_VERIFY remains an explicit diagnostic rollback to the
+     * generic batch verifier.
      */
+#ifdef DS4_ROCM_BUILD
+    const bool prefer_decode2_exact = true;
+#else
+    const bool prefer_decode2_exact = false;
+#endif
     const bool use_decode2_exact =
-        draft_n == 2 && strict_mtp && getenv("DS4_MTP_BATCH_VERIFY") == NULL;
+        draft_n == 2 &&
+        (strict_mtp || prefer_decode2_exact) &&
+        getenv("DS4_MTP_BATCH_VERIFY") == NULL;
     if (use_decode2_exact) {
         ds4_spec_frontier frontier;
         memset(&frontier, 0, sizeof(frontier));
@@ -69650,6 +72751,11 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+#ifndef DS4_NO_GPU
+    if (ds4_session_is_mellum_decode_only(s)) {
+        ds4_mellum_decode_state_reset(s->mellum->decode);
+    }
+#endif
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
     s->dflash_synced = false;
@@ -69661,6 +72767,12 @@ void ds4_session_invalidate(ds4_session *s) {
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
+    if (ds4_session_is_mellum(s)) {
+        /* Partial replay is intentionally outside the inspect-only decode
+         * contract. Resetting preserves the position/KV invariant instead. */
+        ds4_session_invalidate(s);
+        return;
+    }
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
         (void)ds4_tp_send_rewind(s->engine->tp.ctx, s->tp_session_id, pos);
@@ -69690,3 +72802,5 @@ int ds4_session_ctx(ds4_session *s) {
 int ds4_session_prefill_cap(ds4_session *s) {
     return s ? (int)s->prefill_cap : 0;
 }
+
+#include "ds4_mellum_diag.c"

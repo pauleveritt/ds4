@@ -1,0 +1,1 @@
+Quando si lavora con i pesi di un modello su macOS, due approcci comuni sono **mmap

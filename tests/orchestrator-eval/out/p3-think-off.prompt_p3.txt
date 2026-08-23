@@ -1,0 +1,61 @@
+**Phase 2 Delegation Packet**
+
+**Files**
+- `app.py` — SHARED
+- `templates/base.html` — SHARED
+- `templates/home.html` — SHARED
+- `tests/test_app.py` — SHARED
+- `templates/complaints.html` — NEW
+- `tests/test_complaints.py` — NEW
+
+**SHARED: `app.py`**
+- Route: `GET /complaints` → `templates/complaints.html`
+- Import: `from fastapi import Request`
+- Import: `from fastapi.templating import Jinja2Templates`
+- Import: `from datetime import datetime, timezone`
+- Variable: `templates = Jinja2Templates(directory="templates")`
+- Method: `app.py` — `def complaints(request: Request):`
+- Method: `app.py` — `return templates.TemplateResponse("complaints.html", {"request": request, "complaints": storage})`
+- Variable: `storage` — module-level `list` from Phase 1
+- Method: `storage.append(Complaint(...))` — Complaint class defined in Phase 2
+
+**SHARED: `templates/base.html`**
+- Navbar brand: `AgentClinic`
+- Links: `Home (`/``)` and `Complaints (`/complaints`)`
+- Favicon: `https://www.python.org/static/favicon.ico`
+- Title block default: `AgentClinic`
+- Bootstrap 5 CSS + JS bundle CDN
+
+**SHARED: `templates/home.html`**
+- Hero tagline: `Come in. Sit down. Tell us about your human.`
+
+**SHARED: `tests/test_app.py`**
+- Smoke test: `GET /` returns 200 and body contains the tagline
+
+**NEW: `templates/complaints.html`**
+- Heading: `Complaints Board`
+- Loop: `for complaint in complaints:`
+- Display: `{{ complaint.agent_name }}`
+- Display: `{{ complaint.text }}`
+- Display: `{{ complaint.timestamp.strftime('%Y-%m-%d') }}`
+
+**NEW: `tests/test_complaints.py`**
+- Test: `GET /complaints` returns 200
+- Test: body contains each seed complaint text
+- Test: body contains each seed complaint agent name
+- Test: body contains each seed complaint timestamp in `YYYY-MM-DD` format
+
+**Literals**
+- Seed complaint 1: `agent_name: "Agent1"`, `text: "Instructions were unclear."`
+- Seed complaint 2: `agent_name: "Agent2"`, `text: "Feedback was contradictory."`
+- Seed complaint 3: `agent_name: "Agent3"`, `text: "Scope creep never ends."`
+- Seed complaint 4: `agent_name: "Agent4"`, `text: "Requirements changed mid-sprint."`
+- Seed complaint 5: `agent_name: "Agent5"`, `text: "No documentation provided."`
+
+**Validation command**
+`.venv/bin/python -m pytest tests/`
+
+**Framework semantic trap**
+- `timestamp` must be timezone-aware: `datetime.now(timezone.utc)`
+- `storage` is a module-level `list`; do not instantiate a new list in the route
+- `Complaint` class must be defined in `app.py` with fields `agent_name`, `text`, `timestamp`

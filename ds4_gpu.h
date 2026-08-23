@@ -74,6 +74,12 @@ int ds4_gpu_pack_slot_rows_f32_tensor(
         uint32_t                n_slots,
         uint32_t                slot_cap);
 
+/* Focused Metal regression for the Laguna XS 2.1 Q3 streamed-cache work.
+ * It compares resident Q3 down output with the one-expert direct-buffer
+ * control; it neither enables cache admission nor requires a model file. */
+int ds4_gpu_test_glm_q3_down_one_bound_equivalence(void);
+int ds4_gpu_test_glm_q3_down_slots8_bound_equivalence(void);
+
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
@@ -99,6 +105,10 @@ int ds4_gpu_synchronize(void);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
+int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
+                                    const char *model_path);
+int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
+                                 uint64_t bytes);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
@@ -205,6 +215,7 @@ int ds4_gpu_stream_expert_cache_seed_from_layer_selected(
         uint32_t                          n_tokens,
         uint32_t                          n_seed_tokens,
         uint32_t                          n_selected);
+int ds4_gpu_stream_expert_cache_finish_pending_batch(void);
 int ds4_gpu_stream_expert_cache_release_layer_cache(void);
 #endif
 int ds4_gpu_stream_expert_cache_seed_experts(
@@ -212,6 +223,14 @@ int ds4_gpu_stream_expert_cache_seed_experts(
         const int32_t                     *expert_ids,
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts);
+#ifdef __APPLE__
+/* Seed from mapped weights with blits appended to the active command buffer. */
+int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *expert_ids,
+        const uint32_t                    *expert_priorities,
+        uint32_t                           n_experts);
+#endif
 void ds4_gpu_print_memory_report(const char *label);
 
 /* Tensor-parallel per-layer gates (Metal only).  The encoder calls
@@ -766,6 +785,20 @@ int ds4_gpu_matmul_f16_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+
+/* CUDA batch path: fold an input RMS normalization into the FP16 activation
+ * conversion used by the following projection. Returns 0 without touching
+ * out when the optimized path is unavailable. */
+int ds4_gpu_matmul_f16_rms_fold_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        float                   norm_eps);
 
 /* Exact multi-row form of the DeepSeek 4096x256 F16 router projection. */
 int ds4_gpu_matmul_f16_router_rows_exact_tensor(
@@ -2327,6 +2360,333 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         const ds4_gpu_tensor *x,
         bool                    force_resident);
 
+/* Mellum decode MoE: Q4_K gate/up and Q8_0 down for one token.  The explicit
+ * byte strides keep the resident layout compatible with a later selected-
+ * expert address-table implementation. */
+int ds4_gpu_mellum_routed_moe_one_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        const ds4_gpu_tensor *x);
+
+/* Numerical-oracle variant for Mellum's all-Q8_0 GGUF.  This deliberately
+ * remains separate from the Q4_K gate/up deployment-target primitive: Q4_K
+ * and Q8_0 rows have different layouts and must not be treated as aliases. */
+int ds4_gpu_mellum_q8_0_routed_moe_one_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        const ds4_gpu_tensor *x);
+
+/* Token-major Q8_0 Mellum selected-expert MoE.  `mid` is
+ * n_tokens * n_expert * expert_mid_dim floats and `out` is token-major. */
+int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_tokens);
+
+/* Mellum's bias-free softmax router. `probs` exposes the full softmax for
+ * diagnostics; `selected` and `weights` are the deterministic top-k result
+ * with the selected probabilities renormalized to sum to one. */
+int ds4_gpu_mellum_router_select_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used);
+
+/* Token-major batch form of Mellum's bias-free router.  Each token uses the
+ * same deterministic softmax/top-k and selected-probability normalization as
+ * the one-token primitive. */
+int ds4_gpu_mellum_router_select_batch_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        uint32_t                n_tokens);
+
+/* One-token ungated GQA over F16 K/V cache rows. `key_start` is an absolute
+ * position; cache addressing wraps at `cache_cap`, supporting both Mellum's
+ * sliding layers and its full-attention layers. */
+int ds4_gpu_mellum_gqa_decode_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t                cache_cap,
+        uint32_t                key_start,
+        uint32_t                key_count,
+        uint32_t                n_head,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim,
+        float                   scale);
+
+/* Batched causal Mellum GQA. K/V are staged as F16 before all queries run,
+ * then committed to the ring, so a chunk crossing the ring boundary cannot
+ * overwrite history still needed by an earlier query in that same chunk. */
+int ds4_gpu_mellum_gqa_prefill_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        ds4_gpu_tensor       *staged_key,
+        ds4_gpu_tensor       *staged_value,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              n_head,
+        uint32_t              n_head_kv,
+        uint32_t              head_dim,
+        float                 scale);
+
+/* Store the current Mellum K/V vectors in the F16 ring consumed by GQA. */
+int ds4_gpu_mellum_store_kv_tensor(
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t                pos,
+        uint32_t                cache_cap,
+        uint32_t                n_head_kv,
+        uint32_t                head_dim);
+
+/* One-token Mellum attention before its MoE block. All dense projections are
+ * Q8_0; norm weights are F32. `key_start`/`key_count` identify the active
+ * causal cache range and must include `pos` as their final position. */
+typedef struct {
+    uint64_t attn_norm_offset;
+    uint64_t q_offset;
+    uint64_t q_norm_offset;
+    uint64_t k_offset;
+    uint64_t k_norm_offset;
+    uint64_t v_offset;
+    uint64_t output_offset;
+    uint32_t n_embd;
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t n_rot;
+    uint32_t n_ctx_orig;
+    float    rms_eps;
+    float    freq_base;
+    float    freq_scale;
+    float    rope_ext_factor;
+    float    rope_attn_factor;
+    float    yarn_beta_fast;
+    float    yarn_beta_slow;
+} ds4_gpu_mellum_attention_desc;
+
+int ds4_gpu_mellum_attention_decode_tensor(
+        ds4_gpu_tensor                     *out,
+        ds4_gpu_tensor                     *norm,
+        ds4_gpu_tensor                     *q,
+        ds4_gpu_tensor                     *k,
+        ds4_gpu_tensor                     *v,
+        ds4_gpu_tensor                     *heads,
+        ds4_gpu_tensor                     *projected,
+        ds4_gpu_tensor                     *key_cache,
+        ds4_gpu_tensor                     *value_cache,
+        const void                         *model_map,
+        uint64_t                            model_size,
+        const ds4_gpu_mellum_attention_desc *desc,
+        const ds4_gpu_tensor               *hidden,
+        uint32_t                            pos,
+        uint32_t                            cache_cap,
+        uint32_t                            key_start,
+        uint32_t                            key_count);
+
+/* Layer-major batched counterpart of Mellum attention decode. The caller owns
+ * row-major scratch tensors sized for n_tokens and the staged F16 K/V chunk. */
+/* Diagnostic: whether Mellum prefill projections use the row-exact decode
+ * kernel.  Reported by the profile so a measurement is self-describing. */
+int ds4_gpu_mellum_prefill_exact_projections_enabled(void);
+/*
+ * Every Mellum runtime setting, resolved once from the environment the first
+ * time it is asked for and constant thereafter.  It replaces a scatter of
+ * static getenv() caches inside dispatch code, each of which stated its own
+ * default independently -- which is how the batch-versus-decode test came to
+ * encode "unset means off" and break the moment a default moved.  Defaults
+ * live here now, in one readable block, and callers ask rather than re-derive.
+ *
+ * Policy fields describe what ships.  Diagnostic fields are overrides for
+ * measurement and should not change results.
+ */
+typedef struct {
+    /* Policy. */
+    int      moe_gemm;              /* expert-major MoE prefill            */
+    int      prefill_exact;         /* row-exact prefill projections       */
+    int      attn_group;            /* head-grouped decode attention       */
+    int      sync_batch;            /* layer-major session prefill         */
+    uint32_t prefill_chunk;         /* 0 keeps the caller's own default    */
+    /* Diagnostics. */
+    int      attn_trace;
+    int      sync_trace;
+    /* Diagnostic profile geometry; only --mellum-resident-profile reads it. */
+    int      profile_prefill_tokens;
+    int      profile_decode_depth;
+} ds4_mellum_runtime;
+
+const ds4_mellum_runtime *ds4_mellum_runtime_get(void);
+
+int ds4_gpu_mellum_moe_gemm_enabled(void);
+int ds4_gpu_mellum_attn_group_enabled(void);
+
+int ds4_gpu_mellum_attention_prefill_tensor(
+        ds4_gpu_tensor                     *out,
+        ds4_gpu_tensor                     *norm,
+        ds4_gpu_tensor                     *q,
+        ds4_gpu_tensor                     *k,
+        ds4_gpu_tensor                     *v,
+        ds4_gpu_tensor                     *heads,
+        ds4_gpu_tensor                     *projected,
+        ds4_gpu_tensor                     *key_cache,
+        ds4_gpu_tensor                     *value_cache,
+        ds4_gpu_tensor                     *staged_key,
+        ds4_gpu_tensor                     *staged_value,
+        const void                         *model_map,
+        uint64_t                            model_size,
+        const ds4_gpu_mellum_attention_desc *desc,
+        const ds4_gpu_tensor               *hidden,
+        uint32_t                            pos0,
+        uint32_t                            n_tokens,
+        uint32_t                            cache_cap);
+
+/* One complete pre-norm Mellum decode layer for the pinned all-Q8_0 oracle.
+ * It composes attention+residual, FFN RMSNorm, bias-free routing, routed MoE,
+ * and the FFN residual. The inspect-only Mellum engine graph composes this
+ * primitive; it is not an authorization to enable normal Mellum generation. */
+typedef struct {
+    ds4_gpu_mellum_attention_desc attention;
+    uint64_t ffn_norm_offset;
+    uint64_t router_offset;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t gate_row_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t down_row_bytes;
+    uint32_t expert_mid_dim;
+    uint32_t n_expert;
+    uint32_t n_expert_used;
+    /* Quantization of this layer's gate/up experts: Q8_0 or Q4_K, carried
+     * down from weight validation rather than re-derived at dispatch.  Gate
+     * and up always agree -- the pair kernel reads both in one dispatch.
+     * Values are GGUF type ids, so DS4_TENSOR_* and DS4_METAL_TENSOR_*
+     * agree numerically and either spelling reads correctly. */
+    uint32_t pair_type;
+    bool     router_is_f32;
+} ds4_gpu_mellum_q8_0_layer_desc;
+
+int ds4_gpu_mellum_q8_0_layer_decode_tensor(
+        ds4_gpu_tensor                         *out,
+        ds4_gpu_tensor                         *attention_out,
+        ds4_gpu_tensor                         *attention_norm,
+        ds4_gpu_tensor                         *q,
+        ds4_gpu_tensor                         *k,
+        ds4_gpu_tensor                         *v,
+        ds4_gpu_tensor                         *heads,
+        ds4_gpu_tensor                         *projected,
+        ds4_gpu_tensor                         *key_cache,
+        ds4_gpu_tensor                         *value_cache,
+        ds4_gpu_tensor                         *ffn_norm,
+        ds4_gpu_tensor                         *router_logits,
+        ds4_gpu_tensor                         *router_selected,
+        ds4_gpu_tensor                         *router_weights,
+        ds4_gpu_tensor                         *router_probs,
+        ds4_gpu_tensor                         *moe_mid,
+        ds4_gpu_tensor                         *moe_out,
+        const void                             *model_map,
+        uint64_t                                model_size,
+        const ds4_gpu_mellum_q8_0_layer_desc  *desc,
+        const ds4_gpu_tensor                   *hidden,
+        uint32_t                                pos,
+        uint32_t                                cache_cap,
+        uint32_t                                key_start,
+        uint32_t                                key_count);
+
+/* Token-major Mellum Q8 layer prefill.  Attention stages/commits the F16 KV
+ * ring causally; router and selected-expert MoE remain entirely on Metal. */
+int ds4_gpu_mellum_q8_0_layer_prefill_tensor(
+        ds4_gpu_tensor                         *out,
+        ds4_gpu_tensor                         *attention_out,
+        ds4_gpu_tensor                         *attention_norm,
+        ds4_gpu_tensor                         *q,
+        ds4_gpu_tensor                         *k,
+        ds4_gpu_tensor                         *v,
+        ds4_gpu_tensor                         *heads,
+        ds4_gpu_tensor                         *projected,
+        ds4_gpu_tensor                         *key_cache,
+        ds4_gpu_tensor                         *value_cache,
+        ds4_gpu_tensor                         *staged_key,
+        ds4_gpu_tensor                         *staged_value,
+        ds4_gpu_tensor                         *ffn_norm,
+        ds4_gpu_tensor                         *router_logits,
+        ds4_gpu_tensor                         *router_selected,
+        ds4_gpu_tensor                         *router_weights,
+        ds4_gpu_tensor                         *router_probs,
+        ds4_gpu_tensor                         *moe_mid,
+        ds4_gpu_tensor                         *moe_out,
+        const void                             *model_map,
+        uint64_t                                model_size,
+        const ds4_gpu_mellum_q8_0_layer_desc  *desc,
+        const ds4_gpu_tensor                   *hidden,
+        uint32_t                                pos0,
+        uint32_t                                n_tokens,
+        uint32_t                                cache_cap);
+
 typedef struct {
     uint64_t gate_offset;
     uint64_t up_offset;
@@ -2362,6 +2722,7 @@ int ds4_gpu_laguna_routed_shared_moe_one_tensor(
         uint32_t                          n_expert,
         const ds4_gpu_tensor             *shared_selected,
         const ds4_gpu_tensor             *shared_weight,
+        uint32_t                          layer_index,
         const ds4_gpu_tensor             *x);
 
 int ds4_gpu_glm_routed_moe_batch_tensor(
@@ -2886,6 +3247,34 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+/* Decode-island CUDA graph capture (CUDA backend; Metal/ROCm/CPU stub it
+ * out and stay eager).  Design ported from the Entrpi/ds4 batched-serving
+ * fork's per-layer decode graph capture.  The key identifies a captured
+ * island: layer, island index, and the activation buffers whose addresses
+ * the captured kernels bake in.  ds4_cuda.cu mirrors this struct
+ * byte-for-byte (it does not include this header); keep both in sync. */
+typedef struct ds4_decode_graph_key {
+    uint32_t il;
+    uint32_t island;    /* 0: layer top to pre-rope; 1: attn-out to layer end */
+    uint32_t variant;
+    uint32_t _pad;
+    void    *cur_hc;
+    void    *after_attn_hc;
+    void    *after_ffn_hc;
+    void    *attn_norm;
+} ds4_decode_graph_key;
+
+int  ds4_gpu_decode_graphs_supported(void);
+/* 1: replayed (island already executed; skip encoding it)
+ * 0: capturing (encode the island, then call _end)
+ * -1: run eagerly */
+int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
+/* 0: capture committed and launched; -1: capture failed (entry retired;
+ * the caller must re-encode the island eagerly -- no work was executed). */
+int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
+void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
+void ds4_gpu_decode_graphs_invalidate(void);
 
 #ifdef __cplusplus
 }

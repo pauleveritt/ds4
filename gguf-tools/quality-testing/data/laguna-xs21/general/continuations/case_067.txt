@@ -1,0 +1,1 @@
+The difference between mmap page residency and virtual address space size arises from how memory management works in systems using demand paging. Here

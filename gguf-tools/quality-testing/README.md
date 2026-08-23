@@ -18,10 +18,19 @@ calling hosted APIs:
 - `data/laguna-openrouter-100`: 100 Laguna S 2.1 continuations collected
   through OpenRouter `poolside/laguna-s-2.1`. Poolside's endpoint does not
   expose output-token logprobs.
-- `data/flash`: 100 DeepSeek V4 Flash continuations collected from the official
-  DeepSeek API with `top_logprobs=20`.
+- `data/flash`: 100 DeepSeek V4 Flash 0731 continuations collected from the
+  official DeepSeek API with `top_logprobs=20`.
 - `data/pro`: 100 DeepSeek V4 PRO continuations collected from the official
   DeepSeek API with `top_logprobs=20`.
+- `data/laguna-xs21/general`: 100 Laguna XS 2.1 continuations (shared
+  `prompts.jsonl`) captured locally from `Laguna-XS-2.1-Q4_K_M.gguf` with
+  `collect_local.py`, since no `OPENROUTER_API_KEY` was available to collect
+  the hosted `poolside/laguna-xs-2.1` reference. See
+  `data/laguna-xs21/README.md`.
+- `data/laguna-xs21/webpy`: 20 XS-2.1-specific continuations (web/Python
+  coding + tool-call-format prompts from
+  `prompts_laguna_xs21_webpy.jsonl`), also captured locally. See
+  `data/laguna-xs21/README.md`.
 
 DeepSeek V4 Flash also has tracked official smoke vectors in
 `tests/test-vectors/`.  Those vectors drive `./ds4_test --logprob-vectors` and
@@ -32,13 +41,20 @@ full vocabulary logits.
 
 ## 2. Collect Official Continuations
 
+For the tracked DeepSeek V4 Flash 0731 fixture:
+
 ```sh
 export DEEPSEEK_API_KEY=...
 python3 gguf-tools/quality-testing/collect_official.py \
+  --model deepseek-v4-flash \
+  --endpoint https://api.deepseek.com/chat/completions \
   --prompts gguf-tools/quality-testing/prompts.jsonl \
   --out gguf-tools/quality-testing/data/flash \
   --count 100 \
-  --max-tokens 24
+  --max-tokens 24 \
+  --top-logprobs 20 \
+  --thinking disabled \
+  --reasoning-effort omit
 ```
 
 For GLM 5.2 through OpenRouter:
@@ -112,6 +128,31 @@ The prompt list is tracked in `prompts.jsonl`.  Curated fixture directories are
 also tracked after review; ad-hoc API collection directories should stay
 untracked until they are intentionally promoted into the release QA set.
 
+## 2b. Collect Local Continuations (No Hosted Reference)
+
+When a model family has no hosted API/key available, `collect_local.py`
+drives `ds4` itself instead of an HTTP endpoint, writing the same
+`prompts/case_*.txt` + `continuations/case_*.txt` + `manifest.tsv` shape
+(minus `responses/`, since there is no hosted response to retain):
+
+```sh
+python3 gguf-tools/quality-testing/collect_local.py \
+  --ds4 ./ds4 \
+  --model gguf/Laguna-XS-2.1-Q4_K_M.gguf \
+  --prompts gguf-tools/quality-testing/prompts.jsonl \
+  --out gguf-tools/quality-testing/data/laguna-xs21/general \
+  --max-tokens 24 \
+  --think-mode nothink \
+  --lock-file /tmp/ds4-collect.lock
+```
+
+This is a legitimate baseline when later tasks only need to compare local
+GGUF variants against each other (e.g. a biased low-bit quant vs. a known-good
+Q4_K_M), not against an external gold reference. See
+`data/laguna-xs21/README.md` for a worked example, including how to score a
+GGUF against its own captured continuations as a self-consistency P0
+baseline / noise floor.
+
 ## 3. Build The Local Scorer
 
 ```sh
@@ -119,6 +160,12 @@ make -C gguf-tools quality-score
 ```
 
 The scorer links against the DS4 runtime and uses Metal by default.
+
+Build the optional llama.cpp control scorer with:
+
+```sh
+make -C gguf-tools quality-llama-score
+```
 
 ## 4. Score GGUF Variants
 
@@ -137,11 +184,26 @@ gguf-tools/quality-testing/score_official \
 ```
 
 Use `data/flash/manifest.tsv` for Flash GGUFs,
-`data/glm52-openrouter-100/manifest.tsv` for GLM 5.2 GGUFs, and
-`data/laguna-openrouter-100/manifest.tsv` for Laguna S 2.1 GGUFs, and
-`data/pro/manifest.tsv` for PRO GGUFs. The scorer and comparator do not care
-which model produced the manifest; the manifest path selects the continuation
-set.
+`data/glm52-openrouter-100/manifest.tsv` for GLM 5.2 GGUFs,
+`data/laguna-openrouter-100/manifest.tsv` for Laguna S 2.1 GGUFs,
+`data/pro/manifest.tsv` for PRO GGUFs, and
+`data/laguna-xs21/general/manifest.tsv` or
+`data/laguna-xs21/webpy/manifest.tsv` for Laguna XS 2.1 GGUFs. The scorer and
+comparator do not care which model produced the manifest; the manifest path
+selects the continuation set.
+
+Add `--quality` to disable DS4's speed-oriented numerical shortcuts. For an
+independent llama.cpp comparison of a DeepSeek V4 GGUF, use the same manifest
+and the token-identical DS4 prompt renderer:
+
+```sh
+gguf-tools/quality-testing/score_llama \
+  /path/to/model.gguf \
+  gguf-tools/quality-testing/data/flash/manifest.tsv \
+  /tmp/llama.tsv \
+  4096 \
+  deepseek-ds4
+```
 
 For a full-residency vs SSD-streaming comparison, score the same model twice and
 add the streaming flags to one run:

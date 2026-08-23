@@ -1,0 +1,1 @@
+RMSNorm (Root Mean Square Normalization) richiede due passaggi principali — **somma dei quadrati

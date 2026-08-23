@@ -139,15 +139,15 @@ kernel void kernel_laguna_qk_head_rms_norm_rope_neox(
         args, row, weight, scratch, tid, ntg_u.x, token);
 }
 
-struct ds4_metal_args_laguna_kv_store {
+struct ds4_metal_args_store_kv_f16 {
     uint32_t cache_cap;
     uint32_t cache_row;
     uint32_t n_head_kv;
     uint32_t head_dim;
 };
 
-kernel void kernel_laguna_store_kv_f16(
-        constant ds4_metal_args_laguna_kv_store &args,
+kernel void kernel_store_kv_f16(
+        constant ds4_metal_args_store_kv_f16 &args,
         device const float *k,
         device const float *v,
         device half *key_cache,
@@ -657,6 +657,303 @@ struct ds4_metal_args_laguna_gqa3_decode {
     uint32_t nwg;
     float    scale;
 };
+
+struct ds4_metal_args_mellum_gqa_group_decode {
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t cache_cap;
+    uint32_t key_start;
+    uint32_t key_count;
+    uint32_t nsg;
+    uint32_t nwg;
+    float    scale;
+};
+
+struct ds4_metal_args_mellum_gqa_decode {
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t cache_cap;
+    uint32_t key_start;
+    uint32_t key_count;
+    float    scale;
+};
+
+// Mellum has the same four-KV-head GQA layout as Laguna but no learned
+// attention gate. This correctness-first decode kernel keeps one SIMD group
+// per query head; a later split-K specialization can retain this interface.
+kernel void kernel_mellum_attention_decode_gqa_f16(
+        constant ds4_metal_args_mellum_gqa_decode &args,
+        device const float *q,
+        device const half  *key_cache,
+        device const half  *value_cache,
+        device float       *out,
+        ushort lane [[thread_index_in_simdgroup]],
+        uint head [[threadgroup_position_in_grid]]) {
+    if (head >= args.n_head || args.n_head_kv == 0u ||
+        args.n_head % args.n_head_kv != 0u || args.head_dim != 128u ||
+        args.cache_cap == 0u || args.key_count == 0u) return;
+    const uint heads_per_kv = args.n_head / args.n_head_kv;
+    const uint kv_head = head / heads_per_kv;
+    const uint cache_width = args.n_head_kv * args.head_dim;
+    device const float *qh = q + (uint64_t)head * args.head_dim;
+    float4 acc = float4(0.0f);
+    float max_score = -INFINITY;
+    float score_sum = 0.0f;
+    for (uint i = 0; i < args.key_count; i++) {
+        const uint row = (uint)(((uint64_t)args.key_start + i) %
+                                args.cache_cap);
+        const uint64_t kv_base = (uint64_t)row * cache_width +
+            (uint64_t)kv_head * args.head_dim;
+        const uint d0 = lane;
+        const float4 key = float4((float)key_cache[kv_base + d0],
+                                  (float)key_cache[kv_base + d0 + 32u],
+                                  (float)key_cache[kv_base + d0 + 64u],
+                                  (float)key_cache[kv_base + d0 + 96u]);
+        const float4 query = float4(qh[d0], qh[d0 + 32u],
+                                    qh[d0 + 64u], qh[d0 + 96u]);
+        const float score = simd_sum(dot(query, key)) * args.scale;
+        const float next_max = max(max_score, score);
+        const float old_scale = max_score == -INFINITY ? 0.0f :
+            exp(max_score - next_max);
+        const float value_scale = exp(score - next_max);
+        score_sum = score_sum * old_scale + value_scale;
+        const float4 value = float4((float)value_cache[kv_base + d0],
+                                    (float)value_cache[kv_base + d0 + 32u],
+                                    (float)value_cache[kv_base + d0 + 64u],
+                                    (float)value_cache[kv_base + d0 + 96u]);
+        acc = acc * old_scale + value * value_scale;
+        max_score = next_max;
+    }
+    const float inv_sum = score_sum > 0.0f ? 1.0f / score_sum : 0.0f;
+    device float *oh = out + (uint64_t)head * args.head_dim;
+    oh[lane] = acc.x * inv_sum;
+    oh[lane + 32u] = acc.y * inv_sum;
+    oh[lane + 64u] = acc.z * inv_sum;
+    oh[lane + 96u] = acc.w * inv_sum;
+}
+
+// The serial kernel above is a latency chain: every key waits on the previous
+// through the online-softmax running maximum, which is what made decode at
+// depth collapse.  Striping the key range fixes that but leaves the kernel
+// bandwidth-bound on the traffic it issues -- and seven eighths of that traffic
+// is redundant.  Mellum
+// runs 32 query heads over 4 KV heads, so eight query heads want the same K/V
+// row and, one threadgroup per query head, each fetched it separately.
+//
+// Here one threadgroup owns a whole KV head: it loads each row once and scores
+// it against all eight of that row's query heads.  Because that alone would
+// leave only n_head_kv threadgroups resident, the key range is also split over
+// nwg workgroups in z; the partials land in the generic FlashAttention layout
+// and kernel_flash_attn_ext_vec_reduce merges them, exactly as the Laguna
+// gqa3 path does three-wide.
+//
+// Scratch contract: DS4_MELLUM_GROUP_HEADS * nsg * (2 + head_dim) floats.
+#define DS4_MELLUM_GROUP_HEADS 8u
+kernel void kernel_mellum_attention_decode_gqa8_split_f16(
+        constant ds4_metal_args_mellum_gqa_group_decode &args,
+        device const float *q,
+        device const half  *key_cache,
+        device const half  *value_cache,
+        device float       *tmp,
+        threadgroup float  *scratch [[threadgroup(0)]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simd_group_u [[simdgroup_index_in_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    constexpr uint group = DS4_MELLUM_GROUP_HEADS;
+    const uint kv_head = tgpig.x;
+    const uint iwg = tgpig.z;
+    const uint simd_group = (uint)simd_group_u;
+    if (args.n_head_kv == 0u || args.head_dim != 128u || args.cache_cap == 0u ||
+        args.key_count == 0u || args.nsg == 0u || args.nwg == 0u ||
+        kv_head >= args.n_head_kv || simd_group >= args.nsg ||
+        iwg >= args.nwg || args.n_head != args.n_head_kv * group) {
+        return;
+    }
+    const uint head0 = kv_head * group;
+    const uint cache_width = args.n_head_kv * args.head_dim;
+    device const float *qbase = q + (uint64_t)head0 * args.head_dim;
+
+    float4 acc[group];
+    float  max_score[group];
+    float  score_sum[group];
+    for (uint h = 0u; h < group; h++) {
+        acc[h] = float4(0.0f);
+        max_score[h] = -INFINITY;
+        score_sum[h] = 0.0f;
+    }
+
+    const uint d0 = lane;
+    const uint first = iwg * args.nsg + simd_group;
+    const uint stride = args.nwg * args.nsg;
+    for (uint i = first; i < args.key_count; i += stride) {
+        const uint row = (uint)(((uint64_t)args.key_start + i) % args.cache_cap);
+        const uint64_t kv_base = (uint64_t)row * cache_width +
+            (uint64_t)kv_head * args.head_dim;
+        /* Loaded once, consumed by all eight heads.  This is the whole point. */
+        const float4 key = float4((float)key_cache[kv_base + d0],
+                                  (float)key_cache[kv_base + d0 + 32u],
+                                  (float)key_cache[kv_base + d0 + 64u],
+                                  (float)key_cache[kv_base + d0 + 96u]);
+        const float4 value = float4((float)value_cache[kv_base + d0],
+                                    (float)value_cache[kv_base + d0 + 32u],
+                                    (float)value_cache[kv_base + d0 + 64u],
+                                    (float)value_cache[kv_base + d0 + 96u]);
+        for (uint h = 0u; h < group; h++) {
+            device const float *qh = qbase + (uint64_t)h * args.head_dim;
+            const float4 query = float4(qh[d0], qh[d0 + 32u],
+                                        qh[d0 + 64u], qh[d0 + 96u]);
+            const float score = simd_sum(dot(query, key)) * args.scale;
+            const float next_max = max(max_score[h], score);
+            const float old_scale = max_score[h] == -INFINITY ? 0.0f :
+                exp(max_score[h] - next_max);
+            const float value_scale = exp(score - next_max);
+            score_sum[h] = score_sum[h] * old_scale + value_scale;
+            acc[h] = acc[h] * old_scale + value * value_scale;
+            max_score[h] = next_max;
+        }
+    }
+
+    threadgroup float *partial_max = scratch;
+    threadgroup float *partial_sum = partial_max + group * args.nsg;
+    threadgroup float *partial_value = partial_sum + group * args.nsg;
+    for (uint h = 0u; h < group; h++) {
+        const uint slot = h * args.nsg + simd_group;
+        if (lane == 0u) {
+            partial_max[slot] = max_score[h];
+            partial_sum[slot] = score_sum[h];
+        }
+        const uint base = slot * args.head_dim + lane;
+        partial_value[base]        = acc[h].x;
+        partial_value[base + 32u]  = acc[h].y;
+        partial_value[base + 64u]  = acc[h].z;
+        partial_value[base + 96u]  = acc[h].w;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group != 0u) return;
+
+    device float *stats = tmp +
+        (uint64_t)args.n_head * args.head_dim * args.nwg;
+    for (uint h = 0u; h < group; h++) {
+        const uint slot_base = h * args.nsg;
+        float global_max = partial_max[slot_base];
+        for (uint sg = 1u; sg < args.nsg; sg++) {
+            global_max = max(global_max, partial_max[slot_base + sg]);
+        }
+        float merged_sum = 0.0f;
+        float4 merged = float4(0.0f);
+        for (uint sg = 0u; sg < args.nsg; sg++) {
+            const uint slot = slot_base + sg;
+            const float weight = partial_sum[slot] > 0.0f ?
+                exp(partial_max[slot] - global_max) : 0.0f;
+            merged_sum += partial_sum[slot] * weight;
+            const uint base = slot * args.head_dim + lane;
+            merged.x += partial_value[base] * weight;
+            merged.y += partial_value[base + 32u] * weight;
+            merged.z += partial_value[base + 64u] * weight;
+            merged.w += partial_value[base + 96u] * weight;
+        }
+
+        const uint row = head0 + h;
+        const uint64_t row_base = (uint64_t)row * args.head_dim * args.nwg;
+        const uint dims[4] = {lane, lane + 32u, lane + 64u, lane + 96u};
+        const float outputs[4] = {merged.x, merged.y, merged.z, merged.w};
+        for (uint j = 0u; j < 4u; j++) {
+            const uint d = dims[j];
+            tmp[row_base + (d / 4u) * args.nwg * 4u + iwg * 4u + d % 4u] =
+                outputs[j];
+        }
+        if (lane == 0u) {
+            const uint64_t stat = (uint64_t)row * 2u * args.nwg + 2u * iwg;
+            stats[stat] = merged_sum;
+            /*
+             * A workgroup that drew no keys leaves global_max at -INFINITY,
+             * and kernel_flash_attn_ext_vec_reduce feeds the stat straight
+             * into exp(M - m) with no guard.  Metal compiles with fast math,
+             * where exp(-inf) is not contractually 0, so publish a finite
+             * sentinel instead -- the same reason ggml's vec kernels use
+             * -FLT_MAX/2 rather than an infinity.
+             */
+            stats[stat + 1u] = max(global_max, -FLT_MAX / 2.0f);
+        }
+    }
+}
+
+// Mellum's layer-major prefill counterpart. The staged K/V buffers make all
+// current-chunk rows visible without writing the ring until every causal query
+// has consumed the history it needs. Unlike Laguna, Mellum has no gate.
+kernel void kernel_mellum_attention_prefill_gqa_f16(
+        constant ds4_metal_args_laguna_prefill_attention &args,
+        device const float *q,
+        device const half  *key_cache,
+        device const half  *value_cache,
+        device const half  *staged_key,
+        device const half  *staged_value,
+        device float       *out,
+        ushort lane [[thread_index_in_simdgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    const uint head = tgpig.x;
+    const uint token = tgpig.y;
+    if (head >= args.n_head || token >= args.n_tokens ||
+        args.n_head_kv == 0u || args.n_head % args.n_head_kv != 0u ||
+        args.head_dim != 128u || args.cache_cap == 0u) return;
+    const uint heads_per_kv = args.n_head / args.n_head_kv;
+    const uint kv_head = head / heads_per_kv;
+    const uint cache_width = args.n_head_kv * args.head_dim;
+    const uint query_pos = args.pos0 + token;
+    const uint key_count = min(query_pos + 1u, args.cache_cap);
+    const uint key_start = query_pos + 1u - key_count;
+    device const float *qh = q +
+        ((uint64_t)token * args.n_head + head) * args.head_dim;
+    float4 acc = float4(0.0f);
+    float max_score = -INFINITY;
+    float score_sum = 0.0f;
+    for (uint key_pos = key_start; key_pos <= query_pos; key_pos++) {
+        const bool current = key_pos >= args.pos0;
+        const uint row = current ? key_pos - args.pos0 :
+            key_pos % args.cache_cap;
+        const uint64_t kv_base = (uint64_t)row * cache_width +
+            (uint64_t)kv_head * args.head_dim;
+        const uint d0 = lane;
+        const float4 key = current ?
+            float4((float)staged_key[kv_base + d0],
+                   (float)staged_key[kv_base + d0 + 32u],
+                   (float)staged_key[kv_base + d0 + 64u],
+                   (float)staged_key[kv_base + d0 + 96u]) :
+            float4((float)key_cache[kv_base + d0],
+                   (float)key_cache[kv_base + d0 + 32u],
+                   (float)key_cache[kv_base + d0 + 64u],
+                   (float)key_cache[kv_base + d0 + 96u]);
+        const float4 query = float4(qh[d0], qh[d0 + 32u],
+                                    qh[d0 + 64u], qh[d0 + 96u]);
+        const float score = simd_sum(dot(query, key)) * args.scale;
+        const float next_max = max(max_score, score);
+        const float old_scale = max_score == -INFINITY ? 0.0f :
+            exp(max_score - next_max);
+        const float value_scale = exp(score - next_max);
+        score_sum = score_sum * old_scale + value_scale;
+        const float4 value = current ?
+            float4((float)staged_value[kv_base + d0],
+                   (float)staged_value[kv_base + d0 + 32u],
+                   (float)staged_value[kv_base + d0 + 64u],
+                   (float)staged_value[kv_base + d0 + 96u]) :
+            float4((float)value_cache[kv_base + d0],
+                   (float)value_cache[kv_base + d0 + 32u],
+                   (float)value_cache[kv_base + d0 + 64u],
+                   (float)value_cache[kv_base + d0 + 96u]);
+        acc = acc * old_scale + value * value_scale;
+        max_score = next_max;
+    }
+    const float inv_sum = score_sum > 0.0f ? 1.0f / score_sum : 0.0f;
+    device float *oh = out +
+        ((uint64_t)token * args.n_head + head) * args.head_dim;
+    oh[lane] = acc.x * inv_sum;
+    oh[lane + 32u] = acc.y * inv_sum;
+    oh[lane + 64u] = acc.z * inv_sum;
+    oh[lane + 96u] = acc.w * inv_sum;
+}
 
 // Global layers split keys across 32 workgroups. Evaluate three query heads
 // sharing one KV head together so each K/V row is loaded once instead of three

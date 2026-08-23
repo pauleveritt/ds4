@@ -1,0 +1,4 @@
+Here's a concise example of a race condition in C using threads:
+
+```c
+#include <pthread.h>

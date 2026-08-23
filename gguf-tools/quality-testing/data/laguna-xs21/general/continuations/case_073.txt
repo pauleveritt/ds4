@@ -1,0 +1,3 @@
+Ecco un esempio semplice di **race condition** in C utilizzando thread POSIX:
+
+```

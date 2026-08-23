@@ -1,0 +1,4 @@
+Here's a comprehensive checklist for validating that a quantized model still follows instructions:
+
+## Pre-Quantization Baseline Validation
+-

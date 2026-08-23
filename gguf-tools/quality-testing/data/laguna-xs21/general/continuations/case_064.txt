@@ -1,0 +1,3 @@
+**Latency** and **throughput** are key performance metrics in systems, but they measure different aspects:
+
+1.

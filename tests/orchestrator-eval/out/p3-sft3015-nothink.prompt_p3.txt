@@ -1,0 +1,69 @@
+**Phase 2 Delegation Packet**
+
+**1. New Files**
+- `templates/complaints.html` — NEW
+- `tests/test_complaints.py` — NEW
+
+**2. Shared Files (survive from Phase 1)**
+- `app.py`
+- `templates/base.html`
+- `templates/home.html`
+
+**3. Route**
+- `GET /complaints` → renders `complaints.html`
+
+**4. Imports**
+- `from fastapi import Request`
+- `from datetime import datetime, timezone`
+- `from typing import List`
+
+**5. Data Model**
+- `dataclasses.dataclass`
+  - `agent_name: str`
+  - `text: str`
+  - `timestamp: datetime` (timezone-aware, default `datetime.now(timezone.utc)`)
+
+**6. Storage**
+- `complaints: List[Complaint]` (module-level in `app.py`)
+
+**7. Seed Content**
+Three to five complaints, verbatim:
+- "Scope creep never ends."
+- "Instructions were contradictory."
+- "Feedback was unclear."
+- "Scope keeps expanding."
+- "I don't understand what I'm supposed to do."
+
+**8. Display**
+Each complaint entry shows:
+- `agent_name`
+- `text`
+- `timestamp` formatted as `YYYY-MM-DD HH:MM:SS TZ` (e.g., `2025-01-01 12:34:56 UTC`)
+
+**9. Validation Command**
+`.venv/bin/python -m pytest tests/`
+
+**10. Framework Semantic Trap**
+- `datetime.now(timezone.utc)` returns timezone-aware; do not use `datetime.utcnow()` (naive).
+- Bootstrap 5 CDN must be present in `base.html`; do not remove.
+- `TestClient` from `starlette.testclient` is used in tests.
+
+**11. Exact Literals**
+- Page title: "Complaints Board"
+- Heading: "Complaints Board"
+- Favicon URL: `https://www.python.org/static/favicon.ico`
+- Tagline in `home.html`: "Come in. Sit down. Tell us about your human."
+- Seed complaint text: "Scope creep never ends."
+
+**12. Route Behavior**
+- `GET /complaints` returns 200 and body containing "Complaints Board".
+- Each complaint entry is distinct; no merging.
+- No two complaints share identical `timestamp`.
+
+**13. Test Expectations**
+- `test_complaints_board_renders` checks 200 and heading.
+- `test_complaints_seed_content` checks seed complaints appear.
+- `test_complaint_display_format` checks timestamp format.
+
+**14. No Code Blocks**
+Do not include full file contents.

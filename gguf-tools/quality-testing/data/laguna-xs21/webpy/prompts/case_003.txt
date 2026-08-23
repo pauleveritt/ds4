@@ -1,0 +1,1 @@
+Write a TypeScript interface for a paginated API response containing a list of Product objects.

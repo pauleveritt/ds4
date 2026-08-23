@@ -1,0 +1,40 @@
+**Phase 2 Delegation Packet**
+
+**NEW files:**
+- `models.py`  
+  - `Complaint` dataclass with fields: `agent_name: str`, `text: str`, `timestamp: datetime`  
+  - Default `timestamp` set to `datetime.now(timezone.utc)`  
+  - Module-level `complaints: list[Complaint]`  
+  - Populate with 3-5 seed complaints (e.g., "Unclear instructions", "Contradictory feedback", "Scope creep")  
+
+- `templates/complaints.html`  
+  - Extends `base.html`  
+  - Heading: "Complaints Board"  
+  - Renders each complaint as a Bootstrap card showing:  
+    - Agent name  
+    - Timestamp (formatted)  
+    - Complaint text  
+
+**SHARED files (must survive unchanged):**  
+- `app.py`:  
+  - Add `GET /complaints` route  
+  - Import `complaints` from `models`  
+  - Render `templates/complaints.html` with `complaints` context  
+- `templates/base.html`:  
+  - Navbar brand: "AgentClinic"  
+  - Links: Home (`/`), Complaints (`/complaints`)  
+  - Favicon: `https://www.python.org/static/favicon.ico`  
+- `tests/test_app.py`:  
+  - Existing smoke test for `/` must remain  
+  - Add test for `/complaints` (200 status + seed complaint text)  
+
+**Exact literals:**  
+- Heading: "Complaints Board"  
+- Favicon URL: `https://www.python.org/static/favicon.ico`  
+- Brand: "AgentClinic"  
+
+**Validation command:**  
+`.venv/bin/python -m pytest tests/`  
+
+**Framework semantic trap:**  
+- `datetime.now(timezone.utc)` returns timezone-aware datetime; ensure all timestamps use UTC.

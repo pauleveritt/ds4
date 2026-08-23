@@ -1,0 +1,1 @@
+Hash tables handle collisions using several strategies, with the most common being **chaining** and **open addressing**. Here's

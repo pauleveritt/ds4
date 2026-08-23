@@ -1,0 +1,1 @@
+To stream a large file in Flask without loading it entirely into memory, use a generator function to yield chunks of the file

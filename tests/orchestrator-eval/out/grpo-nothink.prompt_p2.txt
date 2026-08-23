@@ -1,0 +1,25 @@
+**Phase 2 Delegation Packet**
+
+**Files**
+- `models.py` NEW
+- `templates/complaints.html` NEW
+
+**SHARED: `app.py`**
+- Route: `GET /complaints`
+- Import: `from models import complaints`
+- Return: `templates/complaints.html` with context `{"complaints": complaints}`
+- Validation: `GET /complaints` returns 200 and contains seed complaint text
+
+**SHARED: `tests/test_app.py`**
+- Test: `GET /complaints` returns 200 and contains seed complaint text
+
+**Literals**
+- `templates/base.html` navbar brand "AgentClinic"
+- `templates/home.html` hero tagline "Come in. Sit down. Tell us about your human."
+- Bootstrap 5 CDN link
+
+**Validation Command**
+`.venv/bin/python -m pytest tests/`
+
+**Framework Semantic Trap**
+`datetime.now(timezone.utc)` must be called with parentheses to produce a callable default; omitting them would store the same timestamp for all instances.

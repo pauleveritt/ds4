@@ -1,0 +1,37 @@
+**Phase 2 Delegation Packet**
+
+**Writable Files:**  
+- `app.py` — SHARED  
+- `templates/complaints.html` — NEW  
+- `tests/test_app.py` — SHARED  
+
+**SHARED FILE SURVIVAL REQUIREMENTS:**  
+`app.py`:  
+- Surviving routes: `/` (home), `/complaints` (new)  
+- Surviving imports: `FastAPI`, `templates`, `TestClient`  
+- Surviving test: `test_app.py` smoke test (GET `/` → 200 + tagline)  
+- User-visible behavior: Home page tagline "Come in. Sit down. Tell us about your human."  
+- Literal strings: "AgentClinic" (navbar brand), favicon URL  
+
+`tests/test_app.py`:  
+- Surviving test: `def test_home_page():` (GET `/` → 200 + tagline)  
+- Literal assertion: `assert "Come in. Sit down. Tell us about your human." in response.text`  
+
+**NEW FILE REQUIREMENTS:**  
+`templates/complaints.html`:  
+- Must contain: `{% extends "base.html" %}`  
+- Must contain: `{% block title %}Complaints Board{% endblock %}`  
+- Must contain: `<h1>Complaints Board</h1>`  
+- Must contain: Seed complaint text verbatim: `"Scope creep never ends"`  
+
+**EXACT LITERALS:**  
+- `Complaints Board` (block title and heading)  
+- `"Scope creep never ends"` (seed complaint text)  
+- `AgentClinic` (navbar brand in base.html)  
+
+**VALIDATION COMMAND:**  
+`.venv/bin/python -m pytest tests/`  
+
+**FRAMEWORK SEMANTIC TRAP:**  
+- `timestamp` in `Complaint` dataclass **must** be timezone-aware `datetime` (e.g., `datetime.now(timezone.utc)`). Naive datetime objects will cause display failures per "timezone-aware form" requirement.  
+- Date display **must** use `complaint.timestamp.year`, `.month`, `.day` (not `strftime`). `strftime` with `%Y, %m, %d` would include timezone offsets, violating "year, month, day" format.

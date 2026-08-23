@@ -1,0 +1,1 @@
+Ecco un esempio di pseudocodice per inserire un elemento in un heap binario (ass

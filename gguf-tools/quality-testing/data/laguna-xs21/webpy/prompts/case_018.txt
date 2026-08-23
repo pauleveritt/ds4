@@ -1,0 +1,1 @@
+You have access to a tool named send_email that takes to, subject, and body arguments. Using Laguna's native tool-call format, call send_email to notify alice@example.com with subject Build Failed and a short body saying the nightly build failed. Respond with only the tool call.

@@ -1,0 +1,1 @@
+La **latency** (latenza) e il **throughput** (throughput) sono due metriche fondament

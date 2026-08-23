@@ -1,0 +1,3 @@
+Here's a responsive CSS Grid layout for a three-column card gallery that collapses to one column on narrow screens:
+
+```

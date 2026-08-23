@@ -1,0 +1,53 @@
+**Phase 2 Delegation Packet**
+
+**Files to Create:**
+
+1. `models.py` — NEW  
+   - Must contain `Complaint` dataclass with fields: `agent_name: str`, `text: str`, `timestamp: datetime`  
+   - Must import `datetime, timezone` from `datetime`  
+   - Must set `timestamp` default to `datetime.now(timezone.utc)`  
+   - Must define module-level list `complaints: list[Complaint]`  
+   - Must populate `complaints` with 3–5 seed complaints (generic AI‑agent gripes)
+
+2. `templates/complaints.html` — NEW  
+   - Must extend `base.html`  
+   - Must contain heading `<h1>Complaints Board</h1>`  
+   - Must loop through `complaints` and render each as a Bootstrap card showing:  
+     - agent name  
+     - timestamp (formatted)  
+     - complaint text  
+
+**Files to Modify:**
+
+3. `app.py` — SHARED  
+   - Must import `Complaint` and `complaints` from `models`  
+   - Must add route `@app.get("/complaints")` returning `templates/complaints.html` with `complaints` as context  
+
+4. `tests/test_app.py` — SHARED  
+   - Must add test for `GET /complaints` returning 200 and containing seed complaint text  
+
+**Exact Literals:**
+
+- `templates/complaints.html` heading: `<h1>Complaints Board</h1>`  
+- `templates/base.html` title block default: `"AgentClinic"`  
+- `templates/home.html` hero tagline: `"Come in. Sit down. Tell us about your human."`  
+- `app.py` uvicorn run: `uvicorn.run("app:app", reload=True)`  
+
+**Validation Command:**
+
+```bash
+.venv/bin/python -m pytest tests/
+```
+
+**Framework Semantic Trap:**
+
+- `datetime.now(timezone.utc)` returns a timezone‑aware datetime; ensure the template formats it correctly (e.g., `dt.isoformat()` or `dt.strftime("%Y-%m-%d %H:%M:%S %Z")`).  
+- The `Complaint` dataclass must be instantiated with keyword arguments; positional arguments will break if the order changes.  
+
+**Surviving Imports/Routes/Strings:**
+
+- `app.py` imports: `from models import complaints`  
+- Route: `GET /complaints`  
+- Template: `templates/complaints.html`  
+- Test: `GET /complaints` returns 200 and contains seed complaint text  
+- Seed complaint text (example): `"The agent gave contradictory feedback on the same task."`

@@ -1,0 +1,4 @@
+To count rows per category in a table, you can use the following SQL query:
+
+```sql
+SELECT category,

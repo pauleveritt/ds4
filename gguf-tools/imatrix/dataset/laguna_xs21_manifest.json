@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "purpose": "Laguna XS 2.1 Python/web-biased imatrix calibration prompts",
+  "renderer": "ds4_server.c:render_laguna_chat_prompt_text",
+  "record_count": 9874,
+  "rendered_utf8_bytes": 12002053,
+  "rough_token_estimate_bytes_div_4": 3000513,
+  "composition_contract": {
+    "web_python": 0.55,
+    "prose_reasoning": 0.3,
+    "shell_c": 0.15
+  },
+  "composition_actual": {
+    "web_python": 0.5499756583311205,
+    "prose_reasoning": 0.29997976179575275,
+    "shell_c": 0.1500445798731267
+  },
+  "categories": {
+    "web_python": 4506,
+    "prose_reasoning": 2662,
+    "shell_c": 2706
+  },
+  "modes": {
+    "nothink": 4937,
+    "think": 4937
+  },
+  "bytes_by_category": {
+    "web_python": 6600837,
+    "prose_reasoning": 3600373,
+    "shell_c": 1800843
+  },
+  "forbidden_languages_absent": true,
+  "files": {
+    "all_rendered": "laguna_xs21_rendered_prompts.txt",
+    "nothink_rendered": "laguna_xs21_rendered_prompts_nothink.txt",
+    "think_rendered": "laguna_xs21_rendered_prompts_think.txt"
+  }
+}

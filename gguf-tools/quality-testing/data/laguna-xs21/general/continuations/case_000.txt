@@ -1,0 +1,2 @@
+B-tree insertion is a process that maintains the tree's properties while adding new keys. Here's a structured explanation:
+

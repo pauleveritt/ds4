@@ -1,0 +1,1 @@
+The difference between raw and compressed KV (key-value) rows lies in how the data is stored and represented. Here's

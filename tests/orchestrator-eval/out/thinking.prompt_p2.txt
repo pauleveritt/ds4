@@ -1,0 +1,155 @@
+We are given a Phase 2 specification for a "Complaints Board" in a FastAPI application.
+ The task is to produce a delegation packet for a fresh implementer (subagent) that has no prior context.
+
+ Steps from the spec:
+ 1. Create `models.py` with a `Complaint` dataclass and a module-level list `complaints`.
+ 2. Populate `complaints` with 3-5 seed complaints.
+ 3. Add a `GET /complaints` route in `app.py` that returns `templates/complaints.html` with the complaints list.
+ 4. Create `templates/complaints.html` that extends `base.html` and displays the complaints as Bootstrap cards.
+ 5. Write tests in `tests/test_app.py` for the new route.
+
+ Existing files after Phase 1:
+   - `app.py`
+   - `templates/base.html`
+   - `templates/home.html`
+   - `tests/test_app.py`
+
+ We are to produce a packet that tells the implementer what to do, without writing code.
+
+ Requirements for the packet:
+   - Name each repo-relative writable file and mark it NEW or SHARED.
+   - For SHARED files, list every route, import, test, string, and user-visible behavior that MUST survive.
+   - State exact literals that must appear verbatim.
+   - Give the single validation command.
+   - State any framework semantic trap the implementer must know.
+
+ Let's break down:
+
+ 1. `models.py` is NEW (does not exist after Phase 1).
+    - Must contain:
+        from datetime import datetime, timezone
+        @dataclass
+        class Complaint:
+            agent_name: str
+            text: str
+            timestamp: datetime = datetime.now(timezone.utc)
+        complaints: list[Complaint] = [ ... ]  # 3-5 seed complaints
+
+    Seed complaints: generic AI-agent gripes (e.g., "unclear instructions", "contradictory feedback", "scope creep")
+
+ 2. `app.py` is SHARED (it exists and we are adding to it).
+    - We must add a new route: `GET /complaints`
+    - In the route function, we must:
+        from models import complaints
+        return templates.TemplateResponse("complaints.html", {"complaints": complaints})
+
+    Also, note that we are using the `templates` module (which is already imported in `app.py` from Phase 1).
+
+ 3. `templates/complaints.html` is NEW.
+    - Must extend `base.html`
+    - Must have a heading: "Complaints Board"
+    - Must loop through the complaints and render each as a Bootstrap card with:
+        agent name, timestamp (formatted), and complaint text.
+
+    How to format timestamp? The spec says: "timestamp (formatted)". We can use a standard format, e.g., 
+    `{{ complaint.timestamp.strftime("%Y-%m-%d %H:%M:%S") }}`
+
+ 4. `tests/test_app.py` is SHARED (it exists and we are adding to it).
+    - We must add a test for `GET /complaints`:
+        response = client.get("/complaints")
+        assert response.status_code == 200
+        # Check for at least one seed complaint text (we'll use one of the seed complaints, e.g., "unclear instructions")
+        assert "unclear instructions" in response.text
+
+ Framework semantic trap:
+   - The `Complaint` dataclass has a default for `timestamp` that uses `datetime.now(timezone.utc)`. 
+     However, note that default values in dataclasses are evaluated at the time of class definition. 
+     So if we create multiple complaints without providing a timestamp, they will all have the same timestamp (the time when the module was loaded). 
+     But in our case, we are providing the seed complaints with explicit timestamps? Actually, the spec says: 
+        "Set `timestamp` default to `datetime.now(timezone.utc)`"
+
+     However, the seed complaints are created as:
+        complaints = [
+            Complaint(agent_name="Agent1", text="unclear instructions", timestamp=...),
+            ...
+        ]
+
+     But note: the spec says "Populate `complaints` with 3-5 seed complaints". It doesn't specify if we set the timestamp or not.
+
+     Since the default is set, we can omit the timestamp in the seed complaints and it will use the default. 
+     However, the default is evaluated at the time of module import, so all seed complaints would have the same timestamp (the time when `models.py` was run). 
+
+     But the spec says: "Set `timestamp` default to `datetime.now(timezone.utc)`", meaning that if we don't provide a timestamp, it uses that.
+
+     However, the implementer must be cautious: if they create a new complaint without a timestamp, it will use the current time at the moment of creation. 
+     But for the seed complaints, we are creating them at module load time, so they all get the same timestamp.
+
+     This might be acceptable for the seed, but note: the spec says "seed complaints", so they are fixed.
+
+     Trap: The default value for `timestamp` is a mutable default? Actually, it's a datetime object, which is immutable, but the issue is that the default is evaluated once. 
+     So if we do:
+
+        complaints = [Complaint(...) for _ in range(10)]
+
+     without providing timestamp, they all get the same timestamp (the time when the module was loaded). 
+
+     But in our case, we are providing explicit text and agent names, and we are not providing timestamp for the seed, so they all get the same timestamp.
+
+     However, the spec does not require the seed complaints to have different timestamps, so it's acceptable.
+
+     But note: the implementer might later add complaints without a timestamp and expect them to have the current time. 
+     That is the intended behavior.
+
+     So the trap is: the default value is evaluated at module load time, so all complaints created without an explicit timestamp (including the seed) have the same timestamp (the time when the module was loaded). 
+     This is acceptable for the seed, but if the implementer wants the seed to have different timestamps, they must provide them.
+
+     However, the spec says: "Populate `complaints` with 3-5 seed complaints (generic AI-agent gripes like unclear instructions, contradictory feedback, scope creep)". 
+     It doesn't specify timestamps, so we can set them to the same (the module load time) or we can set them to different times? 
+
+     But the spec says: "Set `timestamp` default to `datetime.now(timezone.utc)`", meaning that if we don't provide, it uses that. 
+     So for the seed, we are not providing, so they all get the same.
+
+     This is acceptable.
+
+     However, the implementer must know that the seed complaints will have the same timestamp (the time when `models.py` was imported). 
+     So in the test, we cannot rely on the exact timestamp, but we can check that the timestamp is present and in the correct format.
+
+     But the test only checks for the text, not the timestamp.
+
+     So no major trap for the test.
+
+     Another trap: the `templates` module in `app.py` must be imported. In Phase 1, it was already imported (because we had a route returning templates/home.html). 
+     So we don't need to worry.
+
+     But note: the spec says "Import `complaints` from `models`" in the route. So we must have an import for `models`.
+
+     In `app.py`, we currently have (from Phase 1):
+
+        from fastapi import FastAPI
+        from . import templates
+
+     We need to add:
+
+        from . import models
+
+     So that's a change to `app.py`.
+
+     This is a shared file, so we must note that we are adding an import.
+
+ Literal that must appear verbatim:
+
+   - In `models.py`: 
+        from datetime import datetime, timezone
+        @dataclass
+        class Complaint:
+            agent_name: str
+            text: str
+            timestamp: datetime = datetime.now(timezone.utc)
+
+   - In `models.py` (the list):
+        complaints: list[Complaint] = [
+            Complaint(agent_name="Agent1", text="unclear instructions"),
+            Complaint(agent_name="Agent2", text="contradictory feedback"),
+            Complaint(agent_name="Agent3", text="scope creep"),
+            Complaint(agent_name="Agent4", text="vague requirements"),
+            Complaint(agent_

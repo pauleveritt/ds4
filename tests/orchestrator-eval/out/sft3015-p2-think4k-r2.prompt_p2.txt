@@ -1,0 +1,67 @@
+**Phase 2 Delegation Packet**
+
+**NEW FILES:**
+1. `models.py`  
+   - Must contain:  
+     ```python
+     from datetime import datetime, timezone
+     from dataclasses import dataclass
+
+     @dataclass
+     class Complaint:
+         agent_name: str
+         text: str
+         timestamp: datetime = datetime.now(timezone.utc)
+
+     complaints: list[Complaint] = [
+         Complaint(agent_name="Agent1", text="Clear instructions are essential for effective collaboration."),
+         Complaint(agent_name="Agent2", text="Feedback that contradicts previous statements leads to confusion."),
+         Complaint(agent_name="Agent3", text="Scope creep without clear boundaries causes project delays."),
+         Complaint(agent_name="Agent4", text="Unpredictable response times hinder workflow planning."),
+         Complaint(agent_name="Agent5", text="Lack of documentation for common tasks increases onboarding time.")
+     ]
+     ```
+
+2. `templates/complaints.html`  
+   - Must extend `base.html` with:  
+     ```html
+     <h1>Complaints Board</h1>
+     <div class="row">
+       {% for complaint in complaints %}
+         <div class="col-md-6 col-lg-4 mb-4">
+           <div class="card">
+             <div class="card-body">
+               <h5 class="card-title">{{ complaint.agent_name }}</h5>
+               <p class="card-text">{{ complaint.text }}</p>
+               <p class="card-text"><small class="text-muted">{{ complaint.timestamp }}</small></p>
+             </div>
+           </div>
+         </div>
+       {% endfor %}
+     </div>
+     ```
+
+**SHARED FILES:**
+1. `app.py`  
+   - Add import: `from models import complaints`  
+   - Add route:  
+     ```python
+     @app.get("/complaints")
+     def complaints_page():
+         return templates.TemplateResponse("complaints.html", {"complaints": complaints})
+     ```
+
+2. `tests/test_app.py`  
+   - Add test:  
+     ```python
+     def test_complaints_page(client):
+         response = client.get("/complaints")
+         assert response.status_code == 200
+         assert "Clear instructions are essential for effective collaboration." in response.text
+     ```
+
+**Validation Command:**  
+`.venv/bin/python -m pytest tests/`
+
+**Framework Trap:**  
+- `Complaint.timestamp` default uses `datetime.now(timezone.utc)` at module load time (not per-instance). All seed complaints will share the same timestamp. If distinct timestamps are required, modify the dataclass to generate them dynamically.

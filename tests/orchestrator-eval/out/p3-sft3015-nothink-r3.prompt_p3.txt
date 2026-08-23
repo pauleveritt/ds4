@@ -1,0 +1,68 @@
+**Phase 2 Delegation Packet**
+
+---
+
+**NEW FILES**
+
+- `templates/complaints.html` — Complaints Board page
+- `tests/test_complaints.py` — Tests for `/complaints` endpoint
+
+---
+
+**SHARED FILES** (survive unchanged)
+
+- `app.py`
+  - Import `templates.complaints` route
+  - Add `/complaints` route to router
+- `templates/base.html`
+  - Inherit navbar and navigation
+- `templates/home.html`
+  - No changes
+- `tests/test_app.py`
+  - Extend smoke test to include `/complaints`
+
+---
+
+**ROUTE**
+
+- `GET /complaints` → renders `templates/complaints.html`
+
+---
+
+**ENTITY: Complaint**
+
+- `agent_name` (str) — who filed it
+- `text` (str) — what they said
+- `timestamp` (datetime) — timezone-aware, unique per complaint
+
+---
+
+**SEED CONTENT** (verbatim, three to five complaints)
+
+1. "Scope creep never ends."
+2. "The instructions were unclear."
+3. "Feedback was contradictory."
+4. "Requirements kept changing."
+5. "We were told it was simple, but it’s not."
+
+---
+
+**VALIDATION COMMAND**
+
+`.venv/bin/python -m pytest tests/`
+
+---
+
+**FRAMEWORK TRAP**
+
+- Use `datetime.now(timezone.utc)` for timestamp; do not store naive datetime.
+- Ensure `templates/complaints.html` iterates over `complaints` list passed from route.
+- Preserve existing `TestClient` usage; no database required.
+
+---
+
+**LITERAL REQUIRED**
+
+- Heading on page: **"Complaints Board"**
+- Favicon URL: `https://www.python.org/static/favicon.ico`
+- Bootstrap 5 CDN link (unchanged)

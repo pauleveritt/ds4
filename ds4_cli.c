@@ -75,6 +75,7 @@ typedef struct {
     bool min_p_set;
     uint64_t seed;
     bool dump_tokens;
+    bool dump_chat_tokens;
     const char *dump_logits_path;
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
@@ -90,6 +91,17 @@ typedef struct {
     bool metal_graph_test;
     bool metal_graph_full_test;
     bool metal_graph_prompt_test;
+    /*
+     * One diagnostic selector rather than twenty flags.  mellum_diag names the
+     * check; the others are the parameters some of them take.  The names live
+     * in cli_mellum_diag_run().
+     */
+    const char *mellum_diag;
+    const char *mellum_diag_out;
+    const char *mellum_diag_trace_layer;
+    const char *mellum_diag_trace_attention;
+    const char *mellum_diag_trace_qk;
+    int mellum_diag_top_k;
 } cli_generation_options;
 
 typedef struct {
@@ -1980,6 +1992,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.cuda_tensor_parallel = true;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
+        } else if (!strcmp(arg, "--dump-chat-tokens")) {
+            c.gen.dump_chat_tokens = true;
         } else if (!strcmp(arg, "--dump-logits")) {
             c.gen.dump_logits_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-logprobs")) {
@@ -2030,6 +2044,37 @@ static cli_config parse_options(int argc, char **argv) {
 #else
             c.engine.backend = DS4_BACKEND_METAL;
 #endif
+        } else if (!strcmp(arg, "--mellum-diag")) {
+            c.gen.mellum_diag = need_arg(&i, argc, argv, arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-diag-out")) {
+            c.gen.mellum_diag_out = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mellum-diag-trace")) {
+            /* KIND=FILE, where KIND is layer, attention or qk. */
+            const char *spec = need_arg(&i, argc, argv, arg);
+            const char *eq = strchr(spec, '=');
+            if (!eq || eq == spec || !eq[1]) {
+                fprintf(stderr,
+                        "ds4: --mellum-diag-trace expects KIND=FILE "
+                        "(layer, attention or qk)\n");
+                exit(2);
+            }
+            const size_t klen = (size_t)(eq - spec);
+            if (klen == 5 && !strncmp(spec, "layer", klen))
+                c.gen.mellum_diag_trace_layer = eq + 1;
+            else if (klen == 9 && !strncmp(spec, "attention", klen))
+                c.gen.mellum_diag_trace_attention = eq + 1;
+            else if (klen == 2 && !strncmp(spec, "qk", klen))
+                c.gen.mellum_diag_trace_qk = eq + 1;
+            else {
+                fprintf(stderr, "ds4: unknown --mellum-diag-trace kind; "
+                                "expected layer, attention or qk\n");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--mellum-diag-top-k")) {
+            c.gen.mellum_diag_top_k =
+                parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--metal-graph-generate")) {
             fprintf(stderr, "ds4: --metal-graph-generate was removed; --metal is the graph path\n");
             exit(2);
@@ -2081,17 +2126,74 @@ static cli_config parse_options(int argc, char **argv) {
     return c;
 }
 
+/*
+ * Every Mellum diagnostic behind one name.  They were twenty flags and twelve
+ * near-identical dispatch blocks, each repeating the same close-and-free tail;
+ * the engine entry points are unchanged, only the way they are selected.
+ */
+static int cli_mellum_diag_run(ds4_engine *engine,
+                               const cli_generation_options *g,
+                               int ctx_size) {
+    const char *n = g->mellum_diag;
+    if (!strcmp(n, "layer0"))
+        return ds4_engine_mellum_layer0_probe(engine, stdout, g->mellum_diag_out);
+    if (!strcmp(n, "all-layers"))
+        return ds4_engine_mellum_all_layers_probe(
+            engine, stdout, g->mellum_diag_out, g->mellum_diag_trace_layer,
+            g->mellum_diag_trace_attention, g->mellum_diag_trace_qk);
+    if (!strcmp(n, "kv-layout"))
+        return ds4_engine_mellum_kv_layout_probe(engine, stdout, ctx_size);
+    if (!strcmp(n, "session-lifecycle"))
+        return ds4_engine_mellum_session_lifecycle_probe(engine, stdout, ctx_size);
+    if (!strcmp(n, "session-decode"))
+        return ds4_engine_mellum_session_decode_probe(engine, stdout, ctx_size,
+                                                      g->mellum_diag_out);
+    if (!strcmp(n, "session-isolation"))
+        return ds4_engine_mellum_session_isolation_probe(engine, stdout, ctx_size);
+    if (!strcmp(n, "interactive-session"))
+        return ds4_engine_mellum_interactive_session_probe(engine, stdout, ctx_size);
+    if (!strcmp(n, "swa-boundary"))
+        return ds4_engine_mellum_swa_boundary_probe(engine, stdout, ctx_size);
+    if (!strcmp(n, "resident-profile"))
+        return ds4_engine_mellum_resident_profile(engine, stdout, ctx_size);
+    if (!strcmp(n, "true-prefill"))
+        return ds4_engine_mellum_true_prefill_probe(engine, stdout);
+    if (!strcmp(n, "true-prefill-swa"))
+        return ds4_engine_mellum_true_prefill_swa_probe(engine, stdout);
+    if (!strcmp(n, "logits"))
+        return ds4_engine_mellum_logits_probe(engine, stdout, g->mellum_diag_out,
+                                              (uint32_t)g->mellum_diag_top_k);
+    fprintf(stderr,
+            "ds4: unknown --mellum-diag '%s'\n"
+            "     known: layer0, all-layers, kv-layout, session-lifecycle,\n"
+            "            session-decode, session-isolation, interactive-session,\n"
+            "            swa-boundary, resident-profile, true-prefill,\n"
+            "            true-prefill-swa, logits\n", n);
+    return 2;
+}
+
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
-    if (cfg.gen.dump_tokens) {
+    if (cfg.gen.dump_tokens || cfg.gen.dump_chat_tokens) {
         if (cfg.gen.prompt == NULL) {
-            fprintf(stderr, "ds4: --dump-tokens requires -p or --prompt-file\n");
+            fprintf(stderr, "ds4: --dump-tokens and --dump-chat-tokens require -p or --prompt-file\n");
             free(cfg.prompt_owned);
             return 2;
         }
-        int rc = ds4_dump_text_tokenization(cfg.engine.model_path,
-                                            cfg.gen.prompt,
-                                            stdout);
+        if (cfg.gen.dump_tokens && cfg.gen.dump_chat_tokens) {
+            fprintf(stderr, "ds4: choose either --dump-tokens or --dump-chat-tokens\n");
+            free(cfg.prompt_owned);
+            return 2;
+        }
+        int rc = cfg.gen.dump_chat_tokens
+            ? ds4_dump_chat_tokenization(cfg.engine.model_path,
+                                         cfg.gen.system,
+                                         cfg.gen.prompt,
+                                         cli_effective_think_mode(&cfg.gen),
+                                         stdout)
+            : ds4_dump_text_tokenization(cfg.engine.model_path,
+                                         cfg.gen.prompt,
+                                         stdout);
         ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return rc;
@@ -2144,6 +2246,14 @@ int main(int argc, char **argv) {
         return 1;
     }
     cli_apply_model_sampling_defaults(engine, &cfg.gen);
+    if (cfg.gen.mellum_diag) {
+        int rc = cli_mellum_diag_run(engine, &cfg.gen, cfg.gen.ctx_size);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+
     if (!cfg.gen.system_set) {
         cfg.gen.system = ds4_engine_default_system_prompt(engine);
     }

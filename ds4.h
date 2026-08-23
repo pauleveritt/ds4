@@ -23,6 +23,87 @@ typedef enum {
 } ds4_backend;
 
 typedef enum {
+    DS4_MODEL_FAMILY_DEEPSEEK4 = 0,
+    DS4_MODEL_FAMILY_GLM_DSA   = 1,
+    DS4_MODEL_FAMILY_LAGUNA    = 2,
+    DS4_MODEL_FAMILY_MELLUM    = 3,
+} ds4_model_family;
+
+typedef enum {
+    DS4_VARIANT_FLASH = 0,
+    DS4_VARIANT_PRO   = 1,
+    DS4_VARIANT_GLM52 = 2,
+    DS4_VARIANT_LAGUNA_S21 = 3,
+    DS4_VARIANT_LAGUNA_XS21 = 4,
+    DS4_VARIANT_MELLUM2 = 5,
+} ds4_variant;
+
+/* Per-model-shape constants. Most of ds4.c's shape table stays private
+ * (static const) to that translation unit; the Laguna variants are also
+ * exposed here (as extern const globals defined in ds4.c) so tests linked
+ * against ds4.o can assert on GGUF-verified per-variant constants directly. */
+typedef struct {
+    const char *name;
+    ds4_model_family family;
+    ds4_variant variant;
+    uint32_t n_layer;
+    uint32_t n_embd;
+    uint32_t n_vocab;
+    uint32_t n_head;
+    uint32_t n_head_global;
+    uint32_t n_head_swa;
+    uint32_t n_head_kv;
+    uint32_t n_head_dim;
+    uint32_t n_value_dim;
+    uint32_t n_rot;
+    uint32_t n_out_group;
+    uint32_t n_lora_q;
+    uint32_t n_lora_o;
+    uint32_t n_expert;
+    uint32_t n_expert_used;
+    uint32_t n_expert_shared;
+    uint32_t n_ff_exp;
+    uint32_t n_ff_shared;
+    uint32_t n_ff_dense;
+    uint32_t n_hash_layer;
+    uint32_t n_swa;
+    uint32_t n_indexer_head;
+    uint32_t n_indexer_head_dim;
+    uint32_t n_indexer_top_k;
+    uint32_t n_hc;
+    uint32_t n_hc_sinkhorn_iter;
+    uint32_t n_nextn_predict;
+    uint32_t n_leading_dense;
+    uint32_t n_kv_lora;
+    uint32_t n_key_mla;
+    uint32_t n_value_mla;
+    uint32_t n_rot_swa;
+    float rms_eps;
+    float hc_eps;
+    float expert_weight_scale;
+    float swiglu_clamp_exp;
+    float rope_freq_base;
+    float rope_scale_factor;
+    float rope_yarn_beta_fast;
+    float rope_yarn_beta_slow;
+    float rope_yarn_attn_factor;
+    float rope_freq_base_swa;
+    float compress_rope_freq_base;
+    uint64_t context_length;
+    uint64_t rope_orig_ctx;
+} ds4_shape;
+
+extern const ds4_shape DS4_SHAPE_LAGUNA_S21;
+extern const ds4_shape DS4_SHAPE_LAGUNA_XS21;
+extern const ds4_shape DS4_SHAPE_MELLUM2;
+
+/* Mellum's 28 layers repeat [sliding, sliding, sliding, full]. Sliding
+ * layers use ordinary RoPE; full-attention layers use the model's YaRN RoPE
+ * parameters. Invalid layer indices return false from both helpers. */
+bool ds4_mellum_layer_uses_sliding_attention(uint32_t layer_index);
+bool ds4_mellum_layer_uses_yarn_rope(uint32_t layer_index);
+
+typedef enum {
     DS4_THINK_NONE,
     DS4_THINK_HIGH,
     DS4_THINK_MAX,
@@ -162,6 +243,8 @@ typedef struct {
     bool inspect_only;
     /* Multi-GPU placement uses this to price per-layer KV storage. */
     int placement_ctx_hint;
+    /* Number of independently allocated session graphs/caches to reserve. */
+    int placement_session_count_hint;
     /* Server batch mode serializes execution and can share prefill scratch. */
     bool share_session_prefill_workspace;
     bool first_token_test;
@@ -210,6 +293,93 @@ typedef struct {
 } ds4_session_payload_file;
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
+/*
+ * Hosts that own resident, interactive sessions -- ds4-agent and ds4-server --
+ * open through this rather than ds4_engine_open, which is for one-shot and
+ * diagnostic use.  Some model families (Mellum) only expose their session path
+ * to such a host, because a resident session carries a KV cache and sampling
+ * state that a diagnostic open has no way to release correctly.
+ */
+int ds4_engine_open_for_resident_sessions(ds4_engine **out,
+                                          const ds4_engine_options *opt);
+
+/* Prior name for the same thing, kept for callers that predate the rename. */
+int ds4_engine_open_for_agent(ds4_engine **out,
+                              const ds4_engine_options *opt);
+
+/* Diagnostic-only Mellum oracle probe.  Replays the pinned 26-token fixture
+ * through layer 0 without creating a session or enabling generation. */
+int ds4_engine_mellum_layer0_probe(ds4_engine *engine,
+                                   FILE       *out,
+                                   const char *raw_output_path);
+
+/* Diagnostic-only Mellum whole-model oracle. Replays the same pinned fixture
+ * through all 28 layers without creating a session or enabling generation. */
+int ds4_engine_mellum_all_layers_probe(ds4_engine *engine,
+                                       FILE       *out,
+                                       const char *raw_output_path,
+                                       const char *trace_output_path,
+                                       const char *attention_trace_output_path,
+                                       const char *qk_trace_output_path);
+
+/* Inspect-only Mellum KV allocation gate. Allocates and frees the exact
+ * per-layer F16 layout without creating a session or evaluating a token. */
+int ds4_engine_mellum_kv_layout_probe(ds4_engine *engine,
+                                      FILE       *out,
+                                      int         ctx_size);
+
+/* Inspect-only Mellum session gate. Creates and releases a layout-only
+ * ds4_session; all token execution APIs reject that session. */
+int ds4_engine_mellum_session_lifecycle_probe(ds4_engine *engine,
+                                              FILE       *out,
+                                              int         ctx_size);
+
+/* Inspect-only Mellum session decode gate. Replays the fixed fixture through
+ * session-owned KV/scratch and raw logits, while token selection stays off. */
+int ds4_engine_mellum_session_decode_probe(ds4_engine *engine,
+                                           FILE       *out,
+                                           int         ctx_size,
+                                           const char *raw_output_path);
+
+/* Inspect-only Mellum session isolation gate. Interleaves two independent
+ * decode sessions over the fixed fixture and requires bit-identical logits. */
+int ds4_engine_mellum_session_isolation_probe(ds4_engine *engine,
+                                              FILE       *out,
+                                              int         ctx_size);
+
+/* Inspect-only Mellum interactive-session gate. Exercises sequential replay,
+ * selection, interruption, divergent rebuild, and reset without authorizing
+ * ordinary inspect sessions or another frontend. */
+int ds4_engine_mellum_interactive_session_probe(ds4_engine *engine,
+                                                FILE       *out,
+                                                int         ctx_size);
+
+/* Inspect-only Mellum long-context gate. Compares the ordinary decode schedule
+ * with command-batched sequential sync across the 1,024-token SWA boundary. */
+int ds4_engine_mellum_swa_boundary_probe(ds4_engine *engine,
+                                         FILE       *out,
+                                         int         ctx_size);
+
+/* Inspect-only Mellum resident microprofile. Separates decode-layer cost from
+ * final RMSNorm/output-head cost without authorizing generation. */
+int ds4_engine_mellum_resident_profile(ds4_engine *engine, FILE *out,
+                                       int ctx_size);
+
+/* Inspect-only Mellum true-prefill gate. Runs the fixed fixture as one
+ * layer-major batch and compares its raw final logits with sequential decode. */
+int ds4_engine_mellum_true_prefill_probe(ds4_engine *engine, FILE *out);
+
+/* Inspect-only Mellum true-prefill ring evidence probe. Compares an
+ * SWA-window+6 chunk schedule with sequential decode across the boundary;
+ * it does not currently define an acceptance envelope. */
+int ds4_engine_mellum_true_prefill_swa_probe(ds4_engine *engine, FILE *out);
+
+/* Diagnostic-only Mellum output-head oracle. Replays the fixed fixture through
+ * final RMSNorm and the Q8 output projection, but does not select a token. */
+int ds4_engine_mellum_logits_probe(ds4_engine *engine,
+                                   FILE       *out,
+                                   const char *raw_output_path,
+                                   uint32_t    report_top_k);
 
 /* Multi-GPU pipeline-parallel entry point (wave 2).
  *
@@ -266,6 +436,7 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_laguna(ds4_engine *e);
+bool ds4_engine_is_mellum(ds4_engine *e);
 const char *ds4_engine_default_system_prompt(ds4_engine *e);
 void ds4_engine_sampling_defaults(ds4_engine *e, float *temperature,
                                   int *top_k, float *top_p, float *min_p);
@@ -305,6 +476,11 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                int max_tokens);
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
+int ds4_dump_chat_tokenization(const char *model_path,
+                               const char *system,
+                               const char *prompt,
+                               ds4_think_mode think_mode,
+                               FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
@@ -349,6 +525,8 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
+/* False when the session can be restored only by replaying its transcript. */
+bool ds4_session_supports_payload(ds4_session *s);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
 bool ds4_session_is_distributed(ds4_session *s);

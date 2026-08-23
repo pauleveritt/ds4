@@ -1,0 +1,22 @@
+=== PHASE 0 2026-08-01T21:26:09Z commit=943e73b ===
+-- baseline --
+Mellum resident profile tokens=64 repeats=3 no-head=8.327ms 120.1t/s with-head=8.744ms 114.4t/s output-head-delta=0.417ms
+Mellum resident prefill tokens=1024 chunk=1024 exact=0 repeats=3 batch=5467.8ms 187.3t/s
+-- EXACT --
+Mellum resident profile tokens=64 repeats=3 no-head=8.608ms 116.2t/s with-head=9.148ms 109.3t/s output-head-delta=0.540ms
+Mellum resident prefill tokens=1024 chunk=1024 exact=1 repeats=3 batch=6758.5ms 151.5t/s
+-- GROUPED --
+Mellum resident profile tokens=64 repeats=3 no-head=8.660ms 115.5t/s with-head=9.215ms 108.5t/s output-head-delta=0.555ms
+Mellum resident prefill tokens=1024 chunk=1024 exact=0 repeats=3 batch=5788.8ms 176.9t/s
+-- baseline RE-RUN (thermal control) --
+Mellum resident profile tokens=64 repeats=3 no-head=8.422ms 118.7t/s with-head=8.817ms 113.4t/s output-head-delta=0.395ms
+Mellum resident prefill tokens=1024 chunk=1024 exact=0 repeats=3 batch=5691.1ms 179.9t/s
+
+PHASE 0 VERDICT: PASS with protocol correction.
+- decode with-head reproduces (114.4 vs 114.7 recorded).
+- prefill baseline 187.3 then 179.9 on re-run => ~4-5% run-to-run drift.
+- decode moved 114.4/109.3/108.5/113.4 across the sequence: non-monotonic, so
+  noise + thermal, not regression.
+CONSEQUENCE: cross-session comparison against doc-recorded numbers is invalid.
+All A/B tonight must be same-session, interleaved, >=3 reps, and deltas under
+~6% must be treated as noise.

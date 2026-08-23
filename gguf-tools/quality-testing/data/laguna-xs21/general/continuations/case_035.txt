@@ -1,0 +1,1 @@
+Un **ring buffer** (o **coda circolare**) è una struttura dati che utilizza

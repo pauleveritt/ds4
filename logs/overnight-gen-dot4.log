@@ -1,0 +1,13 @@
+=== GREEDY GENERATION: dot4 build 2026-08-01T21:36:40Z ===
+--- PROMPT: Answer with one word: the capital of France is
+
+
+<think>
+1.  **Analyze the user's request:** The user wants a one-word answer to--- PROMPT: Complete this Python function: def add(a, b):
+ return a + b
+
+This is a simple function that takes two numbers as input and returns their sum.--- PROMPT: Count upward from one, placing a space after every integer.
+
+For example, the output for the input 5 should be:
+
+1 2 3 4

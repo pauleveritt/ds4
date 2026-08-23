@@ -1,0 +1,29 @@
+**Phase 2 Delegation Packet**
+
+**Files**
+- `models.py` NEW
+- `templates/complaints.html` NEW
+
+**SHARED: `app.py`**
+- Route: `GET /complaints`
+- Import: `from models import complaints`
+- Return: `templates/complaints.html` with context `{"complaints": complaints}`
+- Test: `GET /complaints` must return 200 and contain seed complaint text
+
+**SHARED: `tests/test_app.py`**
+- Test: `test_complaints_page_returns_200_and_contains_seed_text()`
+- Assertion: `200 == response.status_code`
+- Assertion: `seed_text in response.text`
+
+**Literals**
+- `Complaint` dataclass fields: `agent_name`, `text`, `timestamp`
+- `timestamp` default: `datetime.now(timezone.utc)`
+- Seed complaint texts: "unclear instructions", "contradictory feedback", "scope creep"
+- Template heading: "Complaints Board"
+- Card display: agent name, formatted timestamp, complaint text
+
+**Validation Command**
+`.venv/bin/python -m pytest tests/`
+
+**Framework Trap**
+`datetime.now(timezone.utc)` must be called with parentheses to invoke the function; otherwise `timestamp` will be the function object, not a value.

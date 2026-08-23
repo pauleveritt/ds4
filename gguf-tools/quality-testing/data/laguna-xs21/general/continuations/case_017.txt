@@ -1,0 +1,1 @@
+La **decodifica speculativa** (o *speculative decoding*) è una tecnica utilizzata

@@ -1,0 +1,1 @@
+Grouped MoE expert execution can improve prefill by optimizing computational efficiency and resource utilization during the initial token generation phase.

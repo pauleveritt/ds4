@@ -311,6 +311,9 @@ typedef enum {
     AGENT_TOOL_SYNTAX_DSML,
     AGENT_TOOL_SYNTAX_GLM,
     AGENT_TOOL_SYNTAX_LAGUNA,
+    /* Hermes-style JSON inside <tool_call> tags -- what Mellum's own chat
+     * template specifies and what it was trained on. */
+    AGENT_TOOL_SYNTAX_MELLUM,
 } agent_tool_syntax;
 
 typedef enum {
@@ -408,6 +411,13 @@ typedef struct {
     agent_dsml_marker_detector think_dsml;
     bool dsml_in_think;
     bool dsml_in_think_reported;
+    /* Any non-space byte already rendered as ordinary prose this turn.  Gates
+     * recovery to a response that is nothing but the call. */
+    bool saw_visible_output;
+    /* saw_visible_output as it stood when the current start-tag candidate
+     * began.  The '<' of the candidate sets saw_visible_output itself, so the
+     * live flag cannot answer "was there prose before this tag?". */
+    bool start_tail_after_prose;
     bool post_think_gap;
     bool tool_preflight_error;
     char tool_preflight_error_msg[256];
@@ -481,15 +491,45 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
                                     char *err, size_t err_len);
 static int agent_read_default_lines(agent_worker *w);
 
+/* Bounded corrective nudge.  Mellum reliably decides to call a tool on a
+ * direct request but often narrates intent on an open-ended task and stops.
+ * When set, a turn that ends having executed nothing gets one deterministic
+ * correction fed back through the ordinary tool-result path, then the loop
+ * continues.  Off by default: this is host-side scaffolding under evaluation,
+ * not settled behaviour, and it belongs in the host once the wire is
+ * bidirectional. */
+static int agent_tool_nudge_max(void) {
+    const char *v = getenv("DS4_AGENT_TOOL_NUDGE");
+    if (!v || !v[0]) return 0;
+    int n = atoi(v);
+    return n < 0 ? 0 : (n > 3 ? 3 : n);
+}
+/* Mellum tool-call recovery helpers, defined with the parser below but needed
+ * by agent_dsml_finish, which precedes it. */
+static const char *agent_json_skip_ws(const char *s, const char *end);
+static bool agent_json_scan_value(const char **sp, const char *end,
+                                  const char **val, size_t *val_len);
+static bool agent_mellum_parse_call_json(agent_dsml_parser *p,
+                                         const char *s, const char *end);
+static bool agent_mellum_tool_name_is_registered(const char *name);
+
 static agent_tool_syntax agent_tool_syntax_for_engine(ds4_engine *engine) {
     if (ds4_engine_is_glm_dsa(engine)) return AGENT_TOOL_SYNTAX_GLM;
     if (ds4_engine_is_laguna(engine)) return AGENT_TOOL_SYNTAX_LAGUNA;
+    if (ds4_engine_is_mellum(engine)) return AGENT_TOOL_SYNTAX_MELLUM;
     return AGENT_TOOL_SYNTAX_DSML;
 }
 
+/* "Tagged" means the call is delimited by <tool_call> ... </tool_call>, which
+ * governs stream detection and -- via agent_append_system_prompt -- whether the
+ * tools prompt is framed as a chat message at all.  Mellum belongs here even
+ * though its arguments are JSON rather than <arg_key>/<arg_value>: falling
+ * through to DSML sent it unframed instructions in a markup it has no tokens
+ * for. */
 static bool agent_tool_syntax_is_tagged(agent_tool_syntax syntax) {
     return syntax == AGENT_TOOL_SYNTAX_GLM ||
-           syntax == AGENT_TOOL_SYNTAX_LAGUNA;
+           syntax == AGENT_TOOL_SYNTAX_LAGUNA ||
+           syntax == AGENT_TOOL_SYNTAX_MELLUM;
 }
 
 static void agent_worker_append_assistant_turn_end(agent_worker *w) {
@@ -777,6 +817,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.non_interactive = true;
         } else if (!strcmp(arg, "--raw") || !strcmp(arg, "--raw-prompt")) {
             c.gen.raw_prompt = true;
+        } else if (!strcmp(arg, "--edit-upto")) {
+            c.edit_upto = true;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -1051,7 +1093,15 @@ static const char agent_tools_prompt_intro[] =
 #define AGENT_EDIT_TARGET_RULE \
     "When editing files, state the target filename before the edit; for the edit tool, put path first."
 
-static const char agent_tools_prompt_edit_line[] =
+static const char agent_tools_prompt_edit_exact[] =
+    "## Editing files\n\n"
+    AGENT_EDIT_TARGET_RULE "\n"
+    "Use edit with path, old, and new for changes. The old text must match exactly once in the current file; "
+    "otherwise edit fails for safety. Read enough of the file to provide the exact old text being replaced.\n"
+    "To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.\n"
+    "Use read raw=true only when you need plain file text without line numbers or read annotations.\n\n";
+
+static const char agent_tools_prompt_edit_upto[] =
     "## Editing files\n\n"
     AGENT_EDIT_TARGET_RULE "\n"
     "Use write for new files or deliberate whole-file replacement. Use edit with path, old, and new for changes. "
@@ -1272,8 +1322,9 @@ static const char agent_tools_prompt_after_edit[] =
     "- Work in a way that preserves the current system configuration integrity, "
     "unless explicitly asked otherwise by the user.\n";
 
-static char *agent_build_dsml_tools_prompt(void) {
-    const char *edit = agent_tools_prompt_edit_line;
+static char *agent_build_dsml_tools_prompt(bool edit_upto) {
+    const char *edit = edit_upto ? agent_tools_prompt_edit_upto
+                                 : agent_tools_prompt_edit_exact;
     size_t a = strlen(agent_tools_prompt_intro);
     size_t b = strlen(edit);
     size_t c = strlen(agent_tools_prompt_after_edit);
@@ -1293,7 +1344,7 @@ static const char agent_glm_tools_prompt_intro[] =
     "You are provided with function signatures within <tools></tools> XML tags:\n"
     "<tools>\n";
 
-static const char agent_glm_after_schemas_head[] =
+static const char agent_glm_tools_prompt_after_schemas[] =
     "</tools>\n\n"
     "For a function call, output the function name and arguments within exactly this XML format:\n"
     "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>"
@@ -1304,12 +1355,18 @@ static const char agent_glm_after_schemas_head[] =
     "- read path alone returns a context-sized bounded chunk, not the whole file; for first looks at large files, prefer max_lines around 80-160.\n"
     "- If read says more lines are available, call more with count=<lines> to read the next chunk.\n"
     "- Use whole=true only when the user explicitly asks for the complete file contents or when bounded chunks are insufficient for the task; add raw=true only when line numbers would corrupt the payload.\n"
-    "- " AGENT_EDIT_TARGET_RULE "\n"
-    "- Use edit with exact old text and replacement new text; old may contain one [upto] marker between unique anchors.\n";
-static const char agent_bash_jobs_rule[] = "- For long bash jobs, pass refresh_sec and then poll with bash_status or stop with bash_stop.\n";
-static const char agent_glm_after_schemas_tail[] =
-    "- Preserve the current system configuration unless the user explicitly asks otherwise.\n";
+    "- " AGENT_EDIT_TARGET_RULE "\n";
 
+static const char agent_glm_tools_prompt_edit_exact[] =
+    "- Use edit with exact old text and replacement new text; old must match exactly once.\n";
+
+static const char agent_glm_tools_prompt_edit_upto[] =
+    "- Use edit with exact old text and replacement new text; old may contain one [upto] marker between unique anchors.\n";
+
+static const char agent_bash_jobs_rule[] = "- For long bash jobs, pass refresh_sec and then poll with bash_status or stop with bash_stop.\n";
+
+static const char agent_glm_tools_prompt_final_tail[] =
+    "- Preserve the current system configuration unless the user explicitly asks otherwise.\n";
 
 static const char agent_glm_tool_schemas[] =
     "{\"type\":\"function\",\"function\":{\"name\":\"google_search\",\"description\":\"Search web pages.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"]}}}\n"
@@ -1370,20 +1427,23 @@ static size_t agent_schemas_for(char *out, size_t outlen, bool shell_allowed) {
     return o;
 }
 
-static char *agent_build_glm_tools_prompt(bool shell_allowed) {
+static char *agent_build_glm_tools_prompt(bool shell_allowed, bool edit_upto) {
     size_t a = strlen(agent_glm_tools_prompt_intro);
-    size_t h = strlen(agent_glm_after_schemas_head);
-    size_t t = strlen(agent_glm_after_schemas_tail);
     char schemas[16384];  /* agent_glm_tool_schemas is ~2.3 KB; ample headroom */
     size_t b = agent_schemas_for(schemas, sizeof(schemas), shell_allowed);
-    size_t d = shell_allowed ? strlen(agent_bash_jobs_rule) : 0;
-    char *out = xmalloc(a + b + h + d + t + 1);
+    size_t c = strlen(agent_glm_tools_prompt_after_schemas);
+    const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
+                                 : agent_glm_tools_prompt_edit_exact;
+    size_t d = strlen(edit);
+    size_t e = shell_allowed ? strlen(agent_bash_jobs_rule) : 0;
+    size_t f = strlen(agent_glm_tools_prompt_final_tail);
+    char *out = xmalloc(a + b + c + d + e + f + 1);
     memcpy(out, agent_glm_tools_prompt_intro, a);
     memcpy(out + a, schemas, b);
-    memcpy(out + a + b, agent_glm_after_schemas_head, h);
-    if (d) memcpy(out + a + b + h, agent_bash_jobs_rule, d);
-    memcpy(out + a + b + h + d, agent_glm_after_schemas_tail, t);
-    out[a + b + h + d + t] = '\0';
+    memcpy(out + a + b, agent_glm_tools_prompt_after_schemas, c);
+    memcpy(out + a + b + c, edit, d);
+    if (e) memcpy(out + a + b + c + d, agent_bash_jobs_rule, e);
+    memcpy(out + a + b + c + d + e, agent_glm_tools_prompt_final_tail, f + 1);
     return out;
 }
 
@@ -1396,7 +1456,7 @@ static const char agent_laguna_tools_prompt_intro[] =
     "All available function signatures are listed below:\n"
     "<available_tools>\n";
 
-static const char agent_laguna_after_schemas_head[] =
+static const char agent_laguna_tools_prompt_after_schemas[] =
     "</available_tools>\n\n"
     "For a function call, use exactly this format:\n"
     "<tool_call>{function-name}<arg_key>{argument-name}</arg_key>"
@@ -1407,36 +1467,99 @@ static const char agent_laguna_after_schemas_head[] =
     "- read path alone returns a context-sized bounded chunk, not the whole file; for first looks at large files, prefer max_lines around 80-160.\n"
     "- If read says more lines are available, call more with count=<lines> to read the next chunk.\n"
     "- Use whole=true only when the user explicitly asks for the complete file contents or when bounded chunks are insufficient; add raw=true only when line numbers would corrupt the payload.\n"
-    "- " AGENT_EDIT_TARGET_RULE "\n"
-    "- Use edit with exact old text and replacement new text; old may contain one [upto] marker between unique anchors.\n";
-static const char agent_laguna_after_schemas_tail[] =
-    "- Preserve the current system configuration unless the user explicitly asks otherwise.\n";
+    "- " AGENT_EDIT_TARGET_RULE "\n";
 
-
-static char *agent_build_laguna_tools_prompt(bool shell_allowed) {
+/*
+ * Laguna has its own intro and rules but shares GLM's schema block, tool-call
+ * syntax, edit rule and rules tail.  Composing it the same way GLM does keeps
+ * the edit rule *selected* rather than duplicated: Laguna's rules previously
+ * hard-coded the [upto] wording, so appending a second rule contradicted it
+ * whenever anchored edits were off and repeated it when they were on. The
+ * bash-family schema entries are still filtered by shell_allowed the same way
+ * GLM's are (D1/D11).
+ */
+static char *agent_build_laguna_tools_prompt(bool shell_allowed, bool edit_upto) {
     size_t a = strlen(agent_laguna_tools_prompt_intro);
-    size_t h = strlen(agent_laguna_after_schemas_head);
-    size_t t = strlen(agent_laguna_after_schemas_tail);
     char schemas[16384];
     size_t b = agent_schemas_for(schemas, sizeof(schemas), shell_allowed);
-    size_t d = shell_allowed ? strlen(agent_bash_jobs_rule) : 0;
-    char *out = xmalloc(a + b + h + d + t + 1);
+    size_t c = strlen(agent_laguna_tools_prompt_after_schemas);
+    const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
+                                 : agent_glm_tools_prompt_edit_exact;
+    size_t d = strlen(edit);
+    size_t e = shell_allowed ? strlen(agent_bash_jobs_rule) : 0;
+    size_t f = strlen(agent_glm_tools_prompt_final_tail);
+    char *out = xmalloc(a + b + c + d + e + f + 1);
     memcpy(out, agent_laguna_tools_prompt_intro, a);
     memcpy(out + a, schemas, b);
-    memcpy(out + a + b, agent_laguna_after_schemas_head, h);
-    if (d) memcpy(out + a + b + h, agent_bash_jobs_rule, d);
-    memcpy(out + a + b + h + d, agent_laguna_after_schemas_tail, t);
-    out[a + b + h + d + t] = '\0';
+    memcpy(out + a + b, agent_laguna_tools_prompt_after_schemas, c);
+    memcpy(out + a + b + c, edit, d);
+    if (e) memcpy(out + a + b + c + d, agent_bash_jobs_rule, e);
+    memcpy(out + a + b + c + d + e, agent_glm_tools_prompt_final_tail, f + 1);
     return out;
 }
 
-static char *agent_build_tools_prompt(ds4_engine *engine, bool shell_allowed) {
+/*
+ * Mellum's embedded chat template specifies Hermes-style tool calls: a JSON
+ * object with "name" and "arguments" inside <tool_call></tool_call>.  The
+ * wording below tracks that template so the model sees the framing it was
+ * trained on; the schema block and rules tail are shared with GLM because they
+ * are plain JSON schemas and syntax-independent advice, filtered by
+ * shell_allowed the same way (D1/D11).
+ */
+static const char agent_mellum_tools_prompt_intro[] =
+    "You are a coding agent running in a local workspace. Use tools for local file and system work. "
+    "Avoid printing large file contents or large code blocks as answers; create or edit files with tools, "
+    "then summarize results briefly.\n\n"
+    "# Tools\n\n"
+    "You may call one or more functions to assist with the user query.\n\n"
+    "You are provided with function signatures within <tools></tools> XML tags:\n"
+    "<tools>\n";
+
+static const char agent_mellum_tools_prompt_after_schemas[] =
+    "</tools>\n\n"
+    "For each function call, return a json object with function name and arguments "
+    "within <tool_call></tool_call> XML tags:\n"
+    "<tool_call>\n"
+    "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
+    "</tool_call>\n\n"
+    "Tool calls are not allowed inside <think></think>; finish thinking before emitting <tool_call>.\n\n"
+    "# Rules\n\n"
+    "- Emit one JSON object per <tool_call>; put every argument inside \"arguments\".\n"
+    "- Argument values are JSON, so newlines inside file contents must be escaped as \\n.\n"
+    "- read path alone returns a context-sized bounded chunk, not the whole file; for first looks at large files, prefer max_lines around 80-160.\n"
+    "- If read says more lines are available, call more with count=<lines> to read the next chunk.\n"
+    "- Use whole=true only when the user explicitly asks for the complete file contents or when bounded chunks are insufficient; add raw=true only when line numbers would corrupt the payload.\n"
+    "- " AGENT_EDIT_TARGET_RULE "\n";
+
+static char *agent_build_mellum_tools_prompt(bool shell_allowed, bool edit_upto) {
+    size_t a = strlen(agent_mellum_tools_prompt_intro);
+    char schemas[16384];
+    size_t b = agent_schemas_for(schemas, sizeof(schemas), shell_allowed);
+    size_t c = strlen(agent_mellum_tools_prompt_after_schemas);
+    const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
+                                 : agent_glm_tools_prompt_edit_exact;
+    size_t d = strlen(edit);
+    size_t e = shell_allowed ? strlen(agent_bash_jobs_rule) : 0;
+    size_t f = strlen(agent_glm_tools_prompt_final_tail);
+    char *out = xmalloc(a + b + c + d + e + f + 1);
+    memcpy(out, agent_mellum_tools_prompt_intro, a);
+    memcpy(out + a, schemas, b);
+    memcpy(out + a + b, agent_mellum_tools_prompt_after_schemas, c);
+    memcpy(out + a + b + c, edit, d);
+    if (e) memcpy(out + a + b + c + d, agent_bash_jobs_rule, e);
+    memcpy(out + a + b + c + d + e, agent_glm_tools_prompt_final_tail, f + 1);
+    return out;
+}
+
+static char *agent_build_tools_prompt(ds4_engine *engine, bool shell_allowed, bool edit_upto) {
     agent_tool_syntax syntax = agent_tool_syntax_for_engine(engine);
     if (syntax == AGENT_TOOL_SYNTAX_GLM)
-        return agent_build_glm_tools_prompt(shell_allowed);
+        return agent_build_glm_tools_prompt(shell_allowed, edit_upto);
     if (syntax == AGENT_TOOL_SYNTAX_LAGUNA)
-        return agent_build_laguna_tools_prompt(shell_allowed);
-    return agent_build_dsml_tools_prompt();
+        return agent_build_laguna_tools_prompt(shell_allowed, edit_upto);
+    if (syntax == AGENT_TOOL_SYNTAX_MELLUM)
+        return agent_build_mellum_tools_prompt(shell_allowed, edit_upto);
+    return agent_build_dsml_tools_prompt(edit_upto);
 }
 
 static const char agent_dsml_syntax_reminder[] =
@@ -1457,15 +1580,30 @@ static const char agent_laguna_syntax_reminder[] =
     "<tool_call>$TOOL_NAME<arg_key>$PARAMETER_NAME</arg_key>"
     "<arg_value>$PARAMETER_VALUE</arg_value></tool_call>\n";
 
+/* Not GLM's <arg_key>/<arg_value> encoding.  A malformed Mellum call was
+ * observed being told to retry in GLM's syntax -- is_tagged covers both, and
+ * the caller used it as a stand-in for "is GLM" -- which the JSON parser then
+ * correctly rejected, burning the retry budget on a host bug rather than a
+ * model mistake. */
+static const char agent_mellum_syntax_reminder[] =
+    "Tool-call syntax reminder: JSON inside <tool_call> tags, not "
+    "<arg_key>/<arg_value>.\n"
+    "<tool_call>\n"
+    "{\"name\": \"$TOOL_NAME\", \"arguments\": {\"$PARAMETER_NAME\": \"$PARAMETER_VALUE\"}}\n"
+    "</tool_call>\n";
+
 static const char *agent_tagged_syntax_reminder(agent_tool_syntax syntax) {
+    if (syntax == AGENT_TOOL_SYNTAX_MELLUM) return agent_mellum_syntax_reminder;
     return syntax == AGENT_TOOL_SYNTAX_LAGUNA ?
         agent_laguna_syntax_reminder : agent_glm_syntax_reminder;
 }
 
 #define AGENT_SYSTEM_PROMPT_REMINDER_TOKENS 50000
 
-static char *agent_build_system_prompt_reminder(ds4_engine *engine, bool shell_allowed) {
-    char *tools = agent_build_tools_prompt(engine, shell_allowed);
+static char *agent_build_system_prompt_reminder(ds4_engine *engine,
+                                                bool shell_allowed,
+                                                bool edit_upto) {
+    char *tools = agent_build_tools_prompt(engine, shell_allowed, edit_upto);
     const char *start = "\n\n[System prompt reminder follows.]\n";
     const char *end = "[End system prompt reminder.]\n\n";
     const size_t len = strlen(start) + strlen(tools) + strlen(end) + 1;
@@ -1476,13 +1614,14 @@ static char *agent_build_system_prompt_reminder(ds4_engine *engine, bool shell_a
 }
 
 static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
-                                       const char *extra, bool shell_allowed) {
+                                       const char *extra, bool shell_allowed,
+                                       bool edit_upto) {
     /* The built-in tool prompt is trusted DS4 control text.  Tokenize it like a
      * rendered chat prompt so the literal ｜DSML｜ markers in the examples become
      * the model's dedicated DSML token.  Do not apply that tokenizer to user
      * supplied -sys text: arbitrary user text containing <｜User｜>, <think>, or
      * ｜DSML｜ must remain plain content, not control tokens. */
-    char *tools_prompt = agent_build_tools_prompt(engine, shell_allowed);
+    char *tools_prompt = agent_build_tools_prompt(engine, shell_allowed, edit_upto);
     if (agent_tool_syntax_is_tagged(agent_tool_syntax_for_engine(engine)))
         ds4_chat_append_message(engine, tokens, "system", tools_prompt);
     else
@@ -1497,7 +1636,6 @@ static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
     ds4_chat_append_message(engine, tokens, "system", plain);
     free(plain);
 }
-
 static void agent_worker_note_system_prompt_seen(agent_worker *w) {
     w->last_system_prompt_reminder_at = w->transcript.len;
 }
@@ -1532,7 +1670,9 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
         return;
     }
 
-    char *reminder = agent_build_system_prompt_reminder(w->engine, w->cfg->shell_allowed);
+    char *reminder = agent_build_system_prompt_reminder(w->engine,
+                                                        w->cfg->shell_allowed,
+                                                        w->cfg->edit_upto);
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
@@ -2119,6 +2259,37 @@ static void agent_glm_tool_parse(agent_dsml_parser *p) {
 static void agent_dsml_finish(agent_dsml_parser *p) {
     if (!p || p->state == AGENT_DSML_DONE || p->state == AGENT_DSML_ERROR)
         return;
+
+    /* A bare object recovered without an opener often never gets a closing tag
+     * either, so nothing terminates it mid-stream.  At end of turn the buffer
+     * is final: if what remains is exactly one complete JSON object naming a
+     * registered tool, take it.  Anything less stays incomplete and the worker
+     * turns it into a retry. */
+    if (p->syntax == AGENT_TOOL_SYNTAX_MELLUM &&
+        p->state == AGENT_DSML_STRUCTURAL && !p->glm_after_call &&
+        p->parse_pos < p->raw_len)
+    {
+        const char *raw = p->raw;
+        const char *end = raw + p->raw_len;
+        const char *cur = agent_json_skip_ws(raw + p->parse_pos, end);
+        if (cur < end && *cur == '{') {
+            const char *scan = cur;
+            const char *val = NULL; size_t val_len = 0;
+            if (agent_json_scan_value(&scan, end, &val, &val_len) &&
+                agent_json_skip_ws(scan, end) == end &&
+                agent_mellum_parse_call_json(p, cur, scan) &&
+                agent_mellum_tool_name_is_registered(p->current.name))
+            {
+                agent_tool_calls_push(&p->calls, &p->current);
+                memset(&p->current, 0, sizeof(p->current));
+                p->parse_pos = (size_t)(scan - raw);
+                p->state = AGENT_DSML_DONE;
+                return;
+            }
+            agent_tool_call_free(&p->current);
+            memset(&p->current, 0, sizeof(p->current));
+        }
+    }
     if (!agent_tool_syntax_is_tagged(p->syntax) || !p->glm_after_call)
         return;
 
@@ -2132,11 +2303,347 @@ static void agent_dsml_finish(agent_dsml_parser *p) {
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Mellum tool calls: Hermes-style JSON inside <tool_call> tags.
+ *
+ * Unlike the GLM/Laguna tag grammar there is nothing useful to do with a
+ * partial payload -- a half-read JSON object cannot be executed -- so this
+ * waits for a complete </tool_call> and then parses in one pass.  That keeps
+ * the JSON reader ordinary rather than resumable, at the cost of buffering one
+ * call, which the parser already does anyway.
+ * ------------------------------------------------------------------------ */
+
+static const char *agent_json_skip_ws(const char *s, const char *end) {
+    while (s < end && (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')) s++;
+    return s;
+}
+
+static void agent_json_put_utf8(char **out, uint32_t cp) {
+    char *o = *out;
+    if (cp < 0x80) { *o++ = (char)cp; }
+    else if (cp < 0x800) {
+        *o++ = (char)(0xC0 | (cp >> 6)); *o++ = (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        *o++ = (char)(0xE0 | (cp >> 12));
+        *o++ = (char)(0x80 | ((cp >> 6) & 0x3F));
+        *o++ = (char)(0x80 | (cp & 0x3F));
+    } else {
+        *o++ = (char)(0xF0 | (cp >> 18));
+        *o++ = (char)(0x80 | ((cp >> 12) & 0x3F));
+        *o++ = (char)(0x80 | ((cp >> 6) & 0x3F));
+        *o++ = (char)(0x80 | (cp & 0x3F));
+    }
+    *out = o;
+}
+
+static bool agent_json_hex4(const char *s, uint32_t *out) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = s[i];
+        v <<= 4;
+        if (c >= '0' && c <= '9') v |= (uint32_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') v |= (uint32_t)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v |= (uint32_t)(c - 'A' + 10);
+        else return false;
+    }
+    *out = v;
+    return true;
+}
+
+/* Reads a JSON string at *sp (which must point at the opening quote) and
+ * returns the unescaped bytes.  Caller frees *out. */
+static bool agent_json_read_string(const char **sp, const char *end,
+                                   char **out, size_t *out_len) {
+    const char *s = *sp;
+    if (s >= end || *s != '"') return false;
+    s++;
+    /* Unescaping never grows the text, so the raw span bounds the result. */
+    char *buf = xmalloc((size_t)(end - s) + 4);
+    char *o = buf;
+    while (s < end && *s != '"') {
+        if (*s != '\\') { *o++ = *s++; continue; }
+        s++;
+        if (s >= end) { free(buf); return false; }
+        switch (*s) {
+        case '"': *o++ = '"'; s++; break;
+        case '\\': *o++ = '\\'; s++; break;
+        case '/': *o++ = '/'; s++; break;
+        case 'b': *o++ = '\b'; s++; break;
+        case 'f': *o++ = '\f'; s++; break;
+        case 'n': *o++ = '\n'; s++; break;
+        case 'r': *o++ = '\r'; s++; break;
+        case 't': *o++ = '\t'; s++; break;
+        case 'u': {
+            uint32_t cp = 0;
+            if (s + 5 > end || !agent_json_hex4(s + 1, &cp)) { free(buf); return false; }
+            s += 5;
+            if (cp >= 0xD800 && cp <= 0xDBFF && s + 6 <= end &&
+                s[0] == '\\' && s[1] == 'u') {
+                uint32_t lo = 0;
+                if (agent_json_hex4(s + 2, &lo) && lo >= 0xDC00 && lo <= 0xDFFF) {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    s += 6;
+                }
+            }
+            agent_json_put_utf8(&o, cp);
+            break;
+        }
+        default: free(buf); return false;
+        }
+    }
+    if (s >= end) { free(buf); return false; }
+    *sp = s + 1;
+    *out = buf;
+    *out_len = (size_t)(o - buf);
+    return true;
+}
+
+/* Advances past any JSON value, returning its raw span.  Used for argument
+ * values that are not strings: numbers, booleans, null, and nested
+ * objects/arrays are handed to the tool as their JSON text. */
+static bool agent_json_scan_value(const char **sp, const char *end,
+                                  const char **val, size_t *val_len) {
+    const char *s = agent_json_skip_ws(*sp, end);
+    if (s >= end) return false;
+    *val = s;
+    if (*s == '"') {
+        char *tmp = NULL; size_t tmp_len = 0;
+        if (!agent_json_read_string(&s, end, &tmp, &tmp_len)) return false;
+        free(tmp);
+    } else if (*s == '{' || *s == '[') {
+        int depth = 0;
+        bool in_str = false;
+        while (s < end) {
+            char c = *s;
+            if (in_str) {
+                if (c == '\\') { s += 2; continue; }
+                if (c == '"') in_str = false;
+            } else if (c == '"') in_str = true;
+            else if (c == '{' || c == '[') depth++;
+            else if (c == '}' || c == ']') { depth--; if (depth == 0) { s++; break; } }
+            s++;
+        }
+        if (depth != 0) return false;
+    } else {
+        while (s < end && *s != ',' && *s != '}' && *s != ' ' && *s != '\t' &&
+               *s != '\r' && *s != '\n')
+            s++;
+    }
+    *val_len = (size_t)(s - *val);
+    /* No JSON value is zero-length.  Without this, `{"k": }` scans an empty
+     * span, reports success, and the malformed call reaches the tool as an
+     * empty argument instead of a retryable parse error. */
+    if (*val_len == 0) return false;
+    *sp = s;
+    return true;
+}
+
+/* Parses {"name": "...", "arguments": {...}} into p->current. */
+static bool agent_mellum_parse_call_json(agent_dsml_parser *p,
+                                         const char *s, const char *end) {
+    s = agent_json_skip_ws(s, end);
+    if (s >= end || *s != '{') return false;
+    s++;
+    bool have_name = false;
+    for (;;) {
+        s = agent_json_skip_ws(s, end);
+        if (s < end && *s == '}') { s++; break; }
+        char *key = NULL; size_t key_len = 0;
+        if (!agent_json_read_string(&s, end, &key, &key_len)) return false;
+        s = agent_json_skip_ws(s, end);
+        if (s >= end || *s != ':') { free(key); return false; }
+        s++;
+        if (key_len == 4 && memcmp(key, "name", 4) == 0) {
+            char *name = NULL; size_t name_len = 0;
+            s = agent_json_skip_ws(s, end);
+            if (!agent_json_read_string(&s, end, &name, &name_len)) { free(key); return false; }
+            /* Replace only the name.  agent_tool_call_free would also drop the
+             * argument vector, which silently emptied every call that put
+             * "arguments" before "name" -- a legal JSON ordering the model
+             * does use. */
+            free(p->current.name);
+            p->current.name = xstrndup(name, name_len);
+            free(name);
+            have_name = true;
+        } else if (key_len == 9 && memcmp(key, "arguments", 9) == 0) {
+            s = agent_json_skip_ws(s, end);
+            if (s >= end || *s != '{') { free(key); return false; }
+            s++;
+            for (;;) {
+                s = agent_json_skip_ws(s, end);
+                if (s < end && *s == '}') { s++; break; }
+                char *ak = NULL; size_t ak_len = 0;
+                if (!agent_json_read_string(&s, end, &ak, &ak_len)) { free(key); return false; }
+                s = agent_json_skip_ws(s, end);
+                if (s >= end || *s != ':') { free(ak); free(key); return false; }
+                s++;
+                s = agent_json_skip_ws(s, end);
+                if (s < end && *s == '"') {
+                    char *av = NULL; size_t av_len = 0;
+                    if (!agent_json_read_string(&s, end, &av, &av_len)) {
+                        free(ak); free(key); return false;
+                    }
+                    agent_tool_call_add_arg(&p->current, ak, av, av_len, true);
+                    free(av);
+                } else {
+                    const char *rv = NULL; size_t rv_len = 0;
+                    if (!agent_json_scan_value(&s, end, &rv, &rv_len)) {
+                        free(ak); free(key); return false;
+                    }
+                    agent_tool_call_add_arg(&p->current, ak, rv, rv_len, false);
+                }
+                free(ak);
+                s = agent_json_skip_ws(s, end);
+                if (s < end && *s == ',') { s++; continue; }
+            }
+        } else {
+            const char *rv = NULL; size_t rv_len = 0;
+            if (!agent_json_scan_value(&s, end, &rv, &rv_len)) { free(key); return false; }
+        }
+        free(key);
+        s = agent_json_skip_ws(s, end);
+        if (s < end && *s == ',') { s++; continue; }
+    }
+    return have_name;
+}
+
+/* Recovery executes a call the model framed wrongly, so it must be a call we
+ * can actually run.  An unrecognised name means we misread the output, not
+ * that the model invented a tool -- fail it to a retry rather than dispatch. */
+static bool agent_mellum_tool_name_is_registered(const char *name) {
+    static const char *const known[] = {
+        "bash", "bash_status", "bash_stop", "read", "more", "write",
+        "edit", "search", "list", "google_search", "visit_page",
+    };
+    if (!name || !name[0]) return false;
+    for (size_t i = 0; i < sizeof(known)/sizeof(known[0]); i++)
+        if (!strcmp(name, known[i])) return true;
+    return false;
+}
+
+static void agent_mellum_tool_parse(agent_dsml_parser *p) {
+    static const char start[] = "<tool_call>";
+    static const char close[] = "</tool_call>";
+
+    if (p->raw_len < sizeof(start) - 1 ||
+        memcmp(p->raw, start, sizeof(start) - 1) != 0) {
+        return;
+    }
+    if (p->parse_pos == 0) p->parse_pos = sizeof(start) - 1;
+
+    while (p->state == AGENT_DSML_STRUCTURAL) {
+        const char *raw = p->raw;
+        const char *end = raw + p->raw_len;
+        while (p->parse_pos < p->raw_len &&
+               (raw[p->parse_pos] == ' ' || raw[p->parse_pos] == '\t' ||
+                raw[p->parse_pos] == '\r' || raw[p->parse_pos] == '\n'))
+            p->parse_pos++;
+        const char *cur = raw + p->parse_pos;
+
+        if (p->glm_after_call) {
+            if (agent_bytes_starts_with(cur, end, start)) {
+                p->parse_pos += sizeof(start) - 1;
+                p->glm_after_call = false;
+                continue;
+            }
+            if (agent_bytes_partial_prefix_at(cur, end, start)) return;
+            p->glm_after_call = false;
+            p->state = AGENT_DSML_DONE;
+            return;
+        }
+
+        /* The detector seeds a canonical <tool_call> even when the model used
+         * <tools> or omitted the opener, so the close it eventually writes may
+         * not match.  Accept either, taking whichever arrives first. */
+        static const char close_alt[] = "</tools>";
+        const char *e1 = strstr(cur, close);
+        const char *e2 = strstr(cur, close_alt);
+        const char *call_end = (!e1 || (e2 && e2 < e1)) ? e2 : e1;
+        size_t close_len = (call_end == e2 && e2) ? sizeof(close_alt) - 1
+                                                  : sizeof(close) - 1;
+        if (!call_end) return;  /* wait for the rest of the call */
+        if (!agent_mellum_parse_call_json(p, cur, call_end)) {
+            agent_dsml_set_error(p, "malformed JSON in Mellum tool call");
+            return;
+        }
+        if (!agent_mellum_tool_name_is_registered(p->current.name)) {
+            agent_dsml_set_error(p, "Mellum tool call names an unknown tool");
+            return;
+        }
+        agent_tool_calls_push(&p->calls, &p->current);
+        memset(&p->current, 0, sizeof(p->current));
+        p->parse_pos = (size_t)(call_end - raw) + close_len;
+        p->glm_after_call = true;
+    }
+}
+
 /* Parse as much of the accumulated DSML buffer as possible.  The parser can be
  * called after every streamed byte: incomplete input leaves state unchanged
  * until enough bytes arrive, while malformed completed input switches to
  * AGENT_DSML_ERROR so the model gets a retryable tool error. */
+/* A tool call that never terminates is not a big call, it is a runaway.  One
+ * observed Mellum turn began a legitimate write of templates/base.html,
+ * invented Bootstrap SRI hashes, degenerated into repeated tokens, ran to
+ * roughly 26K output tokens without closing the call, and only stopped when
+ * context compaction failed -- losing the whole attempt including work already
+ * completed in earlier rounds.
+ *
+ * Capping the buffer converts that into an ordinary retryable tool error while
+ * the workspace and the earlier rounds survive.  The limit is generous: real
+ * file writes are large, and the failure mode being caught is unbounded, not
+ * merely big. */
+static size_t agent_tool_call_max_bytes(void) {
+    const char *v = getenv("DS4_AGENT_TOOL_CALL_MAX_BYTES");
+    if (v && v[0]) {
+        long n = atol(v);
+        if (n >= 4096) return (size_t)n;
+    }
+    return 65536;
+}
+
+/* Degeneration usually shows up as one short span repeating.  Checking only
+ * the tail keeps this O(1) per byte and catches the repeated-token case well
+ * before the size cap does. */
+static bool agent_dsml_tail_is_degenerate(const agent_dsml_parser *p) {
+    const size_t len = p->raw_len;
+    if (len < 512) return false;
+    for (size_t unit = 1; unit <= 16; unit++) {
+        /* 24 repeats is decisive for a multi-byte unit, but for a short one it
+         * fires on ordinary file content: 24 identical bytes is a markdown rule,
+         * an RST underline, a "====" banner, or a run of padding.  Requiring the
+         * repeated span to also reach 64 bytes keeps those legitimate -- a
+         * 30-dash rule survives -- while still stopping real degeneration within
+         * 64 bytes of onset, against a runaway that reached ~26K tokens. */
+        size_t repeats = (64 + unit - 1) / unit;
+        if (repeats < 24) repeats = 24;
+        const size_t span = unit * repeats;
+        if (len < span) break;
+        const char *tail = p->raw + len - span;
+        bool same = true;
+        for (size_t i = unit; i < span && same; i++)
+            if (tail[i] != tail[i % unit]) same = false;
+        if (same) return true;
+    }
+    return false;
+}
+
 static void agent_dsml_parse(agent_dsml_parser *p) {
+    if (p->state == AGENT_DSML_STRUCTURAL || p->state == AGENT_DSML_PARAM_VALUE) {
+        if (p->raw_len > agent_tool_call_max_bytes()) {
+            agent_dsml_set_error(p, "tool call exceeded the maximum size; "
+                                    "write smaller chunks");
+            return;
+        }
+        if (agent_dsml_tail_is_degenerate(p)) {
+            agent_dsml_set_error(p, "tool call degenerated into repeated "
+                                    "output and was stopped");
+            return;
+        }
+    }
+    if (p->syntax == AGENT_TOOL_SYNTAX_MELLUM) {
+        agent_mellum_tool_parse(p);
+        return;
+    }
     if (agent_tool_syntax_is_tagged(p->syntax)) {
         agent_glm_tool_parse(p);
         return;
@@ -4372,12 +4879,25 @@ static bool agent_stream_dsml_start_match(agent_tool_syntax syntax,
                                           bool *implicit_invoke) {
     if (agent_tool_syntax_is_tagged(syntax)) {
         static const char glm_call[] = "<tool_call>";
-        size_t form_len = sizeof(glm_call) - 1;
         *complete = false;
         *implicit_invoke = false;
+        size_t form_len = sizeof(glm_call) - 1;
         if (len <= form_len && memcmp(glm_call, tail, len) == 0) {
             *complete = len == form_len;
             return true;
+        }
+        /* Mellum reliably decides to call a tool but is unreliable about the
+         * wrapper: observed variants include <tools>{...}</tools> and a bare
+         * object.  Accept the wrapper here and seed the canonical opener, the
+         * same trick the DSML detector uses for its missing-bar typo, so the
+         * parser downstream stays strict. */
+        if (syntax == AGENT_TOOL_SYNTAX_MELLUM) {
+            static const char tools_open[] = "<tools>";
+            size_t alt_len = sizeof(tools_open) - 1;
+            if (len <= alt_len && memcmp(tools_open, tail, len) == 0) {
+                *complete = len == alt_len;
+                return true;
+            }
         }
         return false;
     }
@@ -4480,7 +5000,29 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
         return;
     }
 
+    /* Missing opener: Mellum sometimes emits the JSON object with no
+     * <tool_call> in front, occasionally closing with </tool_call> anyway.
+     * Recover only when the brace opens the whole response -- a brace in the
+     * middle of prose is prose.  agent_dsml_start seeds the canonical opener,
+     * so the parser never sees the irregular form. */
+    if (sr->syntax == AGENT_TOOL_SYNTAX_MELLUM && !sr->dsml_active &&
+        !sr->dsml_start_len && !sr->saw_visible_output && !sr->in_think &&
+        c == '{')
+    {
+        agent_trace(sr->renderer->worker, "mellum tool recovered_missing_open");
+        agent_stream_start_dsml(sr, sr->in_think);
+        agent_stream_feed_dsml_byte(sr, c);
+        return;
+    }
+    const bool was_visible = sr->saw_visible_output;
+    if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
+        sr->saw_visible_output = true;
+
     if (sr->dsml_start_len || c == start[0]) {
+        /* Capture the state from *before* this byte: the '<' opening the
+         * candidate has already set saw_visible_output above. */
+        if (!sr->dsml_start_len)
+            sr->start_tail_after_prose = was_visible;
         if (sr->dsml_start_len < sizeof(sr->dsml_start_tail))
             sr->dsml_start_tail[sr->dsml_start_len++] = c;
         bool complete = false, implicit_invoke = false;
@@ -4495,6 +5037,20 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
                  * strict and simple.  Also accept a direct invoke opener as an
                  * implicit tool_calls block; the model often knows it wants a
                  * tool but forgets the outer wrapper. */
+                /* <tools> is recovery, not canonical syntax, so it carries
+                 * the same whole-response condition as a missing opener: a
+                 * wrapper appearing after prose is prose. <tool_call> is 11
+                 * bytes, <tools> is 7. */
+                bool wrong_wrapper = sr->syntax == AGENT_TOOL_SYNTAX_MELLUM &&
+                                     sr->dsml_start_len == 7;
+                if (wrong_wrapper && sr->start_tail_after_prose) {
+                    agent_stream_flush_start_tail(sr);
+                    return;
+                }
+                if (wrong_wrapper) {
+                    agent_trace(sr->renderer->worker,
+                                "mellum tool recovered_wrong_wrapper");
+                }
                 agent_stream_start_dsml(sr, sr->in_think);
                 if (sr->syntax == AGENT_TOOL_SYNTAX_DSML && implicit_invoke) {
                     for (size_t i = 0; i < sizeof(canonical_invoke) - 1; i++)
@@ -4574,6 +5130,12 @@ static void agent_stream_text(agent_stream_renderer *sr, const char *text, size_
             renderer_write(sr->renderer, "\n", 1);
             sr->renderer->last_output_newline = true;
             sr->post_think_gap = true;
+            /* The answer starts here.  Recovery is gated on the call being the
+             * whole response, and for a thinking model "the response" is what
+             * follows </think> -- otherwise reasoning text disqualifies every
+             * call the model then emits without a wrapper, which is exactly
+             * the case observed in the canary. */
+            sr->saw_visible_output = false;
             i += strlen(think_close);
             continue;
         }
@@ -5308,8 +5870,29 @@ static char *agent_session_title_from_text(const char *text, size_t text_len,
  *
  * The DS4 payload stores the exact token sequence and graph state.  The rendered
  * text is retained for listing, history rendering, and stripped-session rebuilds. */
+
+/* Bytes from the current position to EOF, restoring the position. Returns false
+ * if the stream is not seekable. Used to cap a file-declared length before
+ * allocating, so a tiny cache file can't drive a multi-GB xmalloc. */
+static bool agent_fp_remaining(FILE *fp, uint64_t *out) {
+    off_t pos = ftello(fp);
+    if (pos < 0 || fseeko(fp, 0, SEEK_END) != 0) return false;
+    off_t end = ftello(fp);
+    if (end < 0 || fseeko(fp, pos, SEEK_SET) != 0) return false;
+    *out = end > pos ? (uint64_t)(end - pos) : 0;
+    return true;
+}
+
 static bool agent_kv_read_text(FILE *fp, uint32_t text_bytes,
                                char **text_out, char *err, size_t err_len) {
+    /* text_bytes is read from the on-disk header; cap it against the bytes
+     * actually left in the file before allocating, so a 1-byte file declaring
+     * text_bytes = 0xFFFFFFFF can't request ~4 GiB. */
+    uint64_t remaining = 0;
+    if (!agent_fp_remaining(fp, &remaining) || text_bytes > remaining) {
+        if (err && err_len) snprintf(err, err_len, "truncated cached text");
+        return false;
+    }
     char *text = xmalloc((size_t)text_bytes + 1);
     if (fread(text, 1, text_bytes, fp) != text_bytes) {
         if (err && err_len) snprintf(err, err_len, "truncated cached text");
@@ -5359,6 +5942,14 @@ static bool agent_kv_read_title_trailer(FILE *fp, const ds4_kvstore_entry *hdr,
         return false;
     }
     uint32_t title_bytes = ds4_kvstore_le_get32(tb);
+    /* Same cap as agent_kv_read_text: reject a title length larger than the
+     * bytes left in the file before allocating. */
+    uint64_t title_remaining = 0;
+    if (!agent_fp_remaining(fp, &title_remaining) || title_bytes > title_remaining) {
+        if (err && err_len) snprintf(err, err_len, "truncated agent session title trailer");
+        fseeko(fp, payload_pos, SEEK_SET);
+        return false;
+    }
     char *title = xmalloc((size_t)title_bytes + 1);
     if (fread(title, 1, title_bytes, fp) != title_bytes) {
         if (err && err_len) snprintf(err, err_len, "truncated agent session title trailer");
@@ -5505,8 +6096,9 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         snprintf(err, err_len, "live KV state does not match session transcript");
         return false;
     }
+    const bool save_payload = ds4_session_supports_payload(w->session);
     const int quant_bits = ds4_engine_routed_quant_bits(w->engine);
-    if (quant_bits != 2 && quant_bits != 4) {
+    if (save_payload && quant_bits != 2 && quant_bits != 4) {
         snprintf(err, err_len, "unsupported routed quantization for KV save");
         return false;
     }
@@ -5536,14 +6128,15 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
 
     ds4_session_payload_file staged = {0};
     char save_err[160] = {0};
-    if (ds4_session_stage_payload(w->session, &staged,
+    if (save_payload &&
+        ds4_session_stage_payload(w->session, &staged,
                                   save_err, sizeof(save_err)) != 0) {
         snprintf(err, err_len, "%s",
                  save_err[0] ? save_err : "session has no valid KV payload");
         free(text);
         return false;
     }
-    uint64_t payload_bytes = staged.bytes;
+    uint64_t payload_bytes = save_payload ? staged.bytes : 0;
 
     agent_buf tmpl = {0};
     agent_buf_puts(&tmpl, path);
@@ -5583,8 +6176,9 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_write_staged_payload(&staged, fp,
-                                               save_err, sizeof(save_err)) == 0 &&
+              (!save_payload ||
+               ds4_session_write_staged_payload(&staged, fp,
+                                                save_err, sizeof(save_err)) == 0) &&
               (!session_identity ||
                agent_kv_write_title_trailer(fp, session_title,
                                             save_err, sizeof(save_err))) &&
@@ -5622,7 +6216,8 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
                think_mode == DS4_THINK_MAX) {
         ds4_chat_append_max_effort_prefix(w->engine, out);
     }
-    agent_append_system_prompt(w->engine, out, w->cfg->gen.system, w->cfg->shell_allowed);
+    agent_append_system_prompt(w->engine, out, w->cfg->gen.system,
+                               w->cfg->shell_allowed, w->cfg->edit_upto);
 }
 
 static void agent_publish_system_status(agent_worker *w, const char *msg) {
@@ -7822,7 +8417,8 @@ static bool agent_edit_upto_forcer_should_replace(agent_edit_upto_forcer *forcer
 }
 
 static bool agent_edit_find_old_span(const char *data, size_t len,
-                                     const char *old, const char **match,
+                                     const char *old, bool allow_upto,
+                                     const char **match,
                                      size_t *match_len, bool *anchored,
                                      char *err, size_t err_len) {
     static const char marker[] = "[upto]";
@@ -7835,6 +8431,11 @@ static bool agent_edit_find_old_span(const char *data, size_t len,
             return false;
         *match_len = old_len;
         return true;
+    }
+    if (!allow_upto) {
+        snprintf(err, err_len,
+                 "[upto] edits are disabled; restart with --edit-upto to enable them");
+        return false;
     }
     if (strstr(upto + strlen(marker), marker)) {
         snprintf(err, err_len, "old text contains more than one [upto] marker");
@@ -7952,7 +8553,12 @@ static void test_agent_edit_upto_tail_newline_is_not_part_of_anchor(void) {
     size_t match_len = 0;
     bool anchored = false;
     char err[128] = {0};
-    AGENT_TEST_ASSERT(agent_edit_find_old_span(data, strlen(data), old,
+    AGENT_TEST_ASSERT(!agent_edit_find_old_span(data, strlen(data), old, false,
+                                               &match, &match_len, &anchored,
+                                               err, sizeof(err)));
+    AGENT_TEST_ASSERT(strstr(err, "--edit-upto") != NULL);
+    err[0] = '\0';
+    AGENT_TEST_ASSERT(agent_edit_find_old_span(data, strlen(data), old, true,
                                               &match, &match_len, &anchored,
                                               err, sizeof(err)));
     AGENT_TEST_ASSERT(anchored);
@@ -7968,7 +8574,7 @@ static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
     bool anchored = false;
     char err[128] = {0};
 
-    AGENT_TEST_ASSERT(!agent_edit_find_old_span(data, strlen(data), old,
+    AGENT_TEST_ASSERT(!agent_edit_find_old_span(data, strlen(data), old, true,
                                                &match, &match_len, &anchored,
                                                err, sizeof(err)));
     AGENT_TEST_ASSERT(strstr(err, "must include a unique tail anchor") != NULL);
@@ -8140,6 +8746,282 @@ static void test_agent_glm_stream_tool_call_chunked(void) {
     AGENT_TEST_ASSERT(strstr(out, "<arg_key>") == NULL);
     AGENT_TEST_ASSERT(strstr(out, "</arg_value>") == NULL);
 
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_stream_tool_call_chunked(void) {
+    /* Split mid-tag and mid-JSON: the parser must hold until </tool_call>. */
+    const char *chunks[] = {
+        "intro ",
+        "<to",
+        "ol_call>\n{\"name\": \"bash\", \"argum",
+        "ents\": {\"command\": \"printf hi\", \"refresh_sec\": 1}}\n</tool_call>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(p.calls.v[0].name && !strcmp(p.calls.v[0].name, "bash"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "command"), "printf hi"));
+    /* Non-string arguments arrive as their JSON text. */
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "refresh_sec"), "1"));
+    AGENT_TEST_ASSERT(strstr(out, "intro ") != NULL);
+    AGENT_TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_stream_tool_call_escapes(void) {
+    /* The residual risk with Hermes JSON is multi-line file payloads, which
+     * must arrive as \n escapes and come back out as real newlines. */
+    const char *chunks[] = {
+        "<tool_call>\n{\"name\": \"write\", \"arguments\": {\"path\": \"app.py\", ",
+        "\"content\": \"line1\\nline2\\t\\\"q\\\"\\n\"}}\n</tool_call>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "path"), "app.py"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "content"),
+                              "line1\nline2\t\"q\"\n"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_stream_two_calls(void) {
+    const char *chunks[] = {
+        "<tool_call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"a\"}}\n</tool_call>\n",
+        "<tool_call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"b\"}}\n</tool_call>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 2);
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "path"), "a"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[1], "path"), "b"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_stream_malformed_json(void) {
+    /* A completed but malformed call must become a retryable tool error, not
+     * a call whose name is the whole payload -- which is what the GLM parser
+     * would have produced from JSON. */
+    const char *chunks[] = {
+        "<tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": }}\n</tool_call>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_ERROR);
+    AGENT_TEST_ASSERT(p.calls.len == 0);
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_args_before_name(void) {
+    /* Legal JSON ordering the model actually produces.  This emptied the
+     * argument vector before the name handler stopped freeing the call. */
+    const char *chunks[] = {
+        "<tool_call>\n{\"arguments\": {\"path\": \"Makefile\"}, \"name\": \"read\"}\n</tool_call>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "read"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "path"), "Makefile"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_recovers_wrong_wrapper(void) {
+    const char *chunks[] = {
+        "<tools>{\"name\": \"read\", \"arguments\": {\"path\": \"Makefile\"}}</tools>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "read"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "path"), "Makefile"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_recovers_missing_open(void) {
+    const char *chunks[] = {
+        "{\"name\": \"read\", \"arguments\": {\"path\": \"Makefile\"}}\n</tool_call>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "read"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_prose_brace_is_not_a_call(void) {
+    /* The guard: recovery is for a response that IS the call.  A brace after
+     * prose must stay prose, or ordinary output containing JSON gets eaten. */
+    const char *chunks[] = {
+        "Here is the config: {\"name\": \"read\", \"arguments\": {\"path\": \"x\"}}\n",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 0);
+    AGENT_TEST_ASSERT(strstr(out, "Here is the config") != NULL);
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_runaway_is_stopped(void) {
+    /* Degeneration inside a legitimate write must become a retryable error,
+     * not run until context compaction fails and loses the whole attempt. */
+    static char big[9000];
+    size_t n = 0;
+    n += (size_t)snprintf(big + n, sizeof(big) - n,
+                          "<tool_call>\n{\"name\": \"write\", \"arguments\": "
+                          "{\"path\": \"templates/base.html\", \"content\": \"");
+    while (n < sizeof(big) - 8) { memcpy(big + n, "V5", 2); n += 2; }
+    big[n] = '\0';
+    const char *chunks[] = { big };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks, 1, &p, NULL);
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_ERROR);
+    AGENT_TEST_ASSERT(p.calls.len == 0);
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_large_write_still_allowed(void) {
+    /* The guard must not punish a big but legitimate file write. */
+    static char big[9000];
+    size_t n = (size_t)snprintf(big, sizeof(big),
+                                "<tool_call>\n{\"name\": \"write\", \"arguments\": "
+                                "{\"path\": \"templates/base.html\", \"content\": \"");
+    const char *filler = "<div class=\\\"row\\\">content line</div>\\n";
+    while (n < sizeof(big) - 200) {
+        size_t fl = strlen(filler);
+        memcpy(big + n, filler, fl); n += fl;
+    }
+    n += (size_t)snprintf(big + n, sizeof(big) - n, "\"}}\n</tool_call>");
+    big[n] = '\0';
+    const char *chunks[] = { big };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks, 1, &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "write"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_write_with_rule_still_allowed(void) {
+    /* A markdown rule is not degeneration.  At 24 repeats the detector stopped
+     * a legitimate README write the moment a 24-dash rule landed, ~880 bytes
+     * in; the span floor is what keeps ordinary punctuation runs writable.
+     * The filler above varies every line, so it never exercised this. */
+    static char big[9000];
+    size_t n = (size_t)snprintf(big, sizeof(big),
+                                "<tool_call>\n{\"name\": \"write\", \"arguments\": "
+                                "{\"path\": \"README.md\", \"content\": \"");
+    const char *filler = "# Project\\n\\nProse describing the thing at length. ";
+    while (n < sizeof(big) - 200) {
+        size_t fl = strlen(filler);
+        memcpy(big + n, filler, fl); n += fl;
+    }
+    memset(big + n, '-', 30); n += 30;      /* the rule that used to trip it */
+    n += (size_t)snprintf(big + n, sizeof(big) - n, "\"}}\n</tool_call>");
+    big[n] = '\0';
+    const char *chunks[] = { big };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks, 1, &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "write"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_recovers_after_thinking(void) {
+    /* Observed verbatim in the n=20 canary: the model reasons, closes
+     * </think>, then emits a bare object with a stray closing tag.  Thinking
+     * text must not disqualify it. */
+    const char *chunks[] = {
+        "<think>I should use the read tool with max_lines 1.</think>\n",
+        "{\"name\": \"read\", \"arguments\": {\"path\": \"Makefile\", \"max_lines\": 1}}\n</tool_call>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "read"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "path"), "Makefile"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_wrapper_after_prose_is_not_a_call(void) {
+    /* <tools> is recovery, so it carries the whole-response condition too.
+     * Prose that happens to mention the wrapper must stay prose. */
+    const char *chunks[] = {
+        "Use the wrapper like <tools>{\"name\": \"read\", \"arguments\": {\"path\": \"x\"}}</tools>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 0);
+    AGENT_TEST_ASSERT(strstr(out, "Use the wrapper like") != NULL);
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_bare_object_without_close(void) {
+    /* Recovered bare objects often never get a closing tag; finalization has
+     * to take a complete object or the call is silently lost. */
+    const char *chunks[] = {
+        "{\"name\": \"read\", \"arguments\": {\"path\": \"Makefile\"}}",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "read"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "path"), "Makefile"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_bare_object_incomplete_stays_incomplete(void) {
+    /* Truncated output must not be completed by guesswork. */
+    const char *chunks[] = {
+        "{\"name\": \"read\", \"arguments\": {\"path\": \"Make",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.calls.len == 0);
+    AGENT_TEST_ASSERT(p.state != AGENT_DSML_DONE);
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_mellum_unknown_tool_is_not_executed(void) {
+    /* An unrecognised name means we misread the output.  Fail to a retry
+     * rather than dispatch something the host cannot run. */
+    const char *chunks[] = {
+        "<tool_call>\n{\"name\": \"launch_missiles\", \"arguments\": {}}\n</tool_call>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_MELLUM, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_ERROR);
+    AGENT_TEST_ASSERT(p.calls.len == 0);
     free(out);
     agent_dsml_parser_free(&p);
 }
@@ -8646,8 +9528,25 @@ static void test_agent_tagged_structural_candidate_guard(void) {
     agent_dsml_parser_free(&complete);
 }
 
+static void test_agent_edit_upto_prompt_is_opt_in(void) {
+    char *dsml_default = agent_build_dsml_tools_prompt(false);
+    char *dsml_upto = agent_build_dsml_tools_prompt(true);
+    char *glm_default = agent_build_glm_tools_prompt(true, false);
+    char *glm_upto = agent_build_glm_tools_prompt(true, true);
+
+    AGENT_TEST_ASSERT(strstr(dsml_default, "[upto]") == NULL);
+    AGENT_TEST_ASSERT(strstr(dsml_upto, "[upto]") != NULL);
+    AGENT_TEST_ASSERT(strstr(glm_default, "[upto]") == NULL);
+    AGENT_TEST_ASSERT(strstr(glm_upto, "[upto]") != NULL);
+
+    free(dsml_default);
+    free(dsml_upto);
+    free(glm_default);
+    free(glm_upto);
+}
+
 static void test_agent_glm_tools_prompt_is_native(void) {
-    char *prompt = agent_build_glm_tools_prompt(true);
+    char *prompt = agent_build_glm_tools_prompt(true, false);
 
     AGENT_TEST_ASSERT(strstr(prompt, "<tools>") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "<tool_call>") != NULL);
@@ -11010,13 +11909,73 @@ static void test_agent_parse_pool_prompt_routes_worker(void) {
     free(text);
 }
 
+static bool agent_test_read_q8_header(uint64_t payload_bytes) {
+    FILE *fp = tmpfile();
+    if (!fp) return false;
+    uint8_t header[DS4_KVSTORE_FIXED_HEADER];
+    uint8_t text_bytes[4];
+    ds4_kvstore_fill_header(header, 1, 8, DS4_KVSTORE_REASON_AGENT_SESSION,
+                            0, 3, 0, 64, 1, 1, payload_bytes);
+    ds4_kvstore_le_put32(text_bytes, 0);
+    bool ok = fwrite(header, 1, sizeof(header), fp) == sizeof(header) &&
+              fwrite(text_bytes, 1, sizeof(text_bytes), fp) ==
+                  sizeof(text_bytes) &&
+              fseek(fp, 0, SEEK_SET) == 0;
+    ds4_kvstore_entry entry = {0};
+    uint32_t read_text_bytes = UINT32_MAX;
+    if (ok) ok = ds4_kvstore_read_header(fp, &entry, &read_text_bytes);
+    fclose(fp);
+    return ok;
+}
+
+static void test_agent_q8_transcript_only_header(void) {
+    AGENT_TEST_ASSERT(agent_test_read_q8_header(0));
+    AGENT_TEST_ASSERT(!agent_test_read_q8_header(1));
+}
+
+static void test_agent_cache_rejects_impossible_lengths(void) {
+    FILE *fp = tmpfile();
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (!fp) return;
+
+    AGENT_TEST_ASSERT(fputc('x', fp) != EOF);
+    rewind(fp);
+    char *text = NULL;
+    char err[128] = {0};
+    AGENT_TEST_ASSERT(!agent_kv_read_text(fp, UINT32_MAX, &text,
+                                         err, sizeof(err)));
+    AGENT_TEST_ASSERT(text == NULL);
+    AGENT_TEST_ASSERT(strstr(err, "truncated cached text") != NULL);
+    fclose(fp);
+
+    fp = tmpfile();
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (!fp) return;
+    uint8_t tb[4];
+    ds4_kvstore_le_put32(tb, UINT32_MAX);
+    AGENT_TEST_ASSERT(fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb));
+    rewind(fp);
+    ds4_kvstore_entry hdr = {0};
+    char *title = NULL;
+    err[0] = '\0';
+    AGENT_TEST_ASSERT(!agent_kv_read_title_trailer(fp, &hdr, &title,
+                                                   err, sizeof(err)));
+    AGENT_TEST_ASSERT(title == NULL);
+    AGENT_TEST_ASSERT(strstr(err, "truncated agent session title trailer") != NULL);
+    AGENT_TEST_ASSERT(ftello(fp) == 0);
+    fclose(fp);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_json_events_release_flushes_and_frees_pending();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
+    test_agent_cache_rejects_impossible_lengths();
     test_agent_read_default_lines_follow_context();
     test_agent_backend_name_matches_build();
+    test_agent_q8_transcript_only_header();
     test_agent_glm_template_policy();
+    test_agent_edit_upto_prompt_is_opt_in();
     test_agent_glm_tools_prompt_is_native();
     test_agent_schemas_gate_bash_when_shell_off();
     test_agent_glm_tool_parser_single_arg();
@@ -11024,6 +11983,22 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_glm_tool_parser_streams_param_state();
     test_agent_glm_tool_parser_multiple_adjacent_calls();
     test_agent_glm_stream_tool_call_chunked();
+    test_agent_mellum_stream_tool_call_chunked();
+    test_agent_mellum_stream_tool_call_escapes();
+    test_agent_mellum_stream_two_calls();
+    test_agent_mellum_stream_malformed_json();
+    test_agent_mellum_args_before_name();
+    test_agent_mellum_recovers_wrong_wrapper();
+    test_agent_mellum_recovers_missing_open();
+    test_agent_mellum_prose_brace_is_not_a_call();
+    test_agent_mellum_unknown_tool_is_not_executed();
+    test_agent_mellum_runaway_is_stopped();
+    test_agent_mellum_large_write_still_allowed();
+    test_agent_mellum_write_with_rule_still_allowed();
+    test_agent_mellum_recovers_after_thinking();
+    test_agent_mellum_wrapper_after_prose_is_not_a_call();
+    test_agent_mellum_bare_object_without_close();
+    test_agent_mellum_bare_object_incomplete_stays_incomplete();
     test_agent_glm_stream_ignores_tool_inside_think();
     test_agent_glm_stream_greedy_sampling_boundaries();
     test_agent_dsml_stream_tool_call_chunked();
@@ -11105,7 +12080,9 @@ static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *cal
     const char *match = NULL;
     size_t match_len = 0;
     bool anchored = false;
-    bool ok = agent_edit_find_old_span(data, len, old, &match, &match_len,
+    bool allow_upto = w && w->cfg && w->cfg->edit_upto;
+    bool ok = agent_edit_find_old_span(data, len, old, allow_upto,
+                                       &match, &match_len,
                                        &anchored, err, err_len);
     free(data);
     free(confined);
@@ -11183,7 +12160,9 @@ static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
     const char *match = NULL;
     size_t match_len = 0;
     bool anchored = false;
-    if (!agent_edit_find_old_span(data, len, old, &match, &match_len,
+    bool allow_upto = w && w->cfg && w->cfg->edit_upto;
+    if (!agent_edit_find_old_span(data, len, old, allow_upto,
+                                  &match, &match_len,
                                   &anchored, err, sizeof(err)))
     {
         free(data);
@@ -13160,6 +14139,14 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
      * real stopping conditions.  The transcript is the single source of truth:
      * after a DSML stanza completes we terminate that assistant message, append
      * the tool result as a tool message, then ask the model to continue. */
+    int nudges_used = 0;
+    const int nudge_max = agent_tool_nudge_max();
+    /* An unbounded malformed-call loop is a host bug, not a model property:
+     * nothing previously stopped a turn from re-generating a broken tool call
+     * indefinitely.  Two corrections is enough for the model to recover from
+     * a genuine mistake; beyond that the turn ends rather than looping. */
+    int malformed_used = 0;
+    enum { AGENT_MALFORMED_RETRY_MAX = 2 };
     for (int tool_round = 0; ; tool_round++) {
         if (tool_round > 0 &&
             !agent_worker_compact_if_needed(w, "soft limit before tool continuation",
@@ -13278,6 +14265,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         bool got_tool = false;
         bool malformed_tool = false;
         bool early_tool_error = false;
+        bool length_truncated_tool = false;
         int generated = 0;
         double t0 = now_sec();
         pthread_mutex_lock(&w->mu);
@@ -13315,7 +14303,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
             size_t text_len = 0;
             char *text = ds4_token_text(w->engine, token, &text_len);
-            if (agent_edit_upto_forcer_should_replace(&upto_forcer, &dsml,
+            if (cfg->edit_upto &&
+                agent_edit_upto_forcer_should_replace(&upto_forcer, &dsml,
                                                        text, text_len))
             {
                 agent_trace(w, "edit old auto-upto replaced token=%d text=%.*s",
@@ -13450,7 +14439,17 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                     dsml.state == AGENT_DSML_PARAM_VALUE))
         {
             malformed_tool = true;
+            /* generated >= max_tokens means the loop above stopped because it
+             * hit -n, not because the model chose to stop or produced broken
+             * syntax.  That is a host limit cutting the model off mid-call,
+             * not a mistake, and it reads very differently to the model: "you
+             * wrote invalid JSON" versus "you were cut off before you could
+             * finish valid JSON".  Still counts against the same retry
+             * ceiling -- it is still a round that produced nothing. */
+            length_truncated_tool = generated >= max_tokens;
             snprintf(dsml.error, sizeof(dsml.error),
+                     length_truncated_tool ? "tool call truncated at the "
+                     "generation limit before it closed" :
                      agent_tool_syntax_is_tagged(tool_syntax) ?
                      "incomplete tagged tool call" :
                      "incomplete DSML tool call");
@@ -13458,29 +14457,57 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
         agent_worker_append_assistant_turn_end(w);
 
+        bool nudge_now = false;
         if (!got_tool && !malformed_tool && !early_tool_error) {
-            /* Turn-outcome snapshot (D12): this clean non-tool exit is the
-             * only place a turn actually ends -- the interrupt paths set
-             * INTERRUPT on their own returns above, and tool rounds (which
-             * resume the loop) are not turn ends. room<=1 means the context
-             * was already full so generation could not start; generated>=
-             * max_tokens is the token limit; otherwise the stop token
-             * ended the round (EOS). */
-            if (room <= 1)
-                w->last_turn_stop_reason = AGENT_TURN_STOP_CONTEXT_FULL;
-            else if (generated >= max_tokens)
-                w->last_turn_stop_reason = AGENT_TURN_STOP_LIMIT;
-            else
-                w->last_turn_stop_reason = AGENT_TURN_STOP_EOS;
-            w->last_turn_generated = generated;
-            w->last_turn_ctx_used = ds4_session_pos(w->session);
+            if (nudges_used < nudge_max) {
+                nudges_used++;
+                nudge_now = true;
+                agent_trace(w, "tool nudge %d/%d", nudges_used, nudge_max);
+            } else {
+                /* Turn-outcome snapshot (D12): this clean non-tool exit is the
+                 * only place a turn actually ends -- the interrupt paths set
+                 * INTERRUPT on their own returns above, and tool rounds (which
+                 * resume the loop) are not turn ends, and a nudge (above) is
+                 * not a turn end either -- the loop continues. room<=1 means
+                 * the context was already full so generation could not start;
+                 * generated>=max_tokens is the token limit; otherwise the
+                 * stop token ended the round (EOS). */
+                if (room <= 1)
+                    w->last_turn_stop_reason = AGENT_TURN_STOP_CONTEXT_FULL;
+                else if (generated >= max_tokens)
+                    w->last_turn_stop_reason = AGENT_TURN_STOP_LIMIT;
+                else
+                    w->last_turn_stop_reason = AGENT_TURN_STOP_EOS;
+                w->last_turn_generated = generated;
+                w->last_turn_ctx_used = ds4_session_pos(w->session);
+                agent_dsml_parser_free(&dsml);
+                agent_set_status(w, AGENT_WORKER_IDLE);
+                return 0;
+            }
+        }
+        if ((malformed_tool || early_tool_error) &&
+            ++malformed_used > AGENT_MALFORMED_RETRY_MAX)
+        {
+            agent_trace(w, "malformed tool call retries exhausted (%d)",
+                       malformed_used - 1);
             agent_dsml_parser_free(&dsml);
-            agent_set_status(w, AGENT_WORKER_IDLE);
-            return 0;
+            agent_set_error(w, "too many malformed tool calls in a row");
+            return 1;
         }
 
         char *tool_result;
-        if (early_tool_error) {
+        /* Only a genuinely executed tool call is role="tool": that is the
+         * only case with a matching tool_call in the model's own history.
+         * The nudge, a preflight error, and a malformed-call error are all
+         * host corrections with no such match, so they go in as role="user" --
+         * see the append site below for what happens when they do not. */
+        bool host_correction = nudge_now || early_tool_error || malformed_tool;
+        if (nudge_now) {
+            tool_result = xstrdup(
+                "Continue the original request. No tool has executed. If it "
+                "refers to workspace files or requests changes, call an "
+                "appropriate tool now. Do not discuss this correction.\n");
+        } else if (early_tool_error) {
             agent_buf b = {0};
             agent_buf_puts(&b, "Tool error: ");
             agent_buf_puts(&b, stream.tool_preflight_error_msg[0] ?
@@ -13488,6 +14515,12 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                            "edit old selector failed before new was generated");
             agent_buf_puts(&b, "\n");
             tool_result = agent_buf_take(&b);
+        } else if (malformed_tool && length_truncated_tool) {
+            tool_result = xstrdup(
+                "Your tool call reached the response limit before it closed, "
+                "so nothing was written. Retry with one concise, complete "
+                "canonical JSON tool call and no narration. Write only one "
+                "file.\n");
         } else if (malformed_tool) {
             agent_buf b = {0};
             agent_buf_puts(&b, agent_tool_syntax_is_tagged(tool_syntax) ?
@@ -13495,6 +14528,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                            "Tool error: invalid DSML tool call: ");
             agent_buf_puts(&b, dsml.error[0] ? dsml.error : "parse error");
             agent_buf_puts(&b, "\n");
+            /* Three encodings share "tagged" framing, so the reminder needs
+             * the real syntax, not the binary is_tagged check. */
             agent_buf_puts(&b, agent_tool_syntax_is_tagged(tool_syntax) ?
                            agent_tagged_syntax_reminder(tool_syntax) :
                            agent_dsml_syntax_reminder);
@@ -13551,7 +14586,14 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             }
         }
-        ds4_chat_append_message(w->engine, &w->transcript, "tool", tool_result);
+        /* The nudge is a host correction, not a tool's output -- appending it
+         * as role="tool" gives the model a tool_response with no matching
+         * tool_call anywhere in its own history.  Observed effect: instead of
+         * calling a tool, it reasons out loud about the anomalous message,
+         * often for many rounds, which is worse than the narration the nudge
+         * was meant to fix. role="user" is what a correction actually is. */
+        ds4_chat_append_message(w->engine, &w->transcript,
+                                host_correction ? "user" : "tool", tool_result);
         free(tool_result);
         agent_dsml_parser_free(&dsml);
 
@@ -16376,7 +17418,7 @@ int main(int argc, char **argv) {
         }
         if (skip_cuda) {
             cfg.engine.backend = DS4_BACKEND_CPU;
-            if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+            if (ds4_engine_open_for_agent(&engine, &cfg.engine) != 0) return 1;
         } else {
             const bool was_auto =
                 (cfg.gpu_vram_arg && !strcmp(cfg.gpu_vram_arg, "auto")) ||
@@ -16391,7 +17433,7 @@ int main(int argc, char **argv) {
             if (ds4_engine_create_with_gpu_config(
                     &engine, &cfg.engine, &gpu_cfg) != 0) return 1;
         }
-    } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
+    } else if (ds4_engine_open_for_agent(&engine, &cfg.engine) != 0) {
         return 1;
     }
     agent_apply_model_sampling_defaults(engine, &cfg.gen);

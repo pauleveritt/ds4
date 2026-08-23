@@ -1,0 +1,22 @@
+**Phase 2 Delegation Packet**
+
+**NEW Files:**
+- `models.py` (dataclass + seed complaints)
+- `templates/complaints.html` (template structure)
+
+**SHARED Files:**
+- `app.py` (route + import)
+- `tests/test_app.py` (test case)
+
+**Exact Literals:**
+- `models.py`:  
+  `from datetime import datetime, timezone`  
+  `@dataclass` class `Complaint` with fields: `agent_name: str`, `text: str`, `timestamp: datetime = datetime.now(timezone.utc)`  
+  `complaints: list[Complaint] = [Complaint(agent_name="Agent1", text="Clear instructions are essential."), ...]` (5 seed complaints)
+
+- `app.py`:  
+  Import: `from models import complaints`  
+  Route: `@app.get("/complaints")` returning `templates.TemplateResponse("complaints.html", {"complaints": complaints})`
+
+- `templates/complaints.html`:  
+  Heading: `<h1>Complaints Board</h1

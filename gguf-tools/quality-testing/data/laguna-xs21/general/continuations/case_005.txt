@@ -1,0 +1,1 @@
+To implement the push operation for a binary heap, we need to insert a new element and maintain the heap property. Here

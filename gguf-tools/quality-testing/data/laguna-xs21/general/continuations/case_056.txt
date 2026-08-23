@@ -1,0 +1,1 @@
+Il **router** in un modello **Mixture-of-Experts (MoE)** svolge un ruolo

@@ -1,0 +1,22 @@
+=== dot4 ADOPTED: gate re-measurement 2026-08-02T06:12:50Z ===
+Mellum layer-0 oracle values=59904 max_abs=0.00493812561 rms=9.80443814e-05 mae=3.69404279e-05 max_at=(15, 1236)
+oracle gate failed: max_abs <= 0.55, rms <= 0.045
+Mellum layer-27-tokenwise oracle values=2304 max_abs=1.23608398 rms=0.0454834355 mae=0.0287036989 max_at=(0, 368)
+oracle gate failed: max_abs <= 0.013, rms <= 0.0024
+Mellum layer-logits-tokenwise oracle values=98304 max_abs=0.0177469254 rms=0.00911324309 mae=0.00890643715 max_at=8514
+-- bitwise batch vs decode (EXACT) --
+Mellum true-prefill probe tokens=26 chunk=26 layers=28 hidden max_abs=0 rms=0 logits max_abs=0 rms=0
+-- gates after re-baseline --
+Mellum layer-0 oracle values=59904 max_abs=0.00493812561 rms=9.80443814e-05 mae=3.69404279e-05 max_at=(15, 1236)
+rc0=0
+Mellum layer-27-tokenwise oracle values=2304 max_abs=1.23608398 rms=0.0454834355 mae=0.0287036989 max_at=(0, 368)
+rc27=0
+Mellum layer-logits-tokenwise oracle values=98304 max_abs=0.0177469254 rms=0.00911324309 mae=0.00890643715 max_at=8514
+rclg=0
+-- performance, 3 same-session reps (protocol-corrected) --
+Mellum resident profile tokens=64 repeats=3 no-head=6.525ms 153.3t/s with-head=6.936ms 144.2t/s output-head-delta=0.411ms
+Mellum resident prefill tokens=1024 chunk=1024 exact=0 repeats=3 batch=3842.1ms 266.5t/s
+Mellum resident profile tokens=64 repeats=3 no-head=6.520ms 153.4t/s with-head=6.958ms 143.7t/s output-head-delta=0.438ms
+Mellum resident prefill tokens=1024 chunk=1024 exact=0 repeats=3 batch=4187.5ms 244.5t/s
+Mellum resident profile tokens=64 repeats=3 no-head=6.664ms 150.1t/s with-head=7.235ms 138.2t/s output-head-delta=0.571ms
+Mellum resident prefill tokens=1024 chunk=1024 exact=0 repeats=3 batch=4316.8ms 237.2t/s

@@ -1,0 +1,51 @@
+**Phase 2 Delegation Packet**
+
+**Files to Create (NEW):**
+- `templates/complaints.html` — Complaints Board page
+
+**Files to Modify (SHARED):**
+- `app.py` — Add `/complaints` route
+- `templates/base.html` — Ensure navbar includes `/complaints` link (already present per Phase 1)
+
+**Entity: Complaint**
+- Fields: `agent_name` (str), `text` (str)
+- `timestamp`: `datetime.datetime` with timezone (UTC)
+- Storage: In-memory `list` of `Complaint` objects
+
+**Route:** `GET /complaints`
+- Returns `templates/complaints.html` with context:
+  - `complaints`: list of `Complaint` objects
+  - Each complaint displays:
+    - `agent_name`
+    - `text`
+    - `timestamp` formatted as `YYYY-MM-DD HH:MM:SS` (timezone-aware)
+
+**Seed Content (hard‑coded in `app.py` before first request):**
+```python
+[
+    Complaint(agent_name="Alice", text="Instructions were unclear.", timestamp=datetime.datetime(2024, 1, 15, 10, 30, tzinfo=timezone.utc)),
+    Complaint(agent_name="Bob", text="Feedback was contradictory.", timestamp=datetime.datetime(2024, 1, 16, 14, 45, tzinfo=timezone.utc)),
+    Complaint(agent_name="Charlie", text="Scope creep never ends.", timestamp=datetime.datetime(2024, 1, 17, 9, 15, tzinfo=timezone.utc)),
+]
+```
+
+**Template `templates/complaints.html` must include:**
+- Heading `<h1>Complaints Board</h1>`
+- Loop over `complaints` and display each as a distinct entry
+- No two complaints share the same timestamp (seed ensures uniqueness)
+
+**Validation command:**
+```bash
+.venv/bin/python -m pytest tests/
+```
+
+**Framework semantic trap:**  
+FastAPI expects `datetime` objects with timezone for automatic OpenAPI schema generation; use `datetime.timezone.utc` to avoid naive datetime warnings.
+
+**Exact literals required:**
+- Page title block in `base.html` remains "AgentClinic"
+- Navbar link text for `/complaints` is "Complaints" (inherited)
+- Heading on complaints page is exactly "Complaints Board"
+- One seed complaint text verbatim: "Scope creep never ends."
+
+**No other changes to Phase 1 files.**

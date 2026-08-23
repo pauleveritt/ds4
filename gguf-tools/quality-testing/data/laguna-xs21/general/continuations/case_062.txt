@@ -1,0 +1,1 @@
+Eventual consistency is a consistency model used in distributed databases where updates to the database are propagated to all nodes asynchronously. Here's
