@@ -421,6 +421,18 @@ typedef struct {
 static volatile sig_atomic_t agent_sigint;
 static agent_worker *agent_completion_worker;
 
+/* P11 (fork divergence #11): the subagent pool. pool_mu serializes generation
+ * (exactly one worker_run_turn at a time — the serialized family has no batch
+ * path); generating_worker names the holder (-1 = none). stdin_mu serializes
+ * access to STDIN_FILENO between the worker threads (which block reading
+ * tool_result lines) and the main loop (which reads prompt lines): the worker
+ * blocks on it, the main loop trylocks it — closing the TOCTOU where the main
+ * loop would otherwise steal a tool_result line. */
+static pthread_mutex_t pool_mu = PTHREAD_MUTEX_INITIALIZER;
+static int generating_worker = -1;
+static pthread_mutex_t stdin_mu = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_host_tool_reading = 0;
+
 static void worker_apply_pending_power(agent_worker *w);
 static void agent_trace(agent_worker *w, const char *fmt, ...);
 /* json_events emitter (defined below agent_buf's helpers, near :4132) and
@@ -10966,6 +10978,29 @@ static void test_agent_pool_worker_field_and_cap(void) {
     }
 }
 
+/* P11 (fork divergence #11): the inbound PoolPrompt contract. JSON addresses
+ * a worker; a bare line addresses worker 0; the s field is JSON-unescaped. */
+static bool agent_parse_pool_prompt(const char *line, int *out_worker, char **out_text);
+static void test_agent_parse_pool_prompt_routes_worker(void) {
+    int wid; char *text = NULL;
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"t\":\"prompt\",\"worker\":3,\"s\":\"do it\"}", &wid, &text));
+    AGENT_TEST_ASSERT(wid == 3);
+    AGENT_TEST_ASSERT(text && strcmp(text, "do it") == 0);
+    free(text);
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("fix a.swift", &wid, &text));
+    AGENT_TEST_ASSERT(wid == 0);
+    AGENT_TEST_ASSERT(text && strcmp(text, "fix a.swift") == 0);
+    free(text);
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"s\":\"hi\",\"worker\":2,\"t\":\"prompt\",\"extra\":1}", &wid, &text));
+    AGENT_TEST_ASSERT(wid == 2);
+    AGENT_TEST_ASSERT(text && strcmp(text, "hi") == 0);
+    free(text);
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"t\":\"prompt\",\"worker\":1,\"s\":\"a\\\"b\"}", &wid, &text));
+    AGENT_TEST_ASSERT(wid == 1);
+    AGENT_TEST_ASSERT(text && strcmp(text, "a\"b") == 0);
+    free(text);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_json_events_release_flushes_and_frees_pending();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
@@ -11001,6 +11036,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_host_tools_off_path_unchanged();
     test_agent_emit_hello_caps_array_closes();
     test_agent_pool_worker_field_and_cap();
+    test_agent_parse_pool_prompt_routes_worker();
     test_agent_emit_status_event_covers_all_eight_states();
     test_agent_emit_status_event_escapes_error_field();
     test_agent_emit_status_event_trims_torn_utf8_error_tail();
@@ -12397,6 +12433,13 @@ static char *agent_execute_tool_calls(agent_worker *w, const agent_tool_calls *c
         pthread_mutex_lock(&w->mu);
         w->host_tool_reading = true;
         pthread_mutex_unlock(&w->mu);
+        /* P11 (fork divergence #11): claim stdin for this block's tool_result
+         * reads — the worker blocks on stdin_mu, the main loop trylocks it, so
+         * the main loop can never steal a tool_result line. The pool mutex
+         * (held around the whole turn) already guarantees at most one worker
+         * is here at a time. */
+        pthread_mutex_lock(&stdin_mu);
+        g_host_tool_reading = 1;
         for (int i = 0; i < calls->len; i++) {
             agent_emit_tool_request(w, i, &calls->v[i]);
             char *line = agent_stdin_read_line(w);
@@ -12449,6 +12492,8 @@ static char *agent_execute_tool_calls(agent_worker *w, const agent_tool_calls *c
             if (res[0] && res[strlen(res) - 1] != '\n') agent_buf_puts(&all, "\n");
             free(res);
         }
+        g_host_tool_reading = 0;
+        pthread_mutex_unlock(&stdin_mu);
         pthread_mutex_lock(&w->mu);
         w->host_tool_reading = false;
         pthread_mutex_unlock(&w->mu);
@@ -13934,8 +13979,17 @@ static void *worker_main(void *arg) {
 
         if (w->cfg->gen.raw_prompt)
             worker_run_raw_prompt(w, cmd);
-        else
+        else {
+            /* P11 (fork divergence #11): exactly one worker generates at a
+             * time. The pool mutex wraps the whole turn (tool execution
+             * included), so --host-tools tool_result reads on stdin are also
+             * serialized. */
+            pthread_mutex_lock(&pool_mu);
+            generating_worker = w->worker_id;
             worker_run_turn(w, cmd);
+            generating_worker = -1;
+            pthread_mutex_unlock(&pool_mu);
+        }
         free(cmd);
         worker_apply_pending_power(w);
         worker_run_deferred_compact(w);
@@ -14084,18 +14138,11 @@ static bool worker_is_idle(agent_worker *w) {
     return idle;
 }
 
-/* P9 --host-tools: true while the worker thread is blocked in
- * agent_execute_tool_calls reading a tool_result line from stdin. The UI
- * thread gates its stdin poll on this so it does not drain the result line
- * into the prompt buffer -- the worker is the sole stdin reader for the
- * block's duration. Reads the flag under the mutex (the worker sets/clears it
- * there). */
-static bool worker_host_tool_reading(agent_worker *w) {
-    pthread_mutex_lock(&w->mu);
-    bool r = w->host_tool_reading;
-    pthread_mutex_unlock(&w->mu);
-    return r;
-}
+/* P9 --host-tools: `w->host_tool_reading` is still set/cleared by the worker
+ * thread inside agent_execute_tool_calls, but the main loop's stdin gate now
+ * reads the global `g_host_tool_reading` (P11) — which the worker sets under
+ * `stdin_mu` — rather than this per-worker flag. The field remains as the
+ * worker-side bookkeeping; the read path was moved to the global. */
 
 static bool worker_is_initialized(agent_worker *w, agent_status *status) {
     pthread_mutex_lock(&w->mu);
@@ -15507,12 +15554,74 @@ static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
  * stdin protocol: announce readiness on stderr, collect bytes until stdin has
  * been quiet for 200 ms, submit that buffer as one prompt, and keep reading so
  * later input can be queued while the model is still working. */
+/* P11 (fork divergence #11): parse an inbound prompt line. A JSON
+ * {"t":"prompt","worker":N,"s":"..."} addresses worker N; any other (bare)
+ * line addresses worker 0. Returns true with out_worker set and out_text a
+ * fresh allocation (the prompt body, JSON-unescaped). */
+static bool agent_parse_pool_prompt(const char *line, int *out_worker, char **out_text) {
+    const char *p = line;
+    agent_json_skip_ws(&p);
+    if (*p == '{') {
+        int worker = 0;
+        char *s = NULL;
+        bool have_s = false;
+        if (!agent_json_match(&p, '{')) goto bare;
+        for (;;) {
+            agent_json_skip_ws(&p);
+            if (*p == '}') { p++; break; }
+            if (*p != '"') { free(s); goto bare; }
+            char *key = NULL;
+            if (!agent_json_parse_string(&p, &key)) { free(s); goto bare; }
+            if (!agent_json_match(&p, ':')) { free(key); free(s); goto bare; }
+            if (!strcmp(key, "worker")) {
+                if (!agent_json_parse_int(&p, &worker)) { free(key); free(s); goto bare; }
+            } else if (!strcmp(key, "s")) {
+                have_s = agent_json_parse_string(&p, &s);
+                if (!have_s) { free(key); goto bare; }
+            } else if (*p == '"') {
+                char *junk = NULL;
+                if (!agent_json_parse_string(&p, &junk)) { free(key); free(junk); free(s); goto bare; }
+                free(junk);
+            } else {
+                int iv; bool bv;
+                if (!(agent_json_parse_int(&p, &iv) || agent_json_parse_bool(&p, &bv))) {
+                    free(key); free(s); goto bare;
+                }
+            }
+            free(key);
+            agent_json_skip_ws(&p);
+            if (*p == ',') { p++; continue; }
+            if (*p == '}') { p++; break; }
+            free(s); goto bare;
+        }
+        agent_json_skip_ws(&p);
+        if (*p != '\0' || !have_s) { free(s); goto bare; }
+        *out_worker = worker;
+        *out_text = s ? s : xstrdup("");
+        return true;
+    }
+bare:
+    *out_worker = 0;
+    *out_text = xstrdup(line);
+    return true;
+}
+
 static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
-    agent_worker worker;
-    if (agent_worker_init(&worker, engine, cfg) != 0) return 1;
+    int n = (cfg->num_workers > 0) ? cfg->num_workers : 1;
+    if (n > 64) n = 64;  /* the poll fd array below is fixed-size */
+    agent_worker *workers = calloc((size_t)n, sizeof(agent_worker));
+    if (!workers) return 1;
+    for (int i = 0; i < n; i++) {
+        if (agent_worker_init(&workers[i], engine, cfg) != 0) {
+            for (int j = 0; j < i; j++) agent_worker_free(&workers[j]);
+            free(workers);
+            return 1;
+        }
+        workers[i].worker_id = i;  /* after init: init memsets the struct */
+    }
 
     if (cfg->json_events) {
-        agent_emit_hello(&worker);  /* binding rule 7: the wire announces itself */
+        agent_emit_hello(&workers[0]);  /* binding rule 7: the wire announces itself */
     }
 
     const bool one_shot = cfg->gen.prompt != NULL;
@@ -15525,6 +15634,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     agent_prompt_queue queue = {0};
     double quiet_deadline = 0.0;
     int rc = 0;
+    int active_worker = 0;  /* P11: the worker whose status the wire reports */
     /* 512, not 256: in JSON mode the dedupe key below folds in st.error
      * (itself up to 255 bytes) alongside the state name and every numeric
      * field, and must not truncate -- a truncated key could alias two
@@ -15544,25 +15654,26 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     if (!one_shot) {
         if (set_nonblock(STDIN_FILENO, true, &old_stdin_flags) != 0) {
             perror("ds4-agent: nonblocking stdin");
-            agent_worker_free(&worker);
+            for (int i = 0; i < n; i++) agent_worker_free(&workers[i]);
+            free(workers);
             return 1;
         }
         stdin_nonblock = true;
     }
 
     while (true) {
-        bool initialized = worker_is_initialized(&worker, NULL);
-        bool idle = worker_is_idle(&worker);
+        bool initialized = worker_is_initialized(&workers[active_worker], NULL);
+        bool idle = worker_is_idle(&workers[active_worker]);
 
         if (one_shot && !one_shot_submitted && initialized) {
-            if (worker_submit(&worker, cfg->gen.prompt))
+            if (worker_submit(&workers[0], cfg->gen.prompt))
                 one_shot_submitted = true;
             idle = false;
         }
 
         if (!one_shot && queue.len && idle) {
             char *queued = agent_prompt_queue_take_all(&queue);
-            if (worker_submit(&worker, queued)) {
+            if (worker_submit(&workers[active_worker], queued)) {
                 idle = false;
             } else {
                 agent_prompt_queue_push_front(&queue, queued);
@@ -15577,8 +15688,8 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             if (cfg->json_events) {
                 ds4_memory_plan plan;
                 const bool have_plan =
-                    ds4_engine_memory_plan(worker.engine, &plan);
-                agent_emit_ready_event(&worker, have_plan ? &plan : NULL);
+                    ds4_engine_memory_plan(engine, &plan);
+                agent_emit_ready_event(&workers[active_worker], have_plan ? &plan : NULL);
             }
             else agent_noninteractive_marker("+DWARFSTAR_WAITING");
             waiting_announced = true;
@@ -15590,15 +15701,16 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             timeout_ms = rem <= 0.0 ? 0 : (int)(rem * 1000.0) + 1;
         }
 
-        struct pollfd pfd[2];
+        struct pollfd pfd[65];
         int nfds = 0;
-        int wake_idx = nfds;
-        pfd[nfds++] = (struct pollfd){.fd = worker.wake_fd[0], .events = POLLIN};
+        pfd[nfds++] = (struct pollfd){.fd = STDIN_FILENO, .events = 0};
         int stdin_idx = -1;
-        if (!one_shot && initialized && !stdin_eof &&
-            !worker_host_tool_reading(&worker)) {
-            stdin_idx = nfds;
-            pfd[nfds++] = (struct pollfd){.fd = STDIN_FILENO, .events = POLLIN};
+        if (!one_shot && initialized && !stdin_eof && !g_host_tool_reading) {
+            pfd[0].events = POLLIN;
+            stdin_idx = 0;
+        }
+        for (int i = 0; i < n; i++) {
+            pfd[nfds++] = (struct pollfd){.fd = workers[i].wake_fd[0], .events = POLLIN};
         }
 
         int prc = poll(pfd, (nfds_t)nfds, timeout_ms);
@@ -15608,7 +15720,9 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             rc = 1;
             break;
         }
-        if (pfd[wake_idx].revents & POLLIN) drain_wake_fd(worker.wake_fd[0]);
+        for (int i = 0; i < n; i++) {
+            if (pfd[1 + i].revents & POLLIN) drain_wake_fd(workers[i].wake_fd[0]);
+        }
         if (stdin_idx >= 0 && (pfd[stdin_idx].revents & (POLLIN | POLLHUP))) {
             size_t old_len = input.len;
             if (agent_read_stdin_available(&input, &stdin_eof) != 0) {
@@ -15618,8 +15732,8 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             /* Strip before the length comparison below: a lone interrupt byte
              * is a signal, not queued prompt text, so it must not restart the
              * 200ms quiet-deadline debounce that decides when to submit. */
-            if (agent_input_buf_take_interrupt(&input) && !worker_is_idle(&worker)) {
-                worker_interrupt(&worker);
+            if (agent_input_buf_take_interrupt(&input) && !worker_is_idle(&workers[active_worker])) {
+                worker_interrupt(&workers[active_worker]);
             }
             if (input.len != old_len) {
                 quiet_deadline = now_sec() + 0.200;
@@ -15627,15 +15741,19 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             }
         }
 
-        char *out = NULL;
-        size_t out_len = 0;
         agent_status st = {0};
-        worker_consume(&worker, &out, &out_len, &st);
-        if (out && out_len) {
-            write_all(STDOUT_FILENO, out, out_len);
-            fflush(stdout);
+        for (int i = 0; i < n; i++) {
+            char *out = NULL;
+            size_t out_len = 0;
+            agent_status si = {0};
+            worker_consume(&workers[i], &out, &out_len, &si);
+            if (out && out_len) {
+                write_all(STDOUT_FILENO, out, out_len);
+                fflush(stdout);
+            }
+            free(out);
+            if (i == active_worker) st = si;
         }
-        free(out);
 
         /* Publish status at most every 200 ms.  Dedupe on a formatted line:
          * while generating, the token count changes so this emits at the throttle
@@ -15671,7 +15789,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
                  * the event lands in the same FIFO as text/tool events
                  * instead of possibly jumping ahead of output still sitting
                  * in that buffer. */
-                agent_maybe_emit_status_event(&worker, &st, state_changed, now,
+                agent_maybe_emit_status_event(&workers[active_worker], &st, state_changed, now,
                                               last_status, sizeof(last_status),
                                               &last_status_at);
             } else if (agent_maybe_emit_marker_status(cur, now, last_status,
@@ -15683,9 +15801,9 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             }
         }
 
-        if (worker_take_queued_user_drain_request(&worker)) {
+        if (worker_take_queued_user_drain_request(&workers[active_worker])) {
             char *queued = agent_prompt_queue_take_all(&queue);
-            worker_answer_queued_user_drain(&worker, queued);
+            worker_answer_queued_user_drain(&workers[active_worker], queued);
         }
 
         if (st.state == AGENT_WORKER_ERROR) {
@@ -15698,43 +15816,58 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         if (!one_shot && input.len > 0 &&
             (stdin_eof || now_sec() >= quiet_deadline))
         {
-            char *prompt = agent_input_buf_take(&input);
-            if (worker_is_idle(&worker) && queue.len == 0) {
-                if (!worker_submit(&worker, prompt)) {
+            char *raw = agent_input_buf_take(&input);
+            int wid = 0;
+            char *prompt = NULL;
+            agent_parse_pool_prompt(raw, &wid, &prompt);
+            free(raw);
+            if (wid < 0 || wid >= n) wid = 0;  /* out-of-range → orchestrator */
+            active_worker = wid;
+            if (worker_is_idle(&workers[wid]) && queue.len == 0) {
+                if (!worker_submit(&workers[wid], prompt)) {
                     agent_prompt_queue_push(&queue, prompt);
-                    if (cfg->json_events) agent_emit_bare_event(&worker, "queued");
+                    if (cfg->json_events) agent_emit_bare_event(&workers[wid], "queued");
                     else agent_noninteractive_marker("+DWARFSTAR_QUEUED");
                 }
             } else {
                 agent_prompt_queue_push(&queue, prompt);
-                if (cfg->json_events) agent_emit_bare_event(&worker, "queued");
+                if (cfg->json_events) agent_emit_bare_event(&workers[wid], "queued");
                 else agent_noninteractive_marker("+DWARFSTAR_QUEUED");
             }
             free(prompt);
             waiting_announced = false;
         }
 
-        if (one_shot && one_shot_submitted && worker_is_idle(&worker)) break;
-        if (!one_shot && stdin_eof && input.len == 0 &&
-            queue.len == 0 && worker_is_idle(&worker))
-            break;
+        {
+            bool all_idle = true;
+            for (int i = 0; i < n; i++) {
+                if (!worker_is_idle(&workers[i])) { all_idle = false; break; }
+            }
+            if (one_shot && one_shot_submitted && all_idle) break;
+            if (!one_shot && stdin_eof && input.len == 0 &&
+                queue.len == 0 && all_idle)
+                break;
+        }
     }
 
     /* Drain anything published between the final status transition and the
      * loop exit.  This keeps stdout complete without adding another protocol. */
-    char *out = NULL;
-    size_t out_len = 0;
-    worker_consume(&worker, &out, &out_len, NULL);
-    if (out && out_len) {
-        write_all(STDOUT_FILENO, out, out_len);
-        fflush(stdout);
+    for (int i = 0; i < n; i++) {
+        char *out = NULL;
+        size_t out_len = 0;
+        worker_consume(&workers[i], &out, &out_len, NULL);
+        if (out && out_len) {
+            write_all(STDOUT_FILENO, out, out_len);
+            fflush(stdout);
+        }
+        free(out);
     }
-    free(out);
 
     if (stdin_nonblock) fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags);
     agent_input_buf_free(&input);
     agent_prompt_queue_free(&queue);
-    agent_worker_free(&worker);
+    for (int i = 0; i < n; i++) agent_worker_free(&workers[i]);
+    free(workers);
     return rc;
 }
 
