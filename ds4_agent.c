@@ -12756,6 +12756,15 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 free(tool_result);
                 agent_dsml_parser_free(&dsml);
                 if (agent_err_is_interrupted(compact_err)) {
+                    /* Turn ended by a latched interrupt during tool-result
+                     * compaction: a tool round completed, compaction for its
+                     * result was interrupted, and the turn ends here (this
+                     * returns to idle, not a resume). `generated` is this
+                     * round's count (in scope from the loop body). Matches
+                     * the other two interrupt sites (D12). */
+                    w->last_turn_stop_reason = AGENT_TURN_STOP_INTERRUPT;
+                    w->last_turn_generated = generated;
+                    w->last_turn_ctx_used = ds4_session_pos(w->session);
                     worker_clear_interrupt(w);
                     agent_set_status(w, AGENT_WORKER_IDLE);
                     return 0;
