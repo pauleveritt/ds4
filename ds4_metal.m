@@ -33286,7 +33286,7 @@ int ds4_gpu_laguna_attention_prefill_tensor(
         id<MTLBuffer> vbuf = ds4_gpu_tensor_buffer(v);
         id<MTLBuffer> gatebuf = ds4_gpu_tensor_buffer(gate);
         id<MTLComputePipelineState> store_pipeline = ds4_gpu_hot_pipeline(
-            g_laguna_store_kv_pipeline, "kernel_laguna_store_kv_f16");
+            g_store_kv_f16_pipeline, "kernel_store_kv_f16");
         id<MTLComputePipelineState> stage_pipeline = ds4_gpu_hot_pipeline(
             g_laguna_stage_kv_pipeline, "kernel_laguna_stage_kv_f16");
         const uint32_t heads_per_kv = n_head / n_head_kv;
@@ -33347,7 +33347,7 @@ int ds4_gpu_laguna_attention_prefill_tensor(
             if (use_batched_global_rows) {
                 for (uint32_t row = 0; row < n_tokens; row++) {
                     const uint32_t pos = pos0 + row;
-                    const ds4_gpu_laguna_kv_store_args store_args = {
+                    const ds4_gpu_store_kv_f16_args store_args = {
                         .cache_cap = cache_cap,
                         .cache_row = pos,
                         .n_head_kv = n_head_kv,
@@ -33497,7 +33497,7 @@ int ds4_gpu_laguna_attention_prefill_tensor(
                 const uint32_t pos = pos0 + row;
                 const uint32_t key_count = MIN(pos + 1u, cache_cap);
                 const uint32_t key_start = pos + 1u - key_count;
-                const ds4_gpu_laguna_kv_store_args store_args = {
+                const ds4_gpu_store_kv_f16_args store_args = {
                     .cache_cap = cache_cap,
                     .cache_row = pos % cache_cap,
                     .n_head_kv = n_head_kv,

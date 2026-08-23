@@ -13261,20 +13261,20 @@ static void agent_emit_tool_request(agent_worker *w, int idx,
  * any order (extra keys whose values are strings/ints/bools are skipped),
  * unescapes the s string, and returns the matched fields.  No other JSON shape
  * is accepted -- a non-tool_result line is a loud protocol refusal. */
-static bool agent_json_skip_ws(const char **p) {
+static bool agent_hosttool_json_skip_ws(const char **p) {
     while (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r') (*p)++;
     return true;
 }
 
 static bool agent_json_match(const char **p, char c) {
-    agent_json_skip_ws(p);
+    agent_hosttool_json_skip_ws(p);
     if (**p != c) return false;
     (*p)++;
     return true;
 }
 
 static bool agent_json_parse_string(const char **p, char **out) {
-    agent_json_skip_ws(p);
+    agent_hosttool_json_skip_ws(p);
     if (**p != '"') return false;
     (*p)++;
     agent_buf b = {0};
@@ -13336,7 +13336,7 @@ static bool agent_json_parse_string(const char **p, char **out) {
 }
 
 static bool agent_json_parse_int(const char **p, int *out) {
-    agent_json_skip_ws(p);
+    agent_hosttool_json_skip_ws(p);
     const char *s = *p;
     if (*s == '-' || *s == '+') s++;
     if (!(*s >= '0' && *s <= '9')) return false;
@@ -13349,7 +13349,7 @@ static bool agent_json_parse_int(const char **p, int *out) {
 }
 
 static bool agent_json_parse_bool(const char **p, bool *out) {
-    agent_json_skip_ws(p);
+    agent_hosttool_json_skip_ws(p);
     if (!strncmp(*p, "true", 4)) { *out = true; *p += 4; return true; }
     if (!strncmp(*p, "false", 5)) { *out = false; *p += 5; return true; }
     return false;
@@ -13363,7 +13363,7 @@ static bool agent_parse_tool_result_line(const char *line, int *out_idx,
     char *tstr = NULL, *sstr = NULL;
     if (!agent_json_match(&p, '{')) goto fail;
     for (;;) {
-        agent_json_skip_ws(&p);
+        agent_hosttool_json_skip_ws(&p);
         if (*p == '}') { p++; break; }
         if (*p != '"') goto fail;
         char *key = NULL;
@@ -13389,12 +13389,12 @@ static bool agent_parse_tool_result_line(const char *line, int *out_idx,
             }
         }
         free(key);
-        agent_json_skip_ws(&p);
+        agent_hosttool_json_skip_ws(&p);
         if (*p == ',') { p++; continue; }
         if (*p == '}') { p++; break; }
         goto fail;
     }
-    agent_json_skip_ws(&p);
+    agent_hosttool_json_skip_ws(&p);
     if (*p != '\0') goto fail;
     if (!have_t || !have_idx || !have_ok || !have_s) goto fail;
     if (!tstr || strcmp(tstr, "tool_result") != 0) goto fail;
@@ -16621,7 +16621,7 @@ static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
 static int agent_parse_pool_prompt(const char *line, bool pool_mode,
                                    int *out_worker, char **out_text) {
     const char *p = line;
-    agent_json_skip_ws(&p);
+    agent_hosttool_json_skip_ws(&p);
     if (pool_mode && *p == '{') {
         int worker = 0;
         char *s = NULL;
@@ -16629,7 +16629,7 @@ static int agent_parse_pool_prompt(const char *line, bool pool_mode,
         bool have_s = false, have_t = false;
         if (!agent_json_match(&p, '{')) goto drop;
         for (;;) {
-            agent_json_skip_ws(&p);
+            agent_hosttool_json_skip_ws(&p);
             if (*p == '}') { p++; break; }
             if (*p != '"') goto drop;
             char *key = NULL;
@@ -16656,12 +16656,12 @@ static int agent_parse_pool_prompt(const char *line, bool pool_mode,
                 }
             }
             free(key);
-            agent_json_skip_ws(&p);
+            agent_hosttool_json_skip_ws(&p);
             if (*p == ',') { p++; continue; }
             if (*p == '}') { p++; break; }
             goto drop;
         }
-        agent_json_skip_ws(&p);
+        agent_hosttool_json_skip_ws(&p);
         if (*p != '\0' || !have_s || !have_t || !tstr || strcmp(tstr, "prompt") != 0)
             goto drop;
         free(tstr);
