@@ -154,11 +154,15 @@ before it.
 **The largest remaining memory win, 0.65–1.3 GiB.** Expert down is Q8_0 on all
 28 layers — 3.66 GiB, 39% of the artifact — and no K-quant can reach it,
 because 896 does not divide by 256. A 32-element-block format does
-(896 ÷ 32 = 28). **Q5_0 and MXFP4 are both candidates**; MXFP4 is smaller
-(0.5313 vs 0.6875 B/elem) and already has ds4 kernels for another family, but
-its existing use is "preserved from native checkpoints" (`ds4.c:842`) — i.e.
-not requantized — so it carries a quality risk Q5_0 does not. Neither Q5_0 nor
-Q4_0 has any code in `metal/moe.metal` today.
+(896 ÷ 32 = 28). **Q5_0 and MXFP4 are both live candidates and the choice is
+step 1's shootout, not an assumption.** MXFP4 is smaller (0.5313 vs 0.6875
+B/elem — ~8.27 GiB at 40k on the 14-layer pattern, ~0.27 below Q5_0's 8.53) and
+ds4 already has its block and dequantization machinery. Its existing ds4 use is
+"preserved from native checkpoints" (`ds4.c:842`), i.e. not requantized, so
+requantizing into it is the open quality risk — **but pinned llama.cpp can
+requantize MoE tensors to MXFP4 with per-tensor regex overrides, so that risk
+is measurable before any ds4 kernel is written.** Neither Q5_0 nor Q4_0 has any
+code in `metal/moe.metal` today.
 
 Scope, mirroring the shape pieces (1) and (2) turned out to have:
 
@@ -224,32 +228,53 @@ shipping default.
 
 ## Agreed sequence (2026-08-23, after two reviews)
 
-**The shipping target is 8.53 GiB at 40k** — Q4_K gate/up across all 28 layers
-plus Q5_0 down on the official artifact's 14, leaving the other 14 at Q8_0.
-That is meaningful 16 GB headroom without an unmeasured all-down quality
-gamble. Uniform Q5_0 (7.88) is a later labelled A/B, not the default.
+**The provisional shipping target is ~8.53 GiB at 40k** (weights + KV; add
+~0.2 GiB batch scratch and process overhead) — Q4_K gate/up across all 28
+layers plus Q5_0 down on the official artifact's 14, leaving the other 14 at
+Q8_0. **Provisional, and reference-matched rather than quality-evidenced**: the
+official placement comes from `use_more_bits`, a generic positional formula
+that never measured this model (verified — see the research note). It is the
+conservative default because a widely-used artifact ships it, not because
+anyone has shown 5-bit is safe here. Uniform Q5_0 (7.88) is the larger bet, but
+**both need quality measurement** — that is step 1, not an afterthought.
 
-**Footprint and prefill are separate milestones, deliberately.** Making the Q5
+**Footprint and prefill are separate milestones, deliberately.** Making the
 artifact correct in decode/tokenwise and measuring it must complete *before*
-any Q5 prefill kernel work — otherwise a prefill kernel project hides a
+any prefill kernel work — otherwise a prefill kernel project hides a
 quantization-quality result, and neither can be attributed.
 
-1. Fix the estimator, and replace the quant/path admission with an explicit
-   contract that refuses unsupported combinations per path.
-2. Implement Q5_0 down **decode**; unsupported batch/grouped paths refuse
-   loudly rather than falling through.
-3. Build the official-pattern artifact; measure quality, real RSS, and 16 GB
-   feasibility. **This is the milestone gate.**
-4. Add Q5_0 grouped/expert-major prefill only if (3) passes.
-5. Test uniform Q5_0 as an explicitly labelled quality/footprint experiment.
-6. Consider MXFP4 only if Q5_0 misses the memory target. It saves roughly a
-   further 0.5 GiB over uniform Q5_0, but its existing ds4 kernels serve
-   *native* MXFP4 checkpoints in another family, which is not evidence that
-   requantized Mellum down weights hold up. Strictly a weaker quality bet than
-   Q5_0 — research candidate, not target.
+**And the quality question is answerable in llama.cpp, for free, before any ds4
+kernel exists.** Pinned llama.cpp can deliberately requantize MoE tensors —
+including to MXFP4 — with per-tensor regex overrides. So the format choice does
+not require writing four Q5_0 kernels first. Doing the shootout first is what
+prevents committing a kernel project to the wrong format.
 
-Pieces (3) and (3a) are prefill work and therefore sit at step 4 or later,
-regardless of how cheap (3a) turns out to be.
+1. **Format shootout in llama.cpp — no ds4 work.** Build matched BF16-derived
+   artifacts: official-pattern Q5_0 down; MXFP4 on those same 14 layers; and
+   optionally uniform Q5_0 and uniform MXFP4 as labelled aggressive arms.
+2. **Compare on held-out teacher-forced logits, greedy-token agreement, and
+   perplexity.** Agent task scores are far too noisy to be the quantization
+   oracle — and this repo's own eval prompts sit inside the imatrix
+   calibration set, so they are a regression check, not a benchmark.
+3. **Decide the format on (2).** If MXFP4 is materially worse, take Q5_0. If
+   the two are statistically indistinguishable, MXFP4 is worth reconsidering:
+   ~8.27 GiB at 40k on the 14-layer pattern, and ds4 already has its block and
+   dequantization machinery.
+4. Fix the estimator, and replace quant/path admission with an explicit
+   contract refusing unsupported combinations per path.
+5. Implement the chosen format's **decode** down kernel; unsupported
+   batch/grouped paths refuse loudly rather than falling through.
+6. Build the artifact in ds4; measure quality, real RSS, and 16 GB
+   feasibility. **This is the milestone gate.**
+7. Add grouped/expert-major prefill only if (6) passes.
+
+Pieces (3) and (3a) are prefill work and sit at step 7 or later, regardless of
+how cheap (3a) turns out to be.
+
+**Prefill target is ~300–350 t/s** — restoring the current Q8_0 expert-major
+rate — *not* llama.cpp's ~4,000. The sensible endpoint is one shared grouped
+schedule with format-specific row staging (Q4_K and Q5_0/MXFP4). Tensor-core
+work remains unnecessary for this.
 
 ## Estimator defects (found 2026-08-23, independent of the pieces above)
 

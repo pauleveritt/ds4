@@ -95,32 +95,40 @@ verified in the prefill-gap note). An earlier draft of this note read that as
 quality evidence — "down is sensitive and JetBrains did not take it to 4-bit."
 **That reading is wrong, and it inverts the conclusion.**
 
-Q4_K_M's heuristic wants `ffn_down` at Q6_K on roughly half the layers and
-Q4_K on the rest. Both are 256-block and both are unrepresentable at 896, so
-llama.cpp's incompatibility fallback maps Q6_K→Q8_0 and Q4_K→Q5_0 — which
-produces exactly the observed 14/14. The split is a **mechanical consequence
-of the same 896 geometry**, not a judgment about 5-bit. "They did not use
-4-bit" is likewise forced, not chosen. *(Inferred from the fallback behaviour
-plus the split's fingerprint; llama.cpp source was not read.)*
+**VERIFIED against pinned llama.cpp source.** Q4_K_M selects Q6_K for
+`ffn_down` on the layers where `use_more_bits` is true and Q4_K on the rest
+(`src/llama-quant.cpp:599–605`). Both are 256-block and unrepresentable at 896,
+so shape fallback maps Q6_K→Q8_0 and Q4_K→Q5_0, producing exactly the observed
+14/14:
 
-The consequence for targeting is direct, and it is the opposite of the earlier
-draft's: the 14 layers that got Q5_0 are the ones the heuristic judged **less**
-sensitive, and the sensitive half was pushed *up* to Q8_0. So the official
-artifact evidences 5-bit down **only on the less-sensitive half**. The
-"official pattern" row below (7.94 GiB weights) is the configuration with
-external support; **uniform Q5_0 across all 28 (7.29 GiB) has none** and is a
-genuine quality bet.
+- **Q8_0:** 0, 1, 2, 5, 8, 11, 14, 17, 20, 23, 24, 25, 26, 27
+- **Q5_0:** 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18, 19, 21, 22
 
-**The placement survives either reading of the split**, which is why the target
-does not rest on the fallback inference. Even if the formats are mechanical,
-the heuristic's *per-layer ranking* is quality-informed — it chose which layers
-deserved the higher format — so copying the official placement copies a real
-sensitivity ranking regardless. Stated precisely, the unevidenced claim is not
-"the split is arbitrary" but the narrower **"5-bit is safe on the other 14
-layers too."** That is what an A/B has to settle, and it is why the split, not
-uniformity, is the shipping default. Unlike Laguna, nothing structural forces
-uniformity here — the slab class does not apply (below) — so the choice is free
-and belongs to measurement.
+`use_more_bits` (`src/llama-quant.cpp:426`) is:
+
+```c
+return i_layer < n_layers/8 || i_layer >= 7*n_layers/8 || (i_layer - n_layers/8)%3 == 2;
+```
+
+**It is a generic positional formula — first eighth, last eighth, every third
+middle layer — and nothing else.** It does not consult the imatrix, the
+weights, or any measurement of this model. It is applied identically to every
+architecture.
+
+That kills a claim an earlier draft of this note made. It said the per-layer
+placement encoded "a real sensitivity ranking," so copying it copied
+quality information. **It does not.** The most that can be said is that a
+generic policy assigned more bits by *position*. Consequently:
+
+- **7.94 GiB / 8.53 at 40k is reference-matched and conservative, not
+  quality-evidenced.** It matches what a widely-used artifact ships, which is
+  a reason to prefer it as a default and is *not* a measurement.
+- Uniform Q5_0 remains the larger bet, but **both configurations require
+  quality measurement.** The difference between them is degree of risk, not
+  evidenced-versus-unevidenced.
+
+Unlike Laguna, nothing structural forces uniformity here — the slab class does
+not apply (below) — so the choice is free and belongs entirely to measurement.
 
 ## The Laguna XS 2.1 wins do not transfer
 
