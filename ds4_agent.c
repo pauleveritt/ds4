@@ -95,6 +95,29 @@ typedef enum {
     AGENT_WORKER_STOPPED,
 } agent_worker_state;
 
+/* Why a turn ended (D12, roadmap 0ee5f6c). NONE = no turn has ended yet,
+ * so the ready emitter gates the outcome block on "did a turn end" and the
+ * startup ready stays bare; a later ready repeats the last turn's outcome
+ * (a consumer that drops a line recovers, like the memory-plan fields). */
+typedef enum {
+    AGENT_TURN_STOP_NONE = 0,
+    AGENT_TURN_STOP_EOS,
+    AGENT_TURN_STOP_LIMIT,
+    AGENT_TURN_STOP_INTERRUPT,
+    AGENT_TURN_STOP_CONTEXT_FULL,
+} agent_turn_stop_reason;
+
+static const char *agent_turn_stop_reason_name(agent_turn_stop_reason r) {
+    switch (r) {
+    case AGENT_TURN_STOP_EOS:          return "eos";
+    case AGENT_TURN_STOP_LIMIT:        return "limit";
+    case AGENT_TURN_STOP_INTERRUPT:     return "interrupt";
+    case AGENT_TURN_STOP_CONTEXT_FULL:  return "context_full";
+    case AGENT_TURN_STOP_NONE:         return NULL;
+    }
+    return NULL;
+}
+
 typedef struct {
     agent_worker_state state;
     int prefill_done;
@@ -143,6 +166,13 @@ typedef struct {
     double progress_started_at;
     char *cmd_text;
     agent_status status;
+    /* Turn-outcome snapshot (D12): set where the turn actually ends (the
+     * final generation round's non-tool exit, plus the interrupt paths that
+     * end a turn), read by the ready emitter. Dedicated fields, not status:
+     * status may be reset at idle, so the snapshot survives across turns. */
+    agent_turn_stop_reason last_turn_stop_reason;
+    int last_turn_generated;
+    int last_turn_ctx_used;
     char *out;
     size_t out_len;
     size_t out_cap;
@@ -4923,6 +4953,15 @@ static void agent_emit_ready_event(agent_worker *w, const ds4_memory_plan *plan)
                  (unsigned long long)plan->planned_bytes);
         agent_buf_puts(&b, nums);
     }
+    if (w->last_turn_stop_reason != AGENT_TURN_STOP_NONE) {
+        const char *reason = agent_turn_stop_reason_name(w->last_turn_stop_reason);
+        char outcome[96];
+        snprintf(outcome, sizeof(outcome),
+                 ",\"stop_reason\":\"%s\",\"generated\":%d,\"ctx_used\":%d",
+                 reason ? reason : "eos", w->last_turn_generated,
+                 w->last_turn_ctx_used);
+        agent_buf_puts(&b, outcome);
+    }
     agent_buf_put_ts(&b, w);
     agent_buf_puts(&b, "}\n");
     char *line = agent_buf_take(&b);
@@ -9204,6 +9243,50 @@ static void test_agent_emit_ready_event_carries_memory_plan(void) {
     pthread_mutex_destroy(&w.mu);
 }
 
+/* The turn-stop reason enum names its cases as lowercase wire strings and
+ * returns NULL for NONE (so the ready emitter can gate the outcome block on
+ * "did a turn end yet"). */
+static void test_agent_turn_stop_reason_names(void) {
+    AGENT_TEST_ASSERT(!strcmp(agent_turn_stop_reason_name(AGENT_TURN_STOP_EOS), "eos"));
+    AGENT_TEST_ASSERT(!strcmp(agent_turn_stop_reason_name(AGENT_TURN_STOP_LIMIT), "limit"));
+    AGENT_TEST_ASSERT(!strcmp(agent_turn_stop_reason_name(AGENT_TURN_STOP_INTERRUPT), "interrupt"));
+    AGENT_TEST_ASSERT(!strcmp(agent_turn_stop_reason_name(AGENT_TURN_STOP_CONTEXT_FULL), "context_full"));
+    AGENT_TEST_ASSERT(agent_turn_stop_reason_name(AGENT_TURN_STOP_NONE) == NULL);
+}
+
+/* The ready event carries the turn-outcome snapshot (stop_reason/generated/
+ * ctx_used) only once a turn has actually ended; the startup ready (NONE) is
+ * bare, and a later ready repeats the last turn's outcome (D12 recovery).
+ * Mirrors test_agent_emit_ready_event_carries_memory_plan's setup. */
+static void test_agent_ready_event_carries_turn_outcome(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1;
+    agent_config cfg = { .json_events = true };
+    w.cfg = &cfg;
+
+    /* Startup ready: no turn has ended, so no outcome fields. */
+    w.last_turn_stop_reason = AGENT_TURN_STOP_NONE;
+    agent_emit_ready_event(&w, NULL);
+    AGENT_TEST_ASSERT(w.out != NULL);
+    if (w.out) AGENT_TEST_ASSERT(strstr(w.out, "stop_reason") == NULL);
+    free(w.out); w.out = NULL; w.out_len = 0; w.out_cap = 0;
+
+    /* After a turn: the ready event carries the outcome snapshot. */
+    w.last_turn_stop_reason = AGENT_TURN_STOP_INTERRUPT;
+    w.last_turn_generated = 42;
+    w.last_turn_ctx_used = 1024;
+    agent_emit_ready_event(&w, NULL);
+    AGENT_TEST_ASSERT(w.out != NULL);
+    if (w.out) {
+        AGENT_TEST_ASSERT(strstr(w.out, "\"stop_reason\":\"interrupt\"") != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\"generated\":42") != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\"ctx_used\":1024") != NULL);
+    }
+    free(w.out); w.out = NULL; w.out_len = 0; w.out_cap = 0;
+    pthread_mutex_destroy(&w.mu);
+}
+
 /* Regression test for a code-review finding on Task 2's --json-events tool
  * events work: agent_tool_viz_param_raw_byte() appends one byte at a time
  * into v->json_param and flushes as a "param_value" event as soon as its
@@ -10544,6 +10627,8 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_maybe_emit_status_event_distinguishes_collapsed_states();
     test_agent_emit_bare_event_ready_and_queued();
     test_agent_emit_ready_event_carries_memory_plan();
+    test_agent_turn_stop_reason_names();
+    test_agent_ready_event_carries_turn_outcome();
     test_agent_json_events_param_value_utf8_boundary_no_tear();
     test_agent_worker_compact_stream_flush_no_utf8_tear();
     test_agent_publish_backstop_wraps_unguarded_bytes_as_text();
@@ -12387,6 +12472,11 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             agent_publish_system_status(
                 w, "Model reading interrupted; the model may only be aware of the prefix processed so far.");
             agent_worker_append_assistant_turn_end(w);
+            /* Turn ended by a latched interrupt during prefill (before
+             * generation could start): no tokens were generated. */
+            w->last_turn_stop_reason = AGENT_TURN_STOP_INTERRUPT;
+            w->last_turn_generated = 0;
+            w->last_turn_ctx_used = ds4_session_pos(w->session);
             worker_clear_interrupt(w);
             agent_set_status(w, AGENT_WORKER_IDLE);
             return 0;
@@ -12579,6 +12669,10 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             got_tool = true;
         if (interrupted) {
             agent_worker_append_assistant_turn_end(w);
+            /* Turn ended by a latched interrupt during generation. */
+            w->last_turn_stop_reason = AGENT_TURN_STOP_INTERRUPT;
+            w->last_turn_generated = generated;
+            w->last_turn_ctx_used = ds4_session_pos(w->session);
             agent_dsml_parser_free(&dsml);
             agent_publish_system_status(w, "Stopped by user");
             worker_clear_interrupt(w);
@@ -12608,6 +12702,21 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_worker_append_assistant_turn_end(w);
 
         if (!got_tool && !malformed_tool && !early_tool_error) {
+            /* Turn-outcome snapshot (D12): this clean non-tool exit is the
+             * only place a turn actually ends -- the interrupt paths set
+             * INTERRUPT on their own returns above, and tool rounds (which
+             * resume the loop) are not turn ends. room<=1 means the context
+             * was already full so generation could not start; generated>=
+             * max_tokens is the token limit; otherwise the stop token
+             * ended the round (EOS). */
+            if (room <= 1)
+                w->last_turn_stop_reason = AGENT_TURN_STOP_CONTEXT_FULL;
+            else if (generated >= max_tokens)
+                w->last_turn_stop_reason = AGENT_TURN_STOP_LIMIT;
+            else
+                w->last_turn_stop_reason = AGENT_TURN_STOP_EOS;
+            w->last_turn_generated = generated;
+            w->last_turn_ctx_used = ds4_session_pos(w->session);
             agent_dsml_parser_free(&dsml);
             agent_set_status(w, AGENT_WORKER_IDLE);
             return 0;
