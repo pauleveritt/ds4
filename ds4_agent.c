@@ -88,6 +88,11 @@ typedef struct {
      * dispatching internally. The app always passes it; the bare CLI keeps
      * internal execution. */
     bool host_tools;
+    /* P11 (fork divergence #11): the subagent pool. 1 = the single-worker
+     * program (byte-identical to pre-P11); N>1 hosts N sessions in one
+     * process sharing one engine, with a `worker` id on every json-events
+     * line. */
+    int num_workers;
 } agent_config;
 
 typedef enum {
@@ -162,6 +167,9 @@ typedef struct {
     bool wake_pending;
     bool stop;
     bool interrupt;
+    /* P11 (fork divergence #11): this worker's id on the pooled wire
+     * (0 = orchestrator). Emitted only when cfg->num_workers > 1. */
+    int worker_id;
     bool host_tool_reading; /* P9 --host-tools: worker owns stdin while blocked
                              * reading a tool_result; gates the UI thread's
                              * stdin poll so the result line is not drained as
@@ -722,6 +730,7 @@ static agent_config parse_options(int argc, char **argv) {
             .think_mode = DS4_THINK_HIGH,
         },
         .shell_allowed = true,  /* D2: absent --shell keeps the bare CLI's bash */
+        .num_workers = 1,       /* P11: the single-worker default (no worker field) */
     };
 
     bool steering_scale_set = false;
@@ -862,6 +871,11 @@ static agent_config parse_options(int argc, char **argv) {
              * tool_request per call and blocks on a tool_result from stdin
              * instead of dispatching internally. Requires --json-events. */
             c.host_tools = true;
+        } else if (!strcmp(arg, "--subagent-pool")) {
+            /* P11 (fork divergence #11): host N sessions in one process on one
+             * engine. 1 = single-worker (byte-identical to pre-P11). */
+            c.num_workers = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (c.num_workers < 1) c.num_workers = 1;
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
@@ -967,6 +981,14 @@ static agent_config parse_options(int argc, char **argv) {
     if (c.host_tools && !c.json_events) {
         fprintf(stderr,
                 "ds4-agent: --host-tools requires --json-events (the bidirectional wire)\n");
+        exit(2);
+    }
+    /* --subagent-pool hosts N sessions; the `worker` field is a json-events
+     * field, so N>1 requires --json-events (the single-session default needs
+     * nothing). */
+    if (c.num_workers > 1 && !c.json_events) {
+        fprintf(stderr,
+                "ds4-agent: --subagent-pool with N>1 requires --json-events (the worker field)\n");
         exit(2);
     }
     return c;
@@ -4833,7 +4855,6 @@ static void agent_json_escape(agent_buf *b, const char *s, size_t n) {
  * json-events line (fork divergence #7). Only deltas are meaningful — the
  * provenance records the wall-clock start for absolute anchoring. */
 static void agent_buf_put_ts(agent_buf *b, const agent_worker *w) {
-    (void)w;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     unsigned long long us = (unsigned long long)ts.tv_sec * 1000000ULL
@@ -4841,6 +4862,14 @@ static void agent_buf_put_ts(agent_buf *b, const agent_worker *w) {
     char num[32];
     snprintf(num, sizeof(num), ",\"ts\":%llu", us);
     agent_buf_puts(b, num);
+    /* P11 (fork divergence #11): the pooled wire carries the emitting worker's
+     * id. Absent when num_workers <= 1, so the single-session wire is
+     * byte-identical to pre-P11. */
+    if (w && w->cfg && w->cfg->num_workers > 1) {
+        char wid[32];
+        snprintf(wid, sizeof(wid), ",\"worker\":%d", w->worker_id);
+        agent_buf_puts(b, wid);
+    }
 }
 
 /* Version/capability handshake: the first line when --json-events is active
@@ -4853,6 +4882,10 @@ static void agent_emit_hello(agent_worker *w) {
      * that does not know the kind can refuse loudly (binding rule 7). */
     if (w->cfg && w->cfg->host_tools)
         agent_buf_puts(&b, ",\"tool_request\"");
+    /* P11 (fork divergence #11): advertise the pooled wire so the app can
+     * detect support instead of guessing. */
+    if (w->cfg && w->cfg->num_workers > 1)
+        agent_buf_puts(&b, ",\"pool\"");
     agent_buf_puts(&b, "]");   /* close the caps array before the top-level ts */
     agent_buf_put_ts(&b, w);
     agent_buf_puts(&b, "}\n");
@@ -10891,6 +10924,48 @@ static void test_agent_confine_path_refuses_missing_read_target(void) {
     rmdir(tmp);
 }
 
+/* P11 (fork divergence #11): the pooled wire. With num_workers <= 1 the wire
+ * is byte-identical (no worker field, no pool cap); with num_workers > 1 every
+ * event carries the emitting worker's id and hello advertises "pool". */
+static void test_agent_pool_worker_field_and_cap(void) {
+    /* single-worker: no worker field, no pool cap. */
+    {
+        agent_worker w = {0};
+        pthread_mutex_init(&w.mu, NULL);
+        w.wake_fd[1] = -1;
+        agent_config cfg = { .json_events = true, .host_tools = false, .num_workers = 1 };
+        w.cfg = &cfg;
+        agent_emit_hello(&w);
+        AGENT_TEST_ASSERT(w.out != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "worker") == NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "pool") == NULL);
+        free(w.out);
+        pthread_mutex_destroy(&w.mu);
+    }
+    /* multi-worker (num_workers=2): hello advertises "pool" and carries the
+     * emitting worker's id; a text event from worker 1 carries "worker":1. */
+    {
+        agent_worker w = {0};
+        pthread_mutex_init(&w.mu, NULL);
+        w.wake_fd[1] = -1;
+        agent_config cfg = { .json_events = true, .host_tools = false, .num_workers = 2 };
+        w.cfg = &cfg;
+        w.worker_id = 0;
+        agent_emit_hello(&w);
+        AGENT_TEST_ASSERT(w.out != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\"pool\"") != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\"worker\":0") != NULL);
+        free(w.out);
+        w.out = NULL; w.out_len = 0; w.out_cap = 0;
+        w.worker_id = 1;
+        agent_emit_event_str(&w, "text", "hi", 2);
+        AGENT_TEST_ASSERT(w.out != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\"worker\":1") != NULL);
+        free(w.out);
+        pthread_mutex_destroy(&w.mu);
+    }
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_json_events_release_flushes_and_frees_pending();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
@@ -10925,6 +11000,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_host_tools_multi_call_threads_idx();
     test_agent_host_tools_off_path_unchanged();
     test_agent_emit_hello_caps_array_closes();
+    test_agent_pool_worker_field_and_cap();
     test_agent_emit_status_event_covers_all_eight_states();
     test_agent_emit_status_event_escapes_error_field();
     test_agent_emit_status_event_trims_torn_utf8_error_tail();
