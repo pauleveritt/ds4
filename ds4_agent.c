@@ -8909,9 +8909,13 @@ static void test_agent_execute_tool_call_unknown_tool_trims_torn_utf8_name(void)
         agent_buf expected = {0};
         agent_buf_puts(&expected, "\\n[tool:");
         for (int i = 0; i < 247; i++) agent_buf_puts(&expected, "a");
-        agent_buf_puts(&expected, "\"}");
+        /* The "s" value is exactly "\n[tool:" + 247 a's; divergence #7's
+         * ts field follows the value's closing quote, so the line no
+         * longer ends in `"}` -- match up to and including that quote. */
+        agent_buf_puts(&expected, "\"");
         char *expected_str = agent_buf_take(&expected);
         AGENT_TEST_ASSERT(strstr(w.out, expected_str) != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\"ts\":") != NULL);
         free(expected_str);
         /* No raw euro-sign byte (lead or continuation) survives anywhere
          * in the emitted line. */
@@ -9008,13 +9012,15 @@ static void test_agent_emit_bare_event_ready_and_queued(void) {
 
     agent_emit_bare_event(&w, "ready");
     AGENT_TEST_ASSERT(w.out != NULL);
-    AGENT_TEST_ASSERT(!strcmp(w.out, "{\"t\":\"ready\"}\n"));
+    AGENT_TEST_ASSERT(strstr(w.out, "{\"t\":\"ready\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"ts\":") != NULL);
     free(w.out);
     w.out = NULL; w.out_len = 0; w.out_cap = 0;
 
     agent_emit_bare_event(&w, "queued");
     AGENT_TEST_ASSERT(w.out != NULL);
-    AGENT_TEST_ASSERT(!strcmp(w.out, "{\"t\":\"queued\"}\n"));
+    AGENT_TEST_ASSERT(strstr(w.out, "{\"t\":\"queued\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"ts\":") != NULL);
     free(w.out);
     pthread_mutex_destroy(&w.mu);
 }
@@ -9037,9 +9043,14 @@ static void test_agent_emit_ready_event_carries_memory_plan(void) {
 
     AGENT_TEST_ASSERT(w.out != NULL);
     if (w.out) {
-        AGENT_TEST_ASSERT(!strcmp(w.out,
+        /* The ready event carries the four plan fields with their exact
+         * values; divergence #7 appends a "ts" field after the last one,
+         * so assert the deterministic prefix plus ts presence, not the
+         * full line. */
+        AGENT_TEST_ASSERT(strstr(w.out,
             "{\"t\":\"ready\",\"kv_bytes\":1685774336,\"scratch_bytes\":6146715648"
-            ",\"model_bytes\":48254631936,\"planned_bytes\":56087121920}\n"));
+            ",\"model_bytes\":48254631936,\"planned_bytes\":56087121920") != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\"ts\":") != NULL);
     }
     free(w.out);
     w.out = NULL; w.out_len = 0; w.out_cap = 0;
@@ -9050,7 +9061,8 @@ static void test_agent_emit_ready_event_carries_memory_plan(void) {
     agent_emit_ready_event(&w, NULL);
     AGENT_TEST_ASSERT(w.out != NULL);
     if (w.out) {
-        AGENT_TEST_ASSERT(!strcmp(w.out, "{\"t\":\"ready\"}\n"));
+        AGENT_TEST_ASSERT(strstr(w.out, "{\"t\":\"ready\"") != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\"ts\":") != NULL);
     }
     free(w.out);
     pthread_mutex_destroy(&w.mu);
@@ -9095,9 +9107,10 @@ static void test_agent_json_events_param_value_utf8_boundary_no_tear(void) {
 
     /* Reconstruct the concatenation of every param_value event's "s" field.
      * None of the input bytes need JSON escaping (no quotes/backslashes/
-     * control bytes), so each event is exactly `{"t":"tool","phase":
-     * "param_value","s":"<raw bytes>"}\n` -- slice out the bytes between
-     * the opening `"s":"` and the closing `"}`. */
+     * control bytes), so the "s" value in each event line is exactly the
+     * raw bytes -- slice them out between the opening `"s":"` and the
+     * value's closing `"` (divergence #7's ts field follows that quote,
+     * so the line no longer ends in `"}`). */
     agent_buf reconstructed = {0};
     size_t pos = 0;
     int event_count = 0;
@@ -9110,7 +9123,11 @@ static void test_agent_json_events_param_value_utf8_boundary_no_tear(void) {
         const char *sval = skey + 5;
         const char *line_end = line_start + line_len;
         AGENT_TEST_ASSERT((size_t)(line_end - sval) >= 2);
-        const char *send = line_end - 2; /* line ends with `"}`; drop it */
+        /* The "s" value's closing quote is the first `"` after sval -- the
+         * raw bytes hold no quotes/backslashes, and divergence #7's ts
+         * field follows that quote, so the line no longer ends in `"}`. */
+        const char *send = memchr(sval, '"', (size_t)(line_end - sval));
+        AGENT_TEST_ASSERT(send != NULL);
         size_t chunk_len = (size_t)(send - sval);
 
         /* Each individually-emitted chunk must be valid UTF-8 on its own:
@@ -9255,7 +9272,11 @@ static void test_agent_worker_compact_stream_flush_no_utf8_tear(void) {
         const char *sval = skey + 5;
         const char *line_end = line_start + line_len;
         AGENT_TEST_ASSERT((size_t)(line_end - sval) >= 2);
-        const char *send = line_end - 2; /* line ends with `"}`; drop it */
+        /* The "s" value's closing quote is the first `"` after sval -- the
+         * raw bytes hold no quotes/backslashes, and divergence #7's ts
+         * field follows that quote, so the line no longer ends in `"}`. */
+        const char *send = memchr(sval, '"', (size_t)(line_end - sval));
+        AGENT_TEST_ASSERT(send != NULL);
         size_t chunk_len = (size_t)(send - sval);
 
         if (chunk_len) {
@@ -9309,7 +9330,11 @@ static void test_agent_worker_compact_stream_flush_no_utf8_tear(void) {
         const char *sval = skey + 5;
         const char *line_end = line_start + line_len;
         AGENT_TEST_ASSERT((size_t)(line_end - sval) >= 2);
-        const char *send = line_end - 2;
+        /* The "s" value's closing quote is the first `"` after sval -- the
+         * raw bytes hold no quotes/backslashes, and divergence #7's ts
+         * field follows that quote, so the line no longer ends in `"}`. */
+        const char *send = memchr(sval, '"', (size_t)(line_end - sval));
+        AGENT_TEST_ASSERT(send != NULL);
         size_t chunk_len = (size_t)(send - sval);
 
         if (chunk_len) {
@@ -9355,7 +9380,11 @@ static void test_agent_publish_backstop_wraps_unguarded_bytes_as_text(void) {
      * assertion is not vacuously true. */
     agent_publish(&w, "raw bytes\n", 10);
     AGENT_TEST_ASSERT(w.out != NULL);
-    AGENT_TEST_ASSERT(!strcmp(w.out, "{\"t\":\"text\",\"s\":\"raw bytes\\n\"}\n"));
+    /* The wrap emits a "text" event whose "s" value is the JSON-escaped
+     * "raw bytes\n"; divergence #7 appends a "ts" field after it, so
+     * assert the deterministic prefix plus ts presence, not the full line. */
+    AGENT_TEST_ASSERT(strstr(w.out, "{\"t\":\"text\",\"s\":\"raw bytes\\n\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"ts\":") != NULL);
 
     free(w.out);
     w.out = NULL; w.out_len = 0; w.out_cap = 0;
@@ -9659,10 +9688,12 @@ static void test_agent_json_events_bash_observation_huge_body_cap_keeps_line_com
     AGENT_TEST_ASSERT(w.out != NULL);
     AGENT_TEST_ASSERT(w.out_len > 3);
 
-    /* The line must be complete: it must end with the closing `"}\n`
-     * agent_emit_tool_event() writes last, not have that silently dropped
-     * by agent_buf_append()'s 128KB truncated latch. */
-    AGENT_TEST_ASSERT(!memcmp(w.out + w.out_len - 3, "\"}\n", 3));
+    /* The line must be complete: it must end with the closing `}\n`
+     * agent_emit_tool_event() writes last (the object close + newline,
+     * preceded by divergence #7's ts field), not have that silently
+     * dropped by agent_buf_append()'s 128KB truncated latch. */
+    AGENT_TEST_ASSERT(!memcmp(w.out + w.out_len - 2, "}\n", 2));
+    AGENT_TEST_ASSERT(strstr(w.out, "\"ts\":") != NULL);
     /* And it must actually parse as one well-formed tool/output event, not
      * just happen to end in those three bytes. */
     AGENT_TEST_ASSERT(!strncmp(w.out, "{\"t\":\"tool\",\"phase\":\"output\",\"idx\":0", 36));
