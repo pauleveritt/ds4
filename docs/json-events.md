@@ -219,6 +219,37 @@ ignore the rest. They are **absent** (only `{"t":"ready"}` is emitted)
 when the engine has no memory plan to report (opened with `ctx_size <= 0`),
 so a parser must treat all four fields as optional.
 
+When a turn has ended, `ready` additionally carries that turn's outcome
+snapshot (P7, divergence #9):
+
+```json
+{"t":"ready",...,"stop_reason":"eos","generated":128,"ctx_used":8192}
+```
+
+| field | type | meaning |
+|---|---|---|
+| `stop_reason` | string, optional | why the turn ended |
+| `generated` | int, optional | tokens generated this turn |
+| `ctx_used` | int, optional | context tokens used, as of the turn end |
+
+`stop_reason` is one of:
+
+| value | meaning |
+|---|---|
+| `eos` | the stop token ended the final generation round (clean non-tool exit) |
+| `limit` | generation hit the configured token limit |
+| `context_full` | the context was already full, so generation could not start |
+| `interrupt` | a latched interrupt ended the turn (during prefill, generation, or compaction) |
+
+Like the memory-plan fields, these three are **absent from the startup
+`ready`** (no turn has ended yet) and **repeated unchanged on every later
+`ready`** until the next turn ends — a consumer that drops a `ready` line
+and re-reads on the next one recovers the last turn's outcome. Treat all
+three as optional. Before this field landed the wire had no stop reason at
+all, and turn end was only inferable from `status.state` transitioning to
+`idle`, so a capture-grade turn outcome could not distinguish EOS from
+limit from context-full.
+
 ### `queued`
 
 ```json
@@ -357,6 +388,32 @@ them.
   be cut mid-line (or even mid-word) across two or more consecutive `text`
   events. A consumer must reassemble `text` (and `think`) content by
   concatenation, not assume one event equals one line or one paragraph.
+
+## Consent flags (P7; no wire impact)
+
+Two spawn-time flags added in P7 (divergence #8) gate the engine's tool
+surface but change **no event kind, field, or ordering guarantee** on this
+wire:
+
+- **`--shell on|off`** (default `on`): when `off`, the three bash tools
+  (`bash`, `bash_status`, `bash_stop`) are dropped from the advertised tool
+  schema and refused at dispatch — a call to any of them returns a tool
+  error instead of executing. On the wire this surfaces only as a `tool`
+  event whose `output` is that error string (the bash tools are among the
+  few that emit `output`; see the `tool` phase table); no new event kind,
+  field, or ordering is introduced.
+- **`--workspace DIR`**: sets the agent's cwd (unless `--chdir` was given
+  explicitly) and confines the file tools `read`/`write`/`list` to `DIR`,
+  failing closed — a call whose resolved path escapes `DIR` returns a tool
+  error rather than touching an arbitrary path. On the wire this is
+  invisible: the file tools never emit `output` (see "Which calls get an
+  `output` event"), and a confined or refused call differs from a normal
+  one only in its result text, not in any event shape.
+
+Both are parsed at startup and enforced in `ds4_agent.c`; neither adds a
+field to any event on this wire. They are noted here only so a consumer
+knows the advertised tool surface can be narrower than the built-in set,
+and that this narrowing is invisible to the wire format itself.
 
 ## Note on this document's relationship to the brief that requested it
 
