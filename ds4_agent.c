@@ -15749,6 +15749,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         }
 
         agent_status st = {0};
+        int status_worker = (generating_worker >= 0) ? generating_worker : active_worker;
         for (int i = 0; i < n; i++) {
             char *out = NULL;
             size_t out_len = 0;
@@ -15759,7 +15760,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
                 fflush(stdout);
             }
             free(out);
-            if (i == active_worker) st = si;
+            if (i == status_worker) st = si;
         }
 
         /* Publish status at most every 200 ms.  Dedupe on a formatted line:
@@ -15796,7 +15797,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
                  * the event lands in the same FIFO as text/tool events
                  * instead of possibly jumping ahead of output still sitting
                  * in that buffer. */
-                agent_maybe_emit_status_event(&workers[active_worker], &st, state_changed, now,
+                agent_maybe_emit_status_event(&workers[status_worker], &st, state_changed, now,
                                               last_status, sizeof(last_status),
                                               &last_status_at);
             } else if (agent_maybe_emit_marker_status(cur, now, last_status,
