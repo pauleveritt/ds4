@@ -13934,9 +13934,16 @@ static void *worker_main(void *arg) {
                 w->cfg->engine.model_path ? w->cfg->engine.model_path : "",
                 w->cfg->gen.trace_path ? w->cfg->gen.trace_path : "");
     char init_err[160] = {0};
-    bool init_ok = agent_worker_wait_distributed_route(w, init_err, sizeof(init_err));
+    bool init_ok;
+    /* P11 (fork divergence #11): serialize init with the same pool mutex that
+     * serializes turns — the system-prompt reset prefills on the shared
+     * engine's Metal device, and two workers doing it concurrently race (a
+     * Metal command-buffer assertion kills the process). */
+    pthread_mutex_lock(&pool_mu);
+    init_ok = agent_worker_wait_distributed_route(w, init_err, sizeof(init_err));
     if (init_ok && !w->cfg->gen.raw_prompt)
         init_ok = agent_worker_reset_to_sysprompt(w, init_err, sizeof(init_err));
+    pthread_mutex_unlock(&pool_mu);
     if (!init_ok) {
         agent_set_error(w, init_err[0] ? init_err : "failed to initialize system prompt");
     }
