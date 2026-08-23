@@ -30,11 +30,12 @@ the kernel story are in `MELLUM.md`'s "9.33 GiB selective artifact" section.
 **Re-oriented 2026-08-23 around a footprint target.** The 9.33 GiB artifact
 decomposes so that expert **down** — untouched, Q8_0 on all 28 layers — is
 39% of it, and it is structurally unreachable by any K-quant (896 does not
-divide by 256). The next target is **~7.3 GiB of weights, ~7.9 GiB at 40k
-context**, reached by a Q5_0 expert-down path plus finishing gate/up on layers
-22–27. Q6_K is *not* the answer in either direction. Laguna XS 2.1's two
-memory wins were checked and neither transfers. Decomposition, target
-arithmetic, and two estimator defects found while measuring:
+divide by 256). The next target is **~8.5 GiB at 40k context evidenced, ~7.9
+aggressive** (against 9.92 today), reached by a Q5_0 or MXFP4 expert-down path
+plus finishing gate/up on layers 22–27. Q6_K is *not* the answer in either
+direction. Laguna XS 2.1's two memory wins were checked and neither transfers.
+Decomposition, target arithmetic, and two estimator defects found while
+measuring:
 [`../research/2026-08-23-mellum-footprint-target.md`](../research/2026-08-23-mellum-footprint-target.md).
 
 ## Piece 2b: select the SIMD Q4_K kernel
@@ -150,29 +151,46 @@ before it.
 
 ## Piece 4: Q5_0 expert-down
 
-**The largest remaining memory win, ~1.3 GiB.** Expert down is Q8_0 on all 28
-layers — 3.66 GiB, 39% of the artifact — and no K-quant can reach it, because
-896 does not divide by 256. A 32-element-block format does (896 ÷ 32 = 28), and
-Q5_0 is the defensible choice: the official artifact already ships Q5_0 down
-tensors, which is evidence the quality holds at 5-bit.
+**The largest remaining memory win, 0.65–1.3 GiB.** Expert down is Q8_0 on all
+28 layers — 3.66 GiB, 39% of the artifact — and no K-quant can reach it,
+because 896 does not divide by 256. A 32-element-block format does
+(896 ÷ 32 = 28). **Q5_0 and MXFP4 are both candidates**; MXFP4 is smaller
+(0.5313 vs 0.6875 B/elem) and already has ds4 kernels for another family, but
+its existing use is "preserved from native checkpoints" (`ds4.c:842`) — i.e.
+not requantized — so it carries a quality risk Q5_0 does not. Neither Q5_0 nor
+Q4_0 has any code in `metal/moe.metal` today.
 
 Scope, mirroring the shape pieces (1) and (2) turned out to have:
 
-1. A Q5_0 expert-down Metal kernel (decode first; the batch path is piece 3's).
-2. Admission in **both** quant gates — `weights_validate_mellum_layout` *and*
-   the decode-contract desc builder. The "two Q8_0 gates, not one" trap above
-   is the same pattern and will reappear here.
-3. Artifact construction: extend
-   `tools/mellum/build-selective-artifact.sh` with explicit
-   `--tensor-type ffn_down_exps=Q5_0`.
+1. Expert-down Metal kernels. Note the Q8 surface is **four** variants —
+   `down_f32`, `down_batch_f32`, `down_grouped4_f32`, `down_grouped8_f32`
+   (`metal/moe.metal:2984, 3038, 3211, 3230`) — so "a kernel" undercounts even
+   a decode-first slice.
+2. Admission in **three** gates, not two — see the trap below.
+3. Artifact construction: extend `tools/mellum/build-selective-artifact.sh`
+   with an explicit `--tensor-type ffn_down_exps=…` override.
 
-**One open choice, and it should be measured not assumed.** The official
-artifact splits down 14 layers Q8_0 / 14 layers Q5_0 (llama.cpp's boost
-heuristic). Uniform Q5_0 across all 28 saves 1.29 GiB against the split's 0.65,
-but is untested for quality. Unlike Laguna, *nothing structural forces
-uniformity here* — the slab class is SSD-streaming-only and Mellum cannot
-stream — so this is a free choice on the quality/size curve, and down is the
-sensitive projection. Run the Q8-relative gate on both.
+**The trap: there is a third quant gate, and it corrupts silently.**
+`ds4_engine_bind_mellum_decode_contract` decides batch-prefill eligibility by
+testing **only** `src->ffn_gate_exps->type == DS4_TENSOR_Q4_K`
+(`ds4.c:36895`) — it never inspects down, and all four down kernels are
+Q8_0-only. So the natural A/B artifact for isolating down (**Q8_0 gate/up +
+Q5_0 down**) leaves the boolean *false* once validation and the desc builder
+admit Q5_0, and a long sync then runs `kernel_mellum_q8_0_down_batch_f32` over
+Q5_0 bytes: wrong output, no error. **The eligibility test must learn about
+down before that artifact is built.** This is the "two Q8_0 gates, not one"
+trap with a third member, and unlike the other two it fails silently.
+
+**One open choice, to be measured not assumed — and the earlier reasoning here
+was wrong.** The official artifact splits down 14 Q8_0 / 14 Q5_0, and this
+plan previously read that as evidence that 5-bit down is safe. It is not: Q4_K_M's
+heuristic wants Q6_K and Q4_K on down, both are 256-block and unrepresentable at
+896, and llama.cpp's fallback maps them to Q8_0 and Q5_0 respectively —
+producing exactly 14/14 mechanically. The Q5_0 half is the half judged *less*
+sensitive. So the split (0.65 GiB) is the evidenced configuration and **uniform
+Q5_0 (1.29 GiB) is an unevidenced quality bet**. Nothing structural forces
+uniformity here — the slab class is SSD-streaming-only and Mellum cannot
+stream — so run the Q8-relative gate on both and let it decide.
 
 ## Estimator defects (found 2026-08-23, independent of the pieces above)
 
