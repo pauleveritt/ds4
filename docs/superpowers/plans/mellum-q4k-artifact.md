@@ -174,23 +174,82 @@ Scope, mirroring the shape pieces (1) and (2) turned out to have:
 `ds4_engine_bind_mellum_decode_contract` decides batch-prefill eligibility by
 testing **only** `src->ffn_gate_exps->type == DS4_TENSOR_Q4_K`
 (`ds4.c:36895`) — it never inspects down, and all four down kernels are
-Q8_0-only. So the natural A/B artifact for isolating down (**Q8_0 gate/up +
-Q5_0 down**) leaves the boolean *false* once validation and the desc builder
-admit Q5_0, and a long sync then runs `kernel_mellum_q8_0_down_batch_f32` over
-Q5_0 bytes: wrong output, no error. **The eligibility test must learn about
-down before that artifact is built.** This is the "two Q8_0 gates, not one"
-trap with a third member, and unlike the other two it fails silently.
+Q8_0-only. This is the "two Q8_0 gates, not one" trap with a third member, and
+unlike the other two it fails silently.
+
+The two candidate artifacts have **different hazard profiles**, which is what
+makes this release-blocking:
+
+| Artifact | Boolean | Path | Outcome |
+| --- | --- | --- | --- |
+| Q4_K gate/up all 28 + mixed down (**shipping**) | `true` | decode only | Safe — but *by coincidence*, because Q4_K gate happens to trip it |
+| Q8_0 gate/up + Q5_0 down (**isolation A/B**) | `false` | batch engages | **Q8_0 batch down kernel reads Q5_0 bytes — wrong output, no error** |
+
+So the defect does not block the shipping artifact; it blocks the diagnostic
+you would need in order to trust it. That is worse, not better.
+
+**The fix is an admission contract, not a wider boolean.** Define the supported
+quant combinations explicitly per path — decode, token-batch, grouped prefill —
+and refuse anything unsupported, loudly. **No dispatch site should infer Q8_0
+layout from "not Q4_K."** That inference is the actual defect; widening the
+test to include down would leave the same latent pattern for the next format.
+
+Note that `kernel_mellum_q8_0_down_f32` (`metal/moe.metal:2984`) is the
+*decode* kernel and is equally Q8_0-only, so a Q5_0 decode down kernel is
+unconditional work — the batch variants are an additional surface, not the
+first one.
 
 **One open choice, to be measured not assumed — and the earlier reasoning here
-was wrong.** The official artifact splits down 14 Q8_0 / 14 Q5_0, and this
-plan previously read that as evidence that 5-bit down is safe. It is not: Q4_K_M's
-heuristic wants Q6_K and Q4_K on down, both are 256-block and unrepresentable at
-896, and llama.cpp's fallback maps them to Q8_0 and Q5_0 respectively —
-producing exactly 14/14 mechanically. The Q5_0 half is the half judged *less*
-sensitive. So the split (0.65 GiB) is the evidenced configuration and **uniform
-Q5_0 (1.29 GiB) is an unevidenced quality bet**. Nothing structural forces
-uniformity here — the slab class is SSD-streaming-only and Mellum cannot
-stream — so run the Q8-relative gate on both and let it decide.
+was wrong.** The official artifact splits down 14 Q8_0 / 14 Q5_0, and this plan
+previously read that as evidence that 5-bit down is safe *in general*. It is
+not. Q4_K_M's heuristic wants Q6_K and Q4_K on down; both are 256-block and
+unrepresentable at 896, and llama.cpp's fallback maps them to Q8_0 and Q5_0
+respectively, producing 14/14 mechanically. *(Inference — llama.cpp source not
+read. Do not strengthen it without confirming the fallback map from source or
+conversion logs.)*
+
+**But the placement survives either reading, and that is what matters.** Even
+under the fallback theory, the heuristic's *per-layer ranking* is
+quality-informed — it chose which layers deserved the higher format — and only
+the format mapping is mechanical. So copying the official placement copies a
+real sensitivity ranking regardless of which theory holds. The precise claim
+that is unevidenced is narrower than "the split is arbitrary": it is **"5-bit is
+safe on the other 14 layers too."**
+
+That makes the split (0.65 GiB) the evidenced configuration and **uniform Q5_0
+(1.29 GiB) the bet**. Nothing structural forces uniformity here — the slab class
+is SSD-streaming-only and Mellum cannot stream — so the choice is free and the
+Q8-relative gate decides it, as a later labelled experiment rather than as the
+shipping default.
+
+## Agreed sequence (2026-08-23, after two reviews)
+
+**The shipping target is 8.53 GiB at 40k** — Q4_K gate/up across all 28 layers
+plus Q5_0 down on the official artifact's 14, leaving the other 14 at Q8_0.
+That is meaningful 16 GB headroom without an unmeasured all-down quality
+gamble. Uniform Q5_0 (7.88) is a later labelled A/B, not the default.
+
+**Footprint and prefill are separate milestones, deliberately.** Making the Q5
+artifact correct in decode/tokenwise and measuring it must complete *before*
+any Q5 prefill kernel work — otherwise a prefill kernel project hides a
+quantization-quality result, and neither can be attributed.
+
+1. Fix the estimator, and replace the quant/path admission with an explicit
+   contract that refuses unsupported combinations per path.
+2. Implement Q5_0 down **decode**; unsupported batch/grouped paths refuse
+   loudly rather than falling through.
+3. Build the official-pattern artifact; measure quality, real RSS, and 16 GB
+   feasibility. **This is the milestone gate.**
+4. Add Q5_0 grouped/expert-major prefill only if (3) passes.
+5. Test uniform Q5_0 as an explicitly labelled quality/footprint experiment.
+6. Consider MXFP4 only if Q5_0 misses the memory target. It saves roughly a
+   further 0.5 GiB over uniform Q5_0, but its existing ds4 kernels serve
+   *native* MXFP4 checkpoints in another family, which is not evidence that
+   requantized Mellum down weights hold up. Strictly a weaker quality bet than
+   Q5_0 — research candidate, not target.
+
+Pieces (3) and (3a) are prefill work and therefore sit at step 4 or later,
+regardless of how cheap (3a) turns out to be.
 
 ## Estimator defects (found 2026-08-23, independent of the pieces above)
 

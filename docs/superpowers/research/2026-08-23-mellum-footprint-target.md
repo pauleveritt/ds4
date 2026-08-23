@@ -107,11 +107,20 @@ The consequence for targeting is direct, and it is the opposite of the earlier
 draft's: the 14 layers that got Q5_0 are the ones the heuristic judged **less**
 sensitive, and the sensitive half was pushed *up* to Q8_0. So the official
 artifact evidences 5-bit down **only on the less-sensitive half**. The
-"official pattern" row below (7.94 GiB) is the configuration with external
-support; **uniform Q5_0 across all 28 (7.29 GiB) has none** and is a genuine
-quality bet. Unlike Laguna, nothing structural forces uniformity here — the
-slab class does not apply (below) — so this is a free choice on the
-quality/size curve and must be settled by measurement.
+"official pattern" row below (7.94 GiB weights) is the configuration with
+external support; **uniform Q5_0 across all 28 (7.29 GiB) has none** and is a
+genuine quality bet.
+
+**The placement survives either reading of the split**, which is why the target
+does not rest on the fallback inference. Even if the formats are mechanical,
+the heuristic's *per-layer ranking* is quality-informed — it chose which layers
+deserved the higher format — so copying the official placement copies a real
+sensitivity ranking regardless. Stated precisely, the unevidenced claim is not
+"the split is arbitrary" but the narrower **"5-bit is safe on the other 14
+layers too."** That is what an A/B has to settle, and it is why the split, not
+uniformity, is the shipping default. Unlike Laguna, nothing structural forces
+uniformity here — the slab class does not apply (below) — so the choice is free
+and belongs to measurement.
 
 ## The Laguna XS 2.1 wins do not transfer
 
