@@ -16902,32 +16902,40 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             (stdin_eof || now_sec() >= quiet_deadline))
         {
             char *raw = agent_input_buf_take(&input);
-            int wid = 0;
-            char *prompt = NULL;
-            int pr = agent_parse_pool_prompt(raw, (n > 1), &wid, &prompt);
-            free(raw);
-            if (pr < 0 || wid < 0 || wid >= n) {
-                /* Drop a non-prompt JSON line or a prompt to a worker this pool
-                 * does not host — never clamp to the orchestrator. */
-                free(prompt);
-                fprintf(stderr, "ds4-agent: dropping inbound prompt (parse=%d worker=%d pool=%d)\n",
-                        pr, wid, n);
-                waiting_announced = false;
-                continue;
-            }
-            active_worker = wid;
-            if (worker_is_idle(&workers[wid]) && queue.len == 0) {
-                if (!worker_submit(&workers[wid], prompt)) {
+            /* The wire is line-delimited, not debounce-delimited: split the
+             * buffered input on newlines and parse each line as its own prompt
+             * (back-to-back PoolPrompts must not coalesce into one). */
+            char *saveptr = NULL;
+            char *line = strtok_r(raw, "\n", &saveptr);
+            while (line) {
+                int wid = 0;
+                char *prompt = NULL;
+                int pr = agent_parse_pool_prompt(line, (n > 1), &wid, &prompt);
+                if (pr < 0 || wid < 0 || wid >= n) {
+                    /* Drop a non-prompt JSON line or a prompt to a worker this
+                     * pool does not host — never clamp to the orchestrator. */
+                    free(prompt);
+                    fprintf(stderr, "ds4-agent: dropping inbound prompt (parse=%d worker=%d pool=%d)\n",
+                            pr, wid, n);
+                    line = strtok_r(NULL, "\n", &saveptr);
+                    continue;
+                }
+                active_worker = wid;
+                if (worker_is_idle(&workers[wid]) && queue.len == 0) {
+                    if (!worker_submit(&workers[wid], prompt)) {
+                        agent_prompt_queue_push(&queue, prompt);
+                        if (cfg->json_events) agent_emit_bare_event(&workers[wid], "queued");
+                        else agent_noninteractive_marker("+DWARFSTAR_QUEUED");
+                    }
+                } else {
                     agent_prompt_queue_push(&queue, prompt);
                     if (cfg->json_events) agent_emit_bare_event(&workers[wid], "queued");
                     else agent_noninteractive_marker("+DWARFSTAR_QUEUED");
                 }
-            } else {
-                agent_prompt_queue_push(&queue, prompt);
-                if (cfg->json_events) agent_emit_bare_event(&workers[wid], "queued");
-                else agent_noninteractive_marker("+DWARFSTAR_QUEUED");
+                free(prompt);
+                line = strtok_r(NULL, "\n", &saveptr);
             }
-            free(prompt);
+            free(raw);
             waiting_announced = false;
         }
 
