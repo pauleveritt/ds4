@@ -403,12 +403,19 @@ wire:
   few that emit `output`; see the `tool` phase table); no new event kind,
   field, or ordering is introduced.
 - **`--workspace DIR`**: sets the agent's cwd (unless `--chdir` was given
-  explicitly) and confines the file tools `read`/`write`/`list` to `DIR`,
+  explicitly) and confines the six file tools `read`/`more`/`write`/`list`/`edit`/`search` to `DIR`,
   failing closed — a call whose resolved path escapes `DIR` returns a tool
-  error rather than touching an arbitrary path. On the wire this is
-  invisible: the file tools never emit `output` (see "Which calls get an
-  `output` event"), and a confined or refused call differs from a normal
-  one only in its result text, not in any event shape.
+  error rather than touching an arbitrary path. (`more` is confined
+  transitively: the confined `read` sets the `w → more_path` it reuses, so a
+  `more` launched from a confined `read` cannot escape either.) The
+  streaming-time `agent_preflight_edit_old` selector — `edit`'s preflight
+  read of the `old` text against `DIR` — is confined too: an `old` whose
+  resolved path escapes `DIR` aborts the block with the `[tool call
+  stopped: edit old selector failed]` finish status rather than reading an
+  arbitrary path. On the wire this is invisible: the file tools never emit
+  `output` (see "Which calls get an `output` event"), and a confined or
+  refused call differs from a normal one only in its result text (or, for
+  the edit preflight, a `finish` `status`), not in any event shape.
 
 Both are parsed at startup and enforced in `ds4_agent.c`; neither adds a
 field to any event on this wire. They are noted here only so a consumer
