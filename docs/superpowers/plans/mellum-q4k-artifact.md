@@ -22,9 +22,20 @@ Pieces (1) and (2) are **landed and gated**. Piece (3) is not started.
 | 2. Q4_K expert gate/up in decode | Done — but wired to the *scalar* kernel |
 | 2b. Mellum-native Q4_K decode kernel | Done — decode 0.75x to 0.94x |
 | 3. Q4_K expert-major prefill | Not started; tokenwise fallback in place |
+| 4. Q5_0 expert-down | Not started; **the largest remaining memory win** |
 
 Decode is close to parity, prefill is the gap — full ratios, methodology and
 the kernel story are in `MELLUM.md`'s "9.33 GiB selective artifact" section.
+
+**Re-oriented 2026-08-23 around a footprint target.** The 9.33 GiB artifact
+decomposes so that expert **down** — untouched, Q8_0 on all 28 layers — is
+39% of it, and it is structurally unreachable by any K-quant (896 does not
+divide by 256). The next target is **~7.3 GiB of weights, ~7.9 GiB at 40k
+context**, reached by a Q5_0 expert-down path plus finishing gate/up on layers
+22–27. Q6_K is *not* the answer in either direction. Laguna XS 2.1's two
+memory wins were checked and neither transfers. Decomposition, target
+arithmetic, and two estimator defects found while measuring:
+[`../research/2026-08-23-mellum-footprint-target.md`](../research/2026-08-23-mellum-footprint-target.md).
 
 ## Piece 2b: select the SIMD Q4_K kernel
 
@@ -120,6 +131,64 @@ the tokenwise sync path (`e->mellum_batched_prefill_unsupported`, set in
 `ds4_engine_bind_mellum_decode_contract`). Correct but slower: `MELLUM.md`
 records tokenwise at ~120 t/s against ~355 for expert-major. Shipping (1) and
 (2) alone is a legitimate stopping point; say so rather than blocking.
+
+### Piece 3a: the flag is whole-model, and should not be
+
+`mellum_batched_prefill_unsupported` is one boolean for the entire model: a
+single Q4_K layer disables layer-major prefill for all 28, **including layers
+22–27, which are pure Q8_0 and whose kernels would run today**. Scoping it per
+layer recovers the 21% of the stack already eligible — **~1.17–1.20x** on
+prefill by arithmetic on the published path ratios, taking 0.21x to roughly
+0.25x. Not a fix for the prefill gap; piece (3) is that. Worth doing first only
+because it is small.
+
+**Verify before costing it:** nobody has established that the two paths can be
+mixed *within one prefill pass*. The flag is consumed as a session-level
+decision and the paths may not share a compatible activation layout. If they
+cannot, this is a prefill-loop restructure and belongs inside piece (3), not
+before it.
+
+## Piece 4: Q5_0 expert-down
+
+**The largest remaining memory win, ~1.3 GiB.** Expert down is Q8_0 on all 28
+layers — 3.66 GiB, 39% of the artifact — and no K-quant can reach it, because
+896 does not divide by 256. A 32-element-block format does (896 ÷ 32 = 28), and
+Q5_0 is the defensible choice: the official artifact already ships Q5_0 down
+tensors, which is evidence the quality holds at 5-bit.
+
+Scope, mirroring the shape pieces (1) and (2) turned out to have:
+
+1. A Q5_0 expert-down Metal kernel (decode first; the batch path is piece 3's).
+2. Admission in **both** quant gates — `weights_validate_mellum_layout` *and*
+   the decode-contract desc builder. The "two Q8_0 gates, not one" trap above
+   is the same pattern and will reappear here.
+3. Artifact construction: extend
+   `tools/mellum/build-selective-artifact.sh` with explicit
+   `--tensor-type ffn_down_exps=Q5_0`.
+
+**One open choice, and it should be measured not assumed.** The official
+artifact splits down 14 layers Q8_0 / 14 layers Q5_0 (llama.cpp's boost
+heuristic). Uniform Q5_0 across all 28 saves 1.29 GiB against the split's 0.65,
+but is untested for quality. Unlike Laguna, *nothing structural forces
+uniformity here* — the slab class is SSD-streaming-only and Mellum cannot
+stream — so this is a free choice on the quality/size curve, and down is the
+sensitive projection. Run the Q8-relative gate on both.
+
+## Estimator defects (found 2026-08-23, independent of the pieces above)
+
+Both are reporting bugs with no runtime effect, but they make every footprint
+measurement untrustworthy until fixed — fix them *before* measuring against the
+7.9 GiB target.
+
+- **KV under-reported ~7x.** Mellum has no branch in
+  `ds4_context_memory_estimate_with_prefill_mode` and inherits the DeepSeek-4
+  formula. Reported 0.07 GiB; actual 0.26 at ctx 16384, 0.48 at 32768 —
+  corroborated by `2026-08-01-mellum2-feasibility.md:338` ("about 0.49 GiB").
+  Fix is a `DS4_MODEL_FAMILY_MELLUM` branch mirroring the real allocations.
+  The same missing branch is why `buffers` prints `0.00`.
+- **`--prefill-chunk` is accepted and ignored.** Stored and never consulted, so
+  it moves only the printed `prefill_cap`. Either wire it or refuse it as GLM
+  and non-XS Laguna do; silently altering the diagnostics is the worst option.
 
 ## Gates
 
