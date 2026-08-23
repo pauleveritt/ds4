@@ -80,6 +80,8 @@ typedef struct {
      * parse_options (D2: the bare CLI keeps bash); the app always passes
      * --shell. workspace_path arrives in Task 2. */
     bool shell_allowed;
+    /* Consent flags (fork divergence #8, P7): the workspace grant. */
+    const char *workspace_path;
 } agent_config;
 
 typedef enum {
@@ -798,6 +800,11 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--workspace")) {
+            c.workspace_path = need_arg(&i, argc, argv, arg);
+            /* D1: the workspace sets the agent's cwd (reuse the existing
+             * --chdir site at :15022) unless --chdir was given explicitly. */
+            if (!c.chdir_path) c.chdir_path = c.workspace_path;
         } else if (!strcmp(arg, "--json-events")) {
             c.json_events = true;
         } else if (!strcmp(arg, "--shell")) {
@@ -7291,15 +7298,58 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
     return agent_buf_take(&out);
 }
 
+/* Fail-closed confinement for file tools (D1). Resolves `path` against cwd
+ * (which is the workspace when one is set) and refuses when the resolved path
+ * escapes the workspace root. allow_missing is true for write targets, whose
+ * file may not exist yet: resolve the parent directory instead and check that.
+ * Returns a malloc'd confined absolute path, or NULL on refusal. */
+static char *agent_confine_path(agent_config *cfg, const char *path, bool allow_missing) {
+    if (!cfg->workspace_path) return xstrdup(path);
+    char root[PATH_MAX];
+    if (!realpath(cfg->workspace_path, root)) return NULL;
+    size_t root_len = strlen(root);
+    if (root_len == 0 || root_len >= PATH_MAX - 2) return NULL;
+
+    char resolved[PATH_MAX];
+    if (!realpath(path, resolved)) {
+        if (!allow_missing) return NULL;
+        char parent[PATH_MAX];
+        snprintf(parent, sizeof(parent), "%s", path);
+        char *slash = strrchr(parent, '/');
+        const char *leaf;
+        if (slash) {
+            *slash = '\0';
+            leaf = slash + 1;
+        } else {
+            snprintf(parent, sizeof(parent), ".");
+            leaf = path;
+        }
+        if (!leaf[0] || !realpath(parent, resolved)) return NULL;
+        size_t plen = strlen(resolved);
+        if (plen + strlen(leaf) + 2 > PATH_MAX) return NULL;
+        if (resolved[plen - 1] != '/') resolved[plen++] = '/';
+        memcpy(resolved + plen, leaf, strlen(leaf) + 1);
+    }
+    if (strncmp(resolved, root, root_len) != 0) return NULL;
+    if (resolved[root_len] != '\0' && resolved[root_len] != '/') return NULL;
+    return xstrdup(resolved);
+}
+
 static char *agent_tool_read(agent_worker *w, const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
+    char *confined = agent_confine_path(w->cfg, path, false);
+    if (!confined) {
+        return xstrdup("Tool error: path is outside the workspace grant (--workspace)\n");
+    }
     bool whole = agent_parse_bool_default(agent_tool_arg_value(call, "whole"), false);
     int start = agent_parse_int_default(agent_tool_arg_value(call, "start_line"),
                                         1, 1, INT_MAX);
     int count = agent_parse_int_default(agent_tool_arg_value(call, "max_lines"),
                                         agent_read_default_lines(w), 1, INT_MAX);
     bool raw = agent_parse_bool_default(agent_tool_arg_value(call, "raw"), false);
-    return agent_read_range(w, path, start, count, whole, raw, true);
+    char *result = agent_read_range(w, confined, start, count, whole, raw, true);
+    free(confined);
+    return result;
 }
 
 static char *agent_tool_more(agent_worker *w, const agent_tool_call *call) {
@@ -7311,17 +7361,21 @@ static char *agent_tool_more(agent_worker *w, const agent_tool_call *call) {
 }
 
 static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
-    (void)w;
     const char *path = agent_tool_arg_value(call, "path");
     const char *content = agent_tool_arg_value(call, "content");
     if (!path || !path[0]) return xstrdup("Tool error: write requires path\n");
     if (!content) return xstrdup("Tool error: write requires content\n");
-    FILE *fp = fopen(path, "wb");
+    char *confined = agent_confine_path(w->cfg, path, true);
+    if (!confined) {
+        return xstrdup("Tool error: path is outside the workspace grant (--workspace)\n");
+    }
+    FILE *fp = fopen(confined, "wb");
     if (!fp) {
         agent_buf b = {0};
         agent_buf_puts(&b, "Tool error: open for write failed: ");
         agent_buf_puts(&b, strerror(errno));
         agent_buf_puts(&b, "\n");
+        free(confined);
         return agent_buf_take(&b);
     }
     size_t len = strlen(content);
@@ -7332,34 +7386,41 @@ static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
         agent_buf_puts(&b, "Tool error: write failed: ");
         agent_buf_puts(&b, strerror(errno));
         agent_buf_puts(&b, "\n");
+        free(confined);
         return agent_buf_take(&b);
     }
     char msg[PATH_MAX + 160];
-    snprintf(msg, sizeof(msg), "Wrote %zu bytes to %s\n", len, path);
+    snprintf(msg, sizeof(msg), "Wrote %zu bytes to %s\n", len, confined);
+    free(confined);
     return xstrdup(msg);
 }
 
-static char *agent_tool_list(const agent_tool_call *call) {
+static char *agent_tool_list(agent_worker *w, const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) path = ".";
-    DIR *dir = opendir(path);
+    char *confined = agent_confine_path(w->cfg, path, false);
+    if (!confined) {
+        return xstrdup("Tool error: path is outside the workspace grant (--workspace)\n");
+    }
+    DIR *dir = opendir(confined);
     if (!dir) {
         agent_buf b = {0};
         agent_buf_puts(&b, "Tool error: opendir failed: ");
         agent_buf_puts(&b, strerror(errno));
         agent_buf_puts(&b, "\n");
+        free(confined);
         return agent_buf_take(&b);
     }
     agent_buf out = {0};
     char hdr[PATH_MAX + 64];
-    snprintf(hdr, sizeof(hdr), "%s:\n", path);
+    snprintf(hdr, sizeof(hdr), "%s:\n", confined);
     agent_buf_puts(&out, hdr);
     struct dirent *de;
     int shown = 0;
     while ((de = readdir(dir)) != NULL && shown < 300) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
         char full[PATH_MAX];
-        snprintf(full, sizeof(full), "%s/%s", path, de->d_name);
+        snprintf(full, sizeof(full), "%s/%s", confined, de->d_name);
         struct stat st;
         if (lstat(full, &st) != 0) continue;
         char type = S_ISDIR(st.st_mode) ? 'd' :
@@ -7373,6 +7434,7 @@ static char *agent_tool_list(const agent_tool_call *call) {
     }
     if (de) agent_buf_puts(&out, "... more entries omitted ...\n");
     closedir(dir);
+    free(confined);
     return agent_buf_take(&out);
 }
 
@@ -10387,6 +10449,62 @@ static void test_agent_execute_tool_call_refuses_bash_when_shell_off(void) {
     pthread_mutex_destroy(&w.mu);
 }
 
+static void test_agent_confine_path_allows_inside(void) {
+    char tmp[PATH_MAX];
+    char oldcwd[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "/tmp/swiftstar-confine-%ld", (long)getpid());
+    if (mkdir(tmp, 0700) != 0 && errno != EEXIST) return;  /* env problem, not the assertion */
+    AGENT_TEST_ASSERT(getcwd(oldcwd, sizeof(oldcwd)) != NULL);
+    AGENT_TEST_ASSERT(chdir(tmp) == 0);
+    agent_config cfg = {0};
+    cfg.workspace_path = tmp;
+    char *out = agent_confine_path(&cfg, "a.txt", true);
+    chdir(oldcwd);
+    AGENT_TEST_ASSERT(out != NULL);
+    if (out) {
+        /* macOS resolves /tmp -> /private/tmp, so compare against the
+         * canonical workspace root rather than the literal /tmp prefix. */
+        char root[PATH_MAX];
+        AGENT_TEST_ASSERT(realpath(tmp, root) != NULL);
+        size_t root_len = strlen(root);
+        AGENT_TEST_ASSERT(strncmp(out, root, root_len) == 0);
+        AGENT_TEST_ASSERT(out[root_len] == '/');
+        free(out);
+    }
+    rmdir(tmp);
+}
+
+static void test_agent_confine_path_refuses_escape(void) {
+    char tmp[PATH_MAX];
+    char oldcwd[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "/tmp/swiftstar-confine-%ld", (long)getpid());
+    if (mkdir(tmp, 0700) != 0 && errno != EEXIST) return;
+    AGENT_TEST_ASSERT(getcwd(oldcwd, sizeof(oldcwd)) != NULL);
+    AGENT_TEST_ASSERT(chdir(tmp) == 0);
+    agent_config cfg = {0};
+    cfg.workspace_path = tmp;
+    char *out = agent_confine_path(&cfg, "../escape.txt", true);
+    chdir(oldcwd);
+    AGENT_TEST_ASSERT(out == NULL);
+    rmdir(tmp);
+}
+
+static void test_agent_confine_path_refuses_missing_read_target(void) {
+    char tmp[PATH_MAX];
+    char oldcwd[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "/tmp/swiftstar-confine-%ld", (long)getpid());
+    if (mkdir(tmp, 0700) != 0 && errno != EEXIST) return;
+    AGENT_TEST_ASSERT(getcwd(oldcwd, sizeof(oldcwd)) != NULL);
+    AGENT_TEST_ASSERT(chdir(tmp) == 0);
+    agent_config cfg = {0};
+    cfg.workspace_path = tmp;
+    /* allow_missing=false (a read target): an unresolvable path must refuse. */
+    char *out = agent_confine_path(&cfg, "no/such/file.txt", false);
+    chdir(oldcwd);
+    AGENT_TEST_ASSERT(out == NULL);
+    rmdir(tmp);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_json_events_release_flushes_and_frees_pending();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
@@ -10420,6 +10538,9 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_tool_viz_trims_torn_utf8_names();
     test_agent_execute_tool_call_unknown_tool_trims_torn_utf8_name();
     test_agent_execute_tool_call_refuses_bash_when_shell_off();
+    test_agent_confine_path_allows_inside();
+    test_agent_confine_path_refuses_escape();
+    test_agent_confine_path_refuses_missing_read_target();
     test_agent_maybe_emit_status_event_distinguishes_collapsed_states();
     test_agent_emit_bare_event_ready_and_queued();
     test_agent_emit_ready_event_carries_memory_plan();
@@ -10442,20 +10563,28 @@ static void ds4_agent_unit_tests_run(void) {
 
 static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len) {
-    (void)w;
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) return true; /* Cannot preflight until path is known. */
+
+    char *confined = agent_confine_path(w->cfg, path, false);
+    if (!confined) {
+        snprintf(err, err_len, "path is outside the workspace grant (--workspace)");
+        return false;
+    }
 
     const char *old = agent_tool_arg_value(call, "old");
     if (!old || !old[0]) {
         snprintf(err, err_len, "edit requires non-empty old text");
+        free(confined);
         return false;
     }
 
     char *data = NULL;
     size_t len = 0;
-    if (agent_read_file_bytes(path, &data, &len, err, err_len) != 0)
+    if (agent_read_file_bytes(confined, &data, &len, err, err_len) != 0) {
+        free(confined);
         return false;
+    }
 
     const char *match = NULL;
     size_t match_len = 0;
@@ -10463,6 +10592,7 @@ static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *cal
     bool ok = agent_edit_find_old_span(data, len, old, &match, &match_len,
                                        &anchored, err, err_len);
     free(data);
+    free(confined);
     return ok;
 }
 
@@ -10505,22 +10635,32 @@ static char *agent_apply_file_splice(const char *path,
  * unique, and the tail must be unique after that head before the whole span is
  * replaced. */
 static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
-    (void)w;
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) return xstrdup("Tool error: edit requires path\n");
+    char *confined = agent_confine_path(w->cfg, path, false);
+    if (!confined) {
+        return xstrdup("Tool error: path is outside the workspace grant (--workspace)\n");
+    }
     const char *old = agent_tool_arg_value(call, "old");
     const char *new_text = agent_tool_arg_value(call, "new");
-    if (!old || !old[0]) return xstrdup("Tool error: edit requires non-empty old text\n");
-    if (!new_text) return xstrdup("Tool error: edit requires new text\n");
+    if (!old || !old[0]) {
+        free(confined);
+        return xstrdup("Tool error: edit requires non-empty old text\n");
+    }
+    if (!new_text) {
+        free(confined);
+        return xstrdup("Tool error: edit requires new text\n");
+    }
 
     char err[256];
     char *data = NULL;
     size_t len = 0;
-    if (agent_read_file_bytes(path, &data, &len, err, sizeof(err)) != 0) {
+    if (agent_read_file_bytes(confined, &data, &len, err, sizeof(err)) != 0) {
         agent_buf b = {0};
         agent_buf_puts(&b, "Tool error: ");
         agent_buf_puts(&b, err);
         agent_buf_puts(&b, "\n");
+        free(confined);
         return agent_buf_take(&b);
     }
 
@@ -10535,15 +10675,17 @@ static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
         agent_buf_puts(&b, "Tool error: ");
         agent_buf_puts(&b, err);
         agent_buf_puts(&b, "\n");
+        free(confined);
         return agent_buf_take(&b);
     }
 
-    char *result = agent_apply_file_splice(path, data, len,
+    char *result = agent_apply_file_splice(confined, data, len,
                                            (size_t)(match - data), match_len,
                                            new_text,
                                            anchored ? "anchored old/new replacement"
                                                     : "old/new replacement");
     free(data);
+    free(confined);
     return result;
 }
 
@@ -10675,11 +10817,14 @@ static void agent_search_path(agent_search_ctx *ctx, const char *path, int depth
 
 /* Implement the search tool using either literal matching or POSIX regex. */
 static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
-    (void)w;
     const char *query = agent_tool_arg_value(call, "query");
     if (!query || !query[0]) return xstrdup("Tool error: search requires query\n");
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) path = ".";
+    char *confined = agent_confine_path(w->cfg, path, false);
+    if (!confined) {
+        return xstrdup("Tool error: path is outside the workspace grant (--workspace)\n");
+    }
     const char *mode = agent_tool_arg_value(call, "mode");
     agent_search_ctx ctx = {
         .query = query,
@@ -10700,11 +10845,13 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
             agent_buf_puts(&b, "Tool error: invalid regex: ");
             agent_buf_puts(&b, msg);
             agent_buf_puts(&b, "\n");
+            free(confined);
             return agent_buf_take(&b);
         }
         ctx.regex_ready = true;
     }
-    agent_search_path(&ctx, path, 0);
+    agent_search_path(&ctx, confined, 0);
+    free(confined);
     if (ctx.regex_ready) regfree(&ctx.regex);
     if (!ctx.out.ptr) agent_buf_puts(&ctx.out, "No matches\n");
     else {
@@ -11462,7 +11609,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "read")) return agent_tool_read(w, call);
     if (!strcmp(call->name, "more")) return agent_tool_more(w, call);
     if (!strcmp(call->name, "write")) return agent_tool_write(w, call);
-    if (!strcmp(call->name, "list")) return agent_tool_list(call);
+    if (!strcmp(call->name, "list")) return agent_tool_list(w, call);
     if (!strcmp(call->name, "edit")) return agent_tool_edit(w, call);
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
     if (!strcmp(call->name, "google_search")) return agent_tool_google_search(w, call);
