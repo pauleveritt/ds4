@@ -36704,6 +36704,61 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
             m.total_bytes = m.raw_bytes + m.scratch_bytes;
             return m;
         }
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+            /* 21 of 28 layers use sliding-window attention capped at
+             * DS4_N_SWA; the remaining 7 are full-attention, capped at the
+             * requested context (see ds4_mellum_decode_state_create). Each
+             * cache row is uint16_t x DS4_N_HEAD_KV x DS4_N_HEAD_DIM, key
+             * and value both -- the generic compressive-KV path below is
+             * built for a different architecture: it neither multiplies by
+             * n_head_kv nor lets a global layer's cap exceed 8192. */
+            m.prefill_cap = 1;
+            m.raw_cap = ctx;
+            m.comp_cap = ctx < DS4_N_SWA ? ctx : DS4_N_SWA;
+            const uint64_t kv_row_bytes =
+                2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                const uint32_t cap = ds4_mellum_layer_uses_sliding_attention(il) ?
+                    DS4_N_SWA : ctx;
+                m.raw_bytes += (uint64_t)cap * kv_row_bytes;
+            }
+
+            /* Prefill workspace (ds4_mellum_prefill_scratch_create) and the
+             * MoE expert-major "s_partial" staging buffer
+             * (ds4_gpu_mellum_moe_group_begin, ds4_metal_mellum.m) are both
+             * sized off the prefill chunk, which defaults to DS4_N_SWA
+             * (ds4_mellum_probe_chunk's fallback) -- ~130 MiB and ~75 MiB
+             * respectively at a 1024-token chunk. This mirrors that default
+             * chunk size; it is approximate (the real chunk can be
+             * overridden via DS4_MELLUM_PREFILL_CHUNK and the workspace is
+             * lazily allocated on the first sync-batch prefill), but
+             * omitting these two multi-hundred-MiB allocations entirely
+             * understated Mellum's real footprint. */
+            const uint64_t chunk = DS4_N_SWA;
+            const uint64_t embd_bytes = chunk * (uint64_t)DS4_N_EMBD * sizeof(float);
+            const uint64_t q_bytes = chunk * (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+            const uint64_t f32_kv_bytes = chunk * (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+            const uint64_t staged_kv_bytes = chunk * (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
+            const uint64_t mid_bytes = chunk * (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float);
+            const uint64_t prefill_workspace_bytes =
+                chunk * sizeof(int32_t) +                               /* tokens */
+                6ull * embd_bytes +                                     /* hidden, layer_out,
+                                                                          * attention_out,
+                                                                          * attention_norm,
+                                                                          * projected, moe_out */
+                2ull * q_bytes +                                        /* q, heads */
+                2ull * f32_kv_bytes +                                   /* k, v */
+                2ull * staged_kv_bytes +                                /* staged_key, staged_value */
+                2ull * chunk * (uint64_t)DS4_N_EXPERT * sizeof(float) + /* router_logits, router_probs */
+                chunk * (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t) + /* router_selected */
+                chunk * (uint64_t)DS4_N_EXPERT_USED * sizeof(float) +   /* router_weights */
+                mid_bytes;                                              /* moe_mid */
+            const uint64_t moe_s_partial_bytes =
+                chunk * (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float);
+            m.scratch_bytes = prefill_workspace_bytes + moe_s_partial_bytes;
+            m.total_bytes = m.raw_bytes + m.scratch_bytes;
+            return m;
+        }
         m.prefill_cap = metal_graph_prefill_cap_for_prompt((int)ctx,
                                                            prefill_chunk);
         m.raw_cap = metal_graph_raw_cap_for_context((int)ctx, m.prefill_cap);
