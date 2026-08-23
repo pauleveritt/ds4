@@ -10980,24 +10980,33 @@ static void test_agent_pool_worker_field_and_cap(void) {
 
 /* P11 (fork divergence #11): the inbound PoolPrompt contract. JSON addresses
  * a worker; a bare line addresses worker 0; the s field is JSON-unescaped. */
-static bool agent_parse_pool_prompt(const char *line, int *out_worker, char **out_text);
+static int agent_parse_pool_prompt(const char *line, bool pool_mode,
+                                   int *out_worker, char **out_text);
 static void test_agent_parse_pool_prompt_routes_worker(void) {
     int wid; char *text = NULL;
-    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"t\":\"prompt\",\"worker\":3,\"s\":\"do it\"}", &wid, &text));
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"t\":\"prompt\",\"worker\":3,\"s\":\"do it\"}", true, &wid, &text) == 1);
     AGENT_TEST_ASSERT(wid == 3);
     AGENT_TEST_ASSERT(text && strcmp(text, "do it") == 0);
     free(text);
-    AGENT_TEST_ASSERT(agent_parse_pool_prompt("fix a.swift", &wid, &text));
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("fix a.swift", true, &wid, &text) == 0);
     AGENT_TEST_ASSERT(wid == 0);
     AGENT_TEST_ASSERT(text && strcmp(text, "fix a.swift") == 0);
     free(text);
-    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"s\":\"hi\",\"worker\":2,\"t\":\"prompt\",\"extra\":1}", &wid, &text));
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"s\":\"hi\",\"worker\":2,\"t\":\"prompt\",\"extra\":1}", true, &wid, &text) == 1);
     AGENT_TEST_ASSERT(wid == 2);
     AGENT_TEST_ASSERT(text && strcmp(text, "hi") == 0);
     free(text);
-    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"t\":\"prompt\",\"worker\":1,\"s\":\"a\\\"b\"}", &wid, &text));
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"t\":\"prompt\",\"worker\":1,\"s\":\"a\\\"b\"}", true, &wid, &text) == 1);
     AGENT_TEST_ASSERT(wid == 1);
     AGENT_TEST_ASSERT(text && strcmp(text, "a\"b") == 0);
+    free(text);
+    /* JSON that is NOT a prompt envelope must be dropped, not injected. */
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"t\":\"tool_result\",\"idx\":0,\"ok\":true,\"s\":\"x\"}", true, &wid, &text) == -1);
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"s\":\"x\"}", true, &wid, &text) == -1);  /* no t */
+    /* pool_mode false (N==1): JSON is a bare literal prompt, pre-P11 behavior. */
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"t\":\"prompt\",\"worker\":3,\"s\":\"x\"}", false, &wid, &text) == 0);
+    AGENT_TEST_ASSERT(wid == 0);
+    AGENT_TEST_ASSERT(text && strcmp(text, "{\"t\":\"prompt\",\"worker\":3,\"s\":\"x\"}") == 0);
     free(text);
 }
 
@@ -15561,56 +15570,70 @@ static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
  * stdin protocol: announce readiness on stderr, collect bytes until stdin has
  * been quiet for 200 ms, submit that buffer as one prompt, and keep reading so
  * later input can be queued while the model is still working. */
-/* P11 (fork divergence #11): parse an inbound prompt line. A JSON
- * {"t":"prompt","worker":N,"s":"..."} addresses worker N; any other (bare)
- * line addresses worker 0. Returns true with out_worker set and out_text a
- * fresh allocation (the prompt body, JSON-unescaped). */
-static bool agent_parse_pool_prompt(const char *line, int *out_worker, char **out_text) {
+/* P11 (fork divergence #11): parse an inbound prompt line. Returns 1 for a pool
+ * prompt ({"t":"prompt","worker":N,"s":"..."}), 0 for a bare line (worker 0,
+ * literal text), and -1 for a line that must be DROPPED — JSON that is not a
+ * prompt envelope (e.g. a misrouted tool_result line). pool_mode is
+ * num_workers > 1: when false (the single-session wire) every line is bare,
+ * preserving pre-P11 behavior. */
+static int agent_parse_pool_prompt(const char *line, bool pool_mode,
+                                   int *out_worker, char **out_text) {
     const char *p = line;
     agent_json_skip_ws(&p);
-    if (*p == '{') {
+    if (pool_mode && *p == '{') {
         int worker = 0;
         char *s = NULL;
-        bool have_s = false;
-        if (!agent_json_match(&p, '{')) goto bare;
+        char *tstr = NULL;
+        bool have_s = false, have_t = false;
+        if (!agent_json_match(&p, '{')) goto drop;
         for (;;) {
             agent_json_skip_ws(&p);
             if (*p == '}') { p++; break; }
-            if (*p != '"') { free(s); goto bare; }
+            if (*p != '"') goto drop;
             char *key = NULL;
-            if (!agent_json_parse_string(&p, &key)) { free(s); goto bare; }
-            if (!agent_json_match(&p, ':')) { free(key); free(s); goto bare; }
+            if (!agent_json_parse_string(&p, &key)) goto drop;
+            if (!agent_json_match(&p, ':')) { free(key); goto drop; }
             if (!strcmp(key, "worker")) {
-                if (!agent_json_parse_int(&p, &worker)) { free(key); free(s); goto bare; }
+                if (!agent_json_parse_int(&p, &worker)) { free(key); goto drop; }
             } else if (!strcmp(key, "s")) {
+                if (have_s) free(s);
                 have_s = agent_json_parse_string(&p, &s);
-                if (!have_s) { free(key); goto bare; }
+                if (!have_s) { free(key); goto drop; }
+            } else if (!strcmp(key, "t")) {
+                if (have_t) free(tstr);
+                have_t = agent_json_parse_string(&p, &tstr);
+                if (!have_t) { free(key); goto drop; }
             } else if (*p == '"') {
                 char *junk = NULL;
-                if (!agent_json_parse_string(&p, &junk)) { free(key); free(junk); free(s); goto bare; }
+                if (!agent_json_parse_string(&p, &junk)) { free(key); free(junk); goto drop; }
                 free(junk);
             } else {
                 int iv; bool bv;
                 if (!(agent_json_parse_int(&p, &iv) || agent_json_parse_bool(&p, &bv))) {
-                    free(key); free(s); goto bare;
+                    free(key); goto drop;
                 }
             }
             free(key);
             agent_json_skip_ws(&p);
             if (*p == ',') { p++; continue; }
             if (*p == '}') { p++; break; }
-            free(s); goto bare;
+            goto drop;
         }
         agent_json_skip_ws(&p);
-        if (*p != '\0' || !have_s) { free(s); goto bare; }
+        if (*p != '\0' || !have_s || !have_t || !tstr || strcmp(tstr, "prompt") != 0)
+            goto drop;
+        free(tstr);
         *out_worker = worker;
         *out_text = s ? s : xstrdup("");
-        return true;
+        return 1;
+    drop:
+        free(s);
+        free(tstr);
+        return -1;
     }
-bare:
     *out_worker = 0;
     *out_text = xstrdup(line);
-    return true;
+    return 0;
 }
 
 static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
@@ -15731,16 +15754,28 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             if (pfd[1 + i].revents & POLLIN) drain_wake_fd(workers[i].wake_fd[0]);
         }
         if (stdin_idx >= 0 && (pfd[stdin_idx].revents & (POLLIN | POLLHUP))) {
+            /* P11: the worker owns stdin while blocked reading a tool_result.
+             * The poll may have armed stdin before the worker claimed it, so
+             * trylock stdin_mu AFTER the poll — if a worker holds it, skip this
+             * iteration (closes the TOCTOU the volatile flag alone cannot). */
+            if (pthread_mutex_trylock(&stdin_mu) != 0) continue;
             size_t old_len = input.len;
-            if (agent_read_stdin_available(&input, &stdin_eof) != 0) {
+            int read_rc = agent_read_stdin_available(&input, &stdin_eof);
+            pthread_mutex_unlock(&stdin_mu);
+            if (read_rc != 0) {
                 rc = 1;
                 break;
             }
             /* Strip before the length comparison below: a lone interrupt byte
              * is a signal, not queued prompt text, so it must not restart the
              * 200ms quiet-deadline debounce that decides when to submit. */
-            if (agent_input_buf_take_interrupt(&input) && !worker_is_idle(&workers[active_worker])) {
-                worker_interrupt(&workers[active_worker]);
+            if (agent_input_buf_take_interrupt(&input)) {
+                /* P11: interrupt the GENERATING worker, not the last-submitted
+                 * one (the two diverge while a dispatch loop is running). */
+                int iw = (generating_worker >= 0) ? generating_worker : active_worker;
+                if (!worker_is_idle(&workers[iw])) {
+                    worker_interrupt(&workers[iw]);
+                }
             }
             if (input.len != old_len) {
                 quiet_deadline = now_sec() + 0.200;
@@ -15827,9 +15862,17 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             char *raw = agent_input_buf_take(&input);
             int wid = 0;
             char *prompt = NULL;
-            agent_parse_pool_prompt(raw, &wid, &prompt);
+            int pr = agent_parse_pool_prompt(raw, (n > 1), &wid, &prompt);
             free(raw);
-            if (wid < 0 || wid >= n) wid = 0;  /* out-of-range → orchestrator */
+            if (pr < 0 || wid < 0 || wid >= n) {
+                /* Drop a non-prompt JSON line or a prompt to a worker this pool
+                 * does not host — never clamp to the orchestrator. */
+                free(prompt);
+                fprintf(stderr, "ds4-agent: dropping inbound prompt (parse=%d worker=%d pool=%d)\n",
+                        pr, wid, n);
+                waiting_announced = false;
+                continue;
+            }
             active_worker = wid;
             if (worker_is_idle(&workers[wid]) && queue.len == 0) {
                 if (!worker_submit(&workers[wid], prompt)) {
