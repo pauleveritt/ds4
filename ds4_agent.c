@@ -12378,6 +12378,14 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                                         compact_err, sizeof(compact_err)))
     {
         if (agent_err_is_interrupted(compact_err)) {
+            /* Turn ended by a latched interrupt during the pre-turn compaction
+             * (soft limit before the user turn even starts): no tokens were
+             * generated yet, so generated=0 is the honest value. A consumer
+             * must never see the previous turn's outcome (or NONE on turn 1)
+             * for a turn that actually ended here (D12). */
+            w->last_turn_stop_reason = AGENT_TURN_STOP_INTERRUPT;
+            w->last_turn_generated = 0;
+            w->last_turn_ctx_used = ds4_session_pos(w->session);
             worker_clear_interrupt(w);
             agent_set_status(w, AGENT_WORKER_IDLE);
             return 0;
@@ -12417,6 +12425,14 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                                             compact_err, sizeof(compact_err)))
         {
             if (agent_err_is_interrupted(compact_err)) {
+                /* Turn ended by a latched interrupt during the pre-continuation
+                 * compaction (soft limit before a tool_round>0 resumes):
+                 * `generated` is not in scope yet (declared inside the loop
+                 * body below), and no tokens were produced for this turn, so
+                 * generated=0 is the honest value (D12). */
+                w->last_turn_stop_reason = AGENT_TURN_STOP_INTERRUPT;
+                w->last_turn_generated = 0;
+                w->last_turn_ctx_used = ds4_session_pos(w->session);
                 worker_clear_interrupt(w);
                 agent_set_status(w, AGENT_WORKER_IDLE);
                 return 0;
