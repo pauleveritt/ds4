@@ -8938,7 +8938,9 @@ static void test_agent_host_tools_roundtrip_returns_host_s(void) {
     pthread_mutex_destroy(&w.mu);
 }
 
-/* ok:false: the engine returns a refusal text, not the host's s. */
+/* ok:false: the engine carries the host's reason through (prefixed with a
+ * "host refused:" marker) so a consent-refusal is distinguishable from an
+ * executor-failure — the agent sees the actual reason, not a fixed discard. */
 static void test_agent_host_tools_ok_false_refuses(void) {
     agent_worker w = {0};
     pthread_mutex_init(&w.mu, NULL);
@@ -8959,8 +8961,9 @@ static void test_agent_host_tools_ok_false_refuses(void) {
     AGENT_TEST_ASSERT(result != NULL);
     AGENT_TEST_ASSERT(strstr(result, "Tool result 1 (fake_read):\n") != NULL);
     AGENT_TEST_ASSERT(strstr(result, "host refused") != NULL);
-    /* A refusal must not leak the host's s as if the call succeeded. */
-    AGENT_TEST_ASSERT(strstr(result, "host reason") == NULL);
+    /* The host's reason is passed through (s-is-carried), not discarded:
+     * the agent sees the actual refusal reason rather than a fixed text. */
+    AGENT_TEST_ASSERT(strstr(result, "host reason") != NULL);
 
     free(result);
     free(w.out);
@@ -12339,8 +12342,24 @@ static char *agent_execute_tool_calls(agent_worker *w, const agent_tool_calls *c
                     res = xstrdup(buf);
                     free(rs);
                 } else if (!rok) {
-                    res = xstrdup("Tool error: host refused the tool call\n");
-                    free(rs);
+                    /* ok:false: the host refused the call. Carry its reason
+                     * through (prefixed with a "host refused:" marker so a
+                     * refusal stays distinguishable from a success) so the
+                     * agent sees the actual reason — a consent-refusal is
+                     * distinguishable from an executor-failure. When the
+                     * host gave no reason, the marker stands alone. */
+                    if (rs && rs[0]) {
+                        size_t n = strlen(rs);
+                        char *buf = xmalloc(n + 40);
+                        snprintf(buf, n + 40,
+                                 "Tool error: host refused: %s\n", rs);
+                        free(rs);
+                        res = buf;
+                    } else {
+                        free(rs);
+                        res = xstrdup(
+                            "Tool error: host refused the tool call\n");
+                    }
                 } else {
                     res = rs;  /* ok:true, idx matched: the host's condensed result */
                 }

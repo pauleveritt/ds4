@@ -463,9 +463,11 @@ The protocol is two NDJSON lines keyed by `idx`:
   The engine matches by `idx` and returns `s` as the call's result text,
   wrapped in the same `Tool result N (name):\n…` envelope as an
   internally-executed call, so the downstream result→KV path is identical. A
-  result with `ok:false` is a **refusal**: the engine returns a fixed
-  `Tool error: host refused the tool call` text (the host's `s` is discarded).
-  A result whose `idx` does not match the call that requested it, or any line
+  result with `ok:false` is a **refusal**: the engine carries the host's `s`
+  through as the refusal text (prefixed `Tool error: host refused: …`) so the
+  agent sees the actual reason — a consent-refusal is distinguishable from an
+  executor-failure. When the host gives no reason, the `host refused` marker
+  stands alone. A result whose `idx` does not match the call that requested it, or any line
   that is not a valid `tool_result` object, is a **loud refusal** (binding
   rule 7's spirit) — `Tool error: host tool_result idx mismatch …` or
   `… protocol violation …` — rather than trusting a result the engine cannot
