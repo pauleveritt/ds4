@@ -56,7 +56,8 @@ The version/capability handshake, emitted once as the first line when
 version (currently `1`); `caps` names the event kinds the engine may emit plus
 `"ts"` (per-event monotonic timestamps). A consumer that requires a capability
 not listed, or a version it does not know, must refuse loudly rather than
-continue on a wire it may misparse.
+continue on a wire it may misparse. With `--host-tools` (P9) `caps` additionally
+includes `"tool_request"` — see "Host tools" below.
 
 ### `text`
 
@@ -161,6 +162,22 @@ events (and the fact that the call reached `finish`) if a preview is wanted
 at all. A very large `output` body is capped and, when truncated, gets a
 trailing `"\n[output truncated: N of M bytes shown]\n"` note appended inside
 `s` itself (not a separate field).
+
+### `tool_request`
+
+```json
+{"t":"tool_request","idx":<int>,"name":"<tool>","params":[{"name":"<p>","value":"<v>"},...],"ts":<µs>}
+```
+
+Emitted only under `--host-tools` (P9; see "Host tools" below), one per call
+in a tool-call block, in place of internally executing the call. `idx` is the
+same zero-based, block-scoped index the `tool` event carries; `name` is the
+tool name; `params` is the call's parameters as `{"name","value"}` objects in
+the order the model wrote them. `ts` is the per-event monotonic timestamp.
+Requires `--json-events` (the gate refuses `--host-tools` without it), so a
+consumer that negotiated `"tool_request"` in `hello` `caps` knows every line
+with `"t":"tool_request"` is a request it is expected to answer over stdin
+with a `tool_result` line (see "Host tools" below).
 
 ### `status`
 
@@ -421,6 +438,50 @@ Both are parsed at startup and enforced in `ds4_agent.c`; neither adds a
 field to any event on this wire. They are noted here only so a consumer
 knows the advertised tool surface can be narrower than the built-in set,
 and that this narrowing is invisible to the wire format itself.
+
+## Host tools (`--host-tools`; P9, the bidirectional wire)
+
+`--host-tools` (default off; requires `--json-events`) makes the wire
+**bidirectional**: the engine **requests** tool execution instead of performing
+it. The app (or a fake app) owns execution and answers each request over stdin.
+Absent the flag, behavior is byte-for-byte unchanged — the bare CLI keeps
+internal execution and emits no `tool_request`.
+
+The protocol is two NDJSON lines keyed by `idx`:
+
+- **Request** (stdout, event kind `tool_request`, one per call in the block):
+  ```json
+  {"t":"tool_request","idx":<int>,"name":"<tool>","params":[{"name":"<p>","value":"<v>"},...],"ts":<µs>}
+  ```
+  `idx` is the existing block-scoped index (see "The `idx` contract"). The
+  engine emits the request and then **blocks** reading one newline-terminated
+  line from stdin for that call's result.
+- **Result** (stdin, one NDJSON line the host writes back):
+  ```json
+  {"t":"tool_result","idx":<int>,"ok":true|false,"s":"<condensed result text>"}
+  ```
+  The engine matches by `idx` and returns `s` as the call's result text,
+  wrapped in the same `Tool result N (name):\n…` envelope as an
+  internally-executed call, so the downstream result→KV path is identical. A
+  result with `ok:false` is a **refusal**: the engine returns a fixed
+  `Tool error: host refused the tool call` text (the host's `s` is discarded).
+  A result whose `idx` does not match the call that requested it, or any line
+  that is not a valid `tool_result` object, is a **loud refusal** (binding
+  rule 7's spirit) — `Tool error: host tool_result idx mismatch …` or
+  `… protocol violation …` — rather than trusting a result the engine cannot
+  associate with the request that prompted it. EOF on stdin before a result
+  line arrives is likewise a refusal (`… EOF before a result line arrived`).
+
+**Stdin ownership during a dispatch.** The blocking read runs on the worker
+thread (the same thread the generation/decode loop already blocks on); while
+it is in flight, `host_tool_reading` gates the non-interactive loop's stdin
+poll so the result line is not drained into the prompt buffer — the worker is
+the sole stdin reader for the block's duration. The host writes a `tool_result`
+line only after reading the matching `tool_request` from stdout, so the line the
+worker blocks for is unambiguous.
+
+The `hello` handshake advertises `"tool_request"` in `caps` iff `--host-tools` is
+active, so a consumer can refuse loudly if it does not understand the kind.
 
 ## Note on this document's relationship to the brief that requested it
 

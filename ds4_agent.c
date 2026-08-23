@@ -82,6 +82,12 @@ typedef struct {
     bool shell_allowed;
     /* Consent flags (fork divergence #8, P7): the workspace grant. */
     const char *workspace_path;
+    /* P9 (fork divergence #10): host owns tool execution. When true,
+     * agent_execute_tool_calls emits one tool_request per call on stdout
+     * and blocks on a matching tool_result line from stdin instead of
+     * dispatching internally. The app always passes it; the bare CLI keeps
+     * internal execution. */
+    bool host_tools;
 } agent_config;
 
 typedef enum {
@@ -156,6 +162,10 @@ typedef struct {
     bool wake_pending;
     bool stop;
     bool interrupt;
+    bool host_tool_reading; /* P9 --host-tools: worker owns stdin while blocked
+                             * reading a tool_result; gates the UI thread's
+                             * stdin poll so the result line is not drained as
+                             * a prompt. False everywhere else. */
     bool initialized;
     bool save_requested;
     bool compact_requested;
@@ -847,6 +857,11 @@ static agent_config parse_options(int argc, char **argv) {
                 fprintf(stderr, "ds4-agent: --shell expects on or off, got \"%s\"\n", v);
                 exit(2);
             }
+        } else if (!strcmp(arg, "--host-tools")) {
+            /* P9 (fork divergence #10): the host owns tool execution. Emits a
+             * tool_request per call and blocks on a tool_result from stdin
+             * instead of dispatching internally. Requires --json-events. */
+            c.host_tools = true;
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
@@ -943,6 +958,15 @@ static agent_config parse_options(int argc, char **argv) {
     if (c.json_events && !c.non_interactive) {
         fprintf(stderr,
                 "ds4-agent: --json-events is only supported with --non-interactive\n");
+        exit(2);
+    }
+    /* --host-tools is the bidirectional NDJSON wire, which only makes sense
+     * under --json-events (the tool_request event is a json-events kind).
+     * The app always passes both; refuse the broken hybrid outright rather
+     * than quietly emitting raw tool_request JSON into formatted text. */
+    if (c.host_tools && !c.json_events) {
+        fprintf(stderr,
+                "ds4-agent: --host-tools requires --json-events (the bidirectional wire)\n");
         exit(2);
     }
     return c;
@@ -4824,7 +4848,12 @@ static void agent_buf_put_ts(agent_buf *b, const agent_worker *w) {
 static void agent_emit_hello(agent_worker *w) {
     agent_buf b = {0};
     agent_buf_puts(&b, "{\"t\":\"hello\",\"v\":1,\"caps\":[\"status\",\"ready\","
-                       "\"text\",\"think\",\"tool\",\"queued\",\"ts\"]");
+                       "\"text\",\"think\",\"tool\",\"queued\",\"ts\"");
+    /* P9 (--host-tools): the wire may carry tool_request events, so a consumer
+     * that does not know the kind can refuse loudly (binding rule 7). */
+    if (w->cfg && w->cfg->host_tools)
+        agent_buf_puts(&b, ",\"tool_request\"");
+    agent_buf_puts(&b, "]");   /* close the caps array before the top-level ts */
     agent_buf_put_ts(&b, w);
     agent_buf_puts(&b, "}\n");
     char *line = agent_buf_take(&b);
@@ -7847,6 +7876,7 @@ static void agent_test_assert(bool cond, const char *expr,
  * ds4_agent_unit_tests_run() registers its test list. */
 static void agent_bash_publish_observation(agent_worker *w, const char *obs, int idx);
 static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call, int idx);
+static char *agent_execute_tool_calls(agent_worker *w, const agent_tool_calls *calls);
 static void agent_format_status_line(const agent_status *st, char *buf, size_t len);
 
 static void test_agent_edit_upto_tail_newline_is_not_part_of_anchor(void) {
@@ -8827,6 +8857,276 @@ static void test_agent_json_events_unknown_tool_header_wraps_as_tool_output(void
     free(result);
     free(w.out);
     pthread_mutex_destroy(&w.mu);
+}
+
+/* P9 --host-tools tests (fork divergence #10). The host owns tool execution:
+ * agent_execute_tool_calls emits one tool_request per call on stdout and
+ * blocks on a matching tool_result line from stdin. These tests feed
+ * tool_result lines to fd 0 by dup2'ing a pipe read end onto STDIN_FILENO
+ * (the worker reads fd 0 directly via agent_stdin_read_line), then restore it.
+ * No UI thread runs here, so the host_tool_reading coordination flag is inert.
+ */
+static int agent_test_feed_stdin(const char *text) {
+    int pfd[2];
+    if (pipe(pfd) != 0) return -1;
+    size_t n = strlen(text);
+    ssize_t wv = write(pfd[1], text, n);
+    (void)wv;
+    close(pfd[1]);
+    int saved = dup(STDIN_FILENO);
+    dup2(pfd[0], STDIN_FILENO);
+    close(pfd[0]);
+    return saved;
+}
+
+static void agent_test_restore_stdin(int saved) {
+    if (saved >= 0) {
+        dup2(saved, STDIN_FILENO);
+        close(saved);
+    }
+}
+
+/* Build a one-call block named NAME with a single "path"=PATH arg. */
+static void agent_test_build_one_call(agent_tool_call *call,
+                                     agent_tool_arg *arg,
+                                     const char *name, const char *path)
+{
+    arg->name = (char *)"path";
+    arg->value = (char *)path;
+    arg->is_string = true;
+    call->name = (char *)name;
+    call->args = arg;
+    call->argc = 1;
+    call->argcap = 1;
+}
+
+/* ok:true + matched idx: the host's condensed s rides the same
+ * "Tool result N (name):\n" wrapper as an internally-executed call, and the
+ * tool_request event carries idx/name/params. */
+static void test_agent_host_tools_roundtrip_returns_host_s(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1;
+    agent_config cfg = { .json_events = true, .host_tools = true };
+    w.cfg = &cfg;
+
+    int saved = agent_test_feed_stdin(
+        "{\"t\":\"tool_result\",\"idx\":0,\"ok\":true,\"s\":\"ok text\"}\n");
+    AGENT_TEST_ASSERT(saved >= 0);
+
+    agent_tool_arg arg = {0};
+    agent_tool_call call = {0};
+    agent_test_build_one_call(&call, &arg, "fake_read", "/tmp/x");
+    agent_tool_calls calls = { .v = &call, .len = 1, .cap = 1 };
+
+    char *result = agent_execute_tool_calls(&w, &calls);
+    AGENT_TEST_ASSERT(result != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "Tool result 1 (fake_read):\n") != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "ok text") != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "Tool error:") == NULL);
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"t\":\"tool_request\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"idx\":0") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"name\":\"fake_read\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"params\":[{\"name\":\"path\",\"value\":\"/tmp/x\"}]") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"ts\":") != NULL);
+
+    free(result);
+    free(w.out);
+    agent_test_restore_stdin(saved);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* ok:false: the engine returns a refusal text, not the host's s. */
+static void test_agent_host_tools_ok_false_refuses(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1;
+    agent_config cfg = { .json_events = true, .host_tools = true };
+    w.cfg = &cfg;
+
+    int saved = agent_test_feed_stdin(
+        "{\"t\":\"tool_result\",\"idx\":0,\"ok\":false,\"s\":\"host reason\"}\n");
+    AGENT_TEST_ASSERT(saved >= 0);
+
+    agent_tool_arg arg = {0};
+    agent_tool_call call = {0};
+    agent_test_build_one_call(&call, &arg, "fake_read", "/tmp/x");
+    agent_tool_calls calls = { .v = &call, .len = 1, .cap = 1 };
+
+    char *result = agent_execute_tool_calls(&w, &calls);
+    AGENT_TEST_ASSERT(result != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "Tool result 1 (fake_read):\n") != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "host refused") != NULL);
+    /* A refusal must not leak the host's s as if the call succeeded. */
+    AGENT_TEST_ASSERT(strstr(result, "host reason") == NULL);
+
+    free(result);
+    free(w.out);
+    agent_test_restore_stdin(saved);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* A mismatched idx is a loud refusal (binding rule 7): the engine does not
+ * trust a result it cannot match to the call that requested it. */
+static void test_agent_host_tools_unknown_idx_refuses(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1;
+    agent_config cfg = { .json_events = true, .host_tools = true };
+    w.cfg = &cfg;
+
+    int saved = agent_test_feed_stdin(
+        "{\"t\":\"tool_result\",\"idx\":9,\"ok\":true,\"s\":\"wrong idx\"}\n");
+    AGENT_TEST_ASSERT(saved >= 0);
+
+    agent_tool_arg arg = {0};
+    agent_tool_call call = {0};
+    agent_test_build_one_call(&call, &arg, "fake_read", "/tmp/x");
+    agent_tool_calls calls = { .v = &call, .len = 1, .cap = 1 };
+
+    char *result = agent_execute_tool_calls(&w, &calls);
+    AGENT_TEST_ASSERT(result != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "Tool result 1 (fake_read):\n") != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "idx mismatch") != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "wrong idx") == NULL);
+
+    free(result);
+    free(w.out);
+    agent_test_restore_stdin(saved);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* A non-tool_result line is a loud protocol refusal. */
+static void test_agent_host_tools_non_tool_result_line_refuses(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1;
+    agent_config cfg = { .json_events = true, .host_tools = true };
+    w.cfg = &cfg;
+
+    int saved = agent_test_feed_stdin(
+        "{\"t\":\"text\",\"s\":\"not a result\"}\n");
+    AGENT_TEST_ASSERT(saved >= 0);
+
+    agent_tool_arg arg = {0};
+    agent_tool_call call = {0};
+    agent_test_build_one_call(&call, &arg, "fake_read", "/tmp/x");
+    agent_tool_calls calls = { .v = &call, .len = 1, .cap = 1 };
+
+    char *result = agent_execute_tool_calls(&w, &calls);
+    AGENT_TEST_ASSERT(result != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "Tool result 1 (fake_read):\n") != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "protocol violation") != NULL);
+
+    free(result);
+    free(w.out);
+    agent_test_restore_stdin(saved);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* A multi-call block: each call emits its own tool_request and blocks for its
+ * own tool_result; idx threads through 0,1 in order and the wrapper labels
+ * them 1,2. */
+static void test_agent_host_tools_multi_call_threads_idx(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1;
+    agent_config cfg = { .json_events = true, .host_tools = true };
+    w.cfg = &cfg;
+
+    int saved = agent_test_feed_stdin(
+        "{\"t\":\"tool_result\",\"idx\":0,\"ok\":true,\"s\":\"first\"}\n"
+        "{\"t\":\"tool_result\",\"idx\":1,\"ok\":true,\"s\":\"second\"}\n");
+    AGENT_TEST_ASSERT(saved >= 0);
+
+    agent_tool_arg a0 = {0}, a1 = {0};
+    agent_tool_call c0 = {0}, c1 = {0};
+    agent_test_build_one_call(&c0, &a0, "fake_read", "/tmp/a");
+    agent_test_build_one_call(&c1, &a1, "fake_list", "/tmp/b");
+    agent_tool_call v[2] = { c0, c1 };
+    agent_tool_calls calls = { .v = v, .len = 2, .cap = 2 };
+
+    char *result = agent_execute_tool_calls(&w, &calls);
+    AGENT_TEST_ASSERT(result != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "Tool result 1 (fake_read):\n") != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "Tool result 2 (fake_list):\n") != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "first") != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "second") != NULL);
+
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"idx\":0") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"idx\":1") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"name\":\"fake_read\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\"name\":\"fake_list\"") != NULL);
+
+    free(result);
+    free(w.out);
+    agent_test_restore_stdin(saved);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* With host_tools off, agent_execute_tool_calls dispatches internally and
+ * emits no tool_request — the bare CLI path is byte-for-byte unchanged. */
+static void test_agent_host_tools_off_path_unchanged(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1;
+    agent_config cfg = { .json_events = true, .host_tools = false };
+    w.cfg = &cfg;
+
+    agent_tool_arg arg = {0};
+    agent_tool_call call = {0};
+    agent_test_build_one_call(&call, &arg, "not_a_real_tool", "/tmp/x");
+    agent_tool_calls calls = { .v = &call, .len = 1, .cap = 1 };
+
+    char *result = agent_execute_tool_calls(&w, &calls);
+    AGENT_TEST_ASSERT(result != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "unknown tool") != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "Tool result 1 (not_a_real_tool):\n") != NULL);
+    /* No tool_request on the off path. */
+    AGENT_TEST_ASSERT(w.out == NULL || strstr(w.out, "tool_request") == NULL);
+
+    free(result);
+    free(w.out);
+    pthread_mutex_destroy(&w.mu);
+}
+
+/* P9 regression: agent_emit_hello must close the caps array. The 741f722 edit
+ * that added the conditional "tool_request" dropped the "]" the parent
+ * b91401d closed the array with, so the emitted line was invalid JSON
+ * (..."queued","ts","ts":<n>} — the wire consumer refuses it). caps must
+ * close after the conditional; "tool_request" is advertised iff host_tools. */
+static void test_agent_emit_hello_caps_array_closes(void) {
+    /* host_tools off: caps closes with "ts"] and carries no tool_request. */
+    {
+        agent_worker w = {0};
+        pthread_mutex_init(&w.mu, NULL);
+        w.wake_fd[1] = -1;
+        agent_config cfg = { .json_events = true, .host_tools = false };
+        w.cfg = &cfg;
+        agent_emit_hello(&w);
+        AGENT_TEST_ASSERT(w.out != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\"queued\",\"ts\"]") != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "tool_request") == NULL);
+        free(w.out);
+        pthread_mutex_destroy(&w.mu);
+    }
+    /* host_tools on: caps closes with "tool_request"] and advertises it. */
+    {
+        agent_worker w = {0};
+        pthread_mutex_init(&w.mu, NULL);
+        w.wake_fd[1] = -1;
+        agent_config cfg = { .json_events = true, .host_tools = true };
+        w.cfg = &cfg;
+        agent_emit_hello(&w);
+        AGENT_TEST_ASSERT(w.out != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\"queued\",\"ts\",\"tool_request\"]") != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "tool_request") != NULL);
+        free(w.out);
+        pthread_mutex_destroy(&w.mu);
+    }
 }
 
 /* agent_emit_status_event() must emit all eight agent_status states, not the
@@ -10615,6 +10915,13 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_json_events_bash_observation_plain_output_wraps_as_tool_output();
     test_agent_bash_observation_unflagged_path_unchanged();
     test_agent_json_events_unknown_tool_header_wraps_as_tool_output();
+    test_agent_host_tools_roundtrip_returns_host_s();
+    test_agent_host_tools_ok_false_refuses();
+    test_agent_host_tools_unknown_idx_refuses();
+    test_agent_host_tools_non_tool_result_line_refuses();
+    test_agent_host_tools_multi_call_threads_idx();
+    test_agent_host_tools_off_path_unchanged();
+    test_agent_emit_hello_caps_array_closes();
     test_agent_emit_status_event_covers_all_eight_states();
     test_agent_emit_status_event_escapes_error_field();
     test_agent_emit_status_event_trims_torn_utf8_error_tail();
@@ -11765,9 +12072,294 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     }
 }
 
+/* P9 --host-tools (fork divergence #10): the host owns tool execution.  The
+ * helpers below implement the bidirectional NDJSON wire -- the engine emits one
+ * tool_request per call on stdout and blocks on a matching tool_result line
+ * from stdin instead of dispatching the call internally.  Absent the flag,
+ * agent_execute_tool_calls below is byte-for-byte unchanged.
+ *
+ * The blocking line reader runs on the worker thread (the same thread the
+ * generation/decode loop already blocks on); it polls fd 0 so it works whether
+ * stdin is blocking or non-blocking (the non-interactive loop sets it
+ * non-blocking), reads byte-at-a-time until '\n', and bails on a latched
+ * interrupt (worker_should_interrupt) so a hung host cannot wedge the worker
+ * forever.  While a host dispatch is in flight, host_tool_reading gates the UI
+ * thread's stdin poll in run_agent_non_interactive so the result line is not
+ * drained into the prompt buffer -- the worker is the sole stdin reader for
+ * the block's duration. */
+static char *agent_stdin_read_line(agent_worker *w) {
+    agent_buf b = {0};
+    for (;;) {
+        if (worker_should_interrupt(w)) { free(b.ptr); return NULL; }
+        struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
+        int prc = poll(&pfd, 1, 200);
+        if (prc < 0) {
+            if (errno == EINTR) continue;
+            free(b.ptr); return NULL;
+        }
+        if (prc == 0) continue;  /* timeout: re-check interrupt, keep waiting */
+        if (!(pfd.revents & (POLLIN | POLLHUP))) continue;
+        char c;
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            free(b.ptr); return NULL;
+        }
+        if (n == 0) {  /* EOF */
+            if (b.len == 0) { free(b.ptr); return NULL; }
+            return agent_buf_take(&b);  /* final line with no trailing newline */
+        }
+        if (c == '\n') {
+            char *line = agent_buf_take(&b);
+            size_t L = strlen(line);
+            if (L && line[L - 1] == '\r') line[L - 1] = '\0';  /* strip CRLF */
+            return line;
+        }
+        char tmp[2] = { c, 0 };
+        agent_buf_puts(&b, tmp);
+    }
+}
+
+/* Emit one tool_request event on stdout (one per call in a host-owned block).
+ * Mirrors agent_emit_tool_event's NDJSON style: agent_buf + agent_json_escape +
+ * agent_buf_put_ts, drained by agent_publish_raw into the same w->out FIFO as
+ * every other event so it lands in order with the block's tool/finish events. */
+static void agent_emit_tool_request(agent_worker *w, int idx,
+                                    const agent_tool_call *call) {
+    agent_buf b = {0};
+    agent_buf_puts(&b, "{\"t\":\"tool_request\",\"idx\":");
+    char num[24];
+    snprintf(num, sizeof(num), "%d", idx);
+    agent_buf_puts(&b, num);
+    agent_buf_puts(&b, ",\"name\":\"");
+    agent_json_escape(&b, call->name ? call->name : "",
+                      call->name ? strlen(call->name) : 0);
+    agent_buf_puts(&b, "\",\"params\":[");
+    for (int i = 0; i < call->argc; i++) {
+        if (i) agent_buf_puts(&b, ",");
+        agent_buf_puts(&b, "{\"name\":\"");
+        const char *an = call->args[i].name ? call->args[i].name : "";
+        agent_json_escape(&b, an, strlen(an));
+        agent_buf_puts(&b, "\",\"value\":\"");
+        const char *av = call->args[i].value ? call->args[i].value : "";
+        agent_json_escape(&b, av, strlen(av));
+        agent_buf_puts(&b, "\"}");
+    }
+    agent_buf_puts(&b, "]");
+    agent_buf_put_ts(&b, w);
+    agent_buf_puts(&b, "}\n");
+    char *line = agent_buf_take(&b);
+    if (line) { agent_publish_raw(w, line, strlen(line)); free(line); }
+}
+
+/* Minimal JSON object parser for the host tool_result line.  Accepts
+ * {"t":"tool_result","idx":N,"ok":true|false,"s":"..."} with the four keys in
+ * any order (extra keys whose values are strings/ints/bools are skipped),
+ * unescapes the s string, and returns the matched fields.  No other JSON shape
+ * is accepted -- a non-tool_result line is a loud protocol refusal. */
+static bool agent_json_skip_ws(const char **p) {
+    while (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r') (*p)++;
+    return true;
+}
+
+static bool agent_json_match(const char **p, char c) {
+    agent_json_skip_ws(p);
+    if (**p != c) return false;
+    (*p)++;
+    return true;
+}
+
+static bool agent_json_parse_string(const char **p, char **out) {
+    agent_json_skip_ws(p);
+    if (**p != '"') return false;
+    (*p)++;
+    agent_buf b = {0};
+    for (;;) {
+        char c = **p;
+        if (c == '\0') { free(b.ptr); return false; }
+        if (c == '"') { (*p)++; *out = agent_buf_take(&b); return true; }
+        if (c == '\\') {
+            char e = (*p)[1];
+            const char *ins = NULL;
+            switch (e) {
+                case 'n': ins = "\n"; break;
+                case 't': ins = "\t"; break;
+                case 'r': ins = "\r"; break;
+                case 'b': ins = "\b"; break;
+                case 'f': ins = "\f"; break;
+                case '"': ins = "\""; break;
+                case '\\': ins = "\\"; break;
+                case '/': ins = "/"; break;
+                case 'u': {
+                    const char *h = *p + 2;
+                    unsigned u = 0; int k;
+                    for (k = 0; k < 4; k++) {
+                        char hc = h[k];
+                        int d = (hc >= '0' && hc <= '9') ? hc - '0'
+                              : (hc >= 'a' && hc <= 'f') ? hc - 'a' + 10
+                              : (hc >= 'A' && hc <= 'F') ? hc - 'A' + 10 : -1;
+                        if (d < 0) break;
+                        u = u * 16 + (unsigned)d;
+                    }
+                    if (k != 4) { free(b.ptr); return false; }
+                    char ub[4] = { 0, 0, 0, 0 };
+                    int ul = 0;
+                    if (u < 0x80) { ub[0] = (char)u; ul = 1; }
+                    else if (u < 0x800) {
+                        ub[0] = (char)(0xC0 | (u >> 6));
+                        ub[1] = (char)(0x80 | (u & 0x3F));
+                        ul = 2;
+                    } else {
+                        ub[0] = (char)(0xE0 | (u >> 12));
+                        ub[1] = (char)(0x80 | ((u >> 6) & 0x3F));
+                        ub[2] = (char)(0x80 | (u & 0x3F));
+                        ul = 3;
+                    }
+                    agent_buf_append(&b, ub, (size_t)ul);
+                    *p += 6;
+                    continue;
+                }
+                default: free(b.ptr); return false;
+            }
+            agent_buf_puts(&b, ins);
+            *p += 2;
+        } else {
+            char tmp[2] = { c, 0 };
+            agent_buf_puts(&b, tmp);
+            (*p)++;
+        }
+    }
+}
+
+static bool agent_json_parse_int(const char **p, int *out) {
+    agent_json_skip_ws(p);
+    const char *s = *p;
+    if (*s == '-' || *s == '+') s++;
+    if (!(*s >= '0' && *s <= '9')) return false;
+    char *end = NULL;
+    long v = strtol(*p, &end, 10);
+    if (end == *p) return false;
+    *out = (int)v;
+    *p = end;
+    return true;
+}
+
+static bool agent_json_parse_bool(const char **p, bool *out) {
+    agent_json_skip_ws(p);
+    if (!strncmp(*p, "true", 4)) { *out = true; *p += 4; return true; }
+    if (!strncmp(*p, "false", 5)) { *out = false; *p += 5; return true; }
+    return false;
+}
+
+static bool agent_parse_tool_result_line(const char *line, int *out_idx,
+                                          bool *out_ok, char **out_s) {
+    const char *p = line;
+    *out_idx = 0; *out_ok = false; *out_s = NULL;
+    bool have_t = false, have_idx = false, have_ok = false, have_s = false;
+    char *tstr = NULL, *sstr = NULL;
+    if (!agent_json_match(&p, '{')) goto fail;
+    for (;;) {
+        agent_json_skip_ws(&p);
+        if (*p == '}') { p++; break; }
+        if (*p != '"') goto fail;
+        char *key = NULL;
+        if (!agent_json_parse_string(&p, &key)) goto fail;
+        if (!agent_json_match(&p, ':')) { free(key); goto fail; }
+        if (!strcmp(key, "t")) {
+            have_t = agent_json_parse_string(&p, &tstr);
+        } else if (!strcmp(key, "idx")) {
+            have_idx = agent_json_parse_int(&p, out_idx);
+        } else if (!strcmp(key, "ok")) {
+            have_ok = agent_json_parse_bool(&p, out_ok);
+        } else if (!strcmp(key, "s")) {
+            have_s = agent_json_parse_string(&p, &sstr);
+        } else if (*p == '"') {
+            char *junk = NULL;
+            if (!agent_json_parse_string(&p, &junk)) { free(key); free(junk); goto fail; }
+            free(junk);
+        } else {
+            int iv; bool bv;
+            if (!(agent_json_parse_int(&p, &iv) ||
+                  agent_json_parse_bool(&p, &bv))) {
+                free(key); goto fail;
+            }
+        }
+        free(key);
+        agent_json_skip_ws(&p);
+        if (*p == ',') { p++; continue; }
+        if (*p == '}') { p++; break; }
+        goto fail;
+    }
+    agent_json_skip_ws(&p);
+    if (*p != '\0') goto fail;
+    if (!have_t || !have_idx || !have_ok || !have_s) goto fail;
+    if (!tstr || strcmp(tstr, "tool_result") != 0) goto fail;
+    free(tstr);
+    *out_s = sstr ? sstr : xstrdup("");
+    return true;
+fail:
+    free(tstr); free(sstr);
+    return false;
+}
+
 /* Execute all tool calls from one DSML block, preserving per-call labels in the
  * combined result so the model can associate observations with calls. */
 static char *agent_execute_tool_calls(agent_worker *w, const agent_tool_calls *calls) {
+    if (w->cfg->host_tools) {
+        /* P9: host owns execution. Emit one tool_request per call and block on
+         * a matching tool_result from stdin. The worker is the sole stdin
+         * reader for this block (host_tool_reading gates the UI thread's
+         * stdin poll), so the result line is not confused with a prompt. A
+         * missing line, a non-tool_result line, a mismatched idx, or ok:false
+         * is a loud refusal that still rides the same result->KV wrapper as
+         * an internally-executed call, so the downstream path is identical. */
+        agent_buf all = {0};
+        pthread_mutex_lock(&w->mu);
+        w->host_tool_reading = true;
+        pthread_mutex_unlock(&w->mu);
+        for (int i = 0; i < calls->len; i++) {
+            agent_emit_tool_request(w, i, &calls->v[i]);
+            char *line = agent_stdin_read_line(w);
+            char *res;
+            if (!line) {
+                res = xstrdup(
+                    "Tool error: host tool_result EOF before a result line arrived\n");
+            } else {
+                int ri; bool rok; char *rs = NULL;
+                if (!agent_parse_tool_result_line(line, &ri, &rok, &rs)) {
+                    res = xstrdup(
+                        "Tool error: host tool_result protocol violation "
+                        "(expected a tool_result line)\n");
+                } else if (ri != i) {
+                    char buf[160];
+                    snprintf(buf, sizeof(buf),
+                             "Tool error: host tool_result idx mismatch "
+                             "(expected %d, got %d)\n", i, ri);
+                    res = xstrdup(buf);
+                    free(rs);
+                } else if (!rok) {
+                    res = xstrdup("Tool error: host refused the tool call\n");
+                    free(rs);
+                } else {
+                    res = rs;  /* ok:true, idx matched: the host's condensed result */
+                }
+                free(line);
+            }
+            char hdr[128];
+            snprintf(hdr, sizeof(hdr), "Tool result %d (%s):\n", i + 1,
+                     calls->v[i].name ? calls->v[i].name : "unknown");
+            agent_buf_puts(&all, hdr);
+            agent_buf_puts(&all, res);
+            if (res[0] && res[strlen(res) - 1] != '\n') agent_buf_puts(&all, "\n");
+            free(res);
+        }
+        pthread_mutex_lock(&w->mu);
+        w->host_tool_reading = false;
+        pthread_mutex_unlock(&w->mu);
+        if (calls->len == 0) agent_buf_puts(&all, "Tool error: empty tool call block\n");
+        return agent_buf_take(&all);
+    }
     agent_buf all = {0};
     for (int i = 0; i < calls->len; i++) {
         char *res = agent_execute_tool_call(w, &calls->v[i], i);
@@ -13397,6 +13989,19 @@ static bool worker_is_idle(agent_worker *w) {
     return idle;
 }
 
+/* P9 --host-tools: true while the worker thread is blocked in
+ * agent_execute_tool_calls reading a tool_result line from stdin. The UI
+ * thread gates its stdin poll on this so it does not drain the result line
+ * into the prompt buffer -- the worker is the sole stdin reader for the
+ * block's duration. Reads the flag under the mutex (the worker sets/clears it
+ * there). */
+static bool worker_host_tool_reading(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    bool r = w->host_tool_reading;
+    pthread_mutex_unlock(&w->mu);
+    return r;
+}
+
 static bool worker_is_initialized(agent_worker *w, agent_status *status) {
     pthread_mutex_lock(&w->mu);
     w->status.ctx_used = w->transcript.len;
@@ -14895,7 +15500,8 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         int wake_idx = nfds;
         pfd[nfds++] = (struct pollfd){.fd = worker.wake_fd[0], .events = POLLIN};
         int stdin_idx = -1;
-        if (!one_shot && initialized && !stdin_eof) {
+        if (!one_shot && initialized && !stdin_eof &&
+            !worker_host_tool_reading(&worker)) {
             stdin_idx = nfds;
             pfd[nfds++] = (struct pollfd){.fd = STDIN_FILENO, .events = POLLIN};
         }
