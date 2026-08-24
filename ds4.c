@@ -37671,6 +37671,14 @@ bool ds4_token_is_stop_for_think_mode(
     return false;
 }
 
+int ds4_token_think_start(ds4_engine *e) {
+    return e ? e->vocab.think_start_id : -1;
+}
+
+int ds4_token_think_end(ds4_engine *e) {
+    return e ? e->vocab.think_end_id : -1;
+}
+
 int ds4_token_user(ds4_engine *e) {
     return e->vocab.user_id;
 }
@@ -63246,6 +63254,11 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
         }
     }
     return best;
+}
+
+void ds4_session_ban_token(ds4_session *s, int token) {
+    if (!s || !s->logits || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return;
+    s->logits[token] = DS4_NEG_INF;
 }
 
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,

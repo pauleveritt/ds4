@@ -211,6 +211,7 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "--think", "Use normal thinking mode.");
     opt(fp, c, "--think-max", "Use Think Max when context is large enough.");
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
+    opt(fp, c, "--think-budget N", "Force </think> once a tool-continuation round's thinking reaches N tokens (0 disables; default 0).");
     if (full) {
         opt(fp, c, "-sys, --system TEXT", "System prompt. Empty string disables the default where supported.");
         opt(fp, c, "-p, --prompt TEXT", "One-shot prompt text.");

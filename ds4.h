@@ -337,6 +337,8 @@ bool ds4_token_is_thinking_control(ds4_engine *e, int token);
 bool ds4_token_is_stop_for_think_mode(ds4_engine *e,
                                       int token,
                                       ds4_think_mode mode);
+int ds4_token_think_start(ds4_engine *e);
+int ds4_token_think_end(ds4_engine *e);
 int ds4_token_user(ds4_engine *e);
 int ds4_token_assistant(ds4_engine *e);
 
@@ -389,6 +391,10 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
+/* Bans one token from the *next* sample call by masking its logit. Logits are
+ * recomputed fresh at every position, so this must be called again before
+ * every sample while the ban should hold. */
+void ds4_session_ban_token(ds4_session *s, int token);
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
