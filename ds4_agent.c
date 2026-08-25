@@ -54,6 +54,12 @@ typedef struct {
     const char *trace_path;
     bool raw_prompt;
     int n_predict;
+    /* 0 = disabled (default): thinking runs unbounded within `n_predict`, the
+     * behavior before this option existed. > 0 forces `</think>` once a
+     * round's thinking has generated this many tokens, so a model that drafts
+     * a complete answer and then never transitions to acting is bounded
+     * without amputating reasoning outright the way --nothink does. */
+    int think_budget;
     int ctx_size;
     float temperature;
     int top_k;
@@ -860,6 +866,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.ctx_size = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--think-budget")) {
+            c.gen.think_budget = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--temp")) {
             c.gen.temperature = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
             c.gen.temperature_set = true;
@@ -14267,6 +14275,19 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         bool early_tool_error = false;
         bool length_truncated_tool = false;
         int generated = 0;
+        /* --think-budget (D-corrected, C10.6): a round-scoped thinking cap,
+         * separate from `max_tokens`. `ds4_chat_append_assistant_prefix`
+         * re-opens `<think>` at the top of every tool round when thinking is
+         * on — that reopening is a legitimate way to reason over fresh tool
+         * output and is never forbidden here. What gets bounded is how long a
+         * single round's thinking may run before the host takes over: once
+         * `think_tokens_this_round` reaches the budget, `</think>` is forced
+         * and `think_start_id` is banned from resampling for the rest of this
+         * round only. Reset every tool round: the next round gets a full
+         * budget and is free to think again. */
+        int think_tokens_this_round = 0;
+        bool think_forced_closed_this_round = false;
+        bool round_in_think = ds4_think_mode_enabled(think_mode);
         double t0 = now_sec();
         pthread_mutex_lock(&w->mu);
         w->status.state = AGENT_WORKER_GENERATING;
@@ -14282,11 +14303,33 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         bool status_greedy_sampling = false;
         while (generated < max_tokens && !worker_should_interrupt(w)) {
             worker_apply_pending_power(w);
+            /* Checked at loop top, before sampling or speculation start, so a
+             * round that reaches the budget mid-batch overshoots by at most
+             * one speculative batch (~16 tokens) rather than being caught
+             * exactly mid-draft — cheap and sufficient, not exact. */
+            if (cfg->gen.think_budget > 0 && round_in_think &&
+                !think_forced_closed_this_round &&
+                think_tokens_this_round >= cfg->gen.think_budget) {
+                if (worker_accept_generated_token(w, ds4_token_think_end(w->engine),
+                                                  &generated, t0, &stream,
+                                                  err, sizeof(err)) != 0) {
+                    goto turn_fail;
+                }
+                think_forced_closed_this_round = true;
+                round_in_think = false;
+                continue;
+            }
             bool stop_from_speculation = false;
             bool greedy_sampling = agent_stream_wants_greedy_sampling(&stream);
             if (greedy_sampling != status_greedy_sampling) {
                 worker_set_greedy_sampling(w, greedy_sampling);
                 status_greedy_sampling = greedy_sampling;
+            }
+            /* Once forced closed, `<think>` must not reopen for the rest of
+             * this round: mask it every time, since logits are recomputed
+             * fresh at each position and an earlier ban does not persist. */
+            if (think_forced_closed_this_round) {
+                ds4_session_ban_token(w->session, ds4_token_think_start(w->engine));
             }
             int token = worker_sample_with_mode(w, cfg, greedy_sampling, &rng);
             if (greedy_sampling) {
@@ -14326,7 +14369,14 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 const bool can_speculate =
                     speculative_argmax &&
                     !stream.dsml_active &&
-                    stream.dsml_start_len == 0;
+                    stream.dsml_start_len == 0 &&
+                    /* A forced-closed round must go through the single-token
+                     * path below so the think_start ban above runs on every
+                     * sample. Speculative batches produce tokens through a
+                     * separate internal decode that never consults it, so
+                     * disabling speculation is the only way to guarantee the
+                     * ban actually holds for the rest of this round. */
+                    !think_forced_closed_this_round;
                 if (can_speculate) {
                     int toks[17];
                     const int ntok = ds4_session_eval_speculative_argmax(
@@ -14351,6 +14401,17 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                             stop_from_speculation = true;
                             break;
                         }
+                        /* Speculation only runs while thinking is unbounded
+                         * for this round (can_speculate above), so counting
+                         * here only ever needs to grow the budget check at
+                         * the next loop top -- never force-close mid-batch. */
+                        if (toks[i] == ds4_token_think_end(w->engine)) {
+                            round_in_think = false;
+                        } else if (toks[i] == ds4_token_think_start(w->engine)) {
+                            round_in_think = true;
+                        } else if (round_in_think) {
+                            think_tokens_this_round++;
+                        }
                         worker_publish_generated_token(
                             w, toks[i], &generated, t0, &stream);
 
@@ -14373,10 +14434,19 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                          * prompt sync to rebuild from the visible prefix. */
                         ds4_session_invalidate(w->session);
                     }
-                } else if (worker_accept_generated_token(
-                               w, token, &generated, t0,
-                               &stream, err, sizeof(err)) != 0) {
-                    goto turn_fail;
+                } else {
+                    if (token == ds4_token_think_end(w->engine)) {
+                        round_in_think = false;
+                    } else if (token == ds4_token_think_start(w->engine)) {
+                        round_in_think = true;
+                    } else if (round_in_think) {
+                        think_tokens_this_round++;
+                    }
+                    if (worker_accept_generated_token(
+                            w, token, &generated, t0,
+                            &stream, err, sizeof(err)) != 0) {
+                        goto turn_fail;
+                    }
                 }
             }
 
