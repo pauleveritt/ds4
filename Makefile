@@ -352,6 +352,12 @@ tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4
 tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_mellum_admission.o: tests/test_mellum_admission.c ds4.h
+	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -c -o $@ tests/test_mellum_admission.c
+
+tests/test_mellum_admission: tests/test_mellum_admission.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 ifneq ($(UNAME_S),Darwin)
 tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<

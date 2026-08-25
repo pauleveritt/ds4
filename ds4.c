@@ -37332,6 +37332,7 @@ static bool ds4_engine_bind_mellum_decode_contract(ds4_engine *e,
         const ds4_layer_weights *src = &e->weights.layer[il];
         ds4_mellum_layer_decode_desc *dst = &e->mellum_layer[il];
         if (!weights_mellum_layer_has_required(src)) return false;
+        if (src->ffn_down_exps->type != DS4_TENSOR_Q8_0) return false;
         if (src->ffn_gate_exps->type == DS4_TENSOR_Q4_K) {
             e->mellum_batched_prefill_unsupported = true;
         }
@@ -61828,6 +61829,66 @@ int ds4_test_session_read_logits(ds4_session *s, float *out,
 
 const int *ds4_test_engine_placement(const ds4_engine *e) {
     return e ? e->placement : NULL;
+}
+
+int ds4_test_mellum_decode_contract_admission(void) {
+    g_ds4_shape = DS4_SHAPE_MELLUM2;
+
+    ds4_tensor t[12];
+    memset(t, 0, sizeof(t));
+
+    ds4_engine e;
+    memset(&e, 0, sizeof(e));
+    ds4_layer_weights *lw = &e.weights.layer[0];
+
+    lw->attn_norm     = &t[0];
+    lw->attn_q        = &t[1];
+    lw->attn_q_norm   = &t[2];
+    lw->attn_k        = &t[3];
+    lw->attn_k_norm   = &t[4];
+    lw->attn_v        = &t[5];
+    lw->attn_output   = &t[6];
+    lw->ffn_norm      = &t[7];
+    lw->ffn_gate_inp  = &t[8];
+    lw->ffn_gate_exps = &t[9];
+    lw->ffn_up_exps   = &t[10];
+    lw->ffn_down_exps = &t[11];
+
+    ds4_tensor *gate = &t[9], *up = &t[10], *down = &t[11];
+    gate->type = up->type = DS4_TENSOR_Q8_0;
+    gate->ndim = up->ndim = down->ndim = 3;
+    gate->dim[0] = DS4_N_EMBD;   gate->dim[1] = DS4_N_FF_EXP; gate->dim[2] = DS4_N_EXPERT;
+    up->dim[0]   = DS4_N_EMBD;   up->dim[1]   = DS4_N_FF_EXP; up->dim[2]   = DS4_N_EXPERT;
+    down->dim[0] = DS4_N_FF_EXP; down->dim[1] = DS4_N_EMBD;  down->dim[2] = DS4_N_EXPERT;
+
+    int failures = 0;
+
+    down->type = DS4_TENSOR_Q8_0;
+    if (!ds4_engine_bind_mellum_decode_contract(&e, 0, 0)) {
+        fprintf(stderr, "mellum admission: Q8_0 down unexpectedly rejected\n");
+        failures++;
+    }
+
+    /* MXFP4 first: it is the one type the un-fixed binder silently accepts. */
+    down->type = DS4_TENSOR_MXFP4;
+    if (ds4_engine_bind_mellum_decode_contract(&e, 0, 0)) {
+        fprintf(stderr, "mellum admission: MXFP4 down unexpectedly accepted\n");
+        failures++;
+    }
+
+    down->type = 6; /* GGUF Q5_0: what official mixed artifacts use for down */
+    if (ds4_engine_bind_mellum_decode_contract(&e, 0, 0)) {
+        fprintf(stderr, "mellum admission: Q5_0 down unexpectedly accepted\n");
+        failures++;
+    }
+
+    down->type = DS4_TENSOR_Q4_K;
+    if (ds4_engine_bind_mellum_decode_contract(&e, 0, 0)) {
+        fprintf(stderr, "mellum admission: Q4_K down unexpectedly accepted\n");
+        failures++;
+    }
+
+    return failures;
 }
 #endif /* DS4_TEST_HOOKS */
 
