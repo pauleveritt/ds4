@@ -62,7 +62,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-mellum-oracle-checker test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-mellum-admission test-mellum-oracle-checker test-metal-session-batch test-mxfp4-cuda test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -357,6 +357,25 @@ tests/test_mellum_admission.o: tests/test_mellum_admission.c ds4.h
 
 tests/test_mellum_admission: tests/test_mellum_admission.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+tests/drive_mellum_admission.o: tests/drive_mellum_admission.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/drive_mellum_admission.c
+
+tests/drive_mellum_admission: tests/drive_mellum_admission.o ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test-mellum-admission: tests/test_mellum_admission tests/drive_mellum_admission
+	./tests/test_mellum_admission
+	python3 tests/gen_mellum_admission_gguf.py --out /tmp/mellum-adm-good.gguf --down-type q8_0
+	python3 tests/gen_mellum_admission_gguf.py --out /tmp/mellum-adm-bad.gguf --down-type q5_0
+	./tests/drive_mellum_admission /tmp/mellum-adm-good.gguf
+	@if ./tests/drive_mellum_admission /tmp/mellum-adm-bad.gguf >/dev/null 2>/tmp/mellum-adm-bad.err; then \
+	  echo "mellum admission: bad fixture was NOT refused" >&2; exit 1; \
+	fi
+	@grep -q "only Q8_0 is supported" /tmp/mellum-adm-bad.err || { \
+	  echo "mellum admission: refusal did not name the down-tensor limit" >&2; \
+	  cat /tmp/mellum-adm-bad.err >&2; exit 1; }
+	@echo "mellum admission: loader gate ok"
 
 ifneq ($(UNAME_S),Darwin)
 tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h ds4_gpu_mgpu.h
