@@ -62230,10 +62230,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        if (e->ssd_streaming && DS4_MODEL_VARIANT != DS4_VARIANT_LAGUNA_XS21) {
+        if (e->ssd_streaming &&
+            DS4_MODEL_VARIANT != DS4_VARIANT_LAGUNA_XS21 &&
+            DS4_MODEL_VARIANT != DS4_VARIANT_LAGUNA_S21) {
             fprintf(stderr,
                     "ds4: --ssd-streaming for Laguna is only supported "
-                    "for Laguna XS 2.1\n");
+                    "for Laguna XS 2.1 and S 2.1\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
