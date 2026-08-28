@@ -200,6 +200,11 @@ typedef struct {
      * worker_submit alongside cmd_text; consumed and reset by worker_run_turn,
      * so an override never leaks into a following turn. */
     int think_override;
+    /* P23 (fork divergence #14, ctx half): the pending turn's context size,
+     * 0 = unset (keep the current session). Written under `mu` by
+     * worker_submit; applied by worker_main before the turn, under pool_mu,
+     * only while the worker is idle. */
+    int pending_ctx;
     agent_status status;
     /* Turn-outcome snapshot (D12): set where the turn actually ends (the
      * final generation round's non-tool exit, plus the interrupt paths that
@@ -599,6 +604,24 @@ static int agent_worker_effective_ctx_size(const agent_worker *w) {
     if (w && w->session) ctx = ds4_session_ctx(w->session);
     if (ctx <= 0 && w && w->cfg) ctx = w->cfg->gen.ctx_size;
     return ctx;
+}
+
+static ds4_think_mode agent_worker_effective_think_mode(const agent_worker *w) {
+    return ds4_think_mode_for_context(w->cfg->gen.think_mode,
+                                      agent_worker_effective_ctx_size(w));
+}
+
+/* P23 (fork divergence #14, ctx half): the system-prompt checkpoint path is
+ * ctx-qualified. Every worker previously shared one fixed "sysprompt.kv", and
+ * a Laguna payload saved at a larger ctx cannot load into a smaller session
+ * (ds4.c's saved_ctx > s->ctx_size check). A mixed-ctx pool therefore
+ * thrashed: the parent wrote the file at its ctx, the first small worker's
+ * load failed, fell back to a full prefill, and overwrote the file at the
+ * small ctx. One file per ctx removes the collision entirely. */
+static char *agent_sysprompt_path(const char *cache_dir, int ctx) {
+    char name[64];
+    snprintf(name, sizeof(name), "sysprompt-%d.kv", ctx);
+    return ds4_kvstore_path_join(cache_dir, name);
 }
 
 /* ============================================================================
@@ -1133,9 +1156,13 @@ static void agent_apply_model_sampling_defaults(
     if (!gen->min_p_set) gen->min_p = min_p;
 }
 
-static ds4_think_mode effective_think_mode(const agent_config *cfg) {
-    return ds4_think_mode_for_context(cfg->gen.think_mode, cfg->gen.ctx_size);
-}
+/* NOTE (P23, fork divergence #14): the cfg-only `effective_think_mode` was
+ * removed here. Every caller now uses `agent_worker_effective_think_mode`
+ * (defined near agent_worker_effective_ctx_size), which applies the same
+ * ds4_think_mode_for_context downgrade against the worker's LIVE session ctx
+ * rather than the spawn config's — once a worker can run at its own context
+ * size, an 8k worker under a large parent must see the MAX->HIGH downgrade,
+ * and the cfg-only form would not. */
 
 /* ============================================================================
  * System Prompt Rendering And Worker Output Queues
@@ -6305,7 +6332,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
 
 static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
     ds4_chat_begin(w->engine, out);
-    ds4_think_mode think_mode = effective_think_mode(w->cfg);
+    ds4_think_mode think_mode = agent_worker_effective_think_mode(w);
     if (agent_tool_syntax_for_engine(w->engine) == AGENT_TOOL_SYNTAX_GLM) {
         const char *effort = ds4_glm_reasoning_effort_text(think_mode);
         if (effort) ds4_chat_append_message(w->engine, out, "system", effort);
@@ -11991,30 +12018,30 @@ static void test_agent_pool_worker_field_and_cap(void) {
  * a worker; a bare line addresses worker 0; the s field is JSON-unescaped. */
 static int agent_parse_pool_prompt(const char *line, bool pool_mode,
                                    int *out_worker, char **out_text,
-                                   int *out_think);
+                                   int *out_think, int *out_ctx);
 static void test_agent_parse_pool_prompt_routes_worker(void) {
     int wid; char *text = NULL;
-    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"t\":\"prompt\",\"worker\":3,\"s\":\"do it\"}", true, &wid, &text, NULL) == 1);
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"t\":\"prompt\",\"worker\":3,\"s\":\"do it\"}", true, &wid, &text, NULL, NULL) == 1);
     AGENT_TEST_ASSERT(wid == 3);
     AGENT_TEST_ASSERT(text && strcmp(text, "do it") == 0);
     free(text);
-    AGENT_TEST_ASSERT(agent_parse_pool_prompt("fix a.swift", true, &wid, &text, NULL) == 0);
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("fix a.swift", true, &wid, &text, NULL, NULL) == 0);
     AGENT_TEST_ASSERT(wid == 0);
     AGENT_TEST_ASSERT(text && strcmp(text, "fix a.swift") == 0);
     free(text);
-    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"s\":\"hi\",\"worker\":2,\"t\":\"prompt\",\"extra\":1}", true, &wid, &text, NULL) == 1);
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"s\":\"hi\",\"worker\":2,\"t\":\"prompt\",\"extra\":1}", true, &wid, &text, NULL, NULL) == 1);
     AGENT_TEST_ASSERT(wid == 2);
     AGENT_TEST_ASSERT(text && strcmp(text, "hi") == 0);
     free(text);
-    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"t\":\"prompt\",\"worker\":1,\"s\":\"a\\\"b\"}", true, &wid, &text, NULL) == 1);
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"t\":\"prompt\",\"worker\":1,\"s\":\"a\\\"b\"}", true, &wid, &text, NULL, NULL) == 1);
     AGENT_TEST_ASSERT(wid == 1);
     AGENT_TEST_ASSERT(text && strcmp(text, "a\"b") == 0);
     free(text);
     /* JSON that is NOT a prompt envelope must be dropped, not injected. */
-    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"t\":\"tool_result\",\"idx\":0,\"ok\":true,\"s\":\"x\"}", true, &wid, &text, NULL) == -1);
-    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"s\":\"x\"}", true, &wid, &text, NULL) == -1);  /* no t */
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"t\":\"tool_result\",\"idx\":0,\"ok\":true,\"s\":\"x\"}", true, &wid, &text, NULL, NULL) == -1);
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"s\":\"x\"}", true, &wid, &text, NULL, NULL) == -1);  /* no t */
     /* pool_mode false (N==1): JSON is a bare literal prompt, pre-P11 behavior. */
-    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"t\":\"prompt\",\"worker\":3,\"s\":\"x\"}", false, &wid, &text, NULL) == 0);
+    AGENT_TEST_ASSERT(agent_parse_pool_prompt("{\"t\":\"prompt\",\"worker\":3,\"s\":\"x\"}", false, &wid, &text, NULL, NULL) == 0);
     AGENT_TEST_ASSERT(wid == 0);
     AGENT_TEST_ASSERT(text && strcmp(text, "{\"t\":\"prompt\",\"worker\":3,\"s\":\"x\"}") == 0);
     free(text);
@@ -12077,7 +12104,7 @@ static void test_agent_parse_pool_prompt_think_key(void) {
     int wid = -1; char *text = NULL; int think = -1;
     int r = agent_parse_pool_prompt(
         "{\"t\":\"prompt\",\"worker\":0,\"think\":\"none\",\"s\":\"go\"}",
-        true, &wid, &text, &think);
+        true, &wid, &text, &think, NULL);
     AGENT_TEST_ASSERT(r == 1);
     AGENT_TEST_ASSERT(wid == 0);
     AGENT_TEST_ASSERT(strcmp(text, "go") == 0);
@@ -12088,7 +12115,7 @@ static void test_agent_parse_pool_prompt_think_key(void) {
     think = -1;
     r = agent_parse_pool_prompt(
         "{\"t\":\"prompt\",\"worker\":0,\"think\":\"max\",\"s\":\"go\"}",
-        true, &wid, &text, &think);
+        true, &wid, &text, &think, NULL);
     AGENT_TEST_ASSERT(r == 1 && think == DS4_THINK_MAX);
     free(text);
     text = NULL;
@@ -12096,7 +12123,7 @@ static void test_agent_parse_pool_prompt_think_key(void) {
     think = -1;
     r = agent_parse_pool_prompt(
         "{\"t\":\"prompt\",\"worker\":1,\"s\":\"plain\"}",
-        true, &wid, &text, &think);
+        true, &wid, &text, &think, NULL);
     AGENT_TEST_ASSERT(r == 1 && think == -1);
     free(text);
     text = NULL;
@@ -12105,9 +12132,58 @@ static void test_agent_parse_pool_prompt_think_key(void) {
     think = -1;
     r = agent_parse_pool_prompt(
         "{\"t\":\"prompt\",\"worker\":0,\"think\":\"banana\",\"s\":\"x\"}",
-        true, &wid, &text, &think);
+        true, &wid, &text, &think, NULL);
     AGENT_TEST_ASSERT(r == 1 && think == -1);
     free(text);
+}
+
+/* P23 (fork divergence #14, ctx half): the envelope's ctx key parses to the
+ * per-worker context; absent = unset (engine default = the parent's). */
+static void test_agent_parse_pool_prompt_ctx_key(void) {
+    int wid = -1; char *text = NULL; int think = -1; int ctx = 0;
+    int r = agent_parse_pool_prompt(
+        "{\"t\":\"prompt\",\"worker\":1,\"ctx\":8192,\"s\":\"do it\"}",
+        true, &wid, &text, &think, &ctx);
+    AGENT_TEST_ASSERT(r == 1);
+    AGENT_TEST_ASSERT(wid == 1);
+    AGENT_TEST_ASSERT(ctx == 8192);
+    AGENT_TEST_ASSERT(strcmp(text, "do it") == 0);
+    free(text);
+    text = NULL;
+    ctx = 0;
+    r = agent_parse_pool_prompt(
+        "{\"t\":\"prompt\",\"worker\":0,\"s\":\"plain\"}",
+        true, &wid, &text, &think, &ctx);
+    AGENT_TEST_ASSERT(r == 1 && ctx == 0);
+    free(text);
+    text = NULL;
+    /* think and ctx travel together on one envelope. */
+    think = -1; ctx = 0;
+    r = agent_parse_pool_prompt(
+        "{\"ctx\":4096,\"s\":\"x\",\"t\":\"prompt\",\"think\":\"none\",\"worker\":2}",
+        true, &wid, &text, &think, &ctx);
+    AGENT_TEST_ASSERT(r == 1 && ctx == 4096 && think == DS4_THINK_NONE && wid == 2);
+    free(text);
+}
+
+/* P23 (fork divergence #14, ctx half): the sysprompt path is ctx-qualified,
+ * so a mixed-ctx pool does not thrash one file (the parent writes at its ctx,
+ * the small worker's load fails the saved_ctx > s->ctx_size check, and the
+ * fallback prefill overwrites the file at the small ctx). */
+static void test_agent_sysprompt_path_is_ctx_qualified(void) {
+    char *p = agent_sysprompt_path("/tmp/cache", 8192);
+    AGENT_TEST_ASSERT(p != NULL);
+    AGENT_TEST_ASSERT(strstr(p, "sysprompt-8192.kv") != NULL);
+    free(p);
+    p = agent_sysprompt_path("/tmp/cache", 32768);
+    AGENT_TEST_ASSERT(p != NULL);
+    AGENT_TEST_ASSERT(strstr(p, "sysprompt-32768.kv") != NULL);
+    /* Two different contexts must not resolve to the same file — that
+     * collision IS the thrash this fix exists to remove. */
+    char *q = agent_sysprompt_path("/tmp/cache", 8192);
+    AGENT_TEST_ASSERT(strcmp(p, q) != 0);
+    free(p);
+    free(q);
 }
 
 static bool agent_test_read_q8_header(uint64_t payload_bytes) {
@@ -12226,6 +12302,8 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_think_override_refusal_matrix();
     test_agent_emit_hello_per_turn_think_cap();
     test_agent_parse_pool_prompt_think_key();
+    test_agent_parse_pool_prompt_ctx_key();
+    test_agent_sysprompt_path_is_ctx_qualified();
     test_agent_emit_status_event_covers_all_eight_states();
     test_agent_emit_status_event_escapes_error_field();
     test_agent_emit_status_event_trims_torn_utf8_error_tail();
@@ -14291,7 +14369,7 @@ static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
  * the model native DSML tool iteration without a client/server protocol. */
 static int worker_run_turn(agent_worker *w, const char *user_text) {
     agent_config *cfg = w->cfg;
-    ds4_think_mode effective = effective_think_mode(cfg);
+    ds4_think_mode effective = agent_worker_effective_think_mode(w);
     ds4_think_mode think_mode = effective;
     /* P23 (fork divergence #14): consume this turn's think override, if the
      * prompt envelope carried one. Read under the same lock worker_submit
@@ -15263,6 +15341,30 @@ static void worker_run_deferred_compact(agent_worker *w) {
 
 /* Worker thread entry point.  The UI thread submits plain user text; this
  * thread owns all DS4 session mutation, tool execution, and compaction. */
+/* P23 (D8): re-create the worker's session at the requested ctx and reload the
+ * system prompt under the ctx-qualified path. Called from the worker thread,
+ * under pool_mu, only when the worker is idle — no working session is ever
+ * killed (rule 3). The sysprompt prefill at the smaller ctx is the point:
+ * prefill cost tracks ctx (P11 measured a 4.2x ceiling), and Laguna scratch
+ * drops from ~6.15 GB to ~1.5 GB below 16k. */
+static int agent_worker_set_session_ctx(agent_worker *w, int ctx,
+                                        char *err, size_t err_len) {
+    if (ctx <= 0) return 0;
+    if (agent_worker_effective_ctx_size(w) == ctx) return 0;
+    ds4_session_free(w->session);
+    w->session = NULL;
+    if (ds4_session_create(&w->session, w->engine, ctx) != 0) {
+        snprintf(err, err_len, "failed to re-create session at ctx %d", ctx);
+        return -1;
+    }
+    char *old = w->sysprompt_path;
+    w->sysprompt_path = agent_sysprompt_path(w->cache_dir, ctx);
+    free(old);
+    if (!agent_worker_reset_to_sysprompt(w, err, err_len)) return -1;
+    agent_trace(w, "worker session ctx %d (per-prompt)", ctx);
+    return 0;
+}
+
 static void *worker_main(void *arg) {
     agent_worker *w = arg;
     agent_trace(w, "agent worker start ctx=%d backend=%s model=%s trace=%s",
@@ -15329,6 +15431,29 @@ static void *worker_main(void *arg) {
              * included), so --host-tools tool_result reads on stdin are also
              * serialized. */
             pthread_mutex_lock(&pool_mu);
+            /* P23 (D8): apply this turn's context size before it starts. The
+             * worker is idle here and pool_mu is held, so the re-create can
+             * never tear down a session that is generating. */
+            pthread_mutex_lock(&w->mu);
+            int want_ctx = w->pending_ctx;
+            w->pending_ctx = 0;
+            pthread_mutex_unlock(&w->mu);
+            if (want_ctx > 0 && want_ctx != agent_worker_effective_ctx_size(w)) {
+                char ctx_err[160] = {0};
+                if (agent_worker_set_session_ctx(w, want_ctx,
+                                                 ctx_err, sizeof(ctx_err)) != 0) {
+                    /* Loud failure: the turn cannot run at the requested ctx.
+                     * Never silently fall back to the parent's — a worker that
+                     * quietly ran at 51,200 when 8,192 was asked for would
+                     * blow the memory budget the caller planned against. */
+                    generating_worker = -1;
+                    pthread_mutex_unlock(&pool_mu);
+                    agent_set_error(w, ctx_err[0] ? ctx_err
+                                                  : "failed to apply worker ctx");
+                    free(cmd);
+                    continue;
+                }
+            }
             generating_worker = w->worker_id;
             worker_run_turn(w, cmd);
             generating_worker = -1;
@@ -15382,7 +15507,8 @@ static void drain_wake_fd(int fd) {
 
 /* Submit one user turn if the worker is idle.  Busy submissions are rejected so
  * the UI can keep the typed text editable instead of silently queueing it. */
-static bool worker_submit(agent_worker *w, const char *text, int think_override) {
+static bool worker_submit(agent_worker *w, const char *text, int think_override,
+                          int pending_ctx) {
     pthread_mutex_lock(&w->mu);
     bool ok = w->initialized && w->status.state == AGENT_WORKER_IDLE && !w->cmd_text;
     if (ok) {
@@ -15390,6 +15516,7 @@ static bool worker_submit(agent_worker *w, const char *text, int think_override)
         /* P23 (fork divergence #14): the per-turn think override travels with
          * the prompt under the same lock, and worker_run_turn consumes it. */
         w->think_override = think_override;
+        w->pending_ctx = pending_ctx;
         /* A late interrupt can latch after the worker already observed idle
          * (see the "stale interrupt" hazard noted near worker_clear_interrupt)
          * and survive here unconsumed — the new turn's first
@@ -15677,9 +15804,11 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
 typedef struct {
     char **v;
     size_t len;
-    /* P23 (fork divergence #14): per-entry think override, -1 = unset. Kept
-     * in lockstep with `v` — same length, same capacity, shifted together. */
+    /* P23 (fork divergence #14): per-entry think override, -1 = unset, and
+     * per-entry context size, 0 = unset. Both kept in lockstep with `v` —
+     * same length, same capacity, grown, shifted and freed together. */
     int *think;
+    int *ctx;
     size_t cap;
 } agent_prompt_queue;
 
@@ -15689,47 +15818,57 @@ typedef struct {
  * unchanged; the two arrays are only ever grown, shifted, and freed together
  * in the five functions below. */
 static void agent_prompt_queue_push(agent_prompt_queue *q, const char *text,
-                                    int think_override) {
+                                    int think_override, int ctx) {
     if (q->len == q->cap) {
         q->cap = q->cap ? q->cap * 2 : 4;
         q->v = xrealloc(q->v, q->cap * sizeof(q->v[0]));
         q->think = xrealloc(q->think, q->cap * sizeof(q->think[0]));
+        q->ctx = xrealloc(q->ctx, q->cap * sizeof(q->ctx[0]));
     }
     q->think[q->len] = think_override;
+    q->ctx[q->len] = ctx;
     q->v[q->len++] = xstrdup(text ? text : "");
 }
 
-static char *agent_prompt_queue_pop(agent_prompt_queue *q, int *out_think) {
+static char *agent_prompt_queue_pop(agent_prompt_queue *q, int *out_think,
+                                    int *out_ctx) {
     if (!q->len) return NULL;
     char *text = q->v[0];
     if (out_think) *out_think = q->think[0];
+    if (out_ctx) *out_ctx = q->ctx[0];
     memmove(q->v, q->v + 1, (q->len - 1) * sizeof(q->v[0]));
     memmove(q->think, q->think + 1, (q->len - 1) * sizeof(q->think[0]));
+    memmove(q->ctx, q->ctx + 1, (q->len - 1) * sizeof(q->ctx[0]));
     q->len--;
     return text;
 }
 
 static void agent_prompt_queue_push_front(agent_prompt_queue *q, char *text,
-                                          int think_override) {
+                                          int think_override, int ctx) {
     if (q->len == q->cap) {
         q->cap = q->cap ? q->cap * 2 : 4;
         q->v = xrealloc(q->v, q->cap * sizeof(q->v[0]));
         q->think = xrealloc(q->think, q->cap * sizeof(q->think[0]));
+        q->ctx = xrealloc(q->ctx, q->cap * sizeof(q->ctx[0]));
     }
     memmove(q->v + 1, q->v, q->len * sizeof(q->v[0]));
     memmove(q->think + 1, q->think, q->len * sizeof(q->think[0]));
+    memmove(q->ctx + 1, q->ctx, q->len * sizeof(q->ctx[0]));
     q->v[0] = text;
     q->think[0] = think_override;
+    q->ctx[0] = ctx;
     q->len++;
 }
 
 /* The merged turn inherits the FIRST entry's override: deterministic, and the
  * app never queues mixed overrides (the merge only happens on the
  * single-session wire when prompts arrive back-to-back mid-turn). */
-static char *agent_prompt_queue_take_all(agent_prompt_queue *q, int *out_think) {
+static char *agent_prompt_queue_take_all(agent_prompt_queue *q, int *out_think,
+                                         int *out_ctx) {
     if (!q->len) return NULL;
     if (out_think) *out_think = q->think[0];
-    if (q->len == 1) return agent_prompt_queue_pop(q, out_think);
+    if (out_ctx) *out_ctx = q->ctx[0];
+    if (q->len == 1) return agent_prompt_queue_pop(q, out_think, out_ctx);
 
     agent_buf b = {0};
     for (size_t i = 0; i < q->len; i++) {
@@ -15763,6 +15902,7 @@ static void agent_prompt_queue_free(agent_prompt_queue *q) {
     for (size_t i = 0; i < q->len; i++) free(q->v[i]);
     free(q->v);
     free(q->think);
+    free(q->ctx);
     memset(q, 0, sizeof(*q));
 }
 
@@ -16721,7 +16861,7 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
         .cancel_privdata = w,
     };
     w->web = ds4_web_create(&web_cfg);
-    w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
+    w->sysprompt_path = agent_sysprompt_path(w->cache_dir, cfg->gen.ctx_size);
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
         if (!w->trace) {
@@ -16935,13 +17075,15 @@ static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
  * preserving pre-P11 behavior. */
 static int agent_parse_pool_prompt(const char *line, bool pool_mode,
                                    int *out_worker, char **out_text,
-                                   int *out_think) {
+                                   int *out_think, int *out_ctx) {
     const char *p = line;
     if (out_think) *out_think = -1;
+    if (out_ctx) *out_ctx = 0;
     agent_hosttool_json_skip_ws(&p);
     if (pool_mode && *p == '{') {
         int worker = 0;
         int think = -1;
+        int ctx = 0;
         char *s = NULL;
         char *tstr = NULL;
         bool have_s = false, have_t = false;
@@ -16975,6 +17117,10 @@ static int agent_parse_pool_prompt(const char *line, bool pool_mode,
                 else if (!strcmp(tv, "high")) think = DS4_THINK_HIGH;
                 else if (!strcmp(tv, "max")) think = DS4_THINK_MAX;
                 free(tv);
+            } else if (!strcmp(key, "ctx")) {
+                /* P23 (fork divergence #14, ctx half): the worker's context
+                 * size for this turn. 0/absent = unset (the parent's ctx). */
+                if (!agent_json_parse_int(&p, &ctx)) { free(key); goto drop; }
             } else if (*p == '"') {
                 char *junk = NULL;
                 if (!agent_json_parse_string(&p, &junk)) { free(key); free(junk); goto drop; }
@@ -16998,6 +17144,7 @@ static int agent_parse_pool_prompt(const char *line, bool pool_mode,
         *out_worker = worker;
         *out_text = s ? s : xstrdup("");
         if (out_think) *out_think = think;
+        if (out_ctx) *out_ctx = ctx;
         return 1;
     drop:
         free(s);
@@ -17070,7 +17217,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
 
         if (one_shot && !one_shot_submitted && initialized) {
             /* The --prompt one-shot carries no envelope, so no override. */
-            if (worker_submit(&workers[0], cfg->gen.prompt, -1))
+            if (worker_submit(&workers[0], cfg->gen.prompt, -1, 0))
                 one_shot_submitted = true;
             idle = false;
         }
@@ -17079,11 +17226,12 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             /* P23: the queued turn's override travels with it, and is put back
              * with the prompt if the submit is refused. */
             int queued_think = -1;
-            char *queued = agent_prompt_queue_take_all(&queue, &queued_think);
-            if (worker_submit(&workers[active_worker], queued, queued_think)) {
+            int queued_ctx = 0;
+            char *queued = agent_prompt_queue_take_all(&queue, &queued_think, &queued_ctx);
+            if (worker_submit(&workers[active_worker], queued, queued_think, queued_ctx)) {
                 idle = false;
             } else {
-                agent_prompt_queue_push_front(&queue, queued, queued_think);
+                agent_prompt_queue_push_front(&queue, queued, queued_think, queued_ctx);
                 queued = NULL;
             }
             free(queued);
@@ -17224,7 +17372,7 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         if (worker_take_queued_user_drain_request(&workers[active_worker])) {
             /* A display drain: the text is echoed back, not run as a turn, so
              * there is no override to carry. */
-            char *queued = agent_prompt_queue_take_all(&queue, NULL);
+            char *queued = agent_prompt_queue_take_all(&queue, NULL, NULL);
             worker_answer_queued_user_drain(&workers[active_worker], queued);
         }
 
@@ -17253,8 +17401,10 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
                  * single-session wire fed a JSON prompt line to the model as
                  * literal text, so the feature would be silently broken in
                  * exactly the configuration the app uses for a lone agent. */
+                int worker_ctx = 0;
                 int pr = agent_parse_pool_prompt(line, (n > 1) || cfg->per_turn_think,
-                                                 &wid, &prompt, &think_override);
+                                                 &wid, &prompt, &think_override,
+                                                 &worker_ctx);
                 if (pr < 0 || wid < 0 || wid >= n) {
                     /* Drop a non-prompt JSON line or a prompt to a worker this
                      * pool does not host — never clamp to the orchestrator. */
@@ -17268,13 +17418,13 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
                 if (worker_is_idle(&workers[wid]) && queue.len == 0) {
                     /* P23: the parsed override rides with the prompt, whether
                      * it runs now or waits in the queue. */
-                    if (!worker_submit(&workers[wid], prompt, think_override)) {
-                        agent_prompt_queue_push(&queue, prompt, think_override);
+                    if (!worker_submit(&workers[wid], prompt, think_override, worker_ctx)) {
+                        agent_prompt_queue_push(&queue, prompt, think_override, worker_ctx);
                         if (cfg->json_events) agent_emit_bare_event(&workers[wid], "queued");
                         else agent_noninteractive_marker("+DWARFSTAR_QUEUED");
                     }
                 } else {
-                    agent_prompt_queue_push(&queue, prompt, think_override);
+                    agent_prompt_queue_push(&queue, prompt, think_override, worker_ctx);
                     if (cfg->json_events) agent_emit_bare_event(&workers[wid], "queued");
                     else agent_noninteractive_marker("+DWARFSTAR_QUEUED");
                 }
@@ -17437,7 +17587,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
         if (worker_take_queued_user_drain_request(&worker)) {
             char *echo = agent_prompt_queue_take_all_echo(&queue);
-            char *queued = agent_prompt_queue_take_all(&queue, NULL);
+            char *queued = agent_prompt_queue_take_all(&queue, NULL, NULL);
             if (echo) {
                 build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
                 editor_write_async(&editor, echo, strlen(echo), prompt, statusline, true);
@@ -17476,7 +17626,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         }
 
         if (initial_pending && worker_is_idle(&worker)) {
-            if (worker_submit(&worker, initial_pending, -1)) {
+            if (worker_submit(&worker, initial_pending, -1, 0)) {
                 free(initial_pending);
                 initial_pending = NULL;
             }
@@ -17484,15 +17634,15 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
         if (!initial_pending && queue.len && worker_is_idle(&worker)) {
             char *echo = agent_prompt_queue_take_all_echo(&queue);
-            char *queued = agent_prompt_queue_take_all(&queue, NULL);
-            if (worker_submit(&worker, queued, -1)) {
+            char *queued = agent_prompt_queue_take_all(&queue, NULL, NULL);
+            if (worker_submit(&worker, queued, -1, 0)) {
                 linenoiseHistoryAdd(queued);
                 linenoiseHistorySave(hist);
                 build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
                 if (echo)
                     editor_write_async(&editor, echo, strlen(echo), prompt, statusline, true);
             } else {
-                agent_prompt_queue_push_front(&queue, queued, -1);
+                agent_prompt_queue_push_front(&queue, queued, -1, 0);
                 queued = NULL;
             }
             free(echo);
@@ -17500,7 +17650,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         }
 
         if (queue.len && editor_take_queued_byte(&editor, 24)) { /* Ctrl+X */
-            char *queued = agent_prompt_queue_pop(&queue, NULL);
+            char *queued = agent_prompt_queue_pop(&queue, NULL, NULL);
             editor_replace_input(&editor, queued);
             worker_get_status(&worker, &st);
             build_prompt_text(&st, prompt, sizeof(prompt));
@@ -17689,11 +17839,11 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                                                    err, sizeof(err)))
                         printf("history failed: %s\n", err);
                 } else if (busy) {
-                    agent_prompt_queue_push(&queue, cmd, -1);
+                    agent_prompt_queue_push(&queue, cmd, -1, 0);
                 } else {
                     linenoiseHistoryAdd(cmd);
                     linenoiseHistorySave(hist);
-                    if (worker_submit(&worker, cmd, -1)) {
+                    if (worker_submit(&worker, cmd, -1, 0)) {
                         agent_echo_user_prompt(cmd);
                     } else {
                         restore_line = xstrdup(cmd);
