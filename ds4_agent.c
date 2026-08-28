@@ -12186,6 +12186,25 @@ static void test_agent_sysprompt_path_is_ctx_qualified(void) {
     free(q);
 }
 
+/* Follow-up to P23 (fork divergence #14, ctx half): a worker stranded with
+ * session == NULL (a failed agent_worker_set_session_ctx re-create) must not
+ * fall into a session dereference. worker_run_turn's first line is that
+ * guard; this pins it without needing a real engine/session, since the
+ * function must return before touching either. Forward-declared: the
+ * definition sits far below, with the rest of the worker-thread machinery. */
+static int worker_run_turn(agent_worker *w, const char *user_text);
+static void test_agent_worker_run_turn_refuses_without_session(void) {
+    agent_worker w = {0};
+    pthread_mutex_init(&w.mu, NULL);
+    w.wake_fd[1] = -1;
+    AGENT_TEST_ASSERT(w.session == NULL);
+    int rc = worker_run_turn(&w, "hello");
+    AGENT_TEST_ASSERT(rc != 0);
+    AGENT_TEST_ASSERT(w.status.state == AGENT_WORKER_ERROR);
+    AGENT_TEST_ASSERT(strstr(w.status.error, "no live session") != NULL);
+    pthread_mutex_destroy(&w.mu);
+}
+
 static bool agent_test_read_q8_header(uint64_t payload_bytes) {
     FILE *fp = tmpfile();
     if (!fp) return false;
@@ -12304,6 +12323,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_parse_pool_prompt_think_key();
     test_agent_parse_pool_prompt_ctx_key();
     test_agent_sysprompt_path_is_ctx_qualified();
+    test_agent_worker_run_turn_refuses_without_session();
     test_agent_emit_status_event_covers_all_eight_states();
     test_agent_emit_status_event_escapes_error_field();
     test_agent_emit_status_event_trims_torn_utf8_error_tail();
@@ -14368,6 +14388,18 @@ static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
  * results are appended to the transcript and the loop continues, which gives
  * the model native DSML tool iteration without a client/server protocol. */
 static int worker_run_turn(agent_worker *w, const char *user_text) {
+    /* A failed agent_worker_set_session_ctx() strands the worker with
+     * session == NULL and puts it in AGENT_WORKER_ERROR, which today's
+     * callers (worker_main's continue, the non-interactive main loop's exit
+     * on ERROR) never route back into worker_run_turn - but that safety is
+     * an accident of three separate conditions holding together, not a
+     * guarantee this function can rely on. ds4_session_pos/common_prefix
+     * below dereference the session unconditionally, so guard here rather
+     * than trust every future caller to keep re-deriving that invariant. */
+    if (!w->session) {
+        agent_set_error(w, "worker has no live session");
+        return 1;
+    }
     agent_config *cfg = w->cfg;
     ds4_think_mode effective = agent_worker_effective_think_mode(w);
     ds4_think_mode think_mode = effective;
@@ -15351,9 +15383,28 @@ static int agent_worker_set_session_ctx(agent_worker *w, int ctx,
                                         char *err, size_t err_len) {
     if (ctx <= 0) return 0;
     if (agent_worker_effective_ctx_size(w) == ctx) return 0;
-    ds4_session_free(w->session);
+
+    /* worker_consume/worker_get_status/worker_is_initialized read w->session
+     * (via agent_worker_effective_ctx_size) under w->mu alone, from the
+     * main/status thread, concurrently with this swap (which runs on the
+     * worker thread under pool_mu only, per rule 3). Detach and reattach the
+     * pointer under w->mu so those readers never see a freed session between
+     * this function's free() and its create(); free/create themselves stay
+     * outside the lock since neither touches other workers. */
+    pthread_mutex_lock(&w->mu);
+    ds4_session *old_session = w->session;
     w->session = NULL;
-    if (ds4_session_create(&w->session, w->engine, ctx) != 0) {
+    pthread_mutex_unlock(&w->mu);
+    ds4_session_free(old_session);
+
+    ds4_session *new_session = NULL;
+    int create_rc = ds4_session_create(&new_session, w->engine, ctx);
+
+    pthread_mutex_lock(&w->mu);
+    w->session = new_session;
+    pthread_mutex_unlock(&w->mu);
+
+    if (create_rc != 0) {
         snprintf(err, err_len, "failed to re-create session at ctx %d", ctx);
         return -1;
     }
