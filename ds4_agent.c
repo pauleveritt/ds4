@@ -1389,6 +1389,12 @@ static const char agent_glm_tool_schemas[] =
     "{\"type\":\"function\",\"function\":{\"name\":\"search\",\"description\":\"Search files.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"},\"context\":{\"type\":\"number\"},\"max_results\":{\"type\":\"number\"},\"case_sensitive\":{\"type\":\"boolean\"}},\"required\":[\"query\"]}}}\n"
     "{\"type\":\"function\",\"function\":{\"name\":\"list\",\"description\":\"List one directory.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}}\n";
 
+/* P20 (fork divergence #12): the `dispatch` host-tool schema — advertised only
+ * under --host-tools, because the engine can only execute it host-side (without
+ * host-tools there is no one to answer the tool_request). */
+static const char agent_dispatch_tool_schema[] =
+    "{\"type\":\"function\",\"function\":{\"name\":\"dispatch\",\"description\":\"Dispatch a bounded task to a subagent (host-executed).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"taskText\":{\"type\":\"string\"},\"writableFiles\":{\"type\":\"string\"},\"validationCommand\":{\"type\":\"string\"}},\"required\":[\"taskText\",\"writableFiles\"]}}}\n";
+
 /* Line-bounded check: does this one schema line (length len) declare one of
  * the bash-family tools? NOT strstr(p, ...) \u2014 that searches past the line's
  * newline and matches later lines' names (google_search and visit_page
@@ -1414,7 +1420,8 @@ static bool agent_schema_line_is_bash(const char *p, size_t len) {
  * existing terminal approval). agent_glm_tool_schemas is a line-oriented JSON
  * blob; walk it line by line and drop the bash lines. Writes at most outlen-1
  * bytes (NUL-terminated) and returns the length written. */
-static size_t agent_schemas_for(char *out, size_t outlen, bool shell_allowed) {
+static size_t agent_schemas_for(char *out, size_t outlen, bool shell_allowed,
+                                bool host_tools) {
     const char *src = agent_glm_tool_schemas;
     size_t o = 0;
     const char *p = src;
@@ -1431,14 +1438,23 @@ static size_t agent_schemas_for(char *out, size_t outlen, bool shell_allowed) {
         if (!nl) break;
         p = nl + 1;
     }
+    /* P20 (fork divergence #12): advertise `dispatch` only under --host-tools. */
+    if (host_tools) {
+        size_t dl = strlen(agent_dispatch_tool_schema);
+        if (o + dl + 1 < outlen) {
+            memcpy(out + o, agent_dispatch_tool_schema, dl + 1);
+            o += dl;
+        }
+    }
     out[o] = '\0';
     return o;
 }
 
-static char *agent_build_glm_tools_prompt(bool shell_allowed, bool edit_upto) {
+static char *agent_build_glm_tools_prompt(bool shell_allowed, bool edit_upto,
+                                          bool host_tools) {
     size_t a = strlen(agent_glm_tools_prompt_intro);
     char schemas[16384];  /* agent_glm_tool_schemas is ~2.3 KB; ample headroom */
-    size_t b = agent_schemas_for(schemas, sizeof(schemas), shell_allowed);
+    size_t b = agent_schemas_for(schemas, sizeof(schemas), shell_allowed, host_tools);
     size_t c = strlen(agent_glm_tools_prompt_after_schemas);
     const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
                                  : agent_glm_tools_prompt_edit_exact;
@@ -1486,10 +1502,11 @@ static const char agent_laguna_tools_prompt_after_schemas[] =
  * bash-family schema entries are still filtered by shell_allowed the same way
  * GLM's are (D1/D11).
  */
-static char *agent_build_laguna_tools_prompt(bool shell_allowed, bool edit_upto) {
+static char *agent_build_laguna_tools_prompt(bool shell_allowed, bool edit_upto,
+                                             bool host_tools) {
     size_t a = strlen(agent_laguna_tools_prompt_intro);
     char schemas[16384];
-    size_t b = agent_schemas_for(schemas, sizeof(schemas), shell_allowed);
+    size_t b = agent_schemas_for(schemas, sizeof(schemas), shell_allowed, host_tools);
     size_t c = strlen(agent_laguna_tools_prompt_after_schemas);
     const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
                                  : agent_glm_tools_prompt_edit_exact;
@@ -1539,10 +1556,11 @@ static const char agent_mellum_tools_prompt_after_schemas[] =
     "- Use whole=true only when the user explicitly asks for the complete file contents or when bounded chunks are insufficient; add raw=true only when line numbers would corrupt the payload.\n"
     "- " AGENT_EDIT_TARGET_RULE "\n";
 
-static char *agent_build_mellum_tools_prompt(bool shell_allowed, bool edit_upto) {
+static char *agent_build_mellum_tools_prompt(bool shell_allowed, bool edit_upto,
+                                             bool host_tools) {
     size_t a = strlen(agent_mellum_tools_prompt_intro);
     char schemas[16384];
-    size_t b = agent_schemas_for(schemas, sizeof(schemas), shell_allowed);
+    size_t b = agent_schemas_for(schemas, sizeof(schemas), shell_allowed, host_tools);
     size_t c = strlen(agent_mellum_tools_prompt_after_schemas);
     const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
                                  : agent_glm_tools_prompt_edit_exact;
@@ -1559,14 +1577,15 @@ static char *agent_build_mellum_tools_prompt(bool shell_allowed, bool edit_upto)
     return out;
 }
 
-static char *agent_build_tools_prompt(ds4_engine *engine, bool shell_allowed, bool edit_upto) {
+static char *agent_build_tools_prompt(ds4_engine *engine, bool shell_allowed, bool edit_upto,
+                                     bool host_tools) {
     agent_tool_syntax syntax = agent_tool_syntax_for_engine(engine);
     if (syntax == AGENT_TOOL_SYNTAX_GLM)
-        return agent_build_glm_tools_prompt(shell_allowed, edit_upto);
+        return agent_build_glm_tools_prompt(shell_allowed, edit_upto, host_tools);
     if (syntax == AGENT_TOOL_SYNTAX_LAGUNA)
-        return agent_build_laguna_tools_prompt(shell_allowed, edit_upto);
+        return agent_build_laguna_tools_prompt(shell_allowed, edit_upto, host_tools);
     if (syntax == AGENT_TOOL_SYNTAX_MELLUM)
-        return agent_build_mellum_tools_prompt(shell_allowed, edit_upto);
+        return agent_build_mellum_tools_prompt(shell_allowed, edit_upto, host_tools);
     return agent_build_dsml_tools_prompt(edit_upto);
 }
 
@@ -1610,8 +1629,9 @@ static const char *agent_tagged_syntax_reminder(agent_tool_syntax syntax) {
 
 static char *agent_build_system_prompt_reminder(ds4_engine *engine,
                                                 bool shell_allowed,
-                                                bool edit_upto) {
-    char *tools = agent_build_tools_prompt(engine, shell_allowed, edit_upto);
+                                                bool edit_upto,
+                                                bool host_tools) {
+    char *tools = agent_build_tools_prompt(engine, shell_allowed, edit_upto, host_tools);
     const char *start = "\n\n[System prompt reminder follows.]\n";
     const char *end = "[End system prompt reminder.]\n\n";
     const size_t len = strlen(start) + strlen(tools) + strlen(end) + 1;
@@ -1623,13 +1643,13 @@ static char *agent_build_system_prompt_reminder(ds4_engine *engine,
 
 static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
                                        const char *extra, bool shell_allowed,
-                                       bool edit_upto) {
+                                       bool edit_upto, bool host_tools) {
     /* The built-in tool prompt is trusted DS4 control text.  Tokenize it like a
      * rendered chat prompt so the literal ｜DSML｜ markers in the examples become
      * the model's dedicated DSML token.  Do not apply that tokenizer to user
      * supplied -sys text: arbitrary user text containing <｜User｜>, <think>, or
      * ｜DSML｜ must remain plain content, not control tokens. */
-    char *tools_prompt = agent_build_tools_prompt(engine, shell_allowed, edit_upto);
+    char *tools_prompt = agent_build_tools_prompt(engine, shell_allowed, edit_upto, host_tools);
     if (agent_tool_syntax_is_tagged(agent_tool_syntax_for_engine(engine)))
         ds4_chat_append_message(engine, tokens, "system", tools_prompt);
     else
@@ -1680,7 +1700,8 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
 
     char *reminder = agent_build_system_prompt_reminder(w->engine,
                                                         w->cfg->shell_allowed,
-                                                        w->cfg->edit_upto);
+                                                        w->cfg->edit_upto,
+                                                        w->cfg->host_tools);
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
@@ -6225,7 +6246,8 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
         ds4_chat_append_max_effort_prefix(w->engine, out);
     }
     agent_append_system_prompt(w->engine, out, w->cfg->gen.system,
-                               w->cfg->shell_allowed, w->cfg->edit_upto);
+                               w->cfg->shell_allowed, w->cfg->edit_upto,
+                               w->cfg->host_tools);
 }
 
 static void agent_publish_system_status(agent_worker *w, const char *msg) {
@@ -9539,8 +9561,8 @@ static void test_agent_tagged_structural_candidate_guard(void) {
 static void test_agent_edit_upto_prompt_is_opt_in(void) {
     char *dsml_default = agent_build_dsml_tools_prompt(false);
     char *dsml_upto = agent_build_dsml_tools_prompt(true);
-    char *glm_default = agent_build_glm_tools_prompt(true, false);
-    char *glm_upto = agent_build_glm_tools_prompt(true, true);
+    char *glm_default = agent_build_glm_tools_prompt(true, false, false);
+    char *glm_upto = agent_build_glm_tools_prompt(true, true, false);
 
     AGENT_TEST_ASSERT(strstr(dsml_default, "[upto]") == NULL);
     AGENT_TEST_ASSERT(strstr(dsml_upto, "[upto]") != NULL);
@@ -9554,7 +9576,7 @@ static void test_agent_edit_upto_prompt_is_opt_in(void) {
 }
 
 static void test_agent_glm_tools_prompt_is_native(void) {
-    char *prompt = agent_build_glm_tools_prompt(true, false);
+    char *prompt = agent_build_glm_tools_prompt(true, false, false);
 
     AGENT_TEST_ASSERT(strstr(prompt, "<tools>") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "<tool_call>") != NULL);
@@ -11738,7 +11760,7 @@ static void test_agent_json_escape_rejects_overlong_and_surrogate_utf8(void) {
 
 static void test_agent_schemas_gate_bash_when_shell_off(void) {
     char buf[16384];
-    agent_schemas_for(buf, sizeof(buf), false);
+    agent_schemas_for(buf, sizeof(buf), false, false);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"bash\"") == NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"bash_status\"") == NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"bash_stop\"") == NULL);
@@ -11749,10 +11771,21 @@ static void test_agent_schemas_gate_bash_when_shell_off(void) {
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"visit_page\"") != NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"read\"") != NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"write\"") != NULL);
-    agent_schemas_for(buf, sizeof(buf), true);
+    agent_schemas_for(buf, sizeof(buf), true, false);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"bash\"") != NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"bash_status\"") != NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"bash_stop\"") != NULL);
+}
+
+static void test_agent_schemas_gate_dispatch_when_host_tools_off(void) {
+    char buf[16384];
+    agent_schemas_for(buf, sizeof(buf), true, false);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"dispatch\"") == NULL);
+    agent_schemas_for(buf, sizeof(buf), true, true);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"dispatch\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"taskText\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"writableFiles\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"validationCommand\"") != NULL);
 }
 
 static void test_agent_execute_tool_call_refuses_bash_when_shell_off(void) {
@@ -11986,6 +12019,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_prompt_is_opt_in();
     test_agent_glm_tools_prompt_is_native();
     test_agent_schemas_gate_bash_when_shell_off();
+    test_agent_schemas_gate_dispatch_when_host_tools_off();
     test_agent_glm_tool_parser_single_arg();
     test_agent_glm_tool_parser_chunked_multi_arg();
     test_agent_glm_tool_parser_streams_param_state();
