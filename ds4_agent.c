@@ -2724,16 +2724,50 @@ static size_t agent_tool_call_max_bytes(void) {
 /* Degeneration usually shows up as one short span repeating.  Checking only
  * the tail keeps this O(1) per byte and catches the repeated-token case well
  * before the size cap does. */
+/* How long a run of one repeated byte must get before it counts as
+ * degeneration rather than formatting.  64/72/80-column dash and equals rules
+ * are ordinary source; a quarter kilobyte of one byte is not, and still stops
+ * the ~26K-token runaway within 256 bytes of onset. */
+#define AGENT_DEGENERATE_BYTE_RUN 256
+
 static bool agent_dsml_tail_is_degenerate(const agent_dsml_parser *p) {
     const size_t len = p->raw_len;
     if (len < 512) return false;
+    /* A trailing run of ONE repeated byte is source formatting until it gets
+     * long, so it is measured explicitly here rather than left to the unit loop
+     * below.  That loop cannot judge it: a run of one byte also matches at unit
+     * 2, 4, 8 and 16, so raising a `unit == 1` floor alone does nothing, and the
+     * span that ends up deciding is whichever unit happens to fit -- emergent,
+     * not chosen.  Bounded at the threshold so this stays cheap per byte. */
+    size_t run = 1;
+    while (run < AGENT_DEGENERATE_BYTE_RUN && run < len
+           && p->raw[len - 1 - run] == p->raw[len - 1]) run++;
+    if (run >= AGENT_DEGENERATE_BYTE_RUN) return true;
     for (size_t unit = 1; unit <= 16; unit++) {
         /* 24 repeats is decisive for a multi-byte unit, but for a short one it
          * fires on ordinary file content: 24 identical bytes is a markdown rule,
          * an RST underline, a "====" banner, or a run of padding.  Requiring the
          * repeated span to also reach 64 bytes keeps those legitimate -- a
          * 30-dash rule survives -- while still stopping real degeneration within
-         * 64 bytes of onset, against a runaway that reached ~26K tokens. */
+         * 64 bytes of onset, against a runaway that reached ~26K tokens.
+         *
+         * 2026-08-29: 64 was still too low for unit == 1.  A section separator
+         * of exactly 64 dashes -- `# ---...`, ordinary Python formatting, and a
+         * common column width alongside 72 and 80 -- hits the span exactly and
+         * aborts a legitimate write.  Measured on the roadmap-user-story
+         * orchestrate arm: five consecutive cells voided, each on a dash run of
+         * exactly 64, every one of them writing tests/test_app.py.  The comment
+         * above was right about the class and wrong about the width.  A quarter
+         * kilobyte of one repeated byte is not source formatting, and still
+         * catches the ~26K-token runaway within 256 bytes of onset.
+         *
+         * Note this cannot be done by special-casing `unit == 1`: a run of one
+         * repeated byte also matches at unit 2, 4, 8 and 16, so a 64-dash rule
+         * still tripped the 64-byte floor there.  The test below keys on the
+         * matched span being a single repeated byte, whatever unit found it.
+         * Multi-byte units otherwise keep the 64-byte floor -- nothing has been
+         * measured against them, and widening on speculation is how the first
+         * threshold got set. */
         size_t repeats = (64 + unit - 1) / unit;
         if (repeats < 24) repeats = 24;
         const size_t span = unit * repeats;
@@ -2742,7 +2776,14 @@ static bool agent_dsml_tail_is_degenerate(const agent_dsml_parser *p) {
         bool same = true;
         for (size_t i = unit; i < span && same; i++)
             if (tail[i] != tail[i % unit]) same = false;
-        if (same) return true;
+        if (!same) continue;
+        /* Single-byte runs were decided above; anything the loop still sees
+         * that is one repeated byte is shorter than the threshold. */
+        bool single_byte_run = true;
+        for (size_t i = 1; i < span && single_byte_run; i++)
+            if (tail[i] != tail[0]) single_byte_run = false;
+        if (single_byte_run) continue;
+        return true;
     }
     return false;
 }
