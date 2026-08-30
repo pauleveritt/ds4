@@ -1231,9 +1231,18 @@ static const char agent_tools_prompt_edit_upto[] =
     "To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.\n"
     "Use read raw=true only when you need plain file text without line numbers or read annotations.\n\n";
 
-static const char agent_tools_prompt_after_edit[] =
+/* P24.3 (fork divergence #18): the DSML prompt is assembled from gated
+ * pieces so `--shell off` and `--host-tools` reach the DSML/DeepSeek family
+ * too. The bash prose rule and the bash schemas ride the shell gate; the
+ * host-tool schemas ride the host gate. Pre-#18 this was one monolithic
+ * `agent_tools_prompt_after_edit`, which is why neither gate applied. */
+static const char agent_dsml_bash_rule[] =
     "For long-running bash commands, pass refresh_sec. If a bash job is still running, use "
-    "bash_status to check it early or bash_stop to terminate it.\n\n"
+    "bash_status to check it early or bash_stop to terminate it.\n\n";
+
+/* Web prose + the schema header + the two web schemas: never gated (D11 gates
+ * only the bash family). */
+static const char agent_tools_prompt_after_edit[] =
     "Use google_search to find web pages. Use visit_page to read a known URL with a visible browser. "
     "The first web call may ask the user for permission to start Chrome.\n\n"
     "### Available Tool Schemas\n\n"
@@ -1264,7 +1273,10 @@ static const char agent_tools_prompt_after_edit[] =
     "      \"required\": [\"url\"]\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}\n\n";
+
+/* The bash family, pretty-printed to match the surrounding DSML block. */
+static const char agent_dsml_bash_schemas[] =
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -1312,7 +1324,11 @@ static const char agent_tools_prompt_after_edit[] =
     "      \"required\": [\"job\"]\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}\n\n";
+
+/* The always-available file tools. Ends with a single newline; the builder
+ * supplies the blank line before whatever follows. */
+static const char agent_dsml_file_schemas[] =
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -1408,7 +1424,10 @@ static const char agent_tools_prompt_after_edit[] =
     "      \"required\": [\"path\"]\n"
     "    }\n"
     "  }\n"
-    "}\n"
+    "}\n";
+
+/* The rules tail. Always last -- appended host-tool schemas go BEFORE it. */
+static const char agent_dsml_rules[] =
     "\n"
     "# Rules\n\n"
     "- Always use strict syntax for DSML tool stanzas.\n"
@@ -1421,16 +1440,63 @@ static const char agent_tools_prompt_after_edit[] =
     "- Work in a way that preserves the current system configuration integrity, "
     "unless explicitly asked otherwise by the user.\n";
 
-static char *agent_build_dsml_tools_prompt(bool edit_upto) {
+/* P20 (fork divergence #12): the `dispatch` host-tool schema — advertised only
+ * under --host-tools, because the engine can only execute it host-side (without
+ * host-tools there is no one to answer the tool_request). */
+static const char agent_dispatch_tool_schema[] =
+    "{\"type\":\"function\",\"function\":{\"name\":\"dispatch\",\"description\":\"Dispatch a bounded task to a subagent (host-executed).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"taskText\":{\"type\":\"string\"},\"writableFiles\":{\"type\":\"string\"},\"validationCommand\":{\"type\":\"string\"}},\"required\":[\"taskText\",\"writableFiles\"]}}}\n";
+
+/* P24.3 (fork divergence #16): the `test` and `lint` host-tool schemas —
+ * advertised only under --host-tools, exactly like `dispatch` (divergence
+ * #12): the engine cannot execute them without a host. Divergence #18
+ * threads the same gate through the DSML/DeepSeek prompt, so these three
+ * constants are shared by both families -- one spelling of each schema. */
+static const char agent_test_tool_schema[] =
+    "{\"type\":\"function\",\"function\":{\"name\":\"test\",\"description\":\"Run the project's test command (host-run; output is digested).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"selector\":{\"type\":\"string\"}},\"required\":[]}}}\n";
+static const char agent_lint_tool_schema[] =
+    "{\"type\":\"function\",\"function\":{\"name\":\"lint\",\"description\":\"Run ruff on the project (host-run; output is digested).\",\"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}}\n";
+
+static char *agent_build_dsml_tools_prompt(bool shell_allowed, bool edit_upto,
+                                           bool host_tools) {
     const char *edit = edit_upto ? agent_tools_prompt_edit_upto
                                  : agent_tools_prompt_edit_exact;
-    size_t a = strlen(agent_tools_prompt_intro);
-    size_t b = strlen(edit);
-    size_t c = strlen(agent_tools_prompt_after_edit);
-    char *out = xmalloc(a + b + c + 1);
-    memcpy(out, agent_tools_prompt_intro, a);
-    memcpy(out + a, edit, b);
-    memcpy(out + a + b, agent_tools_prompt_after_edit, c + 1);
+    /* Assembly order reproduces the pre-#18 monolith exactly: intro, edit
+     * rules, the bash prose rule, the web prose + schema header + web schemas,
+     * the bash schemas, the file schemas, then the host-tool schemas, then the
+     * rules tail. With shell_allowed=true and host_tools=false the result is
+     * byte-for-byte the prompt the fork shipped before this divergence.
+     *
+     * The host-tool schemas are the SAME constants the GLM path appends
+     * (compact, one per line) rather than DSML-pretty copies: one spelling of
+     * each schema, so the two families cannot drift apart. */
+    /* 11 = intro, edit, bash rule, web head, bash schemas, file schemas, the
+     * host-tool separator + its three schemas, rules -- the maximal path. */
+    const char *parts[11];
+    size_t n = 0;
+    parts[n++] = agent_tools_prompt_intro;
+    parts[n++] = edit;
+    if (shell_allowed) parts[n++] = agent_dsml_bash_rule;
+    parts[n++] = agent_tools_prompt_after_edit;
+    if (shell_allowed) parts[n++] = agent_dsml_bash_schemas;
+    parts[n++] = agent_dsml_file_schemas;
+    if (host_tools) {
+        parts[n++] = "\n";
+        parts[n++] = agent_dispatch_tool_schema;
+        parts[n++] = agent_test_tool_schema;
+        parts[n++] = agent_lint_tool_schema;
+    }
+    parts[n++] = agent_dsml_rules;
+
+    size_t total = 0;
+    for (size_t i = 0; i < n; i++) total += strlen(parts[i]);
+    char *out = xmalloc(total + 1);
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t len = strlen(parts[i]);
+        memcpy(out + o, parts[i], len);
+        o += len;
+    }
+    out[o] = '\0';
     return out;
 }
 
@@ -1480,20 +1546,6 @@ static const char agent_glm_tool_schemas[] =
     "{\"type\":\"function\",\"function\":{\"name\":\"search\",\"description\":\"Search files.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"},\"context\":{\"type\":\"number\"},\"max_results\":{\"type\":\"number\"},\"case_sensitive\":{\"type\":\"boolean\"}},\"required\":[\"query\"]}}}\n"
     "{\"type\":\"function\",\"function\":{\"name\":\"list\",\"description\":\"List one directory.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}}\n";
 
-/* P20 (fork divergence #12): the `dispatch` host-tool schema — advertised only
- * under --host-tools, because the engine can only execute it host-side (without
- * host-tools there is no one to answer the tool_request). */
-static const char agent_dispatch_tool_schema[] =
-    "{\"type\":\"function\",\"function\":{\"name\":\"dispatch\",\"description\":\"Dispatch a bounded task to a subagent (host-executed).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"taskText\":{\"type\":\"string\"},\"writableFiles\":{\"type\":\"string\"},\"validationCommand\":{\"type\":\"string\"}},\"required\":[\"taskText\",\"writableFiles\"]}}}\n";
-
-/* P24.3 (fork divergence #16): the `test` and `lint` host-tool schemas —
- * advertised only under --host-tools, exactly like `dispatch` (divergence
- * #12): the engine cannot execute them without a host. The DSML/DeepSeek
- * block is intentionally untouched, the same way dispatch is handled. */
-static const char agent_test_tool_schema[] =
-    "{\"type\":\"function\",\"function\":{\"name\":\"test\",\"description\":\"Run the project's test command (host-run; output is digested).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"selector\":{\"type\":\"string\"}},\"required\":[]}}}\n";
-static const char agent_lint_tool_schema[] =
-    "{\"type\":\"function\",\"function\":{\"name\":\"lint\",\"description\":\"Run ruff on the project (host-run; output is digested).\",\"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}}\n";
 
 /* Line-bounded check: does this one schema line (length len) declare one of
  * the bash-family tools? NOT strstr(p, ...) \u2014 that searches past the line's
@@ -1694,7 +1746,7 @@ static char *agent_build_tools_prompt(ds4_engine *engine, bool shell_allowed, bo
         return agent_build_laguna_tools_prompt(shell_allowed, edit_upto, host_tools);
     if (syntax == AGENT_TOOL_SYNTAX_MELLUM)
         return agent_build_mellum_tools_prompt(shell_allowed, edit_upto, host_tools);
-    return agent_build_dsml_tools_prompt(edit_upto);
+    return agent_build_dsml_tools_prompt(shell_allowed, edit_upto, host_tools);
 }
 
 static const char agent_dsml_syntax_reminder[] =
@@ -9713,8 +9765,8 @@ static void test_agent_tagged_structural_candidate_guard(void) {
 }
 
 static void test_agent_edit_upto_prompt_is_opt_in(void) {
-    char *dsml_default = agent_build_dsml_tools_prompt(false);
-    char *dsml_upto = agent_build_dsml_tools_prompt(true);
+    char *dsml_default = agent_build_dsml_tools_prompt(true, false, false);
+    char *dsml_upto = agent_build_dsml_tools_prompt(true, true, false);
     char *glm_default = agent_build_glm_tools_prompt(true, false, false);
     char *glm_upto = agent_build_glm_tools_prompt(true, true, false);
 
@@ -11957,6 +12009,77 @@ static void test_agent_schemas_add_test_lint_when_host_tools_on(void) {
     AGENT_TEST_ASSERT(strstr(buf, "output is host-digested") != NULL);
 }
 
+/* P24.3 (fork divergence #18): the DSML prompt honors the same two gates the
+ * GLM/Laguna/Mellum prompts do. DeepSeek V4 Flash -- the model SwiftStar
+ * actually ships -- takes the DSML path, which took neither `shell_allowed`
+ * nor `host_tools`, so divergences #12 and #16 were dead code for it: with
+ * `--shell off` the bash family stayed advertised, and with `--host-tools`
+ * neither `dispatch` nor `test`/`lint` ever reached the model. Measured on
+ * captures/live/20260830-180004 and the swiftstar-drive re-run beside it: both
+ * advertised an identical 11-tool surface with no test/lint at all, which is
+ * why "advertised, unused" was the wrong reading of that pair.
+ *
+ * NOTE the spelling: the DSML schema block is pretty-printed (`"name": "bash"`,
+ * space after the colon) where agent_glm_tool_schemas is compact
+ * (`"name":"bash"`). The appended host-tool schemas keep the compact spelling
+ * -- they are the same constants the GLM path appends. */
+static void test_agent_dsml_tools_prompt_honors_gates(void) {
+    /* shell on, host tools off: the pre-#18 surface, byte-unchanged. */
+    char *plain = agent_build_dsml_tools_prompt(true, false, false);
+    AGENT_TEST_ASSERT(strstr(plain, "\"name\": \"bash\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(plain, "\"name\": \"bash_status\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(plain, "\"name\": \"bash_stop\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(plain, "\"name\": \"read\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(plain, "\"name\": \"list\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(plain, "\"name\":\"dispatch\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(plain, "\"name\":\"test\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(plain, "\"name\":\"lint\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(plain, "# Rules") != NULL);
+    /* The exact junction the pre-#18 monolith produced: the file schemas end
+     * with one newline and a blank line precedes the rules tail. Pins that the
+     * split moved the separator rather than dropping or doubling it. */
+    AGENT_TEST_ASSERT(strstr(plain, "}\n\n# Rules") != NULL);
+
+    /* shell off: the bash family AND its prose rule leave; the web tools stay
+     * (D11 -- only the bash family is gated), and so does everything after. */
+    char *noshell = agent_build_dsml_tools_prompt(false, false, false);
+    AGENT_TEST_ASSERT(strstr(noshell, "\"name\": \"bash\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(noshell, "\"name\": \"bash_status\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(noshell, "\"name\": \"bash_stop\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(noshell, "bash_status to check it early") == NULL);
+    AGENT_TEST_ASSERT(strstr(noshell, "\"name\": \"google_search\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(noshell, "\"name\": \"visit_page\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(noshell, "\"name\": \"read\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(noshell, "\"name\": \"list\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(noshell, "# Rules") != NULL);
+
+    /* host tools on: dispatch/test/lint join, and land BEFORE the rules tail
+     * rather than trailing the prompt after it. */
+    char *host = agent_build_dsml_tools_prompt(true, false, true);
+    AGENT_TEST_ASSERT(strstr(host, "\"name\":\"dispatch\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(host, "\"name\":\"test\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(host, "\"name\":\"lint\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(host, "\"selector\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(host, "\"name\": \"bash\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(host, "# Rules") != NULL);
+    AGENT_TEST_ASSERT(strstr(host, "\"name\":\"lint\"") < strstr(host, "# Rules"));
+    /* and the appended block is separated from the file schemas and from the
+     * rules the same way every other schema boundary is. */
+    AGENT_TEST_ASSERT(strstr(host, "}\n\n{\"type\":\"function\",\"function\":{\"name\":\"dispatch\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(host, "}}}\n\n# Rules") != NULL);
+
+    /* the two gates are independent: host tools without a shell. */
+    char *hostnoshell = agent_build_dsml_tools_prompt(false, false, true);
+    AGENT_TEST_ASSERT(strstr(hostnoshell, "\"name\": \"bash\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(hostnoshell, "\"name\":\"test\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(hostnoshell, "\"name\":\"lint\"") != NULL);
+
+    free(plain);
+    free(noshell);
+    free(host);
+    free(hostnoshell);
+}
+
 static void test_agent_execute_tool_call_refuses_bash_when_shell_off(void) {
     /* Mirror the harness setup of test_agent_execute_tool_call_unknown_tool
      * (~:8882): the mutex and the wake fd must be initialized or the real
@@ -12349,6 +12472,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_schemas_gate_bash_when_shell_off();
     test_agent_schemas_gate_dispatch_when_host_tools_off();
     test_agent_schemas_add_test_lint_when_host_tools_on();
+    test_agent_dsml_tools_prompt_honors_gates();
     test_agent_glm_tool_parser_single_arg();
     test_agent_glm_tool_parser_chunked_multi_arg();
     test_agent_glm_tool_parser_streams_param_state();
