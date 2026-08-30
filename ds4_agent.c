@@ -12009,6 +12009,115 @@ static void test_agent_schemas_add_test_lint_when_host_tools_on(void) {
     AGENT_TEST_ASSERT(strstr(buf, "output is host-digested") != NULL);
 }
 
+/* Extract the advertised tool names from a built prompt: every `"name"` key in
+ * a schema object, de-duped and sorted so two families compare as sets. Handles
+ * both spellings -- the shared schema constants are compact (`"name":"read"`)
+ * and the DSML block is pretty-printed (`"name": "read"`). */
+typedef struct { char name[32][40]; int count; } agent_test_tool_set;
+
+static void agent_test_tool_set_add(agent_test_tool_set *set, const char *s, size_t len) {
+    if (len == 0 || len >= sizeof(set->name[0])) return;
+    for (int i = 0; i < set->count; i++)
+        if (strlen(set->name[i]) == len && !memcmp(set->name[i], s, len)) return;
+    if (set->count >= 32) return;
+    memcpy(set->name[set->count], s, len);
+    set->name[set->count][len] = '\0';
+    set->count++;
+}
+
+static agent_test_tool_set agent_test_tool_names(const char *prompt) {
+    agent_test_tool_set set = {0};
+    const char *p = prompt;
+    while ((p = strstr(p, "\"name\"")) != NULL) {
+        p += strlen("\"name\"");
+        while (*p == ' ') p++;
+        if (*p != ':') continue;
+        p++;
+        while (*p == ' ') p++;
+        if (*p != '"') continue;
+        p++;
+        const char *end = strchr(p, '"');
+        if (!end) break;
+        agent_test_tool_set_add(&set, p, (size_t)(end - p));
+        p = end;
+    }
+    for (int i = 1; i < set.count; i++) {
+        char tmp[40];
+        snprintf(tmp, sizeof(tmp), "%s", set.name[i]);
+        int j = i - 1;
+        while (j >= 0 && strcmp(set.name[j], tmp) > 0) {
+            snprintf(set.name[j + 1], sizeof(set.name[j + 1]), "%s", set.name[j]);
+            j--;
+        }
+        snprintf(set.name[j + 1], sizeof(set.name[j + 1]), "%s", tmp);
+    }
+    return set;
+}
+
+static void agent_test_dump_tool_set(const char *label, const agent_test_tool_set *s) {
+    fprintf(stderr, "  %-8s (%d):", label, s->count);
+    for (int i = 0; i < s->count; i++) fprintf(stderr, " %s", s->name[i]);
+    fprintf(stderr, "\n");
+}
+
+static bool agent_test_tool_sets_equal(const agent_test_tool_set *a,
+                                       const agent_test_tool_set *b) {
+    if (a->count != b->count) return false;
+    for (int i = 0; i < a->count; i++)
+        if (strcmp(a->name[i], b->name[i]) != 0) return false;
+    return true;
+}
+
+/* The guard for the trap that produced divergence #18, as opposed to the one
+ * that pins #18 itself.
+ *
+ * #16 added `test`/`lint` to `agent_schemas_for`, which GLM, Laguna and Mellum
+ * all call -- and DSML does not, because it carries its own hand-written schema
+ * block. So the tools were advertised to three families and silently withheld
+ * from the fourth, which is the one SwiftStar ships. Nothing failed: the tests
+ * covered `agent_schemas_for`, and the helper was correct.
+ *
+ * A per-tool test cannot catch the next occurrence, because the next divergence
+ * will name a tool this file does not know about yet. This one compares the
+ * families to each other: whatever the advertised set is, all four must agree
+ * on it under every combination of the two gates. Add a tool to the shared
+ * helper alone and DSML's set diverges here. */
+static void test_agent_families_advertise_the_same_tools(void) {
+    const bool shell[] = {true, false, true, false};
+    const bool host[]  = {false, false, true, true};
+    for (size_t c = 0; c < sizeof(shell) / sizeof(shell[0]); c++) {
+        char *dsml   = agent_build_dsml_tools_prompt(shell[c], false, host[c]);
+        char *glm    = agent_build_glm_tools_prompt(shell[c], false, host[c]);
+        char *laguna = agent_build_laguna_tools_prompt(shell[c], false, host[c]);
+        char *mellum = agent_build_mellum_tools_prompt(shell[c], false, host[c]);
+        agent_test_tool_set d = agent_test_tool_names(dsml);
+        agent_test_tool_set g = agent_test_tool_names(glm);
+        agent_test_tool_set l = agent_test_tool_names(laguna);
+        agent_test_tool_set m = agent_test_tool_names(mellum);
+
+        bool ok = agent_test_tool_sets_equal(&d, &g)
+               && agent_test_tool_sets_equal(&d, &l)
+               && agent_test_tool_sets_equal(&d, &m);
+        if (!ok) {
+            fprintf(stderr, "tool sets diverge (shell=%d host_tools=%d):\n",
+                    (int)shell[c], (int)host[c]);
+            agent_test_dump_tool_set("dsml", &d);
+            agent_test_dump_tool_set("glm", &g);
+            agent_test_dump_tool_set("laguna", &l);
+            agent_test_dump_tool_set("mellum", &m);
+        }
+        AGENT_TEST_ASSERT(ok);
+        /* And the gates must actually do something, or "all four agree" would
+         * be satisfied by four families that all advertise nothing. */
+        AGENT_TEST_ASSERT(d.count > 0);
+
+        free(dsml);
+        free(glm);
+        free(laguna);
+        free(mellum);
+    }
+}
+
 /* P24.3 (fork divergence #18): the DSML prompt honors the same two gates the
  * GLM/Laguna/Mellum prompts do. DeepSeek V4 Flash -- the model SwiftStar
  * actually ships -- takes the DSML path, which took neither `shell_allowed`
@@ -12473,6 +12582,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_schemas_gate_dispatch_when_host_tools_off();
     test_agent_schemas_add_test_lint_when_host_tools_on();
     test_agent_dsml_tools_prompt_honors_gates();
+    test_agent_families_advertise_the_same_tools();
     test_agent_glm_tool_parser_single_arg();
     test_agent_glm_tool_parser_chunked_multi_arg();
     test_agent_glm_tool_parser_streams_param_state();
