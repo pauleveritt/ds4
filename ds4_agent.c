@@ -1470,7 +1470,7 @@ static const char agent_glm_tools_prompt_final_tail[] =
 static const char agent_glm_tool_schemas[] =
     "{\"type\":\"function\",\"function\":{\"name\":\"google_search\",\"description\":\"Search web pages.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"]}}}\n"
     "{\"type\":\"function\",\"function\":{\"name\":\"visit_page\",\"description\":\"Read a URL in browser.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}}\n"
-    "{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"description\":\"Run a shell command.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout_sec\":{\"type\":\"number\"},\"refresh_sec\":{\"type\":\"number\"}},\"required\":[\"command\"]}}}\n"
+    "{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"description\":\"Run a shell command; output is host-digested.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout_sec\":{\"type\":\"number\"},\"refresh_sec\":{\"type\":\"number\"}},\"required\":[\"command\"]}}}\n"
     "{\"type\":\"function\",\"function\":{\"name\":\"bash_status\",\"description\":\"Check a bash job.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"job\":{\"type\":\"number\"},\"pid\":{\"type\":\"number\"},\"refresh_sec\":{\"type\":\"number\"}},\"required\":[\"job\"]}}}\n"
     "{\"type\":\"function\",\"function\":{\"name\":\"bash_stop\",\"description\":\"Stop a bash job.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"job\":{\"type\":\"number\"},\"pid\":{\"type\":\"number\"},\"refresh_sec\":{\"type\":\"number\"}},\"required\":[\"job\"]}}}\n"
     "{\"type\":\"function\",\"function\":{\"name\":\"read\",\"description\":\"Read a text file/range.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"start_line\":{\"type\":\"number\"},\"max_lines\":{\"type\":\"number\"},\"whole\":{\"type\":\"boolean\"},\"raw\":{\"type\":\"boolean\"}},\"required\":[\"path\"]}}}\n"
@@ -1485,6 +1485,15 @@ static const char agent_glm_tool_schemas[] =
  * host-tools there is no one to answer the tool_request). */
 static const char agent_dispatch_tool_schema[] =
     "{\"type\":\"function\",\"function\":{\"name\":\"dispatch\",\"description\":\"Dispatch a bounded task to a subagent (host-executed).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"taskText\":{\"type\":\"string\"},\"writableFiles\":{\"type\":\"string\"},\"validationCommand\":{\"type\":\"string\"}},\"required\":[\"taskText\",\"writableFiles\"]}}}\n";
+
+/* P24.3 (fork divergence #16): the `test` and `lint` host-tool schemas —
+ * advertised only under --host-tools, exactly like `dispatch` (divergence
+ * #12): the engine cannot execute them without a host. The DSML/DeepSeek
+ * block is intentionally untouched, the same way dispatch is handled. */
+static const char agent_test_tool_schema[] =
+    "{\"type\":\"function\",\"function\":{\"name\":\"test\",\"description\":\"Run the project's test command (host-run; output is digested).\",\"parameters\":{\"type\":\"object\",\"properties\":{\"selector\":{\"type\":\"string\"}},\"required\":[]}}}\n";
+static const char agent_lint_tool_schema[] =
+    "{\"type\":\"function\",\"function\":{\"name\":\"lint\",\"description\":\"Run ruff on the project (host-run; output is digested).\",\"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}}\n";
 
 /* Line-bounded check: does this one schema line (length len) declare one of
  * the bash-family tools? NOT strstr(p, ...) \u2014 that searches past the line's
@@ -1530,11 +1539,19 @@ static size_t agent_schemas_for(char *out, size_t outlen, bool shell_allowed,
         p = nl + 1;
     }
     /* P20 (fork divergence #12): advertise `dispatch` only under --host-tools. */
+    /* P24.3 (fork divergence #16): `test`/`lint` ride the same gate. */
     if (host_tools) {
-        size_t dl = strlen(agent_dispatch_tool_schema);
-        if (o + dl + 1 < outlen) {
-            memcpy(out + o, agent_dispatch_tool_schema, dl + 1);
-            o += dl;
+        static const char *const extra[] = {
+            agent_dispatch_tool_schema,
+            agent_test_tool_schema,
+            agent_lint_tool_schema,
+        };
+        for (size_t n = 0; n < sizeof(extra) / sizeof(extra[0]); n++) {
+            size_t xl = strlen(extra[n]);
+            if (o + xl + 1 < outlen) {
+                memcpy(out + o, extra[n], xl + 1);
+                o += xl;
+            }
         }
     }
     out[o] = '\0';
@@ -11925,6 +11942,21 @@ static void test_agent_schemas_gate_dispatch_when_host_tools_off(void) {
     AGENT_TEST_ASSERT(strstr(buf, "\"validationCommand\"") != NULL);
 }
 
+/* P24.3 (fork divergence #16): `test`/`lint` advertise only under
+ * --host-tools, and the bash description advertises host-digested output. */
+static void test_agent_schemas_add_test_lint_when_host_tools_on(void) {
+    char buf[16384];
+    agent_schemas_for(buf, sizeof(buf), true, false);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"test\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"lint\"") == NULL);
+    agent_schemas_for(buf, sizeof(buf), true, true);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"test\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"lint\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"selector\"") != NULL);
+    /* the bash description now advertises host digestion */
+    AGENT_TEST_ASSERT(strstr(buf, "output is host-digested") != NULL);
+}
+
 static void test_agent_execute_tool_call_refuses_bash_when_shell_off(void) {
     /* Mirror the harness setup of test_agent_execute_tool_call_unknown_tool
      * (~:8882): the mutex and the wake fd must be initialized or the real
@@ -12316,6 +12348,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_glm_tools_prompt_is_native();
     test_agent_schemas_gate_bash_when_shell_off();
     test_agent_schemas_gate_dispatch_when_host_tools_off();
+    test_agent_schemas_add_test_lint_when_host_tools_on();
     test_agent_glm_tool_parser_single_arg();
     test_agent_glm_tool_parser_chunked_multi_arg();
     test_agent_glm_tool_parser_streams_param_state();
