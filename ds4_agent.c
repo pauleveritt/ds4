@@ -94,6 +94,12 @@ typedef struct {
      * dispatching internally. The app always passes it; the bare CLI keeps
      * internal execution. */
     bool host_tools;
+    /* Divergence #19 (--tools): a comma-separated allowlist of tool names to
+     * advertise, applied after the shell_allowed/host_tools gating above.
+     * NULL (the default; no --tools flag) advertises everything those two
+     * gates allow -- today's behavior, byte-for-byte. Scoped to the GLM and
+     * Laguna prompt syntaxes; see agent_build_tools_prompt. */
+    const char *tools_filter;
     /* P11 (fork divergence #11): the subagent pool. 1 = the single-worker
      * program (byte-identical to pre-P11); N>1 hosts N sessions in one
      * process sharing one engine, with a `worker` id on every json-events
@@ -1013,6 +1019,12 @@ static agent_config parse_options(int argc, char **argv) {
              * tool_request per call and blocks on a tool_result from stdin
              * instead of dispatching internally. Requires --json-events. */
             c.host_tools = true;
+        } else if (!strcmp(arg, "--tools")) {
+            /* Divergence #19: a comma-separated allowlist of tool names to
+             * advertise. Applied after --shell/--host-tools gating; absent
+             * advertises everything those two gates allow (today's behavior,
+             * unchanged). */
+            c.tools_filter = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--subagent-pool")) {
             /* P11 (fork divergence #11): host N sessions in one process on one
              * engine. 1 = single-worker (byte-identical to pre-P11). */
@@ -1245,7 +1257,17 @@ static const char agent_dsml_bash_rule[] =
 static const char agent_tools_prompt_after_edit[] =
     "Use google_search to find web pages. Use visit_page to read a known URL with a visible browser. "
     "The first web call may ask the user for permission to start Chrome.\n\n"
-    "### Available Tool Schemas\n\n"
+    "### Available Tool Schemas\n\n";
+
+/* Divergence #19 (--tools): the web tool schemas used to be baked into
+ * `agent_tools_prompt_after_edit` above, ungated prose and JSON together.
+ * `agent_filter_pretty_schema_blob` (the DSML filter) can only walk a blob of
+ * top-level `{...}` objects, not prose -- so the two google_search/visit_page
+ * objects are split out here and filtered on their own, the same as
+ * `agent_dsml_bash_schemas`/`agent_dsml_file_schemas`. Concatenating
+ * `agent_tools_prompt_after_edit` + this constant reproduces the pre-split
+ * text exactly (verified by `test_agent_dsml_tools_prompt_honors_gates`). */
+static const char agent_dsml_web_schemas[] =
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -1456,34 +1478,72 @@ static const char agent_test_tool_schema[] =
 static const char agent_lint_tool_schema[] =
     "{\"type\":\"function\",\"function\":{\"name\":\"lint\",\"description\":\"Run ruff on the project (host-run; output is digested).\",\"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}}\n";
 
+static size_t agent_filter_pretty_schema_blob(char *out, size_t outlen,
+                                              const char *blob, const char *tools_csv);
+static bool agent_csv_has_token(const char *csv, const char *tok, size_t tok_len);
+
 static char *agent_build_dsml_tools_prompt(bool shell_allowed, bool edit_upto,
-                                           bool host_tools) {
+                                           bool host_tools, const char *tools_csv) {
     const char *edit = edit_upto ? agent_tools_prompt_edit_upto
                                  : agent_tools_prompt_edit_exact;
     /* Assembly order reproduces the pre-#18 monolith exactly: intro, edit
      * rules, the bash prose rule, the web prose + schema header + web schemas,
      * the bash schemas, the file schemas, then the host-tool schemas, then the
-     * rules tail. With shell_allowed=true and host_tools=false the result is
-     * byte-for-byte the prompt the fork shipped before this divergence.
+     * rules tail. With shell_allowed=true, host_tools=false and no --tools,
+     * the result is byte-for-byte the prompt the fork shipped before this
+     * divergence.
      *
      * The host-tool schemas are the SAME constants the GLM path appends
      * (compact, one per line) rather than DSML-pretty copies: one spelling of
-     * each schema, so the two families cannot drift apart. */
-    /* 11 = intro, edit, bash rule, web head, bash schemas, file schemas, the
-     * host-tool separator + its three schemas, rules -- the maximal path. */
-    const char *parts[11];
+     * each schema, so the two families cannot drift apart.
+     *
+     * Divergence #19 (--tools): DSML is the family SwiftStar actually ships
+     * (see divergence #18's own story -- a filter wired into
+     * `agent_schemas_for` alone would leave this path unfiltered, repeating
+     * #18's exact trap). `agent_dsml_bash_schemas`/`agent_dsml_file_schemas`
+     * are pretty-printed multi-line JSON objects, not the one-object-per-line
+     * blob `agent_schemas_for` walks, so they go through
+     * `agent_filter_pretty_schema_blob` instead; the three host-tool schemas
+     * are the same compact one-liners the GLM path filters, gated the same
+     * way via `agent_csv_has_token`. NULL `tools_csv` leaves every blob
+     * byte-identical to its unfiltered input. */
+    char web_filtered[16384];
+    char bash_filtered[16384];
+    char file_filtered[16384];
+    const char *web_schemas = agent_dsml_web_schemas;
+    const char *bash_schemas = agent_dsml_bash_schemas;
+    const char *file_schemas = agent_dsml_file_schemas;
+    if (tools_csv) {
+        agent_filter_pretty_schema_blob(web_filtered, sizeof(web_filtered),
+                                        agent_dsml_web_schemas, tools_csv);
+        web_schemas = web_filtered;
+        agent_filter_pretty_schema_blob(bash_filtered, sizeof(bash_filtered),
+                                        agent_dsml_bash_schemas, tools_csv);
+        bash_schemas = bash_filtered;
+        agent_filter_pretty_schema_blob(file_filtered, sizeof(file_filtered),
+                                        agent_dsml_file_schemas, tools_csv);
+        file_schemas = file_filtered;
+    }
+    /* 12 = intro, edit, bash rule, web head, web schemas, bash schemas, file
+     * schemas, the host-tool separator + its three schemas, rules -- the
+     * maximal path. */
+    const char *parts[12];
     size_t n = 0;
     parts[n++] = agent_tools_prompt_intro;
     parts[n++] = edit;
     if (shell_allowed) parts[n++] = agent_dsml_bash_rule;
     parts[n++] = agent_tools_prompt_after_edit;
-    if (shell_allowed) parts[n++] = agent_dsml_bash_schemas;
-    parts[n++] = agent_dsml_file_schemas;
+    parts[n++] = web_schemas;
+    if (shell_allowed) parts[n++] = bash_schemas;
+    parts[n++] = file_schemas;
     if (host_tools) {
         parts[n++] = "\n";
-        parts[n++] = agent_dispatch_tool_schema;
-        parts[n++] = agent_test_tool_schema;
-        parts[n++] = agent_lint_tool_schema;
+        if (!tools_csv || agent_csv_has_token(tools_csv, "dispatch", strlen("dispatch")))
+            parts[n++] = agent_dispatch_tool_schema;
+        if (!tools_csv || agent_csv_has_token(tools_csv, "test", strlen("test")))
+            parts[n++] = agent_test_tool_schema;
+        if (!tools_csv || agent_csv_has_token(tools_csv, "lint", strlen("lint")))
+            parts[n++] = agent_lint_tool_schema;
     }
     parts[n++] = agent_dsml_rules;
 
@@ -1567,21 +1627,176 @@ static bool agent_schema_line_is_bash(const char *p, size_t len) {
     return false;
 }
 
+/* Extract this schema span's tool name (the "name" key's string value) into
+ * buf (size buflen, NUL-terminated). Returns true if a name was found.
+ * Tolerates both spellings the two schema encodings use: the compact GLM/
+ * Laguna form (`"name":"X"`, no space) and the pretty-printed DSML form
+ * (`"name": "X"`, space after the colon) -- one scanner, not two, so the two
+ * families cannot silently drift in what "a schema line's name" means. Used
+ * by the --tools filter (divergence #19) to compare each advertised schema
+ * against the caller's allowlist. */
+static bool agent_schema_line_name(const char *p, size_t len, char *buf, size_t buflen) {
+    static const char needle[] = "\"name\"";
+    size_t needle_len = strlen(needle);
+    if (len < needle_len) return false;
+    for (size_t i = 0; i + needle_len <= len; i++) {
+        if (memcmp(p + i, needle, needle_len) != 0) continue;
+        size_t j = i + needle_len;
+        while (j < len && p[j] == ' ') j++;
+        if (j >= len || p[j] != ':') continue;
+        j++;
+        while (j < len && p[j] == ' ') j++;
+        if (j >= len || p[j] != '"') continue;
+        size_t start = j + 1;
+        size_t k = start;
+        while (k < len && p[k] != '"') k++;
+        size_t namelen = k - start;
+        if (namelen >= buflen) namelen = buflen - 1;
+        memcpy(buf, p + start, namelen);
+        buf[namelen] = '\0';
+        return true;
+    }
+    return false;
+}
+
+/* Does the comma-separated list `csv` contain the exact token `tok`
+ * (length tok_len)? Empty segments (leading/trailing/doubled commas) never
+ * match. Used by the --tools filter (divergence #19). */
+static bool agent_csv_has_token(const char *csv, const char *tok, size_t tok_len) {
+    if (!csv) return false;
+    const char *p = csv;
+    while (*p) {
+        const char *comma = strchr(p, ',');
+        size_t seg_len = comma ? (size_t)(comma - p) : strlen(p);
+        if (seg_len == tok_len && memcmp(p, tok, tok_len) == 0) return true;
+        if (!comma) break;
+        p = comma + 1;
+    }
+    return false;
+}
+
+/* Append a single top-level `{...}` JSON object (respecting quoted strings,
+ * so a brace or comma inside a "description" cannot desync the depth count)
+ * starting at *pp (which must point at '{') to out/o/outlen, then advance
+ * *pp past the object AND any immediately following blank-line separator
+ * ("\n\n" or a lone "\n"). Returns false if the object is unterminated
+ * (malformed input; the caller stops rather than emitting a partial blob) or
+ * if outlen is exhausted. `keep` controls whether the object (and its
+ * separator) are actually copied to `out`, or only skipped over -- the same
+ * scan drives both the copy and the skip so the two paths cannot desync on
+ * where one object ends and the next begins. */
+static bool agent_copy_or_skip_json_object(const char **pp, char *out, size_t *o,
+                                           size_t outlen, bool keep) {
+    const char *p = *pp;
+    if (*p != '{') return false;
+    int depth = 0;
+    bool in_string = false;
+    const char *start = p;
+    while (*p) {
+        char c = *p;
+        if (in_string) {
+            if (c == '\\' && p[1]) { p++; }
+            else if (c == '"') in_string = false;
+        } else {
+            if (c == '"') in_string = true;
+            else if (c == '{') depth++;
+            else if (c == '}') {
+                depth--;
+                if (depth == 0) { p++; break; }
+            }
+        }
+        p++;
+    }
+    if (depth != 0) return false;  /* unterminated -- caller stops */
+    const char *obj_end = p;
+    while (*p == '\n') p++;  /* consume the trailing blank-line separator */
+    if (keep) {
+        size_t len = (size_t)(p - start);
+        if (*o + len >= outlen) return false;
+        memcpy(out + *o, start, len);
+        *o += len;
+    }
+    (void)obj_end;
+    *pp = p;
+    return true;
+}
+
+/* Filter a blob of concatenated top-level `{...}` JSON tool-schema objects
+ * (the DSML pretty-printed constants -- `agent_dsml_bash_schemas`,
+ * `agent_dsml_file_schemas` -- one object per tool, separated by a blank
+ * line, no prose in between) down to the ones named in `tools_csv`. NULL
+ * `tools_csv` copies the blob through unchanged. Used by
+ * `agent_build_dsml_tools_prompt` so the --tools filter (divergence #19)
+ * reaches the family SwiftStar actually ships, not only GLM/Laguna (see
+ * `agent_schemas_for`, its line-oriented sibling for the compact encoding).
+ * Writes at most outlen-1 bytes (NUL-terminated) and returns the length
+ * written. */
+static size_t agent_filter_pretty_schema_blob(char *out, size_t outlen,
+                                              const char *blob, const char *tools_csv) {
+    size_t o = 0;
+    if (outlen == 0) return 0;
+    if (!tools_csv) {
+        size_t len = strlen(blob);
+        if (len >= outlen) len = outlen - 1;
+        memcpy(out, blob, len);
+        out[len] = '\0';
+        return len;
+    }
+    const char *p = blob;
+    while (*p) {
+        while (*p == '\n') p++;
+        if (!*p) break;
+        const char *obj_start = p;
+        char name[64];
+        bool named = false;
+        {
+            /* Find this object's span first (without copying) so its name
+             * can be checked, then re-walk to actually copy/skip -- the
+             * same helper does both, just with keep=false first. */
+            const char *scan = obj_start;
+            size_t dummy_o = 0;
+            char scratch[16384];
+            if (!agent_copy_or_skip_json_object(&scan, scratch, &dummy_o, sizeof(scratch), true))
+                break;
+            named = agent_schema_line_name(scratch, dummy_o, name, sizeof(name));
+        }
+        bool keep = !named || agent_csv_has_token(tools_csv, name, strlen(name));
+        if (!agent_copy_or_skip_json_object(&p, out, &o, outlen - 1, keep)) break;
+    }
+    out[o < outlen ? o : outlen - 1] = '\0';
+    return o;
+}
+
 /* The three bash tools are removed from the advertised schema when the shell
  * is off (D1/D11: only the bash family is gated; web tools keep the engine's
  * existing terminal approval). agent_glm_tool_schemas is a line-oriented JSON
- * blob; walk it line by line and drop the bash lines. Writes at most outlen-1
- * bytes (NUL-terminated) and returns the length written. */
+ * blob; walk it line by line and drop the bash lines.
+ *
+ * tools_csv (divergence #19, --tools): when non-NULL, a comma-separated
+ * allowlist of tool names. A schema line survives shell/host gating but
+ * whose name is not in the list is also dropped, and the host-tool extras
+ * below are gated the same way. NULL preserves the pre-#19 behavior exactly
+ * -- every fixture captured before this flag existed must stay byte-for-byte
+ * unchanged, so the filter is applied only when a caller opts in.
+ *
+ * Writes at most outlen-1 bytes (NUL-terminated) and returns the length
+ * written. */
 static size_t agent_schemas_for(char *out, size_t outlen, bool shell_allowed,
-                                bool host_tools) {
+                                bool host_tools, const char *tools_csv) {
     const char *src = agent_glm_tool_schemas;
     size_t o = 0;
     const char *p = src;
     while (*p && o + 1 < outlen) {
         const char *nl = strchr(p, '\n');
         size_t len = nl ? (size_t)(nl - p) : strlen(p);
-        bool bash_line = !shell_allowed && agent_schema_line_is_bash(p, len);
-        if (!bash_line) {
+        bool drop = !shell_allowed && agent_schema_line_is_bash(p, len);
+        if (!drop && tools_csv) {
+            char name[64];
+            if (agent_schema_line_name(p, len, name, sizeof(name))) {
+                if (!agent_csv_has_token(tools_csv, name, strlen(name))) drop = true;
+            }
+        }
+        if (!drop) {
             if (o + len + 2 > outlen) break;
             memcpy(out + o, p, len);
             o += len;
@@ -1598,7 +1813,11 @@ static size_t agent_schemas_for(char *out, size_t outlen, bool shell_allowed,
             agent_test_tool_schema,
             agent_lint_tool_schema,
         };
+        static const char *const extra_names[] = { "dispatch", "test", "lint" };
         for (size_t n = 0; n < sizeof(extra) / sizeof(extra[0]); n++) {
+            if (tools_csv &&
+                !agent_csv_has_token(tools_csv, extra_names[n], strlen(extra_names[n])))
+                continue;
             size_t xl = strlen(extra[n]);
             if (o + xl + 1 < outlen) {
                 memcpy(out + o, extra[n], xl + 1);
@@ -1611,10 +1830,10 @@ static size_t agent_schemas_for(char *out, size_t outlen, bool shell_allowed,
 }
 
 static char *agent_build_glm_tools_prompt(bool shell_allowed, bool edit_upto,
-                                          bool host_tools) {
+                                          bool host_tools, const char *tools_csv) {
     size_t a = strlen(agent_glm_tools_prompt_intro);
     char schemas[16384];  /* agent_glm_tool_schemas is ~2.3 KB; ample headroom */
-    size_t b = agent_schemas_for(schemas, sizeof(schemas), shell_allowed, host_tools);
+    size_t b = agent_schemas_for(schemas, sizeof(schemas), shell_allowed, host_tools, tools_csv);
     size_t c = strlen(agent_glm_tools_prompt_after_schemas);
     const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
                                  : agent_glm_tools_prompt_edit_exact;
@@ -1663,10 +1882,10 @@ static const char agent_laguna_tools_prompt_after_schemas[] =
  * GLM's are (D1/D11).
  */
 static char *agent_build_laguna_tools_prompt(bool shell_allowed, bool edit_upto,
-                                             bool host_tools) {
+                                             bool host_tools, const char *tools_csv) {
     size_t a = strlen(agent_laguna_tools_prompt_intro);
     char schemas[16384];
-    size_t b = agent_schemas_for(schemas, sizeof(schemas), shell_allowed, host_tools);
+    size_t b = agent_schemas_for(schemas, sizeof(schemas), shell_allowed, host_tools, tools_csv);
     size_t c = strlen(agent_laguna_tools_prompt_after_schemas);
     const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
                                  : agent_glm_tools_prompt_edit_exact;
@@ -1720,7 +1939,10 @@ static char *agent_build_mellum_tools_prompt(bool shell_allowed, bool edit_upto,
                                              bool host_tools) {
     size_t a = strlen(agent_mellum_tools_prompt_intro);
     char schemas[16384];
-    size_t b = agent_schemas_for(schemas, sizeof(schemas), shell_allowed, host_tools);
+    /* --tools (divergence #19) is scoped to GLM/Laguna, the two production
+     * syntaxes agent_build_tools_prompt threads it through; Mellum keeps its
+     * pre-#19 unfiltered schema set (NULL). */
+    size_t b = agent_schemas_for(schemas, sizeof(schemas), shell_allowed, host_tools, NULL);
     size_t c = strlen(agent_mellum_tools_prompt_after_schemas);
     const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
                                  : agent_glm_tools_prompt_edit_exact;
@@ -1738,15 +1960,15 @@ static char *agent_build_mellum_tools_prompt(bool shell_allowed, bool edit_upto,
 }
 
 static char *agent_build_tools_prompt(ds4_engine *engine, bool shell_allowed, bool edit_upto,
-                                     bool host_tools) {
+                                     bool host_tools, const char *tools_csv) {
     agent_tool_syntax syntax = agent_tool_syntax_for_engine(engine);
     if (syntax == AGENT_TOOL_SYNTAX_GLM)
-        return agent_build_glm_tools_prompt(shell_allowed, edit_upto, host_tools);
+        return agent_build_glm_tools_prompt(shell_allowed, edit_upto, host_tools, tools_csv);
     if (syntax == AGENT_TOOL_SYNTAX_LAGUNA)
-        return agent_build_laguna_tools_prompt(shell_allowed, edit_upto, host_tools);
+        return agent_build_laguna_tools_prompt(shell_allowed, edit_upto, host_tools, tools_csv);
     if (syntax == AGENT_TOOL_SYNTAX_MELLUM)
         return agent_build_mellum_tools_prompt(shell_allowed, edit_upto, host_tools);
-    return agent_build_dsml_tools_prompt(shell_allowed, edit_upto, host_tools);
+    return agent_build_dsml_tools_prompt(shell_allowed, edit_upto, host_tools, tools_csv);
 }
 
 static const char agent_dsml_syntax_reminder[] =
@@ -1790,8 +2012,9 @@ static const char *agent_tagged_syntax_reminder(agent_tool_syntax syntax) {
 static char *agent_build_system_prompt_reminder(ds4_engine *engine,
                                                 bool shell_allowed,
                                                 bool edit_upto,
-                                                bool host_tools) {
-    char *tools = agent_build_tools_prompt(engine, shell_allowed, edit_upto, host_tools);
+                                                bool host_tools,
+                                                const char *tools_csv) {
+    char *tools = agent_build_tools_prompt(engine, shell_allowed, edit_upto, host_tools, tools_csv);
     const char *start = "\n\n[System prompt reminder follows.]\n";
     const char *end = "[End system prompt reminder.]\n\n";
     const size_t len = strlen(start) + strlen(tools) + strlen(end) + 1;
@@ -1803,13 +2026,14 @@ static char *agent_build_system_prompt_reminder(ds4_engine *engine,
 
 static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
                                        const char *extra, bool shell_allowed,
-                                       bool edit_upto, bool host_tools) {
+                                       bool edit_upto, bool host_tools,
+                                       const char *tools_csv) {
     /* The built-in tool prompt is trusted DS4 control text.  Tokenize it like a
      * rendered chat prompt so the literal ｜DSML｜ markers in the examples become
      * the model's dedicated DSML token.  Do not apply that tokenizer to user
      * supplied -sys text: arbitrary user text containing <｜User｜>, <think>, or
      * ｜DSML｜ must remain plain content, not control tokens. */
-    char *tools_prompt = agent_build_tools_prompt(engine, shell_allowed, edit_upto, host_tools);
+    char *tools_prompt = agent_build_tools_prompt(engine, shell_allowed, edit_upto, host_tools, tools_csv);
     if (agent_tool_syntax_is_tagged(agent_tool_syntax_for_engine(engine)))
         ds4_chat_append_message(engine, tokens, "system", tools_prompt);
     else
@@ -1861,7 +2085,8 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
     char *reminder = agent_build_system_prompt_reminder(w->engine,
                                                         w->cfg->shell_allowed,
                                                         w->cfg->edit_upto,
-                                                        w->cfg->host_tools);
+                                                        w->cfg->host_tools,
+                                                        w->cfg->tools_filter);
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
@@ -6453,7 +6678,7 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
     }
     agent_append_system_prompt(w->engine, out, w->cfg->gen.system,
                                w->cfg->shell_allowed, w->cfg->edit_upto,
-                               w->cfg->host_tools);
+                               w->cfg->host_tools, w->cfg->tools_filter);
 }
 
 static void agent_publish_system_status(agent_worker *w, const char *msg) {
@@ -9765,10 +9990,10 @@ static void test_agent_tagged_structural_candidate_guard(void) {
 }
 
 static void test_agent_edit_upto_prompt_is_opt_in(void) {
-    char *dsml_default = agent_build_dsml_tools_prompt(true, false, false);
-    char *dsml_upto = agent_build_dsml_tools_prompt(true, true, false);
-    char *glm_default = agent_build_glm_tools_prompt(true, false, false);
-    char *glm_upto = agent_build_glm_tools_prompt(true, true, false);
+    char *dsml_default = agent_build_dsml_tools_prompt(true, false, false, NULL);
+    char *dsml_upto = agent_build_dsml_tools_prompt(true, true, false, NULL);
+    char *glm_default = agent_build_glm_tools_prompt(true, false, false, NULL);
+    char *glm_upto = agent_build_glm_tools_prompt(true, true, false, NULL);
 
     AGENT_TEST_ASSERT(strstr(dsml_default, "[upto]") == NULL);
     AGENT_TEST_ASSERT(strstr(dsml_upto, "[upto]") != NULL);
@@ -9782,7 +10007,7 @@ static void test_agent_edit_upto_prompt_is_opt_in(void) {
 }
 
 static void test_agent_glm_tools_prompt_is_native(void) {
-    char *prompt = agent_build_glm_tools_prompt(true, false, false);
+    char *prompt = agent_build_glm_tools_prompt(true, false, false, NULL);
 
     AGENT_TEST_ASSERT(strstr(prompt, "<tools>") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "<tool_call>") != NULL);
@@ -11966,7 +12191,7 @@ static void test_agent_json_escape_rejects_overlong_and_surrogate_utf8(void) {
 
 static void test_agent_schemas_gate_bash_when_shell_off(void) {
     char buf[16384];
-    agent_schemas_for(buf, sizeof(buf), false, false);
+    agent_schemas_for(buf, sizeof(buf), false, false, NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"bash\"") == NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"bash_status\"") == NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"bash_stop\"") == NULL);
@@ -11977,7 +12202,7 @@ static void test_agent_schemas_gate_bash_when_shell_off(void) {
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"visit_page\"") != NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"read\"") != NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"write\"") != NULL);
-    agent_schemas_for(buf, sizeof(buf), true, false);
+    agent_schemas_for(buf, sizeof(buf), true, false, NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"bash\"") != NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"bash_status\"") != NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"bash_stop\"") != NULL);
@@ -11985,9 +12210,9 @@ static void test_agent_schemas_gate_bash_when_shell_off(void) {
 
 static void test_agent_schemas_gate_dispatch_when_host_tools_off(void) {
     char buf[16384];
-    agent_schemas_for(buf, sizeof(buf), true, false);
+    agent_schemas_for(buf, sizeof(buf), true, false, NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"dispatch\"") == NULL);
-    agent_schemas_for(buf, sizeof(buf), true, true);
+    agent_schemas_for(buf, sizeof(buf), true, true, NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"dispatch\"") != NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"taskText\"") != NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"writableFiles\"") != NULL);
@@ -11998,15 +12223,64 @@ static void test_agent_schemas_gate_dispatch_when_host_tools_off(void) {
  * --host-tools, and the bash description advertises host-digested output. */
 static void test_agent_schemas_add_test_lint_when_host_tools_on(void) {
     char buf[16384];
-    agent_schemas_for(buf, sizeof(buf), true, false);
+    agent_schemas_for(buf, sizeof(buf), true, false, NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"test\"") == NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"lint\"") == NULL);
-    agent_schemas_for(buf, sizeof(buf), true, true);
+    agent_schemas_for(buf, sizeof(buf), true, true, NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"test\"") != NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"lint\"") != NULL);
     AGENT_TEST_ASSERT(strstr(buf, "\"selector\"") != NULL);
     /* the bash description now advertises host digestion */
     AGENT_TEST_ASSERT(strstr(buf, "output is host-digested") != NULL);
+}
+
+/* Divergence #19 (--tools): agent_schemas_for's allowlist filter is applied
+ * AFTER the shell/host gating above, and it also gates the host-tool extras
+ * (dispatch/test/lint) appended below the line-oriented walk. */
+static void test_agent_schemas_for_tools_filter(void) {
+    char buf[16384];
+    /* shell on, host tools on: without a filter, bash + dispatch + read all
+     * advertise (the pre-#19 baseline these assertions are contrasted against). */
+    agent_schemas_for(buf, sizeof(buf), true, true, NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"bash\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"dispatch\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"read\"") != NULL);
+
+    /* Same two gates, but "read,write,list" restricts the advertised set to
+     * exactly those three -- bash and dispatch survive the gates but not the
+     * filter, and google_search (never gated by shell/host at all) is
+     * dropped too, proving the filter is independent of the other two gates
+     * rather than layered only on top of what they already remove. */
+    agent_schemas_for(buf, sizeof(buf), true, true, "read,write,list");
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"read\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"write\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"list\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"bash\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"bash_status\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"dispatch\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"google_search\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"edit\"") == NULL);
+
+    /* The filter also gates the host-tool extras (test/lint), appended after
+     * the line-oriented walk -- a naive filter that only touched the walk
+     * would leak them through unconditionally whenever host_tools is on. */
+    agent_schemas_for(buf, sizeof(buf), true, true, "dispatch");
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"dispatch\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"test\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"lint\"") == NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "\"name\":\"read\"") == NULL);
+
+    /* NULL (absent --tools) is byte-identical to the pre-#19 unfiltered call
+     * -- the sibling of the filtered assertions above, same two gates. */
+    char filtered_off[16384];
+    char explicit_null[16384];
+    agent_schemas_for(filtered_off, sizeof(filtered_off), true, true, NULL);
+    agent_schemas_for(explicit_null, sizeof(explicit_null), true, true, NULL);
+    AGENT_TEST_ASSERT(!strcmp(filtered_off, explicit_null));
+    AGENT_TEST_ASSERT(strstr(filtered_off, "\"name\":\"bash\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(filtered_off, "\"name\":\"dispatch\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(filtered_off, "\"name\":\"test\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(filtered_off, "\"name\":\"lint\"") != NULL);
 }
 
 /* Extract the advertised tool names from a built prompt: every `"name"` key in
@@ -12086,9 +12360,9 @@ static void test_agent_families_advertise_the_same_tools(void) {
     const bool shell[] = {true, false, true, false};
     const bool host[]  = {false, false, true, true};
     for (size_t c = 0; c < sizeof(shell) / sizeof(shell[0]); c++) {
-        char *dsml   = agent_build_dsml_tools_prompt(shell[c], false, host[c]);
-        char *glm    = agent_build_glm_tools_prompt(shell[c], false, host[c]);
-        char *laguna = agent_build_laguna_tools_prompt(shell[c], false, host[c]);
+        char *dsml   = agent_build_dsml_tools_prompt(shell[c], false, host[c], NULL);
+        char *glm    = agent_build_glm_tools_prompt(shell[c], false, host[c], NULL);
+        char *laguna = agent_build_laguna_tools_prompt(shell[c], false, host[c], NULL);
         char *mellum = agent_build_mellum_tools_prompt(shell[c], false, host[c]);
         agent_test_tool_set d = agent_test_tool_names(dsml);
         agent_test_tool_set g = agent_test_tool_names(glm);
@@ -12118,6 +12392,42 @@ static void test_agent_families_advertise_the_same_tools(void) {
     }
 }
 
+/* Divergence #19's own version of the #18 trap: a filter wired into
+ * `agent_schemas_for` (the compact, one-line-per-schema encoding GLM/Laguna
+ * share) says nothing about DSML, whose schemas are the pretty-printed,
+ * multi-line `agent_dsml_bash_schemas`/`agent_dsml_file_schemas` blobs. DSML
+ * is the family SwiftStar ships (divergence #18's own measurement), so a
+ * --tools filter that reached only GLM/Laguna would be argv-visible and
+ * inert on the one path that matters -- exactly the "advertised to three
+ * families, silently withheld from the fourth" shape #18 named. This proves
+ * DSML and GLM agree on the filtered set across every combination of the two
+ * gates, the same cross-family comparison #18's guard uses, restricted to
+ * the pair `agent_filter_pretty_schema_blob` and `agent_schemas_for` both
+ * have to get right: the CSV allowlist. */
+static void test_agent_dsml_honors_the_tools_filter_like_glm(void) {
+    const bool shell[] = {true, false, true, false};
+    const bool host[]  = {false, false, true, true};
+    for (size_t c = 0; c < sizeof(shell) / sizeof(shell[0]); c++) {
+        char *dsml = agent_build_dsml_tools_prompt(shell[c], false, host[c], "read,write,dispatch");
+        char *glm  = agent_build_glm_tools_prompt(shell[c], false, host[c], "read,write,dispatch");
+        agent_test_tool_set d = agent_test_tool_names(dsml);
+        agent_test_tool_set g = agent_test_tool_names(glm);
+        bool ok = agent_test_tool_sets_equal(&d, &g);
+        if (!ok) {
+            fprintf(stderr, "--tools filter diverges DSML vs GLM (shell=%d host_tools=%d):\n",
+                    (int)shell[c], (int)host[c]);
+            agent_test_dump_tool_set("dsml", &d);
+            agent_test_dump_tool_set("glm", &g);
+        }
+        AGENT_TEST_ASSERT(ok);
+        /* And the filter must have actually dropped something, or "DSML
+         * agrees with GLM" would be trivially true for a no-op filter. */
+        AGENT_TEST_ASSERT(strstr(dsml, "\"bash_status\"") == NULL);
+        free(dsml);
+        free(glm);
+    }
+}
+
 /* P24.3 (fork divergence #18): the DSML prompt honors the same two gates the
  * GLM/Laguna/Mellum prompts do. DeepSeek V4 Flash -- the model SwiftStar
  * actually ships -- takes the DSML path, which took neither `shell_allowed`
@@ -12134,7 +12444,7 @@ static void test_agent_families_advertise_the_same_tools(void) {
  * -- they are the same constants the GLM path appends. */
 static void test_agent_dsml_tools_prompt_honors_gates(void) {
     /* shell on, host tools off: the pre-#18 surface, byte-unchanged. */
-    char *plain = agent_build_dsml_tools_prompt(true, false, false);
+    char *plain = agent_build_dsml_tools_prompt(true, false, false, NULL);
     AGENT_TEST_ASSERT(strstr(plain, "\"name\": \"bash\"") != NULL);
     AGENT_TEST_ASSERT(strstr(plain, "\"name\": \"bash_status\"") != NULL);
     AGENT_TEST_ASSERT(strstr(plain, "\"name\": \"bash_stop\"") != NULL);
@@ -12151,7 +12461,7 @@ static void test_agent_dsml_tools_prompt_honors_gates(void) {
 
     /* shell off: the bash family AND its prose rule leave; the web tools stay
      * (D11 -- only the bash family is gated), and so does everything after. */
-    char *noshell = agent_build_dsml_tools_prompt(false, false, false);
+    char *noshell = agent_build_dsml_tools_prompt(false, false, false, NULL);
     AGENT_TEST_ASSERT(strstr(noshell, "\"name\": \"bash\"") == NULL);
     AGENT_TEST_ASSERT(strstr(noshell, "\"name\": \"bash_status\"") == NULL);
     AGENT_TEST_ASSERT(strstr(noshell, "\"name\": \"bash_stop\"") == NULL);
@@ -12164,7 +12474,7 @@ static void test_agent_dsml_tools_prompt_honors_gates(void) {
 
     /* host tools on: dispatch/test/lint join, and land BEFORE the rules tail
      * rather than trailing the prompt after it. */
-    char *host = agent_build_dsml_tools_prompt(true, false, true);
+    char *host = agent_build_dsml_tools_prompt(true, false, true, NULL);
     AGENT_TEST_ASSERT(strstr(host, "\"name\":\"dispatch\"") != NULL);
     AGENT_TEST_ASSERT(strstr(host, "\"name\":\"test\"") != NULL);
     AGENT_TEST_ASSERT(strstr(host, "\"name\":\"lint\"") != NULL);
@@ -12178,7 +12488,7 @@ static void test_agent_dsml_tools_prompt_honors_gates(void) {
     AGENT_TEST_ASSERT(strstr(host, "}}}\n\n# Rules") != NULL);
 
     /* the two gates are independent: host tools without a shell. */
-    char *hostnoshell = agent_build_dsml_tools_prompt(false, false, true);
+    char *hostnoshell = agent_build_dsml_tools_prompt(false, false, true, NULL);
     AGENT_TEST_ASSERT(strstr(hostnoshell, "\"name\": \"bash\"") == NULL);
     AGENT_TEST_ASSERT(strstr(hostnoshell, "\"name\":\"test\"") != NULL);
     AGENT_TEST_ASSERT(strstr(hostnoshell, "\"name\":\"lint\"") != NULL);
@@ -12581,8 +12891,10 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_schemas_gate_bash_when_shell_off();
     test_agent_schemas_gate_dispatch_when_host_tools_off();
     test_agent_schemas_add_test_lint_when_host_tools_on();
+    test_agent_schemas_for_tools_filter();
     test_agent_dsml_tools_prompt_honors_gates();
     test_agent_families_advertise_the_same_tools();
+    test_agent_dsml_honors_the_tools_filter_like_glm();
     test_agent_glm_tool_parser_single_arg();
     test_agent_glm_tool_parser_chunked_multi_arg();
     test_agent_glm_tool_parser_streams_param_state();
