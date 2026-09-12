@@ -5384,6 +5384,17 @@ static const char *qwen35moe_tensor_suffix(const ds4_tensor *t) {
     return buf;
 }
 
+/* How far the validation walk reaches.  The MTP block sits above `layer_end`
+ * (the executable range) but is bound by weights_bind when the full model is
+ * loaded, so extend over any bound block above it.  Without this the MTP
+ * tensors are bound and never checked, which is how a transposed assertion
+ * survived the first run of this validator. */
+static uint32_t qwen35_validate_end(const ds4_weights *w, uint32_t layer_end) {
+    uint32_t end = layer_end;
+    while (end + 1u < DS4_N_LAYER && w->layer[end + 1u].attn_norm) end++;
+    return end;
+}
+
 static void qwen35moe_report_unquantizable(const ds4_tensor *t) {
     if (!t) return;
     if (tensor_type_is_dense_quant(t->type)) return;
@@ -5471,15 +5482,7 @@ static void weights_validate_qwen35moe_layout(
         qwen35moe_report_unquantizable(w->output);
     }
 
-    /* The MTP block sits above layer_end (the executable range) but is bound by
-     * weights_bind when the full model is loaded.  Extend the walk over any
-     * bound block above it: without this the MTP tensors are bound and never
-     * checked, which is how a transposed assertion survived the first run of
-     * this validator. */
-    uint32_t validate_end = layer_end;
-    while (validate_end + 1u < DS4_N_LAYER && w->layer[validate_end + 1u].attn_norm) {
-        validate_end++;
-    }
+    const uint32_t validate_end = qwen35_validate_end(w, layer_end);
 
     for (uint32_t il = layer_start; il <= validate_end; il++) {
         const ds4_layer_weights *l = &w->layer[il];
@@ -39039,6 +39042,220 @@ static uint32_t ascii_tolower_cp(uint32_t cp) {
 
 /* ChatGLM4/GLM pre-tokenization.  GLM GGUFs use tokenizer.ggml.pre="glm4",
  * which shares the llama3-style split shape used by llama.cpp's CHATGLM4 path. */
+#include "ds4_unicode_lmn.inc"
+
+/* =========================================================================
+ * Qwen3.5-MoE (Ornith) pre-tokenizer.
+ *
+ * This is a port of llama.cpp's unicode_regex_split_custom_qwen35, which
+ * implements the pre-tokenizer in the checkpoint's tokenizer.json:
+ *
+ *   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|
+ *    ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+ *
+ * It is ported statement-by-statement rather than re-derived from the regex,
+ * including the parts where the reference is looser than the regex it
+ * implements: the alternative order, the optional-prefix backtracking, the
+ * "last CR or LF in the whitespace run" rule, and the `\s+(?!\S)` case that
+ * leaves one whitespace character behind.  Every one of those changes the
+ * token stream, and agreement with llama.cpp --not with a reading of the
+ * regex-- is the acceptance test.
+ *
+ * Equivalence is measured against `llama-tokenize --ids --no-parse-special` on
+ * a corpus; see the research note.
+ * ========================================================================= */
+
+#define QWEN35_CAT_OTHER  0u
+#define QWEN35_CAT_LETTER 1u
+#define QWEN35_CAT_MARK   2u
+#define QWEN35_CAT_NUMBER 3u
+
+/* General category of a codepoint, limited to the three classes this regex
+ * names.  ASCII is inline; the rest comes from the generated table. */
+static uint32_t qwen35_ucat(uint32_t cp) {
+    if (cp < 128u) {
+        if ((cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z')) return QWEN35_CAT_LETTER;
+        if (cp >= '0' && cp <= '9') return QWEN35_CAT_NUMBER;
+        return QWEN35_CAT_OTHER;
+    }
+    uint32_t lo = 0;
+    uint32_t hi = DS4_UNICODE_LMN_RANGES;
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo) / 2u;
+        if (cp < ds4_unicode_lmn[mid][0]) {
+            hi = mid;
+        } else if (cp > ds4_unicode_lmn[mid][1]) {
+            lo = mid + 1u;
+        } else {
+            return ds4_unicode_lmn[mid][2];
+        }
+    }
+    return QWEN35_CAT_OTHER;
+}
+
+static bool qwen35_whitespace(uint32_t cp) {
+    return glm4_unicode_whitespace(cp);
+}
+
+/* Unicode White_Space plus the ASCII controls the engine already treats as
+ * whitespace; shared with the GLM4 pre-tokenizer rather than re-derived. */
+static uint32_t qwen35_tolower_ascii(uint32_t cp) {
+    return (cp >= 'A' && cp <= 'Z') ? cp + 32u : cp;
+}
+
+/* Split `text` into pre-tokenizer pieces.  Writes each piece boundary as a byte
+ * offset into `bounds` (bounds[0] == 0, bounds[pieces] == len) and returns the
+ * piece count, or UINT64_MAX if `cap` is too small.  Separated from the BPE
+ * emission so the split itself is testable without a vocabulary. */
+static uint64_t qwen35_split_pieces(const char *text, uint64_t len,
+                                    uint64_t *bounds, uint64_t cap) {
+    uint64_t n_pieces = 0;
+    bounds[n_pieces++] = 0;
+
+    /* Decode once: the reference works in codepoint indices and the engine
+     * works in byte offsets, so keep both and index by codepoint. */
+    uint64_t cp_cap = len + 1u;
+    uint32_t *cp = xmalloc((size_t)cp_cap * sizeof(cp[0]));
+    uint64_t *bo = xmalloc((size_t)(cp_cap + 1u) * sizeof(bo[0]));
+    uint64_t n = 0;
+    for (uint64_t pos = 0; pos < len; ) {
+        uint64_t next = pos;
+        cp[n] = utf8_peek_one(text, len, pos, &next);
+        bo[n] = pos;
+        n++;
+        pos = next;
+    }
+    bo[n] = len;
+
+    /* Category at a codepoint index; out of range is OTHER, matching the
+     * reference's default-constructed flags. */
+    #define QWEN35_CAT_AT(i) ((uint64_t)(i) < n ? qwen35_ucat(cp[(i)]) : QWEN35_CAT_OTHER)
+    #define QWEN35_WS_AT(i)  ((uint64_t)(i) < n && qwen35_whitespace(cp[(i)]))
+    #define QWEN35_IN_RANGE(i) ((uint64_t)(i) < n)
+
+    uint64_t pos = 0;
+    while (pos < n) {
+        const uint64_t start = pos;
+        const uint32_t cpt = cp[pos];
+        const uint32_t cat = qwen35_ucat(cpt);
+        bool matched = false;
+
+        /* (?i:'s|'t|'re|'ve|'m|'ll|'d) */
+        if (cpt == '\'' && pos + 1u < n) {
+            const uint32_t c1 = qwen35_tolower_ascii(cp[pos + 1u]);
+            if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') {
+                pos += 2u;
+                matched = true;
+            } else if (pos + 2u < n) {
+                const uint32_t c2 = qwen35_tolower_ascii(cp[pos + 2u]);
+                if ((c1 == 'r' && c2 == 'e') ||
+                    (c1 == 'v' && c2 == 'e') ||
+                    (c1 == 'l' && c2 == 'l')) {
+                    pos += 3u;
+                    matched = true;
+                }
+            }
+        }
+
+        /* [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ */
+        if (!matched && !(cpt == '\r' || cpt == '\n' || cat == QWEN35_CAT_NUMBER)) {
+            const uint32_t c1 = QWEN35_CAT_AT(pos + 1u);
+            if (cat == QWEN35_CAT_LETTER || cat == QWEN35_CAT_MARK ||
+                c1 == QWEN35_CAT_MARK || c1 == QWEN35_CAT_LETTER) {
+                pos++;
+                while (QWEN35_CAT_AT(pos) == QWEN35_CAT_LETTER ||
+                       QWEN35_CAT_AT(pos) == QWEN35_CAT_MARK) {
+                    pos++;
+                }
+                matched = true;
+            }
+        }
+
+        /* \p{N} */
+        if (!matched && cat == QWEN35_CAT_NUMBER) {
+            pos++;
+            matched = true;
+        }
+
+        /* <space>?[^\s\p{L}\p{M}\p{N}]+[\r\n]* */
+        if (!matched) {
+            const uint64_t p2 = (cpt == ' ') ? pos + 1u : pos;
+            const uint32_t c2 = QWEN35_CAT_AT(p2);
+            const bool c2_ws = QWEN35_WS_AT(p2);
+            const bool c2_plain = !c2_ws && c2 == QWEN35_CAT_OTHER;
+            const bool cur_present = QWEN35_IN_RANGE(pos);
+            if (c2_plain && cur_present) {
+                if (cpt == ' ') pos++;
+                while (true) {
+                    const uint32_t c3 = QWEN35_CAT_AT(pos);
+                    if (QWEN35_WS_AT(pos) || c3 != QWEN35_CAT_OTHER) break;
+                    if (!QWEN35_IN_RANGE(pos)) break;
+                    pos++;
+                }
+                while (QWEN35_IN_RANGE(pos) && (cp[pos] == '\r' || cp[pos] == '\n')) pos++;
+                matched = true;
+            }
+        }
+
+        if (!matched) {
+            uint64_t num_ws = 0;
+            uint64_t last_end_r_or_n = 0;
+            while (QWEN35_WS_AT(pos + num_ws)) {
+                const uint32_t c2 = cp[pos + num_ws];
+                if (c2 == '\r' || c2 == '\n') last_end_r_or_n = pos + num_ws + 1u;
+                num_ws++;
+            }
+
+            /* \s*[\r\n]+ */
+            if (last_end_r_or_n > 0) {
+                pos = last_end_r_or_n;
+                matched = true;
+            }
+            /* \s+(?!\S): leave one whitespace behind */
+            else if (num_ws > 1u && QWEN35_IN_RANGE(pos + num_ws)) {
+                pos += num_ws - 1u;
+                matched = true;
+            }
+            /* \s+ */
+            else if (num_ws > 0) {
+                pos += num_ws;
+                matched = true;
+            }
+        }
+
+        if (!matched) pos++;          /* no matches: single codepoint */
+        if (pos <= start) pos = start + 1u;
+
+        if (n_pieces + 1u >= cap) { free(cp); free(bo); return UINT64_MAX; }
+        bounds[n_pieces++] = bo[pos];
+    }
+
+    #undef QWEN35_CAT_AT
+    #undef QWEN35_WS_AT
+    #undef QWEN35_IN_RANGE
+
+    free(cp);
+    free(bo);
+    return n_pieces - 1u;
+}
+
+static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    const uint64_t len = strlen(text);
+    if (len == 0) return;
+
+    uint64_t cap = len + 2u;
+    uint64_t *bounds = xmalloc((size_t)cap * sizeof(bounds[0]));
+    const uint64_t pieces = qwen35_split_pieces(text, len, bounds, cap);
+    if (pieces == UINT64_MAX) ds4_die("qwen35 split buffer too small");
+
+    for (uint64_t i = 0; i < pieces; i++) {
+        bpe_emit_piece(vocab,
+                       (ds4_str){ text + bounds[i], bounds[i + 1u] - bounds[i] },
+                       out);
+    }
+    free(bounds);
+}
+
 static void bpe_tokenize_text_glm4(const ds4_vocab *vocab, const char *text, token_vec *out) {
     const uint64_t len = strlen(text);
     uint64_t pos = 0;
@@ -39180,12 +39397,8 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35MOE) {
-        /* Refuse rather than fall through: the default path below is the
-         * DeepSeek pre-tokenizer, and running it on a Qwen vocabulary produces
-         * fluent-looking but wrong tokens.  The Qwen `qwen35` pre-tokenizer is
-         * a separate piece of the port. */
-        ds4_die("the qwen35 pre-tokenizer is not implemented; "
-                "tokenization would be silently wrong");
+        bpe_tokenize_text_qwen35(vocab, text, out);
+        return;
     }
 
     const uint64_t len = strlen(text);
@@ -39277,16 +39490,6 @@ static int vocab_lookup_optional(const ds4_vocab *vocab, const char *text) {
 static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     memset(vocab, 0, sizeof(*vocab));
 
-    /* Reachable refusal.  Without it this family dies further down with
-     * "required tokenizer token is missing: <｜begin▁of▁sentence｜>", which
-     * names a DeepSeek token the user cannot supply and hides the real gap.
-     * The guard in bpe_tokenize_text is unreachable until this is ported. */
-    if (ds4_model_is_qwen35moe()) {
-        ds4_die("the qwen35 tokenizer is not implemented, so this model "
-                "cannot be tokenized yet (the vocabulary loader requires "
-                "DeepSeek special tokens)");
-    }
-
     ds4_array_ref tokens;
     ds4_array_ref merges;
     if (!model_get_array(model, "tokenizer.ggml.tokens", &tokens) ||
@@ -39315,6 +39518,38 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         ds4_str merge;
         if (!cursor_string(&c, &merge)) ds4_die(c.error);
         table_put(&vocab->merge_rank, merge, (int)i);
+    }
+
+    /* Ornith / Qwen3.5-MoE: GPT-2 byte-level BPE with its own pre-tokenizer and
+     * none of the DeepSeek reserved tokens, so it takes this branch instead of
+     * falling through to the DeepSeek special-token lookups below. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35MOE) {
+        if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
+            vocab->bos_id = -1;
+        }
+        if (!model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id)) {
+            vocab->eos_id = -1;
+        }
+        /* All three roles share <|im_start|>; the template names the role in
+         * the following text.  The chat encoder is a later increment, so these
+         * are set for completeness rather than because it reads them yet. */
+        vocab->system_id    = vocab_lookup_optional(vocab, "<|im_start|>");
+        vocab->user_id      = vocab_lookup_optional(vocab, "<|im_start|>");
+        vocab->assistant_id = vocab_lookup_optional(vocab, "<|im_start|>");
+        vocab->observation_id = -1;
+        vocab->sop_id = -1;
+        vocab->think_start_id = vocab_lookup_optional(vocab, "<think>");
+        vocab->think_end_id = vocab_lookup_optional(vocab, "</think>");
+        vocab->tool_call_start_id = vocab_lookup_optional(vocab, "<tool_call>");
+        vocab->tool_call_end_id = vocab_lookup_optional(vocab, "</tool_call>");
+        vocab->tool_response_start_id = -1;
+        vocab->tool_response_end_id = -1;
+        vocab->arg_key_start_id = -1;
+        vocab->arg_key_end_id = -1;
+        vocab->arg_value_start_id = -1;
+        vocab->arg_value_end_id = -1;
+        vocab->dsml_id = -1;
+        return;
     }
 
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -73233,6 +73468,61 @@ static uint64_t ds4_test_mixed_native_evals = 0;
 
 uint64_t ds4_test_mixed_native_count(void) {
     return ds4_test_mixed_native_evals;
+}
+#endif
+
+#ifdef DS4_TEST_HOOKS
+/* Pure qwen35 hooks: no model, no GPU, no I/O.  They exist because the GLM 5.3
+ * review's Critical finding was a check that never ran: the layer-typing rule
+ * and the validation walk were each exercised only by one run against one
+ * 20 GiB artifact, so a regression in either would have been invisible.  These
+ * make the decisions testable on their own. */
+bool ds4_test_qwen35_layer_is_linear(uint32_t il) {
+    g_ds4_shape = DS4_SHAPE_ORNITH15;
+    return ds4_qwen35moe_layer_is_linear(il);
+}
+
+uint32_t ds4_test_qwen35_ucat(uint32_t cp) {
+    return qwen35_ucat(cp);
+}
+
+uint64_t ds4_test_qwen35_pieces(const char *text, uint64_t *bounds, uint64_t cap) {
+    return qwen35_split_pieces(text, strlen(text), bounds, cap);
+}
+
+/* The walk must reach the MTP block when it was bound, and must not reach past
+ * it when it was not. */
+uint32_t ds4_test_qwen35_validate_end(uint32_t layer_end, bool mtp_bound) {
+    g_ds4_shape = DS4_SHAPE_ORNITH15;
+    ds4_weights *w = xcalloc(1, sizeof(*w));
+    if (mtp_bound) {
+        w->layer[DS4_N_LAYER - 1u].attn_norm = (ds4_tensor *)&w->layer[0];
+    }
+    const uint32_t end = qwen35_validate_end(w, layer_end);
+    free(w);
+    return end;
+}
+
+bool ds4_test_qwen35_dense_quant(uint32_t type) {
+    return tensor_type_is_dense_quant(type);
+}
+
+void ds4_test_qwen35_gap_reset(void) {
+    g_qwen35moe_gap_total  = 0;
+    g_qwen35moe_gap_nkinds = 0;
+}
+
+void ds4_test_qwen35_gap_add(uint32_t type) {
+    static const char name[] = "blk.0.attn_qkv.weight";
+    ds4_tensor t;
+    memset(&t, 0, sizeof(t));
+    t.name = (ds4_str){ name, sizeof(name) - 1u };
+    t.type = type;
+    qwen35moe_report_unquantizable(&t);
+}
+
+uint32_t ds4_test_qwen35_gap_total(void) {
+    return g_qwen35moe_gap_total;
 }
 #endif
 
