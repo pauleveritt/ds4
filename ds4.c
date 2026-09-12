@@ -39835,11 +39835,14 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         {"<arg_value>",            vocab->arg_value_start_id},
         {"</arg_value>",           vocab->arg_value_end_id},
         {"｜DSML｜",                vocab->dsml_id},
-        /* Qwen3.5 turn markers.  The rendered template is tokenized with this
-         * lookup, so these must map to single ids. */
-        {"<|im_start|>",           vocab->im_start_id},
-        {"<|im_end|>",             vocab->im_end_id},
-        {"<|endoftext|>",          vocab->bos_id},
+        /* Qwen3.5 turn markers.  Family-gated on purpose: for the DS4 and GLM
+         * families these strings are ordinary text, and matching them here
+         * would rewrite their token streams -- <|endoftext|> would become GLM's
+         * <sop>, since it is mapped to bos_id.  The chat template is only
+         * rendered for this family, so the markers are only meaningful here. */
+        {"<|im_start|>", DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35MOE ? vocab->im_start_id : -1},
+        {"<|im_end|>",   DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35MOE ? vocab->im_end_id : -1},
+        {"<|endoftext|>", DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35MOE ? vocab->bos_id : -1},
     };
 
     for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
