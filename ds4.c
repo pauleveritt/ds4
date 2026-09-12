@@ -546,7 +546,6 @@ typedef struct {
     uint32_t n_gdn_inner;         /* qwen35moe.ssm.inner_size     */
     uint32_t n_gdn_conv;          /* qwen35moe.ssm.conv_kernel    */
     uint32_t n_full_attn_interval;
-    bool     qwen35moe_dense_full_attn;
     float rms_eps;
     float hc_eps;
     float expert_weight_scale;
@@ -5074,10 +5073,36 @@ static bool weights_glm_dsa_layer_has_required(const ds4_layer_weights *l, uint3
     return true;
 }
 
+static bool weights_qwen35moe_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
+    if (!l->attn_norm || !l->ffn_norm ||
+        !l->ffn_gate_inp || !l->ffn_gate_inp_shexp ||
+        !l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps ||
+        !l->ffn_gate_shexp || !l->ffn_up_shexp || !l->ffn_down_shexp) {
+        return false;
+    }
+    if (ds4_qwen35moe_layer_is_linear(il)) {
+        return l->gdn_qkv && l->gdn_conv1d && l->gdn_alpha && l->gdn_beta &&
+               l->gdn_a_log && l->gdn_dt_bias && l->gdn_norm && l->gdn_out &&
+               l->gdn_z;
+    }
+    if (!l->attn_q || !l->attn_k || !l->attn_v || !l->attn_output ||
+        !l->attn_q_norm || !l->attn_k_norm) {
+        return false;
+    }
+    if (DS4_N_NEXTN_PREDICT != 0 && il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER) {
+        return l->nextn_eh_proj && l->nextn_enorm && l->nextn_hnorm &&
+               l->nextn_shared_head_norm;
+    }
+    return true;
+}
+
 static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
     if (!l) return false;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return weights_glm_dsa_layer_has_required(l, il);
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35MOE) {
+        return weights_qwen35moe_layer_has_required(l, il);
     }
     if (!l->hc_attn_fn ||
         !l->hc_attn_scale ||
@@ -5307,22 +5332,105 @@ static void weights_validate_glm_dsa_layout(
 
 /* Shape validation for the Ornith / Qwen3.5-MoE layout.
  *
- * Weight matrices are checked by shape against the file's own quant type, which
- * is how the engine validates routed-expert stacks; norms, the delta-rule
- * parameters and the depthwise conv are checked as F32 because they are read
- * as F32 by the ops that consume them.
+ * Weight matrices are checked by shape against the file's own quant type.  That
+ * is *not* how the engine validates routed-expert stacks (which type-check
+ * against a routed-expert whitelist); it is a deliberate choice here, because
+ * this architecture's quant mix is the file's business and inventing a
+ * whitelist before the kernels exist would be a guess.
  *
  * Dense non-expert weights are additionally reported when their type is outside
  * the engine's dense-quant whitelist.  That report is deliberately not fatal:
  * it names a real, known gap between this port and the loader rather than
  * letting it surface later as an unexplained failure in a matmul path. */
+/* Dense non-expert weights whose quant type is outside the engine's dense-quant
+ * whitelist.  Accumulated and reported once at the end of the walk: the count
+ * and the per-tensor-family breakdown are the numbers that matter, and one
+ * stderr line per tensor buries them. */
+typedef struct {
+    char     suffix[48];
+    char     type[16];
+    uint32_t count;
+} qwen35moe_gap_kind;
+
+#define QWEN35MOE_GAP_MAX_KINDS 8
+static qwen35moe_gap_kind g_qwen35moe_gap_kinds[QWEN35MOE_GAP_MAX_KINDS];
+static uint32_t          g_qwen35moe_gap_nkinds;
+static uint32_t          g_qwen35moe_gap_total;
+
+/* "blk.12.attn_v.weight" -> "attn_v.weight"; names without a block prefix are
+ * returned unchanged. */
+static const char *qwen35moe_tensor_suffix(const ds4_tensor *t) {
+    static char buf[48];
+    uint64_t first_dot = UINT64_MAX;
+    uint64_t second_dot = UINT64_MAX;
+    for (uint64_t i = 0; i < t->name.len; i++) {
+        if (t->name.ptr[i] != '.') continue;
+        if (first_dot == UINT64_MAX) {
+            first_dot = i;
+        } else {
+            second_dot = i;
+            break;
+        }
+    }
+    const char *start = t->name.ptr;
+    uint64_t    len   = t->name.len;
+    if (second_dot != UINT64_MAX && second_dot + 1u < t->name.len) {
+        start = t->name.ptr + second_dot + 1u;
+        len   = t->name.len - second_dot - 1u;
+    }
+    if (len >= sizeof(buf)) len = sizeof(buf) - 1u;
+    memcpy(buf, start, (size_t)len);
+    buf[len] = '\0';
+    return buf;
+}
+
 static void qwen35moe_report_unquantizable(const ds4_tensor *t) {
     if (!t) return;
     if (tensor_type_is_dense_quant(t->type)) return;
+
+    g_qwen35moe_gap_total++;
+    const char *suffix = qwen35moe_tensor_suffix(t);
+    const char *type   = tensor_type_name(t->type);
+    for (uint32_t i = 0; i < g_qwen35moe_gap_nkinds; i++) {
+        if (strcmp(g_qwen35moe_gap_kinds[i].suffix, suffix) == 0 &&
+            strcmp(g_qwen35moe_gap_kinds[i].type, type) == 0) {
+            g_qwen35moe_gap_kinds[i].count++;
+            return;
+        }
+    }
+    if (g_qwen35moe_gap_nkinds < QWEN35MOE_GAP_MAX_KINDS) {
+        qwen35moe_gap_kind *k = &g_qwen35moe_gap_kinds[g_qwen35moe_gap_nkinds++];
+        snprintf(k->suffix, sizeof(k->suffix), "%s", suffix);
+        snprintf(k->type, sizeof(k->type), "%s", type);
+        k->count = 1;
+    }
+}
+
+static void qwen35moe_gap_report_flush(void) {
+    if (g_qwen35moe_gap_total == 0) return;
     fprintf(stderr,
-            "ds4: qwen35moe gap: dense weight %.*s has type %s; the dense-quant "
-            "paths accept only q8_0, q4_K, or q4_0\n",
-            (int)t->name.len, t->name.ptr, tensor_type_name(t->type));
+            "ds4: qwen35moe gap: %u dense weight(s) outside the dense-quant "
+            "whitelist (q8_0, q4_K, q4_0):",
+            g_qwen35moe_gap_total);
+    for (uint32_t i = 0; i < g_qwen35moe_gap_nkinds; i++) {
+        fprintf(stderr, " %s %s x%u",
+                g_qwen35moe_gap_kinds[i].suffix,
+                g_qwen35moe_gap_kinds[i].type,
+                g_qwen35moe_gap_kinds[i].count);
+    }
+    if (g_qwen35moe_gap_total > 0) {
+        uint32_t accounted = 0;
+        for (uint32_t i = 0; i < g_qwen35moe_gap_nkinds; i++) {
+            accounted += g_qwen35moe_gap_kinds[i].count;
+        }
+        if (accounted != g_qwen35moe_gap_total) {
+            fprintf(stderr, " (and %u more)", g_qwen35moe_gap_total - accounted);
+        }
+    }
+    fputc('\n', stderr);
+
+    g_qwen35moe_gap_total  = 0;
+    g_qwen35moe_gap_nkinds = 0;
 }
 
 static void weights_validate_qwen35moe_layout(
@@ -5337,6 +5445,10 @@ static void weights_validate_qwen35moe_layout(
     const uint64_t q_dim     = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t kv_dim    = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     const uint64_t q_gate_dim = 2u * q_dim;   /* q_proj emits query and gate */
+
+    if ((uint64_t)DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_VALUE_DIM != DS4_N_GDN_INNER) {
+        ds4_die("qwen35moe: ssm.inner_size does not equal value heads x value head dim");
+    }
 
     if (!w) ds4_die("internal error: missing weights while validating layout");
     if (layer_start >= DS4_N_LAYER) ds4_die("invalid first layer in weight layout validation");
@@ -5356,24 +5468,35 @@ static void weights_validate_qwen35moe_layout(
     if (weights_have_output_head(w)) {
         tensor_expect_layout(w->output_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
         tensor_expect_shape(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+        qwen35moe_report_unquantizable(w->output);
     }
 
-    for (uint32_t il = layer_start; il <= layer_end; il++) {
+    /* The MTP block sits above layer_end (the executable range) but is bound by
+     * weights_bind when the full model is loaded.  Extend the walk over any
+     * bound block above it: without this the MTP tensors are bound and never
+     * checked, which is how a transposed assertion survived the first run of
+     * this validator. */
+    uint32_t validate_end = layer_end;
+    while (validate_end + 1u < DS4_N_LAYER && w->layer[validate_end + 1u].attn_norm) {
+        validate_end++;
+    }
+
+    for (uint32_t il = layer_start; il <= validate_end; il++) {
         const ds4_layer_weights *l = &w->layer[il];
 
         tensor_expect_layout(l->attn_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
         tensor_expect_layout(l->ffn_norm,  DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
 
         if (ds4_qwen35moe_layer_is_linear(il)) {
-            tensor_expect_layout(l->gdn_qkv,     l->gdn_qkv->type,     2, DS4_N_EMBD, conv_dim, 0);
+            tensor_expect_shape(l->gdn_qkv,     2, DS4_N_EMBD, conv_dim, 0);
             tensor_expect_layout(l->gdn_conv1d,  DS4_TENSOR_F32,       2, DS4_N_GDN_CONV, conv_dim, 0);
-            tensor_expect_layout(l->gdn_alpha,   l->gdn_alpha->type,   2, DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD, 0);
-            tensor_expect_layout(l->gdn_beta,    l->gdn_beta->type,    2, DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD, 0);
+            tensor_expect_shape(l->gdn_alpha,   2, DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD, 0);
+            tensor_expect_shape(l->gdn_beta,    2, DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD, 0);
             tensor_expect_layout(l->gdn_a_log,   DS4_TENSOR_F32,       1, DS4_N_GDN_VALUE_HEAD, 0, 0);
             tensor_expect_layout(l->gdn_dt_bias, DS4_TENSOR_F32,       1, DS4_N_GDN_VALUE_HEAD, 0, 0);
             tensor_expect_layout(l->gdn_norm,    DS4_TENSOR_F32,       1, DS4_N_GDN_VALUE_DIM, 0, 0);
-            tensor_expect_layout(l->gdn_out,     l->gdn_out->type,     2, value_dim, DS4_N_EMBD, 0);
-            tensor_expect_layout(l->gdn_z,       l->gdn_z->type,       2, DS4_N_EMBD, value_dim, 0);
+            tensor_expect_shape(l->gdn_out,     2, value_dim, DS4_N_EMBD, 0);
+            tensor_expect_shape(l->gdn_z,       2, DS4_N_EMBD, value_dim, 0);
 
             qwen35moe_report_unquantizable(l->gdn_qkv);
             qwen35moe_report_unquantizable(l->gdn_out);
@@ -5383,9 +5506,9 @@ static void weights_validate_qwen35moe_layout(
         } else {
             /* attn_q carries the query plus the sigmoid output gate (config
              * attn_output_gate = true), so it is twice the query projection. */
-            tensor_expect_layout(l->attn_q,      l->attn_q->type, 2, DS4_N_EMBD, q_gate_dim, 0);
-            tensor_expect_layout(l->attn_k,      l->attn_k->type, 2, DS4_N_EMBD, kv_dim, 0);
-            tensor_expect_layout(l->attn_v,      l->attn_v->type, 2, DS4_N_EMBD, kv_dim, 0);
+            tensor_expect_shape(l->attn_q,      2, DS4_N_EMBD, q_gate_dim, 0);
+            tensor_expect_shape(l->attn_k,      2, DS4_N_EMBD, kv_dim, 0);
+            tensor_expect_shape(l->attn_v,      2, DS4_N_EMBD, kv_dim, 0);
             tensor_expect_shape(l->attn_output, 2, q_dim, DS4_N_EMBD, 0);
             tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
             tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
@@ -5410,15 +5533,23 @@ static void weights_validate_qwen35moe_layout(
                              DS4_N_EMBD, DS4_N_FF_EXP, 0);
         tensor_expect_shape(l->ffn_down_shexp, 2,
                              DS4_N_FF_EXP, DS4_N_EMBD, 0);
+        qwen35moe_report_unquantizable(l->ffn_gate_shexp);
+        qwen35moe_report_unquantizable(l->ffn_up_shexp);
+        qwen35moe_report_unquantizable(l->ffn_down_shexp);
 
         if (DS4_N_NEXTN_PREDICT != 0 && il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER) {
+            /* [2*n_embd, n_embd]: concat(embed, h) in, n_embd out.  This is the
+             * GLM nextn convention at the same shape; the first version of this
+             * assertion had it backwards and never ran. */
             tensor_expect_shape(l->nextn_eh_proj, 2,
-                                 DS4_N_EMBD, 2u * DS4_N_EMBD, 0);
+                                 2u * DS4_N_EMBD, DS4_N_EMBD, 0);
             tensor_expect_layout(l->nextn_enorm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
             tensor_expect_layout(l->nextn_hnorm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
             tensor_expect_layout(l->nextn_shared_head_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
         }
     }
+
+    qwen35moe_gap_report_flush();
 }
 
 static void weights_validate_layout(
@@ -6382,6 +6513,12 @@ static void config_expect_mrope_sections(const ds4_model *m) {
             exit(1);
         }
     }
+
+    /* Each section counts rotary *pairs*, so the rotary width is twice their
+     * sum; pin that against rope.dimension_count (2 x 32 = 64 here). */
+    if (2u * (expected[0] + expected[1] + expected[2] + expected[3]) != DS4_N_ROT) {
+        ds4_die("qwen35moe: mRoPE sections do not describe rope.dimension_count");
+    }
 }
 
 static void config_validate_qwen35moe_model(const ds4_model *m) {
@@ -6440,11 +6577,13 @@ static void config_validate_qwen35moe_model(const ds4_model *m) {
 
     /* Gate the tokenizer here rather than at first use: the shared BPE path
      * would otherwise fall through to the DeepSeek pre-tokenizer and emit a
-     * plausible-looking but wrong token stream. */
+     * plausible-looking but wrong token stream.  The key is required, not
+     * optional: a file that omits it cannot be tokenized safely either. */
     ds4_str pre = {0};
-    if (model_get_string(m, "tokenizer.ggml.pre", &pre)) {
-        config_expect_string("tokenizer.ggml.pre", pre, "qwen35");
+    if (!model_get_string(m, "tokenizer.ggml.pre", &pre)) {
+        ds4_die("qwen35moe: tokenizer.ggml.pre is required");
     }
+    config_expect_string("tokenizer.ggml.pre", pre, "qwen35");
 }
 
 static void config_validate_model(const ds4_model *m) {
@@ -39045,7 +39184,7 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
          * DeepSeek pre-tokenizer, and running it on a Qwen vocabulary produces
          * fluent-looking but wrong tokens.  The Qwen `qwen35` pre-tokenizer is
          * a separate piece of the port. */
-        ds4_die("ds4: the qwen35 pre-tokenizer is not implemented; "
+        ds4_die("the qwen35 pre-tokenizer is not implemented; "
                 "tokenization would be silently wrong");
     }
 
@@ -39137,6 +39276,16 @@ static int vocab_lookup_optional(const ds4_vocab *vocab, const char *text) {
 
 static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     memset(vocab, 0, sizeof(*vocab));
+
+    /* Reachable refusal.  Without it this family dies further down with
+     * "required tokenizer token is missing: <｜begin▁of▁sentence｜>", which
+     * names a DeepSeek token the user cannot supply and hides the real gap.
+     * The guard in bpe_tokenize_text is unreachable until this is ported. */
+    if (ds4_model_is_qwen35moe()) {
+        ds4_die("the qwen35 tokenizer is not implemented, so this model "
+                "cannot be tokenized yet (the vocabulary loader requires "
+                "DeepSeek special tokens)");
+    }
 
     ds4_array_ref tokens;
     ds4_array_ref merges;
@@ -54709,7 +54858,8 @@ static void ds4_session_glm_note_dense_cache(ds4_session *s,
 #endif
 
 static uint32_t ds4_model_normal_layer_count(void) {
-    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA &&
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN35MOE) {
         return (uint32_t)DS4_N_LAYER;
     }
     if (DS4_N_LAYER <= DS4_N_NEXTN_PREDICT || DS4_N_LAYER > DS4_MAX_LAYER) {
