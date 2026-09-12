@@ -39697,26 +39697,31 @@ static void qwen35_chat_buf_append(qwen35_chat_buf *b, const char *s) {
 /* Jinja applies |trim to message content, so leading and trailing whitespace
  * changes the token stream.  Uses the engine's Unicode whitespace predicate so
  * that non-ASCII padding is stripped the way str.strip() strips it. */
-static void qwen35_chat_buf_append_trimmed(qwen35_chat_buf *b, const char *text) {
-    if (!text) return;
-    const uint64_t len = strlen(text);
-    uint64_t first = len;
+static void qwen35_chat_buf_append_trimmed_span(qwen35_chat_buf *b, const char *text,
+                                                size_t span) {
+    if (!text || span == 0) return;
+    uint64_t first = span;
     uint64_t last_end = 0;
-    for (uint64_t pos = 0; pos < len; ) {
+    for (uint64_t pos = 0; pos < span; ) {
         uint64_t next = pos;
-        const uint32_t cp = utf8_peek_one(text, len, pos, &next);
+        const uint32_t cp = utf8_peek_one(text, span, pos, &next);
         if (!glm4_unicode_whitespace(cp)) {
-            if (first == len) first = pos;
+            if (first == span) first = pos;
             last_end = next;
         }
         pos = next;
     }
-    if (first == len) return;   /* empty, or entirely whitespace */
+    if (first == span) return;   /* empty, or entirely whitespace */
     const size_t n = (size_t)(last_end - first);
     qwen35_chat_buf_reserve(b, n);
     memcpy(b->ptr + b->len, text + first, n);
     b->len += n;
     b->ptr[b->len] = '\0';
+}
+
+static void qwen35_chat_buf_append_trimmed(qwen35_chat_buf *b, const char *text) {
+    if (!text) return;
+    qwen35_chat_buf_append_trimmed_span(b, text, (size_t)strlen(text));
 }
 
 /* Render the template text for one turn.  Separated from tokenization so the
@@ -39739,6 +39744,74 @@ static void qwen35_render_chat(const char *system, const char *prompt, bool thin
     } else {
         qwen35_chat_buf_append(b, "<think>\n\n</think>\n\n");
     }
+}
+
+/* Render one turn of the template.  Per-message, which is what ds4_chat_append_message
+ * needs; the template's two look-ahead behaviours (merging consecutive system
+ * messages, and merging consecutive tool messages into one user turn) cannot be
+ * reproduced one call at a time and are called out where they apply. */
+static void qwen35_render_turn(qwen35_chat_buf *b, const char *role,
+                               const char *content) {
+    if (!role) role = "user";
+    if (!content) content = "";
+
+    if (!strcmp(role, "assistant")) {
+        /* The template: reasoning_content comes from the text before the FIRST
+         * </think>, the answer from the text after the LAST one
+         * (content.split('</think>')[0] and [-1]), each with adjacent newlines
+         * removed and the reasoning then |trim'd. */
+        const char *first_close = strstr(content, "</think>");
+        const char *last_close = NULL;
+        for (const char *p = content; (p = strstr(p, "</think>")) != NULL; p += 8) {
+            last_close = p;
+        }
+
+        qwen35_chat_buf_append(b, "<|im_start|>assistant\n<think>\n");
+        if (first_close) {
+            size_t before = (size_t)(first_close - content);
+            while (before > 0 && content[before - 1u] == '\n') before--;
+
+            /* Text after the last '<think>' inside the reasoning span, if any. */
+            const char *reason = content;
+            size_t reason_len = before;
+            for (size_t i = 0; i + 7u <= before; i++) {
+                if (!strncmp(content + i, "<think>", 7)) {
+                    reason = content + i + 7u;
+                    reason_len = before - (i + 7u);
+                }
+            }
+            while (reason_len > 0 && *reason == '\n') { reason++; reason_len--; }
+            qwen35_chat_buf_append_trimmed_span(b, reason, reason_len);
+        }
+        qwen35_chat_buf_append(b, "\n</think>\n\n");
+
+        if (last_close) {
+            const char *answer = last_close + 8u;
+            while (*answer == '\n') answer++;
+            qwen35_chat_buf_append_trimmed(b, answer);
+        } else {
+            qwen35_chat_buf_append_trimmed(b, content);
+        }
+        qwen35_chat_buf_append(b, "<|im_end|>\n");
+        return;
+    }
+
+    if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+        /* One tool message.  Consecutive tool messages are merged into a single
+         * <|im_start|>user turn by the template; a per-message API cannot see
+         * the next message, so that merge is not reproduced here. */
+        qwen35_chat_buf_append(b, "<|im_start|>user\n<tool_response>\n");
+        qwen35_chat_buf_append_trimmed(b, content);
+        qwen35_chat_buf_append(b, "\n</tool_response><|im_end|>\n");
+        return;
+    }
+
+    /* system, developer, and everything else render as their own turn. */
+    qwen35_chat_buf_append(b, "<|im_start|>");
+    qwen35_chat_buf_append(b, role);
+    qwen35_chat_buf_append(b, "\n");
+    qwen35_chat_buf_append_trimmed(b, content);
+    qwen35_chat_buf_append(b, "<|im_end|>\n");
 }
 
 static void encode_chat_prompt_qwen35(
@@ -39945,6 +40018,21 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     ds4_vocab *vocab = &e->vocab;
     if (!role) role = "user";
     if (!content) content = "";
+
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35MOE) {
+        if (vocab->im_start_id < 0 || vocab->im_end_id < 0) {
+            ds4_die("this tokenizer does not provide the Qwen <|im_start|>/<|im_end|> turn markers");
+        }
+        qwen35_chat_buf b;
+        b.cap = 256u;
+        b.len = 0;
+        b.ptr = xmalloc(b.cap);
+        b.ptr[0] = '\0';
+        qwen35_render_turn(&b, role, content);
+        tokenize_rendered_chat_vocab(vocab, b.ptr, tokens);
+        free(b.ptr);
+        return;
+    }
 
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (!strcmp(role, "system") || !strcmp(role, "developer")) {
@@ -73673,6 +73761,19 @@ void ds4_test_qwen35_render_chat(const char *system, const char *prompt, bool th
     b.ptr = xmalloc(b.cap);
     b.ptr[0] = '\0';
     qwen35_render_chat(system, prompt, thinking, &b);
+    snprintf(out, cap, "%s", b.ptr);
+    free(b.ptr);
+}
+
+/* Render one message turn, for comparison against the template's own rules. */
+void ds4_test_qwen35_render_turn(const char *role, const char *content,
+                                 char *out, size_t cap) {
+    qwen35_chat_buf b;
+    b.cap = 256u;
+    b.len = 0;
+    b.ptr = xmalloc(b.cap);
+    b.ptr[0] = '\0';
+    qwen35_render_turn(&b, role, content);
     snprintf(out, cap, "%s", b.ptr);
     free(b.ptr);
 }

@@ -32,6 +32,8 @@ void     ds4_test_qwen35_gap_add(uint32_t type);
 uint32_t ds4_test_qwen35_gap_total(void);
 void     ds4_test_qwen35_render_chat(const char *system, const char *prompt,
                                      bool thinking, char *out, size_t cap);
+void     ds4_test_qwen35_render_turn(const char *role, const char *content,
+                                     char *out, size_t cap);
 
 /* GGML tensor type ids the quant-gap decision turns on. */
 #define T_F32   0u
@@ -278,13 +280,66 @@ static void test_chat_rendering(void) {
           "all-whitespace prompt becomes an empty turn");
 }
 
-int main(void) {
+static void test_turn_rendering(void) {
+    /* Per-turn rendering for the roles the chat API can express.  The full
+     * multi-turn sequence is diffed against the template by msgcmp.py; these
+     * are the invariants that must hold without Jinja present. */
+    char out[4096];
+
+    ds4_test_qwen35_render_turn("user", "hi", out, sizeof(out));
+    check(strcmp(out, "<|im_start|>user\nhi<|im_end|>\n") == 0,
+          "user turn");
+
+    ds4_test_qwen35_render_turn("system", "be terse", out, sizeof(out));
+    check(strcmp(out, "<|im_start|>system\nbe terse<|im_end|>\n") == 0,
+          "system turn");
+
+    /* Assistant with no reasoning: the template opens and closes an empty
+     * <think> block before the answer. */
+    ds4_test_qwen35_render_turn("assistant", "the answer", out, sizeof(out));
+    check(strcmp(out,
+                 "<|im_start|>assistant\n<think>\n\n</think>\n\nthe answer"
+                 "<|im_end|>\n") == 0,
+          "assistant turn without reasoning");
+
+    /* Assistant carrying its reasoning: the template splits on the last
+     * </think> and drops the newlines adjacent to it. */
+    ds4_test_qwen35_render_turn("assistant",
+                                "<think>\nwhy\n</think>\nthe answer",
+                                out, sizeof(out));
+    check(strcmp(out,
+                 "<|im_start|>assistant\n<think>\nwhy\n</think>\n\nthe answer"
+                 "<|im_end|>\n") == 0,
+          "assistant turn with reasoning is split on </think>");
+
+    ds4_test_qwen35_render_turn("tool", "42", out, sizeof(out));
+    check(strcmp(out,
+                 "<|im_start|>user\n<tool_response>\n42\n</tool_response>"
+                 "<|im_end|>\n") == 0,
+          "tool turn renders as a user turn with a tool_response block");
+
+    ds4_test_qwen35_render_turn("user", "  padded  ", out, sizeof(out));
+    check(strcmp(out, "<|im_start|>user\npadded<|im_end|>\n") == 0,
+          "turn content is trimmed");
+}
+
+int main(int argc, char **argv) {
+    /* Render one turn and print it verbatim, so an external harness can diff it
+     * against the GGUF's own Jinja template.  Used by msgcmp.py. */
+    if (argc == 4 && !strcmp(argv[1], "--render")) {
+        char out[8192];
+        ds4_test_qwen35_render_turn(argv[2], argv[3], out, sizeof(out));
+        fputs(out, stdout);
+        return 0;
+    }
+
     test_layer_typing();
     test_unicode_categories();
     test_piece_splitting();
     test_validation_coverage();
     test_quant_gap_report();
     test_chat_rendering();
+    test_turn_rendering();
 
     if (failures) {
         printf("\n%d qwen35 check(s) failed\n", failures);
