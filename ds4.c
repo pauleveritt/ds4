@@ -540,7 +540,12 @@ typedef struct {
      * KDA fields above: the value side has twice the key head count, and the
      * gating tensors differ, so overloading the KDA fields would be a trap. */
     uint32_t n_gdn_key_head;      /* qwen35moe.ssm.group_count     */
-    uint32_t n_gdn_value_head;    /* qwen35moe.ssm.time_step_rank */
+    /* Validated against qwen35moe.ssm.time_step_rank.  Those coincide for this
+     * checkpoint (32 = 32 value heads), but they are different quantities: the
+     * delta rule's per-channel dt/A rank is not the head count, and Qwen3-Next
+     * already diverges (time_step_rank 256 against 32 value heads).  Split this
+     * into two fields before a second Qwen3.5-MoE model is added. */
+    uint32_t n_gdn_value_head;
     uint32_t n_gdn_head_dim;      /* qwen35moe.ssm.state_size     */
     uint32_t n_gdn_value_dim;     /* per value head               */
     uint32_t n_gdn_inner;         /* qwen35moe.ssm.inner_size     */
@@ -6565,6 +6570,8 @@ static void config_validate_qwen35moe_model(const ds4_model *m) {
 
     config_expect_u32("ssm.group_count", required_u32(m, "qwen35moe.ssm.group_count"),
                       DS4_N_GDN_KEY_HEAD);
+    /* time_step_rank is the delta rule's dt/A rank, not the value head count;
+     * they are equal for this checkpoint only.  See the field comment. */
     config_expect_u32("ssm.time_step_rank", required_u32(m, "qwen35moe.ssm.time_step_rank"),
                       DS4_N_GDN_VALUE_HEAD);
     config_expect_u32("ssm.state_size", required_u32(m, "qwen35moe.ssm.state_size"),
