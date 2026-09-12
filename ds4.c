@@ -38390,6 +38390,11 @@ struct ds4_vocab {
     int arg_value_start_id;
     int arg_value_end_id;
     int dsml_id;
+    /* Qwen3.5-MoE turn markers.  Distinct from system/user/assistant_id, which
+     * for this family all hold <|im_start|>: the role name is literal text that
+     * follows the marker in the rendered template, not a token of its own. */
+    int im_start_id;
+    int im_end_id;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
 };
@@ -39556,6 +39561,8 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         vocab->arg_value_start_id = -1;
         vocab->arg_value_end_id = -1;
         vocab->dsml_id = -1;
+        vocab->im_start_id = vocab_lookup_optional(vocab, "<|im_start|>");
+        vocab->im_end_id   = vocab_lookup_optional(vocab, "<|im_end|>");
         return;
     }
 
@@ -39616,7 +39623,11 @@ static void vocab_free(ds4_vocab *vocab) {
  * marker, and either <think> or </think> depending on the requested mode.  Max
  * thinking is only a prompt prefix: the model still enters through <think>. */
 static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
-    token_vec_push(out, vocab->bos_id);
+    /* Ornith sets tokenizer.ggml.add_bos_token = false and its template emits
+     * no BOS, so the prompt must not start with one. */
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN35MOE) {
+        token_vec_push(out, vocab->bos_id);
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && vocab->sop_id >= 0)
         token_vec_push(out, vocab->sop_id);
 }
@@ -39633,6 +39644,10 @@ const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
 static void chat_push_think_prefix(const ds4_vocab *vocab,
                                    ds4_think_mode   think_mode,
                                    token_vec       *out) {
+    /* The Qwen3.5 template encodes thinking with its own <think> markers, not
+     * with a reasoning-effort prefix. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35MOE) return;
+
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         const char *effort = ds4_glm_reasoning_effort_text(think_mode);
         if (effort) {
@@ -39644,12 +39659,120 @@ static void chat_push_think_prefix(const ds4_vocab *vocab,
     }
 }
 
+/* ---- Ornith / Qwen3.5-MoE chat encoding --------------------------------
+ *
+ * The template lives in the GGUF as tokenizer.chat_template and is *rendered*
+ * here, then tokenized with special-token parsing, rather than emitted marker
+ * by marker.  Two reasons: the role name after <|im_start|> is literal text
+ * rather than a token of its own, and rendering first means the marker lookup
+ * is the same code path a pre-rendered prompt takes.  The rendered bytes are
+ * verified against the GGUF's own template run through Jinja and tokenized by
+ * llama.cpp.
+ */
+
+typedef struct {
+    char  *ptr;
+    size_t len;
+    size_t cap;
+} qwen35_chat_buf;
+
+/* Defined below, after the marker-aware tokenizer it depends on. */
+static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
+                                         token_vec *out);
+
+static void qwen35_chat_buf_reserve(qwen35_chat_buf *b, size_t extra) {
+    if (b->len + extra + 1u <= b->cap) return;
+    while (b->len + extra + 1u > b->cap) b->cap *= 2u;
+    b->ptr = xrealloc(b->ptr, b->cap);
+}
+
+static void qwen35_chat_buf_append(qwen35_chat_buf *b, const char *s) {
+    const size_t n = strlen(s);
+    qwen35_chat_buf_reserve(b, n);
+    memcpy(b->ptr + b->len, s, n);
+    b->len += n;
+    b->ptr[b->len] = '\0';
+}
+
+/* Jinja applies |trim to message content, so leading and trailing whitespace
+ * changes the token stream.  Uses the engine's Unicode whitespace predicate so
+ * that non-ASCII padding is stripped the way str.strip() strips it. */
+static void qwen35_chat_buf_append_trimmed(qwen35_chat_buf *b, const char *text) {
+    if (!text) return;
+    const uint64_t len = strlen(text);
+    uint64_t first = len;
+    uint64_t last_end = 0;
+    for (uint64_t pos = 0; pos < len; ) {
+        uint64_t next = pos;
+        const uint32_t cp = utf8_peek_one(text, len, pos, &next);
+        if (!glm4_unicode_whitespace(cp)) {
+            if (first == len) first = pos;
+            last_end = next;
+        }
+        pos = next;
+    }
+    if (first == len) return;   /* empty, or entirely whitespace */
+    const size_t n = (size_t)(last_end - first);
+    qwen35_chat_buf_reserve(b, n);
+    memcpy(b->ptr + b->len, text + first, n);
+    b->len += n;
+    b->ptr[b->len] = '\0';
+}
+
+/* Render the template text for one turn.  Separated from tokenization so the
+ * rendering -- which is where the template's decisions live -- is testable
+ * without a vocabulary.  `thinking` is the template's enable_thinking: when
+ * false the template pre-closes an empty <think> block. */
+static void qwen35_render_chat(const char *system, const char *prompt, bool thinking,
+                               qwen35_chat_buf *b) {
+    if (system && system[0]) {
+        qwen35_chat_buf_append(b, "<|im_start|>system\n");
+        qwen35_chat_buf_append_trimmed(b, system);
+        qwen35_chat_buf_append(b, "<|im_end|>\n");
+    }
+    qwen35_chat_buf_append(b, "<|im_start|>user\n");
+    qwen35_chat_buf_append_trimmed(b, prompt);
+    qwen35_chat_buf_append(b, "<|im_end|>\n");
+    qwen35_chat_buf_append(b, "<|im_start|>assistant\n");
+    if (thinking) {
+        qwen35_chat_buf_append(b, "<think>\n");
+    } else {
+        qwen35_chat_buf_append(b, "<think>\n\n</think>\n\n");
+    }
+}
+
+static void encode_chat_prompt_qwen35(
+        const ds4_vocab *vocab,
+        const char      *system,
+        const char      *prompt,
+        ds4_think_mode   think_mode,
+        token_vec       *out) {
+    if (vocab->im_start_id < 0 || vocab->im_end_id < 0) {
+        ds4_die("this tokenizer does not provide the Qwen <|im_start|>/<|im_end|> turn markers");
+    }
+
+    qwen35_chat_buf b;
+    b.cap = 256u;
+    b.len = 0;
+    b.ptr = xmalloc(b.cap);
+    b.ptr[0] = '\0';
+
+    qwen35_render_chat(system, prompt, ds4_think_mode_enabled(think_mode), &b);
+    tokenize_rendered_chat_vocab(vocab, b.ptr, out);
+    free(b.ptr);
+}
+
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN35MOE) {
+        encode_chat_prompt_qwen35(vocab, system, prompt, think_mode, out);
+        return;
+    }
+
     const bool need_think_start =
         ds4_think_mode_enabled(think_mode) ||
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
@@ -39712,6 +39835,11 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         {"<arg_value>",            vocab->arg_value_start_id},
         {"</arg_value>",           vocab->arg_value_end_id},
         {"｜DSML｜",                vocab->dsml_id},
+        /* Qwen3.5 turn markers.  The rendered template is tokenized with this
+         * lookup, so these must map to single ids. */
+        {"<|im_start|>",           vocab->im_start_id},
+        {"<|im_end|>",             vocab->im_end_id},
+        {"<|endoftext|>",          vocab->bos_id},
     };
 
     for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
@@ -73530,6 +73658,20 @@ void ds4_test_qwen35_gap_add(uint32_t type) {
 
 uint32_t ds4_test_qwen35_gap_total(void) {
     return g_qwen35moe_gap_total;
+}
+
+/* Render a chat turn into `out` for comparison against the GGUF's own Jinja
+ * template.  Pure text: no vocabulary, no model. */
+void ds4_test_qwen35_render_chat(const char *system, const char *prompt, bool thinking,
+                                 char *out, size_t cap) {
+    qwen35_chat_buf b;
+    b.cap = 256u;
+    b.len = 0;
+    b.ptr = xmalloc(b.cap);
+    b.ptr[0] = '\0';
+    qwen35_render_chat(system, prompt, thinking, &b);
+    snprintf(out, cap, "%s", b.ptr);
+    free(b.ptr);
 }
 #endif
 

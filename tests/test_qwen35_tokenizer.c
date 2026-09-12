@@ -30,6 +30,8 @@ bool     ds4_test_qwen35_dense_quant(uint32_t type);
 void     ds4_test_qwen35_gap_reset(void);
 void     ds4_test_qwen35_gap_add(uint32_t type);
 uint32_t ds4_test_qwen35_gap_total(void);
+void     ds4_test_qwen35_render_chat(const char *system, const char *prompt,
+                                     bool thinking, char *out, size_t cap);
 
 /* GGML tensor type ids the quant-gap decision turns on. */
 #define T_F32   0u
@@ -232,12 +234,57 @@ static void test_quant_gap_report(void) {
     check_u32(ds4_test_qwen35_gap_total(), 0u, "reset clears the accumulator");
 }
 
+static void test_chat_rendering(void) {
+    /* Expectations are the GGUF's own template (tokenizer.chat_template),
+     * rendered.  The whole chat result is verified against Jinja + llama.cpp
+     * by an external harness; these are the invariants that must hold without
+     * either of those present. */
+    char out[1024];
+
+    ds4_test_qwen35_render_chat("", "hi", true, out, sizeof(out));
+    check(strcmp(out,
+                 "<|im_start|>user\nhi<|im_end|>\n"
+                 "<|im_start|>assistant\n<think>\n") == 0,
+          "no system prompt omits the system turn");
+
+    ds4_test_qwen35_render_chat("", "hi", false, out, sizeof(out));
+    check(strcmp(out,
+                 "<|im_start|>user\nhi<|im_end|>\n"
+                 "<|im_start|>assistant\n<think>\n\n</think>\n\n") == 0,
+          "disabled thinking pre-closes an empty think block");
+
+    ds4_test_qwen35_render_chat("sys", "hi", true, out, sizeof(out));
+    check(strcmp(out,
+                 "<|im_start|>system\nsys<|im_end|>\n"
+                 "<|im_start|>user\nhi<|im_end|>\n"
+                 "<|im_start|>assistant\n<think>\n") == 0,
+          "system turn is emitted before the user turn");
+
+    /* The template applies |trim to content, so padding must not survive. */
+    ds4_test_qwen35_render_chat("  sys  ", "  hi  ", true, out, sizeof(out));
+    check(strstr(out, "system\nsys<|im_end|>") != NULL,
+          "system content is trimmed");
+    check(strstr(out, "user\nhi<|im_end|>") != NULL,
+          "user content is trimmed");
+
+    /* Interior newlines are content and must be preserved. */
+    ds4_test_qwen35_render_chat("", "a\nb", true, out, sizeof(out));
+    check(strstr(out, "user\na\nb<|im_end|>") != NULL,
+          "interior newlines survive trimming");
+
+    /* An all-whitespace prompt renders as an empty user turn, not a space. */
+    ds4_test_qwen35_render_chat("", "   ", true, out, sizeof(out));
+    check(strstr(out, "user\n<|im_end|>") != NULL,
+          "all-whitespace prompt becomes an empty turn");
+}
+
 int main(void) {
     test_layer_typing();
     test_unicode_categories();
     test_piece_splitting();
     test_validation_coverage();
     test_quant_gap_report();
+    test_chat_rendering();
 
     if (failures) {
         printf("\n%d qwen35 check(s) failed\n", failures);
