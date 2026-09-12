@@ -73697,6 +73697,74 @@ uint64_t ds4_test_mixed_native_count(void) {
 }
 #endif
 
+/* =========================================================================
+ * Ornith / Qwen3.5-MoE expert routing.
+ *
+ * Reference (transformers, Qwen3_5MoeTopKRouter.forward):
+ *     logits = softmax(router_logits.to(float32), dim=-1)
+ *     top_value, top_index = topk(logits, k)
+ *     top_value /= top_value.sum(-1, keepdim=True)
+ *
+ * The softmax is over ALL experts and the selected k values are then
+ * renormalised -- not a softmax over the top k.  There is no expert bias and no
+ * scale factor: Qwen3.5 renormalises where the other families scale, which is
+ * why the preset's expert_weight_scale is documented as a placeholder and is
+ * deliberately unused here.
+ *
+ * Ordering matches torch.topk: descending probability, ties broken by the lower
+ * expert index.  Returns the number of experts written to indices/weights.
+ * ========================================================================= */
+static uint32_t qwen35_moe_route(const float *logits, uint32_t n_expert, uint32_t top_k,
+                                 uint32_t *indices, float *weights) {
+    if (n_expert == 0 || n_expert > DS4_MAX_EXPERT) {
+        ds4_die("qwen35 routing: expert count is out of range");
+    }
+    if (top_k == 0) return 0;
+    if (top_k > n_expert) top_k = n_expert;
+
+    float probs[DS4_MAX_EXPERT];
+
+    /* Max-subtracted softmax in float, as the reference casts to float32. */
+    float max_logit = logits[0];
+    for (uint32_t i = 1; i < n_expert; i++) {
+        if (logits[i] > max_logit) max_logit = logits[i];
+    }
+    double sum = 0.0;
+    for (uint32_t i = 0; i < n_expert; i++) {
+        probs[i] = (float)exp((double)logits[i] - (double)max_logit);
+        sum += probs[i];
+    }
+    if (!(sum > 0.0)) ds4_die("qwen35 routing: degenerate softmax");
+    for (uint32_t i = 0; i < n_expert; i++) probs[i] = (float)(probs[i] / sum);
+
+    /* k passes of selection sort.  Scanning in index order means an equal
+     * probability keeps the lower index, which is what torch.topk does. */
+    bool used[DS4_MAX_EXPERT] = { false };
+    for (uint32_t t = 0; t < top_k; t++) {
+        uint32_t best = UINT32_MAX;
+        for (uint32_t i = 0; i < n_expert; i++) {
+            if (used[i]) continue;
+            if (best == UINT32_MAX || probs[i] > probs[best]) best = i;
+        }
+        used[best] = true;
+        indices[t] = best;
+        weights[t] = probs[best];
+    }
+
+    double wsum = 0.0;
+    for (uint32_t t = 0; t < top_k; t++) wsum += weights[t];
+    if (!(wsum > 0.0)) ds4_die("qwen35 routing: selected weights sum to zero");
+    for (uint32_t t = 0; t < top_k; t++) weights[t] = (float)(weights[t] / wsum);
+    return top_k;
+}
+
+/* The shared expert is gated: sigmoid(dot(<ffn_gate_inp_shexp>, h)) * shexp(h).
+ * The engine's other families have an ungated shared expert, and this is the
+ * one tensor with no home in ds4_layer_weights for that reason. */
+static float qwen35_shared_expert_gate(float dot) {
+    return 1.0f / (1.0f + expf(-dot));
+}
+
 #ifdef DS4_TEST_HOOKS
 /* Pure qwen35 hooks: no model, no GPU, no I/O.  They exist because the GLM 5.3
  * review's Critical finding was a check that never ran: the layer-typing rule
@@ -73749,6 +73817,15 @@ void ds4_test_qwen35_gap_add(uint32_t type) {
 
 uint32_t ds4_test_qwen35_gap_total(void) {
     return g_qwen35moe_gap_total;
+}
+
+uint32_t ds4_test_qwen35_moe_route(const float *logits, uint32_t n_expert, uint32_t top_k,
+                                   uint32_t *indices, float *weights) {
+    return qwen35_moe_route(logits, n_expert, top_k, indices, weights);
+}
+
+float ds4_test_qwen35_shared_expert_gate(float dot) {
+    return qwen35_shared_expert_gate(dot);
 }
 
 /* Render a chat turn into `out` for comparison against the GGUF's own Jinja

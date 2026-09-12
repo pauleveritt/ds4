@@ -14,6 +14,8 @@
  *
  * Build/run: make tests/test_qwen35_tokenizer && ./tests/test_qwen35_tokenizer
  */
+#include <math.h>
+#include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -34,6 +36,9 @@ void     ds4_test_qwen35_render_chat(const char *system, const char *prompt,
                                      bool thinking, char *out, size_t cap);
 void     ds4_test_qwen35_render_turn(const char *role, const char *content,
                                      char *out, size_t cap);
+uint32_t ds4_test_qwen35_moe_route(const float *logits, uint32_t n_expert, uint32_t top_k,
+                                   uint32_t *indices, float *weights);
+float    ds4_test_qwen35_shared_expert_gate(float dot);
 
 /* GGML tensor type ids the quant-gap decision turns on. */
 #define T_F32   0u
@@ -323,6 +328,53 @@ static void test_turn_rendering(void) {
           "turn content is trimmed");
 }
 
+static void test_moe_routing(void) {
+    /* Reference is the template-independent router in transformers:
+     * softmax over all experts, top-k, renormalise.  routecmp.py checks this
+     * against a pure-Python reference on random logits; these are the cases
+     * that can be stated exactly. */
+    float logits[8];
+    uint32_t idx[8];
+    float w[8];
+
+    /* Uniform logits: every expert equal, so the top-k is the k lowest indices
+     * and the renormalised weights are exactly 1/k. */
+    for (int i = 0; i < 8; i++) logits[i] = 0.5f;
+    uint32_t n = ds4_test_qwen35_moe_route(logits, 8, 3, idx, w);
+    check_u32(n, 3u, "route returns k experts");
+    check(idx[0] == 0 && idx[1] == 1 && idx[2] == 2,
+          "uniform logits select the lowest indices in order");
+    for (int i = 0; i < 3; i++) {
+        check(fabsf(w[i] - 1.0f / 3.0f) < 1e-6f,
+              "uniform logits renormalise to 1/k");
+    }
+
+    /* A dominant expert takes most of the probability and comes first. */
+    for (int i = 0; i < 8; i++) logits[i] = 0.0f;
+    logits[5] = 10.0f;
+    logits[2] = 5.0f;
+    n = ds4_test_qwen35_moe_route(logits, 8, 2, idx, w);
+    check_u32(n, 2u, "route with k=2");
+    check(idx[0] == 5 && idx[1] == 2, "experts come back in descending probability");
+    {
+        float s = w[0] + w[1];
+        check(fabsf(s - 1.0f) < 1e-6f, "selected weights are renormalised to sum 1");
+        check(w[0] > w[1], "the dominant expert carries the larger weight");
+    }
+
+    /* Top-k larger than the expert count is clamped, not an error. */
+    n = ds4_test_qwen35_moe_route(logits, 4, 9, idx, w);
+    check_u32(n, 4u, "top_k is clamped to the expert count");
+
+    /* The shared-expert gate is a sigmoid. */
+    check(fabsf(ds4_test_qwen35_shared_expert_gate(0.0f) - 0.5f) < 1e-6f,
+          "shared expert gate at 0 is 0.5");
+    check(ds4_test_qwen35_shared_expert_gate(20.0f) > 0.99f,
+          "shared expert gate saturates high");
+    check(ds4_test_qwen35_shared_expert_gate(-20.0f) < 0.01f,
+          "shared expert gate saturates low");
+}
+
 int main(int argc, char **argv) {
     /* Render one turn and print it verbatim, so an external harness can diff it
      * against the GGUF's own Jinja template.  Used by msgcmp.py. */
@@ -333,6 +385,21 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    /* Route one logit vector and print "index weight" pairs, so an external
+     * harness can diff it against a reference router. */
+    if (argc >= 4 && !strcmp(argv[1], "--route")) {
+        const uint32_t top_k = (uint32_t)strtoul(argv[2], NULL, 10);
+        const uint32_t n = (uint32_t)(argc - 3);
+        if (n == 0 || n > 384u) { fprintf(stderr, "bad expert count\n"); return 2; }
+        float logits[384];
+        for (uint32_t i = 0; i < n; i++) logits[i] = strtof(argv[3 + i], NULL);
+        uint32_t idx[384];
+        float w[384];
+        const uint32_t got = ds4_test_qwen35_moe_route(logits, n, top_k, idx, w);
+        for (uint32_t i = 0; i < got; i++) printf("%u %.9g\n", idx[i], (double)w[i]);
+        return 0;
+    }
+
     test_layer_typing();
     test_unicode_categories();
     test_piece_splitting();
@@ -340,6 +407,7 @@ int main(int argc, char **argv) {
     test_quant_gap_report();
     test_chat_rendering();
     test_turn_rendering();
+    test_moe_routing();
 
     if (failures) {
         printf("\n%d qwen35 check(s) failed\n", failures);
