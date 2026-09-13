@@ -73771,6 +73771,152 @@ static float qwen35_shared_expert_gate(float dot) {
  * and the validation walk were each exercised only by one run against one
  * 20 GiB artifact, so a regression in either would have been invisible.  These
  * make the decisions testable on their own. */
+typedef struct {
+    /* f32 weights, row-major: element (out, in) is weight[out * in_dim + in].
+     * This mirrors the GGUF [in_dim, out_dim] layout the engine reads. */
+    const float *attn_q;       /* [2*q_dim][n_embd] query then gate */
+    const float *attn_k;       /* [kv_dim][n_embd] */
+    const float *attn_v;       /* [kv_dim][n_embd] */
+    const float *attn_output;  /* [n_embd][q_dim] */
+    const float *attn_norm;    /* [n_embd] pre-attention */
+    const float *ffn_norm;     /* [n_embd] post-attention */
+    /* Reserved for the per-head q/k norm and partial RoPE increment: unused
+     * today, so the contract does not have to change to add them. */
+    const float *attn_q_norm;  /* [head_dim] */
+    const float *attn_k_norm;  /* [head_dim] */
+    const float *x;            /* [n_tokens][n_embd] */
+    float       *out;          /* [n_tokens][n_embd] */
+    uint32_t     n_tokens;
+    uint32_t     il;
+    uint32_t     n_rot;
+    uint32_t     pos0;
+    float        rope_freq_base;
+} ds4_test_qwen35_attn_args;
+
+/* The layer core has no q/k norm, RoPE or output gate yet; it is the GQA
+ * attention block with its pre- and post-attention RMSNorm and the residual.
+ * The gate half of attn_q is projected but not applied.  Run the engine's own
+ * f32 matvec by wrapping the explicit pointer in a synthetic 2D tensor. */
+static void qwen35_attn_matvec_f32(
+        float          * out,
+        const float    * weight,
+        uint64_t         in_dim,
+        uint64_t         out_dim,
+        const float    * x) {
+    ds4_tensor t;
+    ds4_model m;
+    memset(&t, 0, sizeof(t));
+    memset(&m, 0, sizeof(m));
+    t.type = DS4_TENSOR_F32;
+    t.ndim = 2;
+    t.dim[0] = in_dim;
+    t.dim[1] = out_dim;
+    m.map = (const uint8_t *)weight;
+    matvec_f32(out, &m, &t, x);
+}
+
+int ds4_test_qwen35_attn_forward(const ds4_test_qwen35_attn_args *args) {
+    if (!args || !args->attn_q || !args->attn_k || !args->attn_v ||
+        !args->attn_output || !args->attn_norm || !args->ffn_norm ||
+        !args->x || !args->out || args->n_tokens == 0) {
+        return 1;
+    }
+
+    g_ds4_shape = DS4_SHAPE_ORNITH15;
+
+    const uint64_t n_embd = DS4_N_EMBD;
+    const uint32_t n_head = DS4_N_HEAD;
+    const uint32_t n_head_kv = DS4_N_HEAD_KV;
+    const uint64_t head_dim = DS4_N_HEAD_DIM;
+    const uint64_t q_dim = (uint64_t)n_head * head_dim;
+    const uint64_t q_gate_dim = 2u * q_dim;
+    const uint64_t kv_dim = (uint64_t)n_head_kv * head_dim;
+    const uint32_t group = n_head / n_head_kv;
+    const uint32_t n_tokens = args->n_tokens;
+
+    if (group == 0 || n_head % n_head_kv != 0) return 1;
+
+    float *normed = xmalloc((size_t)n_tokens * n_embd * sizeof(float));
+    float *q = xmalloc((size_t)n_tokens * q_gate_dim * sizeof(float));
+    float *k = xmalloc((size_t)n_tokens * kv_dim * sizeof(float));
+    float *v = xmalloc((size_t)n_tokens * kv_dim * sizeof(float));
+    float *context = xmalloc((size_t)n_tokens * q_dim * sizeof(float));
+    float *proj = xmalloc((size_t)n_embd * sizeof(float));
+    float *resid = xmalloc((size_t)n_embd * sizeof(float));
+    float *scores = xmalloc((size_t)n_tokens * sizeof(float));
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        rms_norm_weight(normed + (uint64_t)t * n_embd,
+                        args->x + (uint64_t)t * n_embd, args->attn_norm,
+                        n_embd, DS4_RMS_EPS);
+    }
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const float *xt = normed + (uint64_t)t * n_embd;
+        qwen35_attn_matvec_f32(q + (uint64_t)t * q_gate_dim, args->attn_q,
+                               n_embd, q_gate_dim, xt);
+        qwen35_attn_matvec_f32(k + (uint64_t)t * kv_dim, args->attn_k,
+                               n_embd, kv_dim, xt);
+        qwen35_attn_matvec_f32(v + (uint64_t)t * kv_dim, args->attn_v,
+                               n_embd, kv_dim, xt);
+    }
+
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t h = 0; h < n_head; h++) {
+            const uint64_t kv_head = h / group;
+            const float *qh =
+                q + (uint64_t)t * q_gate_dim + (uint64_t)h * head_dim;
+            float *ctx =
+                context + (uint64_t)t * q_dim + (uint64_t)h * head_dim;
+            float max_score = -FLT_MAX;
+            for (uint32_t s = 0; s <= t; s++) {
+                const float *kh = k + (uint64_t)s * kv_dim + kv_head * head_dim;
+                double dot = 0.0;
+                for (uint64_t d = 0; d < head_dim; d++) {
+                    dot += (double)qh[d] * kh[d];
+                }
+                scores[s] = (float)dot * scale;
+                if (scores[s] > max_score) max_score = scores[s];
+            }
+            double denom = 0.0;
+            for (uint32_t s = 0; s <= t; s++) {
+                scores[s] = expf(scores[s] - max_score);
+                denom += scores[s];
+            }
+            for (uint64_t d = 0; d < head_dim; d++) {
+                double acc = 0.0;
+                for (uint32_t s = 0; s <= t; s++) {
+                    const float *vh =
+                        v + (uint64_t)s * kv_dim + kv_head * head_dim;
+                    acc += ((double)scores[s] / denom) * vh[d];
+                }
+                ctx[d] = (float)acc;
+            }
+        }
+    }
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        qwen35_attn_matvec_f32(proj, args->attn_output, q_dim, n_embd,
+                               context + (uint64_t)t * q_dim);
+        for (uint64_t d = 0; d < n_embd; d++) {
+            resid[d] = args->x[(uint64_t)t * n_embd + d] + proj[d];
+        }
+        rms_norm_weight(args->out + (uint64_t)t * n_embd, resid, args->ffn_norm,
+                        n_embd, DS4_RMS_EPS);
+    }
+
+    free(scores);
+    free(resid);
+    free(proj);
+    free(context);
+    free(v);
+    free(k);
+    free(q);
+    free(normed);
+    return 0;
+}
+
 bool ds4_test_qwen35_layer_is_linear(uint32_t il) {
     g_ds4_shape = DS4_SHAPE_ORNITH15;
     return ds4_qwen35moe_layer_is_linear(il);

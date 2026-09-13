@@ -604,3 +604,13 @@ tests/test_qwen35_tokenizer: tests/test_qwen35_tokenizer.o ds4_cpu_test_hooks.o 
 .PHONY: test-qwen35
 test-qwen35: tests/test_qwen35_tokenizer
 	./tests/test_qwen35_tokenizer
+
+tests/test_qwen35_attn.o: tests/test_qwen35_attn.c ds4.h
+	$(CC) $(CFLAGS) -I. -DDS4_NO_GPU -c -o $@ $<
+
+tests/test_qwen35_attn: tests/test_qwen35_attn.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+.PHONY: test-qwen35-attn
+test-qwen35-attn: tests/test_qwen35_attn
+	./tests/test_qwen35_attn
