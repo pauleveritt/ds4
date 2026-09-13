@@ -74040,6 +74040,130 @@ float ds4_test_qwen35_shared_expert_gate(float dot) {
     return qwen35_shared_expert_gate(dot);
 }
 
+/* The qwen35moe MoE feed-forward CPU layer.  The hook is model-free: it takes
+ * explicit f32 weight pointers, one post-attention hidden row and one output
+ * row.  It consumes the already-tested router (qwen35_moe_route) and the shared
+ * gate (qwen35_shared_expert_gate) rather than reimplementing either.
+ *
+ * Expert layout: each stacked expert tensor is a contiguous [n_expert][out][in]
+ * buffer -- expert is the outer (slowest-varying) axis and each expert's matrix
+ * is row-major [out][in] with the input dim innermost.  This is the layout
+ * tensor_expert_bytes produces (base + expert * out_dim * row_bytes).  In
+ * ds4_tensor terms that is dim[0]=in, dim[1]=out, dim[2]=expert, so the expert
+ * axis is the *outer* block, i.e. slice e sits at e*out*in.  gate/up are
+ * [n_ff_exp][n_embd]; down is [n_embd][n_ff_exp]. */
+typedef struct {
+    const float *ffn_gate_inp;       /* [n_expert][n_embd] router */
+    const float *ffn_gate_exps;      /* [n_expert][n_ff_exp][n_embd] */
+    const float *ffn_up_exps;        /* [n_expert][n_ff_exp][n_embd] */
+    const float *ffn_down_exps;      /* [n_expert][n_embd][n_ff_exp] */
+    const float *ffn_gate_inp_shexp; /* [n_embd] shared gate */
+    const float *ffn_gate_shexp;     /* [n_ff_exp][n_embd] */
+    const float *ffn_up_shexp;       /* [n_ff_exp][n_embd] */
+    const float *ffn_down_shexp;     /* [n_embd][n_ff_exp] */
+} ds4_test_qwen35_moe_weights;
+
+/* Run the engine's own f32 matvec by wrapping the explicit pointer in a
+ * synthetic 2D tensor, exactly as the attn/gdn hooks do. */
+static void qwen35_moe_matvec_f32(
+        float          * out,
+        const float    * weight,
+        uint64_t         in_dim,
+        uint64_t         out_dim,
+        const float    * x) {
+    ds4_tensor t;
+    ds4_model m;
+    memset(&t, 0, sizeof(t));
+    memset(&m, 0, sizeof(m));
+    t.type = DS4_TENSOR_F32;
+    t.ndim = 2;
+    t.dim[0] = in_dim;
+    t.dim[1] = out_dim;
+    m.map = (const uint8_t *)weight;
+    matvec_f32(out, &m, &t, x);
+}
+
+int ds4_test_qwen35_moe_forward(const ds4_test_qwen35_moe_weights *w,
+                                const float *x, float *out) {
+    if (!w || !w->ffn_gate_inp || !w->ffn_gate_exps || !w->ffn_up_exps ||
+        !w->ffn_down_exps || !w->ffn_gate_inp_shexp || !w->ffn_gate_shexp ||
+        !w->ffn_up_shexp || !w->ffn_down_shexp || !x || !out) {
+        return 1;
+    }
+
+    g_ds4_shape = DS4_SHAPE_ORNITH15;
+
+    /* Pin the compiled preset to the Ornith MoE geometry so the test's
+     * hardcoded constants can only match by construction. */
+    if (DS4_N_EMBD != 2048u || DS4_N_FF_EXP != 512u ||
+        DS4_N_EXPERT != 256u || DS4_N_EXPERT_USED != 8u ||
+        DS4_N_EXPERT_SHARED != 1u) {
+        return 2;
+    }
+
+    const uint64_t n_embd = DS4_N_EMBD;
+    const uint64_t n_ff_exp = DS4_N_FF_EXP;
+    const uint32_t n_expert = DS4_N_EXPERT;
+    const uint32_t n_used = DS4_N_EXPERT_USED;
+
+    float *logits = xmalloc((size_t)n_expert * sizeof(float));
+    uint32_t *indices = xmalloc((size_t)n_used * sizeof(uint32_t));
+    float *weights = xmalloc((size_t)n_used * sizeof(float));
+    float *gate = xmalloc((size_t)n_ff_exp * sizeof(float));
+    float *up = xmalloc((size_t)n_ff_exp * sizeof(float));
+    float *h = xmalloc((size_t)n_ff_exp * sizeof(float));
+    float *y = xmalloc((size_t)n_embd * sizeof(float));
+
+    qwen35_moe_matvec_f32(logits, w->ffn_gate_inp, n_embd, n_expert, x);
+    const uint32_t used =
+        qwen35_moe_route(logits, n_expert, n_used, indices, weights);
+
+    for (uint64_t d = 0; d < n_embd; d++) out[d] = 0.0f;
+
+    for (uint32_t k = 0; k < used; k++) {
+        const uint32_t e = indices[k];
+        const float *gate_e =
+            w->ffn_gate_exps + (uint64_t)e * n_ff_exp * n_embd;
+        const float *up_e =
+            w->ffn_up_exps + (uint64_t)e * n_ff_exp * n_embd;
+        const float *down_e =
+            w->ffn_down_exps + (uint64_t)e * n_embd * n_ff_exp;
+
+        qwen35_moe_matvec_f32(gate, gate_e, n_embd, n_ff_exp, x);
+        qwen35_moe_matvec_f32(up, up_e, n_embd, n_ff_exp, x);
+        for (uint64_t j = 0; j < n_ff_exp; j++)
+            h[j] = silu(gate[j]) * up[j];
+        qwen35_moe_matvec_f32(y, down_e, n_ff_exp, n_embd, h);
+        for (uint64_t d = 0; d < n_embd; d++)
+            out[d] += weights[k] * y[d];
+    }
+
+    /* Shared expert: h_s = silu(gate_s . x) * (up_s . x); y_s = down_s . h_s;
+     * out += sigmoid(ffn_gate_inp_shexp . x) * y_s. */
+    qwen35_moe_matvec_f32(gate, w->ffn_gate_shexp, n_embd, n_ff_exp, x);
+    qwen35_moe_matvec_f32(up, w->ffn_up_shexp, n_embd, n_ff_exp, x);
+    for (uint64_t j = 0; j < n_ff_exp; j++)
+        h[j] = silu(gate[j]) * up[j];
+    qwen35_moe_matvec_f32(y, w->ffn_down_shexp, n_ff_exp, n_embd, h);
+    {
+        double sgate = 0.0;
+        for (uint64_t d = 0; d < n_embd; d++)
+            sgate += (double)w->ffn_gate_inp_shexp[d] * x[d];
+        const float g = qwen35_shared_expert_gate((float)sgate);
+        for (uint64_t d = 0; d < n_embd; d++)
+            out[d] += g * y[d];
+    }
+
+    free(y);
+    free(h);
+    free(up);
+    free(gate);
+    free(weights);
+    free(indices);
+    free(logits);
+    return 0;
+}
+
 /* Render a chat turn into `out` for comparison against the GGUF's own Jinja
  * template.  Pure text: no vocabulary, no model. */
 void ds4_test_qwen35_render_chat(const char *system, const char *prompt, bool thinking,
