@@ -16,6 +16,13 @@
  * assertion that removing it changes the output, so a silently-dropped conv,
  * decay, sk subtraction or z gate cannot pass.
  *
+ * Task 2 adds the spec's remaining edge cases: a two-token recurrence, the
+ * beta=0 (write suppressed, state only decays) and gate=0 (g=exp(0)=1, no
+ * decay) branches, and a four-token case that pins the depthwise conv's
+ * last-3-positions window.  The scalar reference gains force_beta_zero and
+ * force_gate_zero so those branches are compared against an independent path,
+ * and the state-equivalence case is the one a planted state reset breaks.
+ *
  * Build/run:
  *   make -C external/ds4 test-qwen35-gdn
  *   ./external/ds4/tests/test_qwen35_gdn
@@ -124,10 +131,12 @@ static void matvec1(float *out, const float *weight, uint32_t in_dim,
 /* Which of the four Task 1 behaviours a reference run applies.  Each is
  * toggled separately so the test can show it changes the output. */
 typedef struct {
-    int apply_conv;   /* 0 skips the depthwise conv and its silu */
-    int apply_decay;  /* 0 sets g = 1 (no decay) */
-    int apply_sk;     /* 0 drops the s.k subtraction */
-    int apply_zgate;  /* 0 drops the silu(z) gate */
+    int apply_conv;      /* 0 skips the depthwise conv and its silu */
+    int apply_decay;     /* 0 sets g = 1 (no decay) */
+    int apply_sk;        /* 0 drops the s.k subtraction */
+    int apply_zgate;     /* 0 drops the silu(z) gate */
+    int force_beta_zero; /* 1 sets b = 0: no write, the state only decays */
+    int force_gate_zero; /* 1 sets gate = 0, so g = exp(0) = 1 (no decay) */
 } gdn_config;
 
 /* Independent scalar reference for the whole layer core.  `state` is the
@@ -198,9 +207,11 @@ static void reference_forward(const ds4_test_qwen35_gdn_weights *w,
 
         for (uint32_t vh = 0; vh < N_V; vh++) {
             const float a = w->gdn_a_log[vh];
-            gate[vh] = a * softplus1(alpha[vh] + w->gdn_dt_bias[vh]);
+            gate[vh] = cfg->force_gate_zero
+                           ? 0.0f
+                           : a * softplus1(alpha[vh] + w->gdn_dt_bias[vh]);
             const float g = cfg->apply_decay ? expf(gate[vh]) : 1.0f;
-            const float b = sigmoid1(beta[vh]);
+            const float b = cfg->force_beta_zero ? 0.0f : sigmoid1(beta[vh]);
 
             float *s = rec + (uint64_t)vh * D_V * D_K;
             for (uint32_t i = 0; i < D_V * D_K; i++) s[i] *= g;
@@ -279,9 +290,15 @@ int main(void) {
     float *wnorm = wdt + N_V;
     float *wout = wnorm + D_V;
     float *wz = wout + (uint64_t)N_EMBD * D_INNER;
+    /* Edge-case weight variants: a beta projection far negative enough that
+     * sigmoid underflows to exactly 0, and an all-zero ssm_a (so gate = 0). */
+    float *wbeta_zero = wz + (uint64_t)D_INNER * N_EMBD;
+    float *wzero_log = wbeta_zero + (uint64_t)N_V * N_EMBD;
     require_ok((uint8_t *)(wz + (uint64_t)D_INNER * N_EMBD) <=
                    model + MODEL_BYTES,
                "synthetic weights fit the mapping");
+    require_ok((uint8_t *)(wzero_log + N_V) <= model + MODEL_BYTES,
+               "edge-case weights fit the mapping");
 
     for (uint32_t o = 0; o < CONV_DIM; o++)
         for (uint32_t i = 0; i < N_EMBD; i++)
@@ -308,6 +325,10 @@ int main(void) {
     for (uint32_t o = 0; o < D_INNER; o++)
         for (uint32_t i = 0; i < N_EMBD; i++)
             wz[(uint64_t)o * N_EMBD + i] = synth(o + 211u, i, 0.02f);
+    for (uint32_t o = 0; o < N_V; o++)
+        for (uint32_t i = 0; i < N_EMBD; i++)
+            wbeta_zero[(uint64_t)o * N_EMBD + i] = -1000.0f;
+    for (uint32_t h = 0; h < N_V; h++) wzero_log[h] = 0.0f;
 
     ds4_test_qwen35_gdn_weights w = {
         .gdn_qkv = wqkv,
@@ -330,6 +351,11 @@ int main(void) {
             x[(uint64_t)t * N_EMBD + d] =
                 synth(d + 1u, 17u, 0.5f) + 0.01f * (float)t;
 
+    /* All-ones input for the beta=0 case: with the -1000 beta rows the
+     * projection is -1000*n_embd, so sigmoid underflows to exactly 0. */
+    float xones[N_EMBD];
+    for (uint32_t d = 0; d < N_EMBD; d++) xones[d] = 1.0f;
+
     const gdn_config all = {
         .apply_conv = 1,
         .apply_decay = 1,
@@ -339,8 +365,8 @@ int main(void) {
 
     /* Single-token case, against the full reference. */
     {
-        float st_ref[STATE_FLOATS] = {0};
-        float st_hook[STATE_FLOATS] = {0};
+        static float st_ref[STATE_FLOATS] = {0};
+        static float st_hook[STATE_FLOATS] = {0};
         float expect[N_EMBD], actual[N_EMBD];
         reference_forward(&w, &all, x, 1, st_ref, expect);
         run_hook(&w, x, 1, st_hook, actual);
@@ -351,9 +377,21 @@ int main(void) {
                    "qwen35 gdn single-token state matches");
     }
 
+    /* Two-token recurrence, against the full reference. */
+    {
+        static float st2_ref[STATE_FLOATS] = {0};
+        static float st2_hook[STATE_FLOATS] = {0};
+        float expect2[2 * N_EMBD], actual2[2 * N_EMBD];
+        reference_forward(&w, &all, x, 2, st2_ref, expect2);
+        run_hook(&w, x, 2, st2_hook, actual2);
+        for (uint32_t d = 0; d < 2 * N_EMBD; d++)
+            require_close("qwen35 gdn two tokens", actual2[d], expect2[d],
+                          1e-5f);
+    }
+
     /* Three-token case, against the full reference. */
-    float st_ref[STATE_FLOATS] = {0};
-    float st_hook[STATE_FLOATS] = {0};
+    static float st_ref[STATE_FLOATS] = {0};
+    static float st_hook[STATE_FLOATS] = {0};
     float expect[N_TOKENS * N_EMBD], actual[N_TOKENS * N_EMBD];
     reference_forward(&w, &all, x, N_TOKENS, st_ref, expect);
     run_hook(&w, x, N_TOKENS, st_hook, actual);
@@ -367,7 +405,7 @@ int main(void) {
      * the output and the final state.  This pins the conv carry-over and the
      * recurrent state layout. */
     {
-        float st_split[STATE_FLOATS] = {0};
+        static float st_split[STATE_FLOATS] = {0};
         float out_split[N_TOKENS * N_EMBD];
         run_hook(&w, x, 1, st_split, out_split);
         run_hook(&w, x + N_EMBD, N_TOKENS - 1, st_split, out_split + N_EMBD);
@@ -378,6 +416,125 @@ int main(void) {
                               actual[(uint64_t)t * N_EMBD + d], 0.0f);
         require_ok(max_abs_diff(st_split, st_hook, STATE_FLOATS) == 0.0f,
                    "qwen35 gdn split state is identical");
+    }
+
+    /* A non-zero state seeded by one normal token, used by the beta=0 and
+     * gate=0 cases so the decay (and its absence) is observable. */
+    static float st_seed[STATE_FLOATS] = {0};
+    float st_seed_out[N_EMBD];
+    reference_forward(&w, &all, x, 1, st_seed, st_seed_out);
+
+    /* beta = 0: the delta-rule write is suppressed, so a non-zero state can
+     * only decay.  The hook is driven to beta == 0 by the -1000 projection
+     * (sigmoid underflows to exactly zero); the reference takes the same
+     * branch via force_beta_zero. */
+    {
+        gdn_config no_beta = all;
+        no_beta.force_beta_zero = 1;
+
+        ds4_test_qwen35_gdn_weights wb = w;
+        wb.gdn_beta = wbeta_zero;
+
+        static float st_refb[STATE_FLOATS], st_hookb[STATE_FLOATS];
+        memcpy(st_refb, st_seed, sizeof(st_seed));
+        memcpy(st_hookb, st_seed, sizeof(st_seed));
+        float expect_b[N_EMBD], actual_b[N_EMBD];
+        reference_forward(&w, &no_beta, xones, 1, st_refb, expect_b);
+        run_hook(&wb, xones, 1, st_hookb, actual_b);
+        for (uint32_t d = 0; d < N_EMBD; d++)
+            require_close("qwen35 gdn beta=0", actual_b[d], expect_b[d],
+                          1e-5f);
+        require_ok(max_abs_diff(st_refb, st_hookb, STATE_FLOATS) < 1e-6f,
+                   "qwen35 gdn beta=0 state matches");
+
+        /* The suppression must matter: with beta live the write moves it. */
+        static float st_live[STATE_FLOATS];
+        memcpy(st_live, st_seed, sizeof(st_seed));
+        float live_out[N_EMBD];
+        reference_forward(&w, &all, xones, 1, st_live, live_out);
+        require_ok(max_abs_diff(expect_b, live_out, N_EMBD) > 1e-4f,
+                   "beta=0 suppresses the delta write");
+    }
+
+    /* gate = 0: the log-decay is zero, so g = exp(0) = 1 and the state does
+     * not decay.  The hook is driven by an all-zero ssm_a; the reference takes
+     * force_gate_zero. */
+    {
+        gdn_config no_gate = all;
+        no_gate.force_gate_zero = 1;
+
+        ds4_test_qwen35_gdn_weights wg = w;
+        wg.gdn_a_log = wzero_log;
+
+        static float st_refg[STATE_FLOATS], st_hookg[STATE_FLOATS];
+        memcpy(st_refg, st_seed, sizeof(st_seed));
+        memcpy(st_hookg, st_seed, sizeof(st_seed));
+        float expect_g[N_EMBD], actual_g[N_EMBD];
+        reference_forward(&w, &no_gate, xones, 1, st_refg, expect_g);
+        run_hook(&wg, xones, 1, st_hookg, actual_g);
+        for (uint32_t d = 0; d < N_EMBD; d++)
+            require_close("qwen35 gdn gate=0", actual_g[d], expect_g[d],
+                          1e-5f);
+        require_ok(max_abs_diff(st_refg, st_hookg, STATE_FLOATS) < 1e-6f,
+                   "qwen35 gdn gate=0 state matches");
+
+        /* The zero gate must matter: with decay live the state shrinks. */
+        static float st_decay[STATE_FLOATS];
+        memcpy(st_decay, st_seed, sizeof(st_seed));
+        float decay_out[N_EMBD];
+        reference_forward(&w, &all, xones, 1, st_decay, decay_out);
+        require_ok(max_abs_diff(expect_g, decay_out, N_EMBD) > 1e-4f,
+                   "gate=0 disables decay");
+    }
+
+    /* Conv window: the depthwise conv is a 4-tap causal filter, so after four
+     * tokens its state holds the raw qkv projections of tokens 1,2,3 (oldest
+     * first) and token 0 has fallen out.  Recompute those rows and require the
+     * stored state to match -- a 3-tap window or the wrong order cannot pass.
+     * Token 0 is also three positions back from token 3's output, so changing
+     * it must move that output. */
+    {
+        enum { CONV_TOKENS = 4 };
+        float xc[CONV_TOKENS * N_EMBD];
+        for (uint32_t t = 0; t < CONV_TOKENS; t++)
+            for (uint32_t d = 0; d < N_EMBD; d++)
+                xc[(uint64_t)t * N_EMBD + d] =
+                    synth(d + 1u, 31u, 0.5f) + 0.05f * (float)t;
+
+        static float st_conv[STATE_FLOATS] = {0};
+        float out_conv[CONV_TOKENS * N_EMBD];
+        run_hook(&w, xc, CONV_TOKENS, st_conv, out_conv);
+
+        /* The four-token hook output still matches the full reference. */
+        static float st_conv_ref[STATE_FLOATS] = {0};
+        float out_conv_ref[CONV_TOKENS * N_EMBD];
+        reference_forward(&w, &all, xc, CONV_TOKENS, st_conv_ref,
+                          out_conv_ref);
+        for (uint32_t d = 0; d < CONV_TOKENS * N_EMBD; d++)
+            require_close("qwen35 gdn conv four tokens", out_conv[d],
+                          out_conv_ref[d], 1e-5f);
+
+        /* The last three raw qkv rows, oldest first. */
+        for (uint32_t t = 1; t < CONV_TOKENS; t++) {
+            float qrow[CONV_DIM];
+            matvec1(qrow, wqkv, N_EMBD, CONV_DIM, xc + (uint64_t)t * N_EMBD);
+            const float *stored =
+                st_conv + REC_SIZE + (uint64_t)(t - 1) * CONV_DIM;
+            for (uint32_t ch = 0; ch < CONV_DIM; ch++)
+                require_close("qwen35 gdn conv window row", stored[ch],
+                              qrow[ch], 1e-6f);
+        }
+
+        float xc_alt[CONV_TOKENS * N_EMBD];
+        memcpy(xc_alt, xc, sizeof(xc));
+        for (uint32_t d = 0; d < N_EMBD; d++) xc_alt[d] = 0.0f;
+        static float st_alt[STATE_FLOATS] = {0};
+        float out_alt[CONV_TOKENS * N_EMBD];
+        run_hook(&w, xc_alt, CONV_TOKENS, st_alt, out_alt);
+        require_ok(max_abs_diff(out_conv + (uint64_t)3 * N_EMBD,
+                                out_alt + (uint64_t)3 * N_EMBD, N_EMBD) >
+                       1e-4f,
+                   "conv output depends on the token 3 positions back");
     }
 
     /* Ablation sensitivity: the four behaviours must all change the output.
@@ -395,7 +552,8 @@ int main(void) {
         abl[2].apply_sk = 0;
         abl[3].apply_zgate = 0;
         for (int i = 0; i < 4; i++) {
-            float st_abl[STATE_FLOATS] = {0};
+            static float st_abl[STATE_FLOATS];
+            memset(st_abl, 0, sizeof(st_abl));
             float abl_out[N_TOKENS * N_EMBD];
             reference_forward(&w, &abl[i], x, N_TOKENS, st_abl, abl_out);
             require_ok(max_abs_diff(actual, abl_out, N_TOKENS * N_EMBD) > 1e-4f,
@@ -413,7 +571,7 @@ int main(void) {
             walog_refolded[h] = -expf(walog[h]);
         ds4_test_qwen35_gdn_weights wr = w;
         wr.gdn_a_log = walog_refolded;
-        float st_refold[STATE_FLOATS] = {0};
+        static float st_refold[STATE_FLOATS] = {0};
         float out_refold[N_TOKENS * N_EMBD];
         run_hook(&wr, x, N_TOKENS, st_refold, out_refold);
         require_ok(max_abs_diff(actual, out_refold, N_TOKENS * N_EMBD) > 1e-4f,
