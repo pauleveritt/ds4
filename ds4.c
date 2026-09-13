@@ -73780,8 +73780,8 @@ typedef struct {
     const float *attn_output;  /* [n_embd][q_dim] */
     const float *attn_norm;    /* [n_embd] pre-attention */
     const float *ffn_norm;     /* [n_embd] post-attention */
-    /* Reserved for the per-head q/k norm and partial RoPE increment: unused
-     * today, so the contract does not have to change to add them. */
+    /* Per-head q/k norm and partial RoPE inputs; the rope fields are ignored
+     * when n_rot is 0. */
     const float *attn_q_norm;  /* [head_dim] */
     const float *attn_k_norm;  /* [head_dim] */
     const float *x;            /* [n_tokens][n_embd] */
@@ -73793,10 +73793,12 @@ typedef struct {
     float        rope_freq_base;
 } ds4_test_qwen35_attn_args;
 
-/* The layer core has no q/k norm, RoPE or output gate yet; it is the GQA
- * attention block with its pre- and post-attention RMSNorm and the residual.
- * The gate half of attn_q is projected but not applied.  Run the engine's own
- * f32 matvec by wrapping the explicit pointer in a synthetic 2D tensor. */
+/* The qwen35moe full-attention CPU layer: pre-attention RMSNorm, double-width
+ * attn_q (query then sigmoid output gate), GQA k/v, per-head q/k RMSNorm,
+ * plain partial RoPE over the tail n_rot of each head, causal softmax, the
+ * sigmoid gate on the attention output, the output projection, the residual
+ * and the post-attention RMSNorm.  Run the engine's own f32 matvec by wrapping
+ * the explicit pointer in a synthetic 2D tensor. */
 static void qwen35_attn_matvec_f32(
         float          * out,
         const float    * weight,
@@ -73815,9 +73817,16 @@ static void qwen35_attn_matvec_f32(
     matvec_f32(out, &m, &t, x);
 }
 
+/* Defined later in this file; declared here so the test hook can call it. */
+static void rope_tail_ext_inplace(float *x, uint32_t n_head, uint32_t head_dim,
+        uint32_t n_rot, uint32_t pos, uint64_t n_ctx_orig, float freq_base,
+        float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow, bool inverse);
+
 int ds4_test_qwen35_attn_forward(const ds4_test_qwen35_attn_args *args) {
     if (!args || !args->attn_q || !args->attn_k || !args->attn_v ||
         !args->attn_output || !args->attn_norm || !args->ffn_norm ||
+        !args->attn_q_norm || !args->attn_k_norm ||
         !args->x || !args->out || args->n_tokens == 0) {
         return 1;
     }
@@ -73852,6 +73861,10 @@ int ds4_test_qwen35_attn_forward(const ds4_test_qwen35_attn_args *args) {
 
     if (group == 0 || n_head % n_head_kv != 0) return 1;
 
+    /* Partial RoPE rotates the tail n_rot dims of each head in place; it must
+     * not exceed the head and must pair up. */
+    if (args->n_rot > head_dim || args->n_rot % 2u != 0u) return 1;
+
     float *normed = xmalloc((size_t)n_tokens * n_embd * sizeof(float));
     float *q = xmalloc((size_t)n_tokens * q_gate_dim * sizeof(float));
     float *k = xmalloc((size_t)n_tokens * kv_dim * sizeof(float));
@@ -73875,6 +73888,33 @@ int ds4_test_qwen35_attn_forward(const ds4_test_qwen35_attn_args *args) {
                                n_embd, kv_dim, xt);
         qwen35_attn_matvec_f32(v + (uint64_t)t * kv_dim, args->attn_v,
                                n_embd, kv_dim, xt);
+    }
+
+    /* Per-head q/k RMSNorm (attn_q_norm/attn_k_norm, [head_dim]) before RoPE,
+     * then plain partial RoPE over the tail n_rot of each head.  The gate half
+     * of attn_q begins at offset q_dim and is left untouched. */
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        float *qt = q + (uint64_t)t * q_gate_dim;
+        for (uint32_t h = 0; h < n_head; h++) {
+            rms_norm_weight(qt + (uint64_t)h * head_dim,
+                            qt + (uint64_t)h * head_dim, args->attn_q_norm,
+                            head_dim, DS4_RMS_EPS);
+        }
+        float *kt = k + (uint64_t)t * kv_dim;
+        for (uint32_t h = 0; h < n_head_kv; h++) {
+            rms_norm_weight(kt + (uint64_t)h * head_dim,
+                            kt + (uint64_t)h * head_dim, args->attn_k_norm,
+                            head_dim, DS4_RMS_EPS);
+        }
+        if (args->n_rot != 0) {
+            rope_tail_ext_inplace(qt, n_head, (uint32_t)head_dim, args->n_rot,
+                                  args->pos0 + t, 0, args->rope_freq_base,
+                                  1.0f, 0.0f, 1.0f, 0.0f, 0.0f, false);
+            rope_tail_ext_inplace(kt, n_head_kv, (uint32_t)head_dim,
+                                  args->n_rot, args->pos0 + t, 0,
+                                  args->rope_freq_base,
+                                  1.0f, 0.0f, 1.0f, 0.0f, 0.0f, false);
+        }
     }
 
     const float scale = 1.0f / sqrtf((float)head_dim);
@@ -73909,6 +73949,16 @@ int ds4_test_qwen35_attn_forward(const ds4_test_qwen35_attn_args *args) {
                 }
                 ctx[d] = (float)acc;
             }
+        }
+    }
+
+    /* Sigmoid output gate: the second half of attn_q scales the attention
+     * output elementwise before the output projection. */
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const float *gate = q + (uint64_t)t * q_gate_dim + q_dim;
+        float *ctx = context + (uint64_t)t * q_dim;
+        for (uint64_t d = 0; d < q_dim; d++) {
+            ctx[d] *= 1.0f / (1.0f + expf(-gate[d]));
         }
     }
 
