@@ -198,8 +198,7 @@ static void reference_forward(const ds4_test_qwen35_gdn_weights *w,
 
         for (uint32_t vh = 0; vh < N_V; vh++) {
             const float a = w->gdn_a_log[vh];
-            gate[vh] = (-expf(a)) *
-                       softplus1(alpha[vh] + w->gdn_dt_bias[vh]);
+            gate[vh] = a * softplus1(alpha[vh] + w->gdn_dt_bias[vh]);
             const float g = cfg->apply_decay ? expf(gate[vh]) : 1.0f;
             const float b = sigmoid1(beta[vh]);
 
@@ -296,9 +295,9 @@ int main(void) {
             wbeta[(uint64_t)o * N_EMBD + i] = synth(o + 29u, i, 0.01f);
         }
     for (uint32_t h = 0; h < N_V; h++) {
-        /* Positive A_log keeps exp(A_log) > 1, so the gate is clearly
-         * negative and the decay is strongly exercised. */
-        walog[h] = 0.3f + 0.1f * (float)(h % 5u);
+        /* ssm_a is stored already folded as -exp(A_log), so every value is
+         * negative; the magnitude sets how fast the recurrent state decays. */
+        walog[h] = -(0.4f + 0.1f * (float)(h % 5u));
         wdt[h] = 0.2f * (float)((h % 3u)) - 0.2f;
     }
     for (uint32_t d = 0; d < D_V; d++)
@@ -402,6 +401,23 @@ int main(void) {
             require_ok(max_abs_diff(actual, abl_out, N_TOKENS * N_EMBD) > 1e-4f,
                        names[i]);
         }
+    }
+
+    /* Folded-coefficient sensitivity: ssm_a is stored as -exp(A_log), i.e.
+     * already the folded decay coefficient.  Feeding the hook the raw log
+     * coefficient (-exp of the stored value) must change the output, so a
+     * re-applied exp in the hook cannot pass silently. */
+    {
+        float walog_refolded[N_V];
+        for (uint32_t h = 0; h < N_V; h++)
+            walog_refolded[h] = -expf(walog[h]);
+        ds4_test_qwen35_gdn_weights wr = w;
+        wr.gdn_a_log = walog_refolded;
+        float st_refold[STATE_FLOATS] = {0};
+        float out_refold[N_TOKENS * N_EMBD];
+        run_hook(&wr, x, N_TOKENS, st_refold, out_refold);
+        require_ok(max_abs_diff(actual, out_refold, N_TOKENS * N_EMBD) > 1e-4f,
+                   "re-folding ssm_a changes the output");
     }
 
     /* The hook must reject a null weight pointer and a zero-token call. */

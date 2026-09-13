@@ -74210,9 +74210,10 @@ int ds4_test_qwen35_gdn_forward(const ds4_test_qwen35_gdn_weights *w,
         const float *vraw = convout + 2u * n_k * d_k;
 
         /* The decayed delta-rule recurrence, one [d_v, d_k] state per value
-         * head.  gate is a log-decay: g = exp((-exp(A_log)) * softplus(a+dt)). */
+         * head.  ssm_a is the already-folded -exp(A_log) decay coefficient, so
+         * gate is the log-decay g = exp(ssm_a * softplus(a+dt)). */
         for (uint32_t vh = 0; vh < n_v; vh++) {
-            gate[vh] = (-expf(w->gdn_a_log[vh])) *
+            gate[vh] = w->gdn_a_log[vh] *
                        softplus_stable(alpha[vh] + w->gdn_dt_bias[vh]);
             const float g = expf(gate[vh]);
             const float b = sigmoid_stable(beta[vh]);
