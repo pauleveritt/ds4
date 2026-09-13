@@ -32,7 +32,7 @@
  *
  * Cases: token A routes to the biased set {248..255}; token B re-runs that set
  * with a non-uniform input; token C routes to a set that overlaps A's but is
- * not identical (a mixed expert gather); token D amplifies the shared expert's
+ * not identical (a mixed expert gather); token D doubles each shared-expert matrix (see the case comment)
  * three matrices so the shared contribution dominates the routed sum.
  *
  * Build/run:
@@ -400,8 +400,9 @@ int main(void) {
              "qwen35 moe token C (overlapping expert set)", 1e-5f);
 
     /* Token D: shared-expert-dominant.  The routed experts keep their nonzero
-     * synthetic weights, but the shared expert's three matrices are amplified
-     * 2x, so the shared term dominates the routed sum.  Assert dominance on the
+     * synthetic weights, but each of the shared expert's three matrices is
+     * doubled (compounding to ~8x before the SiLU; measured ~3.6x on the output),
+     * so the shared term dominates the routed sum.  Assert dominance on the
      * scalar reference's own partials, then compare the hook against it. */
     float xd[N_EMBD];
     for (uint32_t d = 0; d < N_EMBD; d++) xd[d] = synth(d, 5u, 0.5f);
