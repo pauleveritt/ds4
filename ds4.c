@@ -74066,6 +74066,214 @@ void ds4_test_qwen35_render_turn(const char *role, const char *content,
     snprintf(out, cap, "%s", b.ptr);
     free(b.ptr);
 }
+
+/* The qwen35moe gated-delta-net (linear attention) CPU layer.  The hook is
+ * model-free: it takes explicit f32 weight pointers, an input row (or a short
+ * token sequence) and a mutable per-layer state buffer.  The state buffer is
+ * one allocation:
+ *   [0, n_v*d_v*d_k)                       recurrent state, [n_v][d_v][d_k]
+ *   [n_v*d_v*d_k, + (kconv-1)*conv_dim)    conv's last kconv-1 input rows
+ * The recurrent state is head-major with d_k innermost, so element (vh, dv, dk)
+ * is at vh*d_v*d_k + dv*d_k + dk (the layout llama.cpp's delta-net base reads
+ * back).  The conv rows are oldest-first, each a raw conv_dim projection row;
+ * after a token they shift left and the new raw qkv is appended.  The compact
+ * test fixtures are in tests/test_qwen35_gdn.c; the layout here is pinned there
+ * by a token-by-token vs batched equivalence check. */
+typedef struct {
+    const float *gdn_qkv;     /* [conv_dim][n_embd] */
+    const float *gdn_conv1d;  /* [conv_dim][kconv], channel-major */
+    const float *gdn_alpha;   /* [n_v][n_embd] */
+    const float *gdn_beta;    /* [n_v][n_embd] */
+    const float *gdn_a_log;   /* [n_v] */
+    const float *gdn_dt_bias; /* [n_v] */
+    const float *gdn_norm;    /* [d_v] */
+    const float *gdn_out;     /* [n_embd][d_inner] */
+    const float *gdn_z;       /* [d_inner][n_embd] */
+} ds4_test_qwen35_gdn_weights;
+
+static void qwen35_gdn_matvec_f32(
+        float          * out,
+        const float    * weight,
+        uint64_t         in_dim,
+        uint64_t         out_dim,
+        const float    * x) {
+    ds4_tensor t;
+    ds4_model m;
+    memset(&t, 0, sizeof(t));
+    memset(&m, 0, sizeof(m));
+    t.type = DS4_TENSOR_F32;
+    t.ndim = 2;
+    t.dim[0] = in_dim;
+    t.dim[1] = out_dim;
+    m.map = (const uint8_t *)weight;
+    matvec_f32(out, &m, &t, x);
+}
+
+int ds4_test_qwen35_gdn_forward(const ds4_test_qwen35_gdn_weights *w,
+                                const float *x, uint32_t n_tokens,
+                                float *state, float *out) {
+    if (!w || !w->gdn_qkv || !w->gdn_conv1d || !w->gdn_alpha ||
+        !w->gdn_beta || !w->gdn_a_log || !w->gdn_dt_bias || !w->gdn_norm ||
+        !w->gdn_out || !w->gdn_z || !x || !state || !out || n_tokens == 0) {
+        return 1;
+    }
+
+    g_ds4_shape = DS4_SHAPE_ORNITH15;
+
+    /* Pin the compiled preset to the Ornith gated-delta-net geometry so the
+     * test's hardcoded constants can only match by construction. */
+    if (DS4_N_EMBD != 2048u || DS4_N_GDN_KEY_HEAD != 16u ||
+        DS4_N_GDN_VALUE_HEAD != 32u || DS4_N_GDN_HEAD_DIM != 128u ||
+        DS4_N_GDN_VALUE_DIM != 128u || DS4_N_GDN_INNER != 4096u ||
+        DS4_N_GDN_CONV != 4u) {
+        return 2;
+    }
+
+    const uint32_t n_embd = DS4_N_EMBD;
+    const uint32_t n_k = DS4_N_GDN_KEY_HEAD;
+    const uint32_t d_k = DS4_N_GDN_HEAD_DIM;
+    const uint32_t n_v = DS4_N_GDN_VALUE_HEAD;
+    const uint32_t d_v = DS4_N_GDN_VALUE_DIM;
+    const uint32_t d_inner = DS4_N_GDN_INNER;
+    const uint32_t kconv = DS4_N_GDN_CONV;
+    const uint32_t conv_dim = 2u * n_k * d_k + n_v * d_v;
+
+    if (n_k == 0 || n_v % n_k != 0) return 1;
+    if ((uint64_t)n_v * d_v != d_inner) return 1;
+
+    float *rec = state;
+    float *conv = state + (uint64_t)n_v * d_v * d_k;
+
+    float *qkv = xmalloc((size_t)conv_dim * sizeof(float));
+    float *z = xmalloc((size_t)d_inner * sizeof(float));
+    float *beta = xmalloc((size_t)n_v * sizeof(float));
+    float *alpha = xmalloc((size_t)n_v * sizeof(float));
+    float *gate = xmalloc((size_t)n_v * sizeof(float));
+    float *qn = xmalloc((size_t)n_v * d_k * sizeof(float));
+    float *kn = xmalloc((size_t)n_v * d_k * sizeof(float));
+    float *o = xmalloc((size_t)n_v * d_v * sizeof(float));
+    float *on = xmalloc((size_t)n_v * d_v * sizeof(float));
+    float *convout = xmalloc((size_t)conv_dim * sizeof(float));
+    float *sk = xmalloc((size_t)d_v * sizeof(float));
+    float *dd = xmalloc((size_t)d_v * sizeof(float));
+
+    const float q_scale = 1.0f / sqrtf((float)d_k);
+    const float l2_eps = DS4_RMS_EPS;
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const float *xt = x + (uint64_t)t * n_embd;
+        qwen35_gdn_matvec_f32(qkv, w->gdn_qkv, n_embd, conv_dim, xt);
+        qwen35_gdn_matvec_f32(z, w->gdn_z, n_embd, d_inner, xt);
+        qwen35_gdn_matvec_f32(beta, w->gdn_beta, n_embd, n_v, xt);
+        qwen35_gdn_matvec_f32(alpha, w->gdn_alpha, n_embd, n_v, xt);
+
+        /* Depthwise causal conv over the raw projection, kernel kconv, then
+         * silu.  The conv state holds the previous kconv-1 raw rows. */
+        for (uint32_t ch = 0; ch < conv_dim; ch++) {
+            double acc = 0.0;
+            for (uint32_t kk = 0; kk < kconv; kk++) {
+                const float in = (kk < kconv - 1)
+                                     ? conv[(uint64_t)kk * conv_dim + ch]
+                                     : qkv[ch];
+                acc += (double)in * w->gdn_conv1d[(uint64_t)ch * kconv + kk];
+            }
+            convout[ch] = silu((float)acc);
+        }
+        for (uint32_t kk = 0; kk + 1 < kconv - 1; kk++)
+            memcpy(conv + (uint64_t)kk * conv_dim,
+                   conv + (uint64_t)(kk + 1) * conv_dim,
+                   (size_t)conv_dim * sizeof(float));
+        memcpy(conv + (uint64_t)(kconv - 2) * conv_dim, qkv,
+               (size_t)conv_dim * sizeof(float));
+
+        /* Split q/k/v, per-head L2 norm of q and k, repeat q/k to the value
+         * head count (head vh reads key head vh % n_k) and scale q. */
+        for (uint32_t h = 0; h < n_k; h++) {
+            const float *qraw = convout + (uint64_t)h * d_k;
+            double ss = 0.0;
+            for (uint32_t d = 0; d < d_k; d++) ss += (double)qraw[d] * qraw[d];
+            const float qinv = 1.0f / sqrtf((float)ss + l2_eps);
+            for (uint32_t vh = h; vh < n_v; vh += n_k)
+                for (uint32_t d = 0; d < d_k; d++)
+                    qn[(uint64_t)vh * d_k + d] = qraw[d] * qinv * q_scale;
+
+            const float *kraw =
+                convout + (uint64_t)n_k * d_k + (uint64_t)h * d_k;
+            ss = 0.0;
+            for (uint32_t d = 0; d < d_k; d++) ss += (double)kraw[d] * kraw[d];
+            const float kinv = 1.0f / sqrtf((float)ss + l2_eps);
+            for (uint32_t vh = h; vh < n_v; vh += n_k)
+                for (uint32_t d = 0; d < d_k; d++)
+                    kn[(uint64_t)vh * d_k + d] = kraw[d] * kinv;
+        }
+
+        const float *vraw = convout + 2u * n_k * d_k;
+
+        /* The decayed delta-rule recurrence, one [d_v, d_k] state per value
+         * head.  gate is a log-decay: g = exp((-exp(A_log)) * softplus(a+dt)). */
+        for (uint32_t vh = 0; vh < n_v; vh++) {
+            gate[vh] = (-expf(w->gdn_a_log[vh])) *
+                       softplus_stable(alpha[vh] + w->gdn_dt_bias[vh]);
+            const float g = expf(gate[vh]);
+            const float b = sigmoid_stable(beta[vh]);
+
+            float *s = rec + (uint64_t)vh * d_v * d_k;
+            for (uint32_t i = 0; i < d_v * d_k; i++) s[i] *= g;
+
+            for (uint32_t dv = 0; dv < d_v; dv++) {
+                double acc = 0.0;
+                for (uint32_t dk = 0; dk < d_k; dk++)
+                    acc += (double)s[(uint64_t)dv * d_k + dk] *
+                           kn[(uint64_t)vh * d_k + dk];
+                sk[dv] = (float)acc;
+            }
+            for (uint32_t dv = 0; dv < d_v; dv++) {
+                dd[dv] = (vraw[(uint64_t)vh * d_v + dv] - sk[dv]) * b;
+            }
+            for (uint32_t dv = 0; dv < d_v; dv++)
+                for (uint32_t dk = 0; dk < d_k; dk++)
+                    s[(uint64_t)dv * d_k + dk] +=
+                        kn[(uint64_t)vh * d_k + dk] * dd[dv];
+            for (uint32_t dv = 0; dv < d_v; dv++) {
+                double acc = 0.0;
+                for (uint32_t dk = 0; dk < d_k; dk++)
+                    acc += (double)s[(uint64_t)dv * d_k + dk] *
+                           qn[(uint64_t)vh * d_k + dk];
+                o[(uint64_t)vh * d_v + dv] = (float)acc;
+            }
+        }
+
+        /* Gated RMSNorm: RMSNorm(o, gdn_norm) per value head, then silu(z). */
+        for (uint32_t vh = 0; vh < n_v; vh++) {
+            double ss = 0.0;
+            for (uint32_t dv = 0; dv < d_v; dv++)
+                ss += (double)o[(uint64_t)vh * d_v + dv] *
+                      o[(uint64_t)vh * d_v + dv];
+            const float inv = 1.0f / sqrtf((float)(ss / d_v) + DS4_RMS_EPS);
+            for (uint32_t dv = 0; dv < d_v; dv++) {
+                const uint64_t idx = (uint64_t)vh * d_v + dv;
+                on[idx] = o[idx] * inv * w->gdn_norm[dv] * silu(z[idx]);
+            }
+        }
+
+        qwen35_gdn_matvec_f32(out + (uint64_t)t * n_embd, w->gdn_out, d_inner,
+                              n_embd, on);
+    }
+
+    free(dd);
+    free(sk);
+    free(convout);
+    free(on);
+    free(o);
+    free(kn);
+    free(qn);
+    free(gate);
+    free(alpha);
+    free(beta);
+    free(z);
+    free(qkv);
+    return 0;
+}
 #endif
 
 static int ds4_sessions_eval_batch_with_prefill_cuda(

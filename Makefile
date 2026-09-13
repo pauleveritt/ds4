@@ -614,3 +614,13 @@ tests/test_qwen35_attn: tests/test_qwen35_attn.o ds4_cpu_test_hooks.o ds4_image.
 .PHONY: test-qwen35-attn
 test-qwen35-attn: tests/test_qwen35_attn
 	./tests/test_qwen35_attn
+
+tests/test_qwen35_gdn.o: tests/test_qwen35_gdn.c ds4.h
+	$(CC) $(CFLAGS) -I. -DDS4_NO_GPU -c -o $@ $<
+
+tests/test_qwen35_gdn: tests/test_qwen35_gdn.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+.PHONY: test-qwen35-gdn
+test-qwen35-gdn: tests/test_qwen35_gdn
+	./tests/test_qwen35_gdn
