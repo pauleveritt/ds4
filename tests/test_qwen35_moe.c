@@ -25,9 +25,15 @@
  *
  * Four behaviours are shown to fail by manual ablation in the hook (recorded
  * in the task report): the expert gather (indices[k] -> 0), the top-k
- * renormalisation (raw softmax weights), the shared sigmoid gate (g = 1) and
- * the silu placement (silu of the product).  The main case uses a shared gate
- * near 0.5, so setting it to 1 changes the output far beyond tolerance.
+ * renormalisation (raw full-softmax probabilities), the shared sigmoid gate
+ * (g = 1) and the silu placement (silu of the product).  The main case uses a
+ * shared gate near 0.5, so setting it to 1 changes the output far beyond
+ * tolerance.
+ *
+ * Cases: token A routes to the biased set {248..255}; token B re-runs that set
+ * with a non-uniform input; token C routes to a set that overlaps A's but is
+ * not identical (a mixed expert gather); token D amplifies the shared expert's
+ * three matrices so the shared contribution dominates the routed sum.
  *
  * Build/run:
  *   make -C external/ds4 test-qwen35-moe
@@ -140,9 +146,10 @@ static void matvec1(float *out, const float *weight, uint32_t in_dim,
 
 /* Independent scalar reference for the whole MoE FFN.  Routing and the shared
  * gate are consumed from the shipped hooks; the matmuls and the combination are
- * scalar.  The expert slice for `e` is the outer block e*out*in. */
-static void reference_forward(const ds4_test_qwen35_moe_weights *w,
-                              const float *x, float *out) {
+ * scalar.  The expert slice for `e` is the outer block e*out*in.  The routed and
+ * shared partials are written separately so a case can assert which dominates. */
+static void reference_split(const ds4_test_qwen35_moe_weights *w,
+                            const float *x, float *routed, float *shared) {
     float logits[N_EXPERT];
     uint32_t indices[N_EXPERT_USED];
     float weights[N_EXPERT_USED];
@@ -155,7 +162,10 @@ static void reference_forward(const ds4_test_qwen35_moe_weights *w,
         logits, N_EXPERT, N_EXPERT_USED, indices, weights);
     require_ok(used == N_EXPERT_USED, "reference router returns top-8");
 
-    for (uint32_t d = 0; d < N_EMBD; d++) out[d] = 0.0f;
+    for (uint32_t d = 0; d < N_EMBD; d++) {
+        routed[d] = 0.0f;
+        shared[d] = 0.0f;
+    }
 
     for (uint32_t k = 0; k < used; k++) {
         const uint32_t e = indices[k];
@@ -173,7 +183,7 @@ static void reference_forward(const ds4_test_qwen35_moe_weights *w,
             double acc = 0.0;
             for (uint32_t j = 0; j < N_FF_EXP; j++)
                 acc += (double)row[j] * h[j];
-            out[d] += weights[k] * (float)acc;
+            routed[d] += weights[k] * (float)acc;
         }
     }
 
@@ -191,14 +201,28 @@ static void reference_forward(const ds4_test_qwen35_moe_weights *w,
             double acc = 0.0;
             for (uint32_t j = 0; j < N_FF_EXP; j++)
                 acc += (double)row[j] * h[j];
-            out[d] += sgate * (float)acc;
+            shared[d] = sgate * (float)acc;
         }
     }
+}
+
+static void reference_forward(const ds4_test_qwen35_moe_weights *w,
+                              const float *x, float *out) {
+    float routed[N_EMBD];
+    float shared[N_EMBD];
+    reference_split(w, x, routed, shared);
+    for (uint32_t d = 0; d < N_EMBD; d++) out[d] = routed[d] + shared[d];
 }
 
 static float max_abs_diff(const float *a, const float *b, uint64_t n) {
     float m = 0.0f;
     for (uint64_t i = 0; i < n; i++) m = fmaxf(m, fabsf(a[i] - b[i]));
+    return m;
+}
+
+static float max_abs(const float *a, uint64_t n) {
+    float m = 0.0f;
+    for (uint64_t i = 0; i < n; i++) m = fmaxf(m, fabsf(a[i]));
     return m;
 }
 
@@ -230,21 +254,28 @@ static void run_hook(const ds4_test_qwen35_moe_weights *w, const float *x,
                "qwen35 moe forward");
 }
 
+/* Route a token with the shipped router and copy the top-8 indices out.
+ * Returns the number of experts used (always N_EXPERT_USED here). */
+static uint32_t route_only(const ds4_test_qwen35_moe_weights *w, const float *x,
+                           uint32_t *indices) {
+    float logits[N_EXPERT];
+    float weights[N_EXPERT_USED];
+    for (uint32_t e = 0; e < N_EXPERT; e++)
+        logits[e] = dot1(w->ffn_gate_inp + (uint64_t)e * N_EMBD, x, N_EMBD);
+    const uint32_t used = ds4_test_qwen35_moe_route(
+        logits, N_EXPERT, N_EXPERT_USED, indices, weights);
+    require_ok(used == N_EXPERT_USED, "router returns top-8");
+    return used;
+}
+
 /* One case: route a token, fill exactly the selected experts, then require the
  * hook and the scalar reference to agree.  Returns the top-1 index so the
  * caller can assert the expert-axis wiring. */
 static uint32_t run_case(const ds4_test_qwen35_moe_weights *w,
                          float *gate_exps, float *up_exps, float *down_exps,
                          const float *x, const char *what, float tolerance) {
-    float logits[N_EXPERT];
     uint32_t indices[N_EXPERT_USED];
-    float weights[N_EXPERT_USED];
-
-    for (uint32_t e = 0; e < N_EXPERT; e++)
-        logits[e] = dot1(w->ffn_gate_inp + (uint64_t)e * N_EMBD, x, N_EMBD);
-    const uint32_t used = ds4_test_qwen35_moe_route(
-        logits, N_EXPERT, N_EXPERT_USED, indices, weights);
-    require_ok(used == N_EXPERT_USED, "case router returns top-8");
+    const uint32_t used = route_only(w, x, indices);
 
     for (uint32_t k = 0; k < used; k++)
         fill_expert(gate_exps, up_exps, down_exps, indices[k]);
@@ -337,12 +368,64 @@ int main(void) {
         require_ok(g > 0.05f && g < 0.95f, "shared gate is away from 1");
     }
 
-    /* Token B: a varied token, so a different (unbiased) expert set is
-     * exercised through the same wiring. */
+    /* Token B: a varied token.  With this router bias the same biased top-8
+     * wins (in a different order), so token B re-runs the gather on the same
+     * expert set with a non-uniform input; token C below supplies the
+     * overlapping-but-different set. */
     float xb[N_EMBD];
     for (uint32_t d = 0; d < N_EMBD; d++) xb[d] = synth(d, 3u, 0.5f);
     run_case(&w, gate_exps, up_exps, down_exps, xb,
              "qwen35 moe token B (varied token)", 1e-5f);
+
+    /* Token C: all ones except the biased router dimension, weakened to 0.15.
+     * That lets unbiased experts into the top-8, so token C routes to a set
+     * overlapping token A's {248..255} but not identical -- the gather must
+     * handle a mixed expert set.  Assert the overlap is partial. */
+    float xc[N_EMBD];
+    for (uint32_t d = 0; d < N_EMBD; d++) xc[d] = 1.0f;
+    xc[0] = 0.15f;
+    {
+        uint32_t ia[N_EXPERT_USED];
+        uint32_t ic[N_EXPERT_USED];
+        route_only(&w, xa, ia);
+        route_only(&w, xc, ic);
+        uint32_t overlap = 0;
+        for (uint32_t k = 0; k < N_EXPERT_USED; k++)
+            for (uint32_t j = 0; j < N_EXPERT_USED; j++)
+                if (ia[k] == ic[j]) overlap++;
+        require_ok(overlap >= 1u && overlap < N_EXPERT_USED,
+                   "token C routed set overlaps but differs from token A");
+    }
+    run_case(&w, gate_exps, up_exps, down_exps, xc,
+             "qwen35 moe token C (overlapping expert set)", 1e-5f);
+
+    /* Token D: shared-expert-dominant.  The routed experts keep their nonzero
+     * synthetic weights, but the shared expert's three matrices are amplified
+     * 2x, so the shared term dominates the routed sum.  Assert dominance on the
+     * scalar reference's own partials, then compare the hook against it. */
+    float xd[N_EMBD];
+    for (uint32_t d = 0; d < N_EMBD; d++) xd[d] = synth(d, 5u, 0.5f);
+
+    const uint64_t shared_floats = (uint64_t)N_FF_EXP * N_EMBD;
+    for (uint64_t i = 0; i < shared_floats; i++) gate_shexp[i] *= 2.0f;
+    for (uint64_t i = 0; i < shared_floats; i++) up_shexp[i] *= 2.0f;
+    for (uint64_t i = 0; i < shared_floats; i++) down_shexp[i] *= 2.0f;
+    {
+        uint32_t indices[N_EXPERT_USED];
+        float routed[N_EMBD];
+        float shared[N_EMBD];
+        route_only(&w, xd, indices);
+        for (uint32_t k = 0; k < N_EXPERT_USED; k++)
+            fill_expert(gate_exps, up_exps, down_exps, indices[k]);
+        reference_split(&w, xd, routed, shared);
+        require_ok(max_abs(shared, N_EMBD) > max_abs(routed, N_EMBD),
+                   "token D shared contribution dominates the routed sum");
+    }
+    run_case(&w, gate_exps, up_exps, down_exps, xd,
+             "qwen35 moe token D (shared-dominant)", 1e-5f);
+    for (uint64_t i = 0; i < shared_floats; i++) gate_shexp[i] *= 0.5f;
+    for (uint64_t i = 0; i < shared_floats; i++) up_shexp[i] *= 0.5f;
+    for (uint64_t i = 0; i < shared_floats; i++) down_shexp[i] *= 0.5f;
 
     /* The hook must reject a null weight pointer and a null row. */
     {
