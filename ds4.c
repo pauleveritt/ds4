@@ -73824,6 +73824,22 @@ int ds4_test_qwen35_attn_forward(const ds4_test_qwen35_attn_args *args) {
 
     g_ds4_shape = DS4_SHAPE_ORNITH15;
 
+    /* Every dimension below is derived from the compiled preset, so the test's
+     * hardcoded Ornith geometry can only match by construction.  Pin the
+     * preset's attention fields to the constants the test and the spec assume,
+     * and pin value_dim to head_dim (the layer's K/V stride uses head_dim), so
+     * a future preset that differs fails here instead of silently measuring the
+     * wrong shape. */
+    if (DS4_N_EMBD != 2048u || DS4_N_HEAD != 16u || DS4_N_HEAD_KV != 2u ||
+        DS4_N_HEAD_DIM != 256u || DS4_N_ROT != 64u) {
+        return 2;
+    }
+    if (DS4_N_VALUE_DIM != DS4_N_HEAD_DIM) return 3;
+
+    /* Only full-attention blocks take this path: a linear (gated delta net)
+     * layer has no attn_q/k/v weights at all. */
+    if (ds4_qwen35moe_layer_is_linear(args->il)) return 4;
+
     const uint64_t n_embd = DS4_N_EMBD;
     const uint32_t n_head = DS4_N_HEAD;
     const uint32_t n_head_kv = DS4_N_HEAD_KV;

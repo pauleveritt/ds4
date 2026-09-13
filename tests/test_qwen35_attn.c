@@ -271,7 +271,7 @@ int main(void) {
     for (uint32_t t = 0; t < N_TOKENS; t++)
         for (uint32_t d = 0; d < N_EMBD; d++)
             require_close("qwen35 attn layer", actual[(uint64_t)t * N_EMBD + d],
-                          expected[(uint64_t)t * N_EMBD + d], 2e-4f);
+                          expected[(uint64_t)t * N_EMBD + d], 1e-5f);
 
     /* The first two rows of a 3-token batch must equal a 1- and a 2-token run:
      * this pins causal masking (a later key must not influence an earlier
@@ -296,6 +296,15 @@ int main(void) {
         group_delta += fabsf(wk[d] - wk[(uint64_t)HEAD_DIM + d]);
     }
     require_ok(group_delta > 1.0f, "the two KV groups differ");
+
+    /* il=3 is a full-attention block; il=4 is a linear (gated delta net) block
+     * per ds4_qwen35moe_layer_is_linear.  The hook must refuse the latter: it
+     * has no attn_q/k/v and is not the layer this core models. */
+    args.il = 4;
+    args.out = actual;
+    require_ok(ds4_test_qwen35_attn_forward(&args) != 0,
+               "attn forward rejects a linear layer");
+    args.il = 3;
 
     munmap(model, MODEL_BYTES);
     puts("qwen35 full-attention layer core: PASS");
