@@ -124,6 +124,13 @@ tests/test_metal_session_batch.o: tests/test_metal_session_batch.c ds4.h
 tests/test_metal_session_batch: tests/test_metal_session_batch.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_laguna_kv_ring: tests/test_laguna_kv_ring.c ds4_gpu.h $(CORE_OBJS)
+	$(CC) $(CFLAGS) -fno-fast-math -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
+
+.PHONY: test-laguna-kv-ring
+test-laguna-kv-ring: tests/test_laguna_kv_ring
+	./tests/test_laguna_kv_ring
+
 # Model-free GPU regression: resident grouped MoE, Q6_K down, FP32 intermediate.
 tests/test_laguna_q6_f32_down: tests/test_laguna_q6_f32_down.c ds4_gpu.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -fno-fast-math -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
