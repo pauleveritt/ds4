@@ -168,6 +168,57 @@ done:
     return ok;
 }
 
+static int check_mixed_class_cache(void *model, uint64_t bytes) {
+    enum { SEED_N = 4 };
+    const uint64_t row = D / block_values * block_bytes;
+    const uint64_t large_expert = H * row;
+    const uint64_t small_expert = large_expert / 2;
+    if (small_expert == 0) return 1;
+    int32_t ids[SEED_N];
+    for (int i = 0; i < SEED_N; i++) ids[i] = i;
+    /* Two expert size classes in one model: a smaller class (class A) and a
+     * larger one (class B). The padded primary sizes the single slab slot to
+     * the larger class and must still admit the smaller one, because the MoE
+     * read kernel resolves each expert by absolute address, not by slot stride
+     * (research/2026-09-19-mixed-class-expert-cache.md). */
+    const ds4_gpu_stream_expert_table small_table = {
+        .model_map = model, .model_size = bytes, .layer = 11, .n_total_expert = E,
+        .gate_offset = 0, .up_offset = E * small_expert,
+        .down_offset = 2 * E * small_expert,
+        .gate_expert_bytes = small_expert, .down_expert_bytes = small_expert,
+    };
+    const ds4_gpu_stream_expert_table large_table = {
+        .model_map = model, .model_size = bytes, .layer = 12, .n_total_expert = E,
+        .gate_offset = 0, .up_offset = E * large_expert,
+        .down_offset = 2 * E * large_expert,
+        .gate_expert_bytes = large_expert, .down_expert_bytes = large_expert,
+    };
+    ds4_gpu_set_streaming_expert_cache_budget(16);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(3 * large_expert);
+    int ok = ds4_gpu_begin_commands() &&
+             ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
+                &small_table, ids, NULL, SEED_N) &&
+             ds4_gpu_end_commands();
+    const uint32_t small_count = ds4_gpu_stream_expert_cache_current_count();
+    ok = ok && ds4_gpu_begin_commands() &&
+         ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
+            &large_table, ids, NULL, SEED_N) &&
+         ds4_gpu_end_commands();
+    const uint32_t total = ds4_gpu_stream_expert_cache_current_count();
+    if (small_count != SEED_N || total != 2 * SEED_N) {
+        fprintf(stderr,
+                "Metal SSD mixed-class cache dropped a class: class A=%u/%d "
+                "total=%u/%d (slot stride=%llu, class A=%llu, class B=%llu)\n",
+                small_count, SEED_N, total, 2 * SEED_N,
+                (unsigned long long)(3 * large_expert),
+                (unsigned long long)(3 * small_expert),
+                (unsigned long long)(3 * large_expert));
+        return 0;
+    }
+    fprintf(stderr, "Metal SSD mixed-class cache serves both classes: PASS\n");
+    return 1;
+}
+
 static uint64_t memory_footprint(void) {
     task_vm_info_data_t info;
     mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
@@ -333,6 +384,7 @@ int main(int argc, char **argv) {
     ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid);
     ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(out);
     if (ok) ok = check_batch_cache(model, bytes, expert);
+    if (ok) ok = check_mixed_class_cache(model, bytes);
     if (ok && D == 256) ok = check_seed_release(model, bytes, expert);
     ds4_gpu_print_memory_report("SSD expert test");
     if (ok) ok = check_mapping_lifetime();
