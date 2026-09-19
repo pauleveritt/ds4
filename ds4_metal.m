@@ -960,6 +960,14 @@ typedef struct {
 
 static ds4_gpu_model_view g_model_views[DS4_METAL_MAX_MODEL_VIEWS];
 static uint32_t g_model_view_count;
+/* Streaming requests replace the active set, including when it shrinks.
+ * Remember the request, not individual view coverage: large tensors may be
+ * split across overlapping views. Every view mutation invalidates this key. */
+static const void *g_span_request_map;
+static uint64_t g_span_request_size, g_span_request_max_tensor;
+static uint32_t g_span_request_count;
+static uint64_t g_span_request_offsets[DS4_METAL_MAX_MODEL_VIEWS];
+static uint64_t g_span_request_sizes[DS4_METAL_MAX_MODEL_VIEWS];
 
 enum {
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER = 80,
@@ -2104,6 +2112,7 @@ static void ds4_gpu_progress_failed(void) {
 }
 
 static void ds4_gpu_model_views_clear(void) {
+    g_span_request_count = 0;
     for (uint32_t i = 0; i < g_model_view_count; i++) {
         g_model_views[i].buffer = nil;
         g_model_views[i].model_map = NULL;
@@ -2115,6 +2124,7 @@ static void ds4_gpu_model_views_clear(void) {
 }
 
 static void ds4_gpu_model_views_remove_map(const void *model_map) {
+    g_span_request_count = 0;
     uint32_t kept = 0;
     for (uint32_t i = 0; i < g_model_view_count; i++) {
         if (g_model_views[i].model_map != model_map)
@@ -2210,6 +2220,7 @@ static int ds4_gpu_add_model_view_range(
         uint64_t    max_tensor_bytes,
         bool        use_default_view_cap,
         uint64_t   *mapped_model_size_out) {
+    g_span_request_count = 0;
     const uint64_t page = (uint64_t)getpagesize();
     const uintptr_t model_addr = (uintptr_t)model_map;
 
@@ -4704,6 +4715,7 @@ void ds4_gpu_set_glm_model(bool enabled) {
 }
 
 void ds4_gpu_set_ssd_streaming(bool enabled) {
+    g_span_request_count = 0;
     g_ssd_streaming_mode = enabled ? 1 : 0;
     ds4_gpu_stream_expert_cache_clear_all(1);
     if (g_ssd_streaming_mode) {
@@ -13270,7 +13282,14 @@ int ds4_gpu_set_model_map_spans(
                                            sizes[0],
                                            max_tensor_bytes);
     }
-    if (ds4_gpu_model_views_cover_spans(model_map, model_size, offsets, sizes, count)) {
+    const uint64_t requested_max_tensor = max_tensor_bytes;
+    if (g_ssd_streaming_mode && count == g_span_request_count &&
+        model_map == g_span_request_map && model_size == g_span_request_size &&
+        requested_max_tensor == g_span_request_max_tensor &&
+        memcmp(offsets, g_span_request_offsets, count * sizeof(*offsets)) == 0 &&
+        memcmp(sizes, g_span_request_sizes, count * sizeof(*sizes)) == 0) return 1;
+    if (!g_ssd_streaming_mode &&
+        ds4_gpu_model_views_cover_spans(model_map, model_size, offsets, sizes, count)) {
         return 1;
     }
 
@@ -13313,6 +13332,14 @@ int ds4_gpu_set_model_map_spans(
             ds4_gpu_model_residency_clear();
             ds4_gpu_model_views_clear();
             return 0;
+        }
+        if (g_ssd_streaming_mode && count <= DS4_METAL_MAX_MODEL_VIEWS) {
+            memcpy(g_span_request_offsets, offsets, count * sizeof(*offsets));
+            memcpy(g_span_request_sizes, sizes, count * sizeof(*sizes));
+            g_span_request_map = model_map;
+            g_span_request_size = model_size;
+            g_span_request_max_tensor = requested_max_tensor;
+            g_span_request_count = count;
         }
         g_model_map_ptr = model_map;
         g_model_map_size = model_size;
@@ -41183,7 +41210,11 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
         return 0;
     }
 
-    const bool mid_f16 = true;
+    /* Unclamped Laguna activations can exceed FP16 even for finite inputs.
+     * Q6 down must consume FP32 directly; F32 storage alone is insufficient
+     * because the grouped down kernel stages its RHS in half precision. */
+    const bool q6_f32_down = down_type == DS4_METAL_TENSOR_Q6_K && swiglu_clamp == 0.0f;
+    const bool mid_f16 = !q6_f32_down;
     const NSUInteger mm_id_threadgroup_bytes = 8192u;
     const uint64_t compact_mid_values = (uint64_t)pair_rows * expert_mid_dim;
     const uint64_t down_values = (uint64_t)pair_rows * out_dim;
@@ -41396,6 +41427,32 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                                                    mid_f16);
         }
         DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("activation_weight");
+        if (q6_f32_down) {
+            ds4_gpu_glm_routed_moe_args args = {
+                .tp_rank = g_tp_split_rank, .tp_world = g_tp_split_world,
+                .tp_expert_base = (int32_t)first_expert,
+                .in_dim = expert_in_dim, .mid_dim = expert_mid_dim,
+                .out_dim = out_dim, .n_total_expert = n_total_expert,
+                .n_expert_used = n_expert, .n_tokens = n_tokens,
+                .mid_token_stride = n_expert * expert_mid_dim,
+                .down_type = down_type,
+                .down_expert_bytes = down_expert_bytes,
+                .down_row_bytes = down_row_bytes,
+            };
+            if (!ok || !g_glm_q6_k_down_f32_pipeline) return 0;
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:g_glm_q6_k_down_f32_pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:downbuf offset:(NSUInteger)down_inner atIndex:1];
+            [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+            [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:3];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake((out_dim + 3u) / 4u, n_tokens, 1)
+                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            return ds4_gpu_finish_command_buffer(cb, owned, "GLM grouped Q6 FP32 down");
+        }
+
 
         id<MTLBuffer> down_dst = n_expert == 1 ? outbuf : g_moe_down_scratch_buffer;
         NSUInteger down_dst_off = n_expert == 1 ? ds4_gpu_tensor_offset(out) : 0;
@@ -41798,8 +41855,16 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
         return 0;
     }
 
+    /* XS Q4_K_M uses Q6_K down projections. The batched cache-address
+     * path cannot serve that layout and already falls back to mapped weights.
+     * Keep the resident grouped arithmetic for this fallback: selecting the
+     * scalar kernels only because streaming is enabled changes F16 staging
+     * and therefore the model's logits. The caller maps this layer's tensors. */
+    const bool mapped_q4_q6 = gate_type == DS4_METAL_TENSOR_Q4_K &&
+                              up_type == DS4_METAL_TENSOR_Q4_K &&
+                              down_type == DS4_METAL_TENSOR_Q6_K;
     if (allow_grouped &&
-        (!g_ssd_streaming_mode ||
+        (!g_ssd_streaming_mode || mapped_q4_q6 ||
          ds4_gpu_glm_streaming_prefill_full_layer_active()) &&
         ds4_gpu_glm_grouped_moe_layer_enabled(layer_index) &&
         ds4_gpu_glm_routed_moe_batch_grouped_available(gate_type,
