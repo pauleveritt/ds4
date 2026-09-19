@@ -4738,11 +4738,12 @@ void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
 
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
     /*
-     * Pre-seed the cache's single slab size class with the model's uniform
-     * per-expert bytes (first routed layer). With a mixed-precision GGUF this
-     * pins the class to the majority layers so the boosted ones are rejected
-     * deterministically from startup, instead of depending on which layer
-     * happens to touch the cache first.
+     * Pre-seed the cache's single padded slab class with the model's LARGEST
+     * per-expert bytes (ds4_streaming_routed_expert_bytes picks the max, not
+     * the majority). Every smaller class is padded to this stride and admitted,
+     * instead of being rejected as off-class. Pinning it at startup makes the
+     * admission deterministic, independent of which layer touches the cache
+     * first.
      */
     g_stream_expert_cache_expert_bytes = bytes;
 }
@@ -13636,19 +13637,21 @@ static int ds4_gpu_stream_expert_cache_note_expert_size(
         return 0;
     }
     /*
-     * The cache is a single-size-class slab allocator: the expert byte size is
-     * frozen on first sight (or pre-seeded at startup from the model's slab
-     * class) and off-size layers are REJECTED rather than adopted. A rejected
-     * layer (mixed-precision boost: Q4_K experts among IQ2 layers) falls back
-     * to the mapped-model per-expert path; last-writer-wins here would instead
-     * poison the slab size class and deadlock slab reuse.
+     * The cache is a single padded slab allocator. Its slot stride is the
+     * model's LARGEST per-expert class (pre-seeded at startup); any class at
+     * or below that stride is admitted and padded up to the slot. The MoE read
+     * kernel resolves each expert by an absolute address built from the
+     * layer's own bytes, so a smaller expert is read from its own offsets
+     * inside the slot -- the slot stride is never the expert size (see
+     * research/2026-09-19-mixed-class-expert-cache.md). A class larger than
+     * the stride is still rejected: it would overrun the slot.
      */
     const uint64_t bytes = gate_expert_bytes * 2ull + down_expert_bytes;
     if (g_stream_expert_cache_expert_bytes == 0) {
         g_stream_expert_cache_expert_bytes = bytes;
         return 1;
     }
-    return bytes == g_stream_expert_cache_expert_bytes;
+    return bytes <= g_stream_expert_cache_expert_bytes;
 }
 
 static uint32_t ds4_gpu_stream_expert_cache_requested_budget(void) {
@@ -14706,11 +14709,30 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
         slot_bytes = round_up_u64(slot_bytes, page);
         if (slot_bytes == 0 || slot_bytes > (uint64_t)NSUIntegerMax) return 0;
     }
-    if (g_stream_expert_cache_slab_slot_bytes != 0 &&
-        g_stream_expert_cache_slab_slot_bytes != slot_bytes) {
+    if (g_stream_expert_cache_slab_slot_bytes == 0) {
+        /*
+         * Size the single padded slot to the LARGEST class. Seed the stride
+         * from the pinned model class (ds4_gpu_set_streaming_expert_cache_
+         * expert_bytes) rather than lazily from whichever layer allocates
+         * first: a smaller layer seen first must not shrink the slot and
+         * reject the larger class. Synthetic callers with no pinned class
+         * keep the old first-allocation behaviour.
+         */
+        uint64_t stride = slot_bytes;
+        if (g_stream_expert_cache_expert_bytes != 0) {
+            uint64_t pinned = g_stream_expert_cache_expert_bytes;
+            if (page != 0) {
+                pinned = round_up_u64(pinned, page);
+                if (pinned == 0 || pinned > (uint64_t)NSUIntegerMax) return 0;
+            }
+            if (pinned > stride) stride = pinned;
+        }
+        g_stream_expert_cache_slab_slot_bytes = stride;
+    }
+    if (slot_bytes > g_stream_expert_cache_slab_slot_bytes) {
         return 0;
     }
-    g_stream_expert_cache_slab_slot_bytes = slot_bytes;
+    const uint64_t stride = g_stream_expert_cache_slab_slot_bytes;
 
     if (g_stream_expert_cache_free_slot_count != 0) {
         const uint32_t slot =
@@ -14741,7 +14763,7 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
             return 0;
         }
         uint64_t target = ds4_gpu_stream_expert_slab_target_bytes();
-        uint64_t slots64 = target / slot_bytes;
+        uint64_t slots64 = target / stride;
         if (slots64 == 0) slots64 = 1;
         if (slots64 > UINT32_MAX) slots64 = UINT32_MAX;
         uint32_t slots = (uint32_t)slots64;
@@ -14753,11 +14775,11 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
         if (slots == 0) return 0;
         id<MTLBuffer> slab_buffer = nil;
         while (slots != 0) {
-            if ((uint64_t)slots <= UINT64_MAX / slot_bytes &&
-                (uint64_t)slots * slot_bytes <= (uint64_t)NSUIntegerMax) {
+            if ((uint64_t)slots <= UINT64_MAX / stride &&
+                (uint64_t)slots * stride <= (uint64_t)NSUIntegerMax) {
                 slab_buffer =
                     ds4_gpu_stream_expert_alloc_slab_buffer(
-                            (uint64_t)slots * slot_bytes,
+                            (uint64_t)slots * stride,
                             @"ds4_stream_expert_slab");
                 if (slab_buffer) break;
             }
@@ -40786,21 +40808,16 @@ int ds4_gpu_laguna_routed_shared_moe_one_tensor(
          * decode integration (ds4_gpu_glm_routed_moe_one_tensor) using the
          * same generic cache primitives (peek / load_selected_missing /
          * set_addr_slot / addr_buffers / prune_layer / prune_global). The
-         * cache is a single-size-class slab allocator: its class is pinned
-         * once, at engine startup, to the FIRST sparse layer's routed
-         * gate+down byte size (ds4_streaming_routed_expert_bytes in ds4.c,
-         * generic/family-agnostic, not something this function controls).
-         * For XS 2.1's official Q4_K_M file that first layer's down
-         * projection happens to be Q6_K (llama.cpp's per-layer Q4_K/Q6_K
-         * "extra bits" heuristic, uncorrelated with the SWA pattern), so
-         * ds4_gpu_stream_expert_cache_note_expert_size below only accepts
-         * Q6_K-down layers at runtime even though a Q4_K addr-table kernel
-         * also exists (gate/up are always Q4_K for every XS 2.1 layer, so a
-         * Q4_K-down layer's pair projection could stream too, if some other
-         * XS 2.1 quant recipe ever pins the class to Q4_K instead). Layers
-         * whose bytes don't match the pinned class always take the
-         * mapped-model path below, exactly like GLM's mixed-precision
-         * "boosted" layers that fall off the cache's slab size class.
+         * cache is a single PADDED slab: its stride is the model's LARGEST
+         * routed per-expert gate+down byte size (ds4_streaming_routed_expert_
+         * bytes in ds4.c, generic/family-agnostic, not something this function
+         * controls), and ds4_gpu_stream_expert_cache_note_expert_size below
+         * admits any class at or below that stride. For XS 2.1's official
+         * Q4_K_M file both classes stream: Q4_K-down and Q6_K-down layers are
+         * each read from their own bytes inside the padded slot, because the
+         * MoE kernel resolves experts by absolute address rather than by slot
+         * stride. Only a down type this function has no addr-table kernel for
+         * (or a class above the stride) takes the mapped-model path below.
          */
         const BOOL down_addr_q4 = routed->down_type == DS4_METAL_TENSOR_Q4_K;
         const BOOL down_addr_q6 = routed->down_type == DS4_METAL_TENSOR_Q6_K;

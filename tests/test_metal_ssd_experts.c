@@ -168,6 +168,104 @@ done:
     return ok;
 }
 
+static int check_mixed_class_cache(void *model, uint64_t bytes) {
+    enum { SEED_N = 4 };
+    const uint64_t row = D / block_values * block_bytes;
+    const uint64_t large_expert = H * row;
+    const uint64_t small_expert = large_expert / 2;
+    if (small_expert == 0) return 1;
+    int32_t ids[SEED_N];
+    for (int i = 0; i < SEED_N; i++) ids[i] = i;
+    /* Two expert size classes in one model: a smaller class (class A) and a
+     * larger one (class B). The padded primary sizes the single slab slot to
+     * the larger class and must still admit the smaller one, because the MoE
+     * read kernel resolves each expert by absolute address, not by slot stride
+     * (research/2026-09-19-mixed-class-expert-cache.md).
+     *
+     * This asserts ADMISSION into the pool (current_count), not cache hits:
+     * a class can be admitted and still record zero hits under the victim
+     * policy (the live result shows class B gets 0 hits at this budget). */
+    const ds4_gpu_stream_expert_table small_table = {
+        .model_map = model, .model_size = bytes, .layer = 11, .n_total_expert = E,
+        .gate_offset = 0, .up_offset = E * small_expert,
+        .down_offset = 2 * E * small_expert,
+        .gate_expert_bytes = small_expert, .down_expert_bytes = small_expert,
+    };
+    const ds4_gpu_stream_expert_table large_table = {
+        .model_map = model, .model_size = bytes, .layer = 12, .n_total_expert = E,
+        .gate_offset = 0, .up_offset = E * large_expert,
+        .down_offset = 2 * E * large_expert,
+        .gate_expert_bytes = large_expert, .down_expert_bytes = large_expert,
+    };
+    ds4_gpu_set_streaming_expert_cache_budget(16);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(3 * large_expert);
+    int ok = ds4_gpu_begin_commands() &&
+             ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
+                &small_table, ids, NULL, SEED_N) &&
+             ds4_gpu_end_commands();
+    const uint32_t small_count = ds4_gpu_stream_expert_cache_current_count();
+    ok = ok && ds4_gpu_begin_commands() &&
+         ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
+            &large_table, ids, NULL, SEED_N) &&
+         ds4_gpu_end_commands();
+    const uint32_t total = ds4_gpu_stream_expert_cache_current_count();
+    if (small_count != SEED_N || total != 2 * SEED_N) {
+        fprintf(stderr,
+                "Metal SSD mixed-class cache dropped a class: class A=%u/%d "
+                "total=%u/%d (slot stride=%llu, class A=%llu, class B=%llu)\n",
+                small_count, SEED_N, total, 2 * SEED_N,
+                (unsigned long long)(3 * large_expert),
+                (unsigned long long)(3 * small_expert),
+                (unsigned long long)(3 * large_expert));
+        return 0;
+    }
+    fprintf(stderr, "Metal SSD mixed-class cache admits both classes: PASS\n");
+    return 1;
+}
+
+static int check_mixed_class_reuse(void *model, uint64_t bytes, int fd) {
+    enum { SEED_N = 2 };
+    const uint64_t row = D / block_values * block_bytes;
+    const uint64_t large_expert = H * row;
+    if (large_expert == 0) return 1;
+    int32_t ids[SEED_N];
+    for (int i = 0; i < SEED_N; i++) ids[i] = i;
+    /* Class B (the larger, Q6_K-down analog) at the padded stride. */
+    const ds4_gpu_stream_expert_table large_table = {
+        .model_map = model, .model_size = bytes, .layer = 14, .n_total_expert = E,
+        .gate_offset = 0, .up_offset = E * large_expert,
+        .down_offset = 2 * E * large_expert,
+        .gate_expert_bytes = large_expert, .down_expert_bytes = large_expert,
+    };
+    ds4_gpu_set_streaming_expert_cache_budget(16);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(3 * large_expert);
+    /* Admit class B through the pread path (the cache's only fill source), then
+     * request it a second time with nothing else inserted: the budget (16) far
+     * exceeds the two entries, so there is no eviction pressure. Withdraw the
+     * backing fd for the second request -- a resident entry must be served from
+     * the cache without touching the source, while a refill would fail. This is
+     * the named check that separates "a lookup can hit" from the victim policy
+     * that starves class B in the live run. */
+    int ok = ds4_gpu_stream_expert_cache_seed_experts(&large_table, ids, NULL, SEED_N);
+    const uint32_t seeded = ds4_gpu_stream_expert_cache_current_count();
+    ds4_gpu_set_model_fd(-1);
+    const int second = ds4_gpu_stream_expert_cache_seed_selected(&large_table, ids, SEED_N);
+    ds4_gpu_set_model_fd(fd);
+    const uint32_t after_second = ds4_gpu_stream_expert_cache_current_count();
+    ok = ok && seeded == SEED_N && second && after_second == seeded;
+    if (!ok) {
+        fprintf(stderr,
+                "Metal SSD mixed-class reuse: class B seeded=%u/2 second=%d "
+                "count=%u (stride=%llu, class B=%llu)\n",
+                seeded, second, after_second,
+                (unsigned long long)(3 * large_expert),
+                (unsigned long long)(3 * large_expert));
+        return 0;
+    }
+    fprintf(stderr, "Metal SSD mixed-class reuse serves class B from the padded cache: PASS\n");
+    return 1;
+}
+
 static uint64_t memory_footprint(void) {
     task_vm_info_data_t info;
     mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
@@ -333,6 +431,8 @@ int main(int argc, char **argv) {
     ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid);
     ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(out);
     if (ok) ok = check_batch_cache(model, bytes, expert);
+    if (ok) ok = check_mixed_class_reuse(model, bytes, fileno(file));
+    if (ok) ok = check_mixed_class_cache(model, bytes);
     if (ok && D == 256) ok = check_seed_release(model, bytes, expert);
     ds4_gpu_print_memory_report("SSD expert test");
     if (ok) ok = check_mapping_lifetime();
