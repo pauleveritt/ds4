@@ -180,7 +180,11 @@ static int check_mixed_class_cache(void *model, uint64_t bytes) {
      * larger one (class B). The padded primary sizes the single slab slot to
      * the larger class and must still admit the smaller one, because the MoE
      * read kernel resolves each expert by absolute address, not by slot stride
-     * (research/2026-09-19-mixed-class-expert-cache.md). */
+     * (research/2026-09-19-mixed-class-expert-cache.md).
+     *
+     * This asserts ADMISSION into the pool (current_count), not cache hits:
+     * a class can be admitted and still record zero hits under the victim
+     * policy (the live result shows class B gets 0 hits at this budget). */
     const ds4_gpu_stream_expert_table small_table = {
         .model_map = model, .model_size = bytes, .layer = 11, .n_total_expert = E,
         .gate_offset = 0, .up_offset = E * small_expert,
@@ -215,7 +219,7 @@ static int check_mixed_class_cache(void *model, uint64_t bytes) {
                 (unsigned long long)(3 * large_expert));
         return 0;
     }
-    fprintf(stderr, "Metal SSD mixed-class cache serves both classes: PASS\n");
+    fprintf(stderr, "Metal SSD mixed-class cache admits both classes: PASS\n");
     return 1;
 }
 
