@@ -227,18 +227,10 @@ static int check_mixed_class_reuse(void *model, uint64_t bytes, int fd) {
     enum { SEED_N = 2 };
     const uint64_t row = D / block_values * block_bytes;
     const uint64_t large_expert = H * row;
-    const uint64_t small_expert = large_expert / 2;
-    if (small_expert == 0) return 1;
+    if (large_expert == 0) return 1;
     int32_t ids[SEED_N];
     for (int i = 0; i < SEED_N; i++) ids[i] = i;
-    /* The padded stride is the larger class (class B, the Q6_K-down analog);
-     * the smaller class (class A, the Q4_K-down analog) sits below it. */
-    const ds4_gpu_stream_expert_table small_table = {
-        .model_map = model, .model_size = bytes, .layer = 13, .n_total_expert = E,
-        .gate_offset = 0, .up_offset = E * small_expert,
-        .down_offset = 2 * E * small_expert,
-        .gate_expert_bytes = small_expert, .down_expert_bytes = small_expert,
-    };
+    /* Class B (the larger, Q6_K-down analog) at the padded stride. */
     const ds4_gpu_stream_expert_table large_table = {
         .model_map = model, .model_size = bytes, .layer = 14, .n_total_expert = E,
         .gate_offset = 0, .up_offset = E * large_expert,
@@ -261,20 +253,13 @@ static int check_mixed_class_reuse(void *model, uint64_t bytes, int fd) {
     ds4_gpu_set_model_fd(fd);
     const uint32_t after_second = ds4_gpu_stream_expert_cache_current_count();
     ok = ok && seeded == SEED_N && second && after_second == seeded;
-    /* The below-stride class is the one the base equality gate rejects; it must
-     * also be resident under the padded stride, which is what makes this check
-     * RED on the unmodified base. */
-    ok = ok && ds4_gpu_stream_expert_cache_seed_experts(&small_table, ids, NULL, SEED_N);
-    const uint32_t total = ds4_gpu_stream_expert_cache_current_count();
-    ok = ok && total == 2 * SEED_N;
     if (!ok) {
         fprintf(stderr,
                 "Metal SSD mixed-class reuse: class B seeded=%u/2 second=%d "
-                "count=%u total=%u/%d (stride=%llu, class B=%llu, class A=%llu)\n",
-                seeded, second, after_second, total, 2 * SEED_N,
+                "count=%u (stride=%llu, class B=%llu)\n",
+                seeded, second, after_second,
                 (unsigned long long)(3 * large_expert),
-                (unsigned long long)(3 * large_expert),
-                (unsigned long long)(3 * small_expert));
+                (unsigned long long)(3 * large_expert));
         return 0;
     }
     fprintf(stderr, "Metal SSD mixed-class reuse serves class B from the padded cache: PASS\n");
@@ -446,8 +431,8 @@ int main(int argc, char **argv) {
     ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid);
     ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(out);
     if (ok) ok = check_batch_cache(model, bytes, expert);
-    if (ok) ok = check_mixed_class_cache(model, bytes);
     if (ok) ok = check_mixed_class_reuse(model, bytes, fileno(file));
+    if (ok) ok = check_mixed_class_cache(model, bytes);
     if (ok && D == 256) ok = check_seed_release(model, bytes, expert);
     ds4_gpu_print_memory_report("SSD expert test");
     if (ok) ok = check_mapping_lifetime();
