@@ -5135,33 +5135,25 @@ static bool ds4_streaming_routed_expert_bytes(
     if (per_expert_bytes_out) *per_expert_bytes_out = 0;
     if (!weights || !per_expert_bytes_out) return false;
 
-    /* Mixed-precision models can put an outlier quant at the first routed
-     * layer owned by a distributed slice.  Choosing that first layer as the
-     * slab class makes every ordinary layer bypass the cache.  Use the most
-     * common local size class instead (ties retain the earliest class). */
+    /*
+     * Mixed-precision models carry more than one routed per-expert size class
+     * (e.g. XS Q4_K_M: Q4_K-down and Q6_K-down). The streaming cache is a
+     * single PADDED slab, so size its slot stride to the LARGEST class in the
+     * weights and admit any class at or below it. A dominant (most common)
+     * class would leave the larger class uncached; the largest class lets
+     * every class share the one pool. Uniform models still get the single
+     * class unchanged.
+     */
     uint64_t best_bytes = 0;
-    uint32_t best_count = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         uint64_t candidate = 0;
         if (!streaming_layer_routed_expert_bytes(&weights->layer[il],
                                                  &candidate)) {
             continue;
         }
-        uint32_t count = 0;
-        for (uint32_t jl = 0; jl < DS4_N_LAYER; jl++) {
-            uint64_t bytes = 0;
-            if (streaming_layer_routed_expert_bytes(&weights->layer[jl],
-                                                    &bytes) &&
-                bytes == candidate) {
-                count++;
-            }
-        }
-        if (count > best_count) {
-            best_bytes = candidate;
-            best_count = count;
-        }
+        if (candidate > best_bytes) best_bytes = candidate;
     }
-    if (best_count == 0) return false;
+    if (best_bytes == 0) return false;
     *per_expert_bytes_out = best_bytes;
     return true;
 }
@@ -5186,7 +5178,7 @@ static bool ds4_streaming_cacheable_expert_count(
                                                  &per_expert_bytes)) {
             continue;
         }
-        if (per_expert_bytes == slab_bytes) layers++;
+        if (per_expert_bytes <= slab_bytes) layers++;
     }
 
     if (layers == 0 ||
@@ -5232,10 +5224,15 @@ static bool ds4_streaming_prefill_headroom_bytes(
 /*
  * Mixed-precision ("boosted") GGUFs upcast a few layers' routed experts to a
  * bigger quant (e.g. Q4_K among IQ2 layers). The streaming expert cache is a
- * single-size-class slab allocator sized from the dominant local routed-layer
- * size class, so other layers can never be served from it: they must read
- * expert weights through the mapped-model views instead. A layer is "uniform"
- * iff its per-expert bytes match the slab class.
+ * single PADDED slab allocator whose slot stride is the largest class; it
+ * admits any class at or below that stride, so a layer whose per-expert bytes
+ * are below the stride is cache-served too (padded to the slot). This helper
+ * still reports the old "uniform" (exact-class) predicate and is used by the
+ * startup off-class warning and the decode-span residency set. Task 5 input:
+ * once a smaller class is cache-served it is no longer "off the slab class",
+ * so the warning below is stale and this predicate is the thing to revisit.
+ * A class above the stride (impossible once the stride is the max) would fall
+ * back to the mapped-model views.
  */
 static DS4_MAYBE_UNUSED bool weights_streaming_layer_experts_uniform(
         const ds4_weights *w,
@@ -8862,14 +8859,13 @@ static bool laguna_decode_experts_cache_servable(const ds4_layer_weights *l) {
  * (ds4_gpu_laguna_routed_shared_moe_one_tensor) has address-table streaming
  * variants for a Q4_K and a Q6_K routed down projection only, while the
  * byte-size "uniform" test can also pass for the Q3_K/Q2_K routed layouts
- * load-time validation accepts. Whichever type the FIRST sparse layer happens
- * to be (Q6_K for XS 2.1's official Q4_K_M file) becomes the pinned slab class
- * at startup (ds4_streaming_routed_expert_bytes in ds4_engine_open_internal),
- * and only layers matching that exact byte signature are actually served from
- * the cache at runtime (ds4_gpu_stream_expert_cache_note_expert_size in
- * ds4_metal.m). Layers off that class -- or of a type the kernel has no
- * variant for -- always fall back to wrapping the whole routed-expert tensor
- * from the mapped model range, so they must stay in this static set.
+ * load-time validation accepts. The padded slab stride is the model's largest
+ * class at startup (ds4_streaming_routed_expert_bytes in
+ * ds4_engine_open_internal); a layer whose bytes match that stride is served
+ * from the cache at runtime (ds4_gpu_stream_expert_cache_note_expert_size in
+ * ds4_metal.m). A layer of a type the kernel has no variant for always falls
+ * back to wrapping the whole routed-expert tensor from the mapped model range,
+ * so it must stay in this static set.
  */
 static void model_map_span_vec_include_layer_decode(
         ds4_model_map_span_vec *spans,
@@ -73521,10 +73517,19 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #endif
         if (e->ssd_streaming) {
             /*
-             * Pin the expert cache's slab size class to the model's uniform
-             * per-expert bytes, and count mixed-precision (boosted) layers:
-             * those are served through mapped model views instead of the
-             * cache (see weights_streaming_layer_experts_uniform).
+             * Pin the expert cache's single PADDED slab stride to the model's
+             * LARGEST per-expert bytes. Every class at or below the stride is
+             * admitted (padded to the slot); the MoE read kernel resolves each
+             * expert by absolute address, so a smaller class is read from its
+             * own bytes inside the slot.
+             *
+             * Task 5 input (stale message, not silently left): "boosted" is
+             * still counted with weights_streaming_layer_experts_uniform's
+             * exact-class test, so for a padded cache it counts layers the slab
+             * now DOES serve. The two warnings below therefore overstate the
+             * bypass ("... will bypass the expert cache and read experts via
+             * mapped model views"), and the floor formula's (routed - boosted)
+             * undercounts the cached working set. Both are Task 5's to fix.
              */
             uint64_t slab_expert_bytes = 0;
             if (ds4_streaming_routed_expert_bytes(&e->weights, &slab_expert_bytes)) {
@@ -73551,12 +73556,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
                             boosted, routed);
                 }
                 /*
-                 * Below one token's routed working set (uniform routed layers
-                 * x experts used) every token evicts entries it is about to
-                 * reuse, and prefill serves layer overflow through mapped
-                 * model views.  Output stays byte-identical at any budget
-                 * (the addr-table kernels read the same bytes either way);
-                 * only throughput collapses, so warn instead of refusing.
+                 * Below one token's routed working set every token evicts
+                 * entries it is about to reuse. Output stays byte-identical at
+                 * any budget (the addr-table kernels read the same bytes either
+                 * way); only throughput collapses, so warn instead of refusing.
+                 * Task 5 input: under padding the working set is every routed
+                 * layer x experts used, but (routed - boosted) still subtracts
+                 * the now-cached smaller class, so this threshold is too low.
                  */
                 const uint64_t min_experts =
                     (uint64_t)(routed - boosted) * DS4_N_EXPERT_USED;
