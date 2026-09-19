@@ -5227,12 +5227,11 @@ static bool ds4_streaming_prefill_headroom_bytes(
  * single PADDED slab allocator whose slot stride is the largest class; it
  * admits any class at or below that stride, so a layer whose per-expert bytes
  * are below the stride is cache-served too (padded to the slot). This helper
- * still reports the old "uniform" (exact-class) predicate and is used by the
- * startup off-class warning and the decode-span residency set. Task 5 input:
- * once a smaller class is cache-served it is no longer "off the slab class",
- * so the warning below is stale and this predicate is the thing to revisit.
- * A class above the stride (impossible once the stride is the max) would fall
- * back to the mapped-model views.
+ * therefore reports "cache-served" as bytes at or below the pinned stride --
+ * not exact-class equality -- and is used by the startup off-class warning and
+ * the decode-span residency set. A layer whose bytes exceed the stride
+ * (impossible while the stride is the max) is the only one that falls back to
+ * the mapped-model views.
  */
 static DS4_MAYBE_UNUSED bool weights_streaming_layer_experts_uniform(
         const ds4_weights *w,
@@ -5243,7 +5242,7 @@ static DS4_MAYBE_UNUSED bool weights_streaming_layer_experts_uniform(
     const ds4_layer_weights *l = &w->layer[il];
     if (!streaming_layer_routed_expert_bytes(l, &bytes)) return true;
     if (!ds4_streaming_routed_expert_bytes(w, &base)) return true;
-    return bytes == base;
+    return bytes <= base;
 }
 
 static uint32_t ds4_streaming_cache_experts_for_byte_budget(
@@ -8826,18 +8825,18 @@ static bool glm_stream_decode_expert_cache_ready(
 }
 
 /*
- * weights_streaming_layer_experts_uniform() compares per-expert BYTE SIZE
- * against the pinned slab class and never inspects the quant type, but Metal's
- * Laguna address-table streaming kernel (stream_eligible in
+ * weights_streaming_layer_experts_uniform() tests whether per-expert BYTE SIZE
+ * is at or below the pinned slab stride and never inspects the quant type, but
+ * Metal's Laguna address-table streaming kernel (stream_eligible in
  * ds4_gpu_laguna_routed_shared_moe_one_tensor, ds4_metal.m) only has Q4_K and
  * Q6_K routed-down variants. Load-time layout validation admits four routed
  * down types -- Q4_K, Q6_K, and (matching gate/up) Q3_K or Q2_K, see the
  * layer_routed_type / down_supported checks near ds4.c:5150 -- so a layer can
- * be uniform-by-bytes yet unservable by the kernel. Such a layer must stay in
- * the resident span set: dropping it would leave it neither mapped nor cached,
- * the silent-corruption shape Task 3 already hit once. Reporting it as
+ * be cache-served-by-bytes yet unservable by the kernel. Such a layer must stay
+ * in the resident span set: dropping it would leave it neither mapped nor
+ * cached, the silent-corruption shape Task 3 already hit once. Reporting it as
  * not-servable here routes it to the same mapped-model fallback that
- * off-slab-class layers already use -- correct, just not cache-accelerated.
+ * over-stride layers already use -- correct, just not cache-accelerated.
  */
 static bool laguna_decode_experts_cache_servable(const ds4_layer_weights *l) {
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) return true;
@@ -8861,9 +8860,9 @@ static bool laguna_decode_experts_cache_servable(const ds4_layer_weights *l) {
  * byte-size "uniform" test can also pass for the Q3_K/Q2_K routed layouts
  * load-time validation accepts. The padded slab stride is the model's largest
  * class at startup (ds4_streaming_routed_expert_bytes in
- * ds4_engine_open_internal); a layer whose bytes match that stride is served
- * from the cache at runtime (ds4_gpu_stream_expert_cache_note_expert_size in
- * ds4_metal.m). A layer of a type the kernel has no variant for always falls
+ * ds4_engine_open_internal); a layer whose bytes are at or below that stride is
+ * served from the cache at runtime (ds4_gpu_stream_expert_cache_note_expert_size
+ * in ds4_metal.m). A layer of a type the kernel has no variant for always falls
  * back to wrapping the whole routed-expert tensor from the mapped model range,
  * so it must stay in this static set.
  */
@@ -58299,9 +58298,9 @@ static bool laguna_graph_forward_token(
      * model range ... is not covered by mapped model views". Routed-expert
      * tensors stay excluded when their layer is servable from the streaming
      * expert cache (weights_streaming_layer_experts_uniform), matching the
-     * eligibility check in ds4_gpu_laguna_routed_shared_moe_one_tensor; a
-     * boosted/off-slab-class layer's routed tensors are still included here
-     * so its mapped-model fallback path has real bytes to read. In resident
+     * eligibility check in ds4_gpu_laguna_routed_shared_moe_one_tensor; an
+     * over-stride layer's routed tensors are still included here so its
+     * mapped-model fallback path has real bytes to read. In resident
      * (non-streaming) mode the whole file is already mapped, so this is a
      * cheap no-op (ds4_gpu_model_views_cover_spans short-circuits). */
     ds4_model_map_span_vec laguna_decode_spans;
@@ -73521,61 +73520,55 @@ static int ds4_engine_open_internal(ds4_engine **out,
              * LARGEST per-expert bytes. Every class at or below the stride is
              * admitted (padded to the slot); the MoE read kernel resolves each
              * expert by absolute address, so a smaller class is read from its
-             * own bytes inside the slot.
-             *
-             * Task 5 input (stale message, not silently left): "boosted" is
-             * still counted with weights_streaming_layer_experts_uniform's
-             * exact-class test, so for a padded cache it counts layers the slab
-             * now DOES serve. The two warnings below therefore overstate the
-             * bypass ("... will bypass the expert cache and read experts via
-             * mapped model views"), and the floor formula's (routed - boosted)
-             * undercounts the cached working set. Both are Task 5's to fix.
+             * own bytes inside the slot. weights_streaming_layer_experts_uniform
+             * reports cache-served (bytes <= stride), so `bypassing` counts only
+             * layers a larger-than-stride class would push back to the mapped
+             * model views -- none while the stride is the max.
              */
             uint64_t slab_expert_bytes = 0;
             if (ds4_streaming_routed_expert_bytes(&e->weights, &slab_expert_bytes)) {
                 ds4_gpu_set_streaming_expert_cache_expert_bytes(slab_expert_bytes);
-                uint32_t routed = 0, boosted = 0;
+                uint32_t routed = 0, bypassing = 0;
                 for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
                     const ds4_layer_weights *l = &e->weights.layer[il];
                     if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) continue;
                     routed++;
-                    if (!weights_streaming_layer_experts_uniform(&e->weights, il)) boosted++;
+                    if (!weights_streaming_layer_experts_uniform(&e->weights, il)) bypassing++;
                 }
-                if (boosted > 0) {
+                if (bypassing > 0) {
                     fprintf(stderr,
                             "ds4: SSD streaming mixed-precision model: %u/%u routed layers "
-                            "off the slab size class will bypass the expert cache and read "
-                            "experts via mapped model views\n",
-                            boosted, routed);
+                            "exceed the slab slot stride and will bypass the expert cache, "
+                            "reading experts via mapped model views\n",
+                            bypassing, routed);
                 }
-                if (boosted * 2 > routed) {
+                if (bypassing * 2 > routed) {
                     fprintf(stderr,
-                            "ds4: WARNING: the majority of routed layers (%u/%u) are off the "
-                            "slab size class (is the FIRST routed layer itself boosted?); "
-                            "expert-cache hit rate will be catastrophic\n",
-                            boosted, routed);
+                            "ds4: WARNING: the majority of routed layers (%u/%u) exceed the "
+                            "slab slot stride; expert-cache hit rate will be catastrophic\n",
+                            bypassing, routed);
                 }
                 /*
                  * Below one token's routed working set every token evicts
                  * entries it is about to reuse. Output stays byte-identical at
                  * any budget (the addr-table kernels read the same bytes either
                  * way); only throughput collapses, so warn instead of refusing.
-                 * Task 5 input: under padding the working set is every routed
-                 * layer x experts used, but (routed - boosted) still subtracts
-                 * the now-cached smaller class, so this threshold is too low.
+                 * Every routed layer occupies a padded slot, so the working set
+                 * is ALL cached layers x experts used -- not the exact-class
+                 * subset, which undercounted once the smaller class was served.
                  */
-                const uint64_t min_experts =
-                    (uint64_t)(routed - boosted) * DS4_N_EXPERT_USED;
+                const uint64_t cached_layers = (uint64_t)(routed - bypassing);
+                const uint64_t min_experts = cached_layers * DS4_N_EXPERT_USED;
                 if (min_experts != 0 &&
                     e->ssd_streaming_cache_experts != 0 &&
                     e->ssd_streaming_cache_experts < 2u * min_experts) {
                     fprintf(stderr,
                             "ds4: WARNING: SSD streaming expert cache (%u experts) is "
-                            "under twice the per-token routed working set (%u layers "
+                            "under twice the per-token routed working set (%llu layers "
                             "x %u experts = %llu); expect heavy thrashing below "
                             "%.2f GiB\n",
                             e->ssd_streaming_cache_experts,
-                            routed - boosted,
+                            (unsigned long long)cached_layers,
                             DS4_N_EXPERT_USED,
                             (unsigned long long)min_experts,
                             (double)(2u * min_experts * slab_expert_bytes) /
