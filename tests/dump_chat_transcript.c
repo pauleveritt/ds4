@@ -4,7 +4,7 @@
  * chat rendering for roles `--dump-chat-tokens` cannot reach: assistant and
  * tool.  This is the engine side of P20's G4 leg.
  *
- *   tests/dump_chat_transcript [--think] MODEL.gguf TRANSCRIPT
+ *   tests/dump_chat_transcript [--nothink] MODEL.gguf TRANSCRIPT
  *
  * TRANSCRIPT is UTF-8.  Each record is the role name, a newline, then the
  * content, then the record separator byte 0x1E (so content may contain
@@ -18,8 +18,10 @@
  * The model is opened for inspection only — no GPU, no generation, never
  * --raw-prompt.  A generation prompt (ds4_chat_append_assistant_prefix) is
  * always appended, matching the reference renderer's
- * add_generation_prompt=True; --think selects thinking mode (the default is
- * non-thinking, i.e. what ds4's --nothink renders).
+ * add_generation_prompt=True.  Thinking is ON by default and --nothink opts
+ * out, the same polarity as `ds4 --dump-chat-tokens` (ds4_cli.c:1964 sets
+ * DS4_THINK_HIGH as the default; :2201 handles --nothink).  --think is
+ * accepted as a no-op alias for the default.
  *
  * stdout carries exactly one line: the space-separated token ids.  Everything
  * else goes to stderr.
@@ -127,11 +129,17 @@ static int split_records(char *buf, size_t len, char ***roles_out, char ***conte
 }
 
 int main(int argc, char **argv) {
-    bool thinking = false;
+    /* Thinking on by default, --nothink opts out: the polarity of
+     * `ds4 --dump-chat-tokens` (ds4_cli.c:1964, :2201), which the G4
+     * comparison is run against. */
+    bool thinking = true;
     int arg = 1;
     while (arg < argc && !strncmp(argv[arg], "--", 2)) {
-        if (!strcmp(argv[arg], "--think")) {
-            thinking = true;
+        if (!strcmp(argv[arg], "--nothink")) {
+            thinking = false;
+            arg++;
+        } else if (!strcmp(argv[arg], "--think")) {
+            thinking = true;   /* no-op alias for the default */
             arg++;
         } else {
             fprintf(stderr, "dump_chat_transcript: unknown option %s\n", argv[arg]);
@@ -139,7 +147,7 @@ int main(int argc, char **argv) {
         }
     }
     if (argc - arg != 2) {
-        fprintf(stderr, "usage: dump_chat_transcript [--think] MODEL.gguf TRANSCRIPT\n");
+        fprintf(stderr, "usage: dump_chat_transcript [--nothink] MODEL.gguf TRANSCRIPT\n");
         return 2;
     }
     const char *model_path = argv[arg];
