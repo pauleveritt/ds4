@@ -43212,14 +43212,25 @@ static bool ds4_engine_bind_mellum_decode_contract(ds4_engine *e,
  * measurement.
  */
 
-/* One layer's key (or value) cache.  Sliding layers hold the window, full
- * layers hold the context; ds4_mellum_layer_uses_sliding_attention is the
- * same predicate e->mellum_layer[il].sliding_attention is bound from above. */
+/* One key (or value) cache, sized from the capacity the caller actually
+ * records for that layer.  THE ALLOCATORS USE THIS ONE, passing the cap they
+ * store (state->cache_cap[il], layout->cache_cap[il]), so a buffer can never
+ * be smaller than the capacity the decode kernels are told they may write —
+ * which, with a GPU buffer, is an overrun, not a wrong number (P20 review,
+ * F6). */
+static uint64_t ds4_mellum_cache_bytes_for_cap(uint32_t cap) {
+    return (uint64_t)cap * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
+}
+
+/* PLANNING ONLY: the same bytes, derived from the layer index rather than
+ * from a stored cap.  ds4_mellum_layer_uses_sliding_attention is the same
+ * predicate e->mellum_layer[il].sliding_attention is bound from above, but
+ * that is an invariant nothing enforces, so no allocator depends on it. */
 static uint64_t ds4_mellum_layer_cache_bytes(uint32_t layer_index,
                                              uint32_t ctx_size) {
-    const uint32_t cap = ds4_mellum_layer_uses_sliding_attention(layer_index)
-        ? DS4_N_SWA : ctx_size;
-    return (uint64_t)cap * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
+    return ds4_mellum_cache_bytes_for_cap(
+        ds4_mellum_layer_uses_sliding_attention(layer_index)
+            ? DS4_N_SWA : ctx_size);
 }
 
 /* Every per-layer key and value cache of one session, whichever of the two
@@ -43645,9 +43656,9 @@ static bool ds4_mellum_kv_layout_alloc(const ds4_engine *e,
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t cap = e->mellum_layer[il].sliding_attention
             ? DS4_N_SWA : ctx_size;
-        /* One formula for the allocator and the plan (P20). */
-        const uint64_t cache_bytes =
-            ds4_mellum_layer_cache_bytes(il, ctx_size);
+        /* Sized from the cap this layout stores, not from the layer index
+         * (P20 review, F6). */
+        const uint64_t cache_bytes = ds4_mellum_cache_bytes_for_cap(cap);
         if (cache_bytes > (UINT64_MAX - total) / 2u) {
             ds4_mellum_kv_layout_free(layout);
             return false;
@@ -43885,9 +43896,10 @@ static ds4_mellum_decode_state *ds4_mellum_decode_state_create(
         }
         state->cache_cap[il] = e->mellum_layer[il].sliding_attention
             ? DS4_N_SWA : full_cache_cap;
-        /* One formula for the allocator and the plan (P20). */
+        /* Sized from the cap this state stores, not from the layer index
+         * (P20 review, F6). */
         const uint64_t cache_bytes =
-            ds4_mellum_layer_cache_bytes(il, full_cache_cap);
+            ds4_mellum_cache_bytes_for_cap(state->cache_cap[il]);
         state->key_cache[il] = ds4_gpu_tensor_alloc(cache_bytes);
         state->value_cache[il] = ds4_gpu_tensor_alloc(cache_bytes);
         state->gpu_bytes_requested += 2u * cache_bytes;
