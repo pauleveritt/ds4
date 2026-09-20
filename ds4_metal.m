@@ -13278,6 +13278,23 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
     }
 }
 
+uint32_t ds4_gpu_test_model_view_count(void) {
+    return g_model_view_count;
+}
+
+void ds4_gpu_test_model_views_reset(void) {
+    if (!g_initialized) return;
+    @autoreleasepool {
+        ds4_gpu_model_residency_clear();
+        ds4_gpu_model_views_clear();
+        g_model_map_ptr = NULL;
+        g_model_map_size = 0;
+        g_model_mapped_offset = 0;
+        g_model_mapped_size = 0;
+        g_model_mapped_max_tensor_bytes = 0;
+    }
+}
+
 static int ds4_gpu_model_views_cover_spans(
         const void     *model_map,
         uint64_t        model_size,

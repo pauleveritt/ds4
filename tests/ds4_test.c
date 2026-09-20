@@ -7211,6 +7211,73 @@ static void test_metal_router_weights_batch_exact(void) {
 }
 #endif
 
+#if defined(__APPLE__)
+#include <sys/mman.h>
+/*
+ * P20 Task 2 — the model-view table must not grow when a path re-maps a range
+ * the open path already mapped.
+ *
+ * The P19 finding's F4 mechanism (docs/superpowers/research/
+ * 2026-09-20-p19-finding.md, "The mechanism, diagnosed"): the Mellum open path
+ * maps the tensor-data range `(tensor_data_pos, size - tensor_data_pos,
+ * max_tensor_bytes)`, and `ds4_mellum_decode_state_create` then called
+ * `ds4_gpu_set_model_map(map, size)`, which is the range `(0, size, 0)`. The
+ * mapper's identical-tuple early return does not fire (offset 0 is below
+ * tensor_data_pos), the containing-view check does not fire either, and the
+ * range path never clears the old views — so a second view is appended and
+ * both enter one MTLResidencySet.
+ *
+ * Two halves are pinned here, model-free:
+ *   - the FIXED sequence (the same tuple twice) leaves the count at 1;
+ *   - the OLD form appends, taking the count to 2. That second assertion is a
+ *     control recording the defect, not a wish: if it ever stops holding, the
+ *     mapper changed and this test's premise needs re-reading.
+ */
+static void test_metal_model_map_range_dedupe(void) {
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t size = page * 64u;
+    /* A scaled-down analogue of the real 3.42 MiB tensor_data_pos: non-zero
+     * and deliberately not page-aligned (the mapper rounds the offset down to
+     * a page boundary itself). */
+    const uint64_t tdp = page + 896u;
+    const uint64_t maxb = page * 4u;
+
+    char path[] = "/tmp/ds4_model_map_range_XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    unlink(path);
+    TEST_ASSERT(ftruncate(fd, (off_t)size) == 0);
+    void *map = mmap(NULL, (size_t)size, PROT_READ, MAP_PRIVATE, fd, 0);
+    TEST_ASSERT(map != MAP_FAILED);
+    if (map == MAP_FAILED) {
+        close(fd);
+        return;
+    }
+
+    /* Earlier tests in this group leave their own views behind. */
+    ds4_gpu_test_model_views_reset();
+    TEST_ASSERT(ds4_gpu_test_model_view_count() == 0u);
+
+    /* 1. What the open path does (ds4.c, the startup range map). */
+    TEST_ASSERT(ds4_gpu_set_model_map_range(map, size, tdp, size - tdp, maxb) != 0);
+    TEST_ASSERT(ds4_gpu_test_model_view_count() == 1u);
+
+    /* 2. What the fixed decode-state create does: the same tuple. */
+    TEST_ASSERT(ds4_gpu_set_model_map_range(map, size, tdp, size - tdp, maxb) != 0);
+    TEST_ASSERT(ds4_gpu_test_model_view_count() == 1u);
+
+    /* 3. Control: the call the defect made. It appends a second view. */
+    TEST_ASSERT(ds4_gpu_set_model_map(map, size) != 0);
+    TEST_ASSERT(ds4_gpu_test_model_view_count() == 2u);
+
+    /* Drop the Metal buffers before the pages they wrap go away. */
+    ds4_gpu_test_model_views_reset();
+    munmap(map, (size_t)size);
+    close(fd);
+}
+#endif
+
 static void test_metal_kernel_group(void) {
     test_mellum_layer_policy();
     test_metal_f16_matvec_fast_nr0_4();
@@ -7221,6 +7288,7 @@ static void test_metal_kernel_group(void) {
     test_dspark_cache_window_crop();
     test_metal_q8_0_decode_pair_exact();
 #if defined(__APPLE__)
+    test_metal_model_map_range_dedupe();
     TEST_ASSERT(ds4_gpu_test_glm_q3_down_one_bound_equivalence() != 0);
     TEST_ASSERT(ds4_gpu_test_glm_q3_down_slots8_bound_equivalence() != 0);
     test_metal_mellum_router();

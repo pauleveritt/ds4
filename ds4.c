@@ -43343,7 +43343,14 @@ int ds4_engine_mellum_layer0_probe(ds4_engine  *e,
     uint64_t raw_output_values = 0;
     int32_t selected_cpu[8] = {0};
     float weights_cpu[8] = {0};
-    int ok = ds4_gpu_set_model_map(e->model.map, e->model.size) != 0;
+    /* Ask for the range the open path already mapped so the mapper's
+     * identical-tuple early return fires instead of appending a second model
+     * view (P19 finding, F4 mechanism). */
+    int ok = ds4_gpu_set_model_map_range(e->model.map,
+                                         e->model.size,
+                                         e->model.tensor_data_pos,
+                                         e->model.size - e->model.tensor_data_pos,
+                                         e->model.max_tensor_bytes) != 0;
 #define DS4_MELLUM_PROBE_ALLOC(name, bytes) \
     do { \
         (name) = ds4_gpu_tensor_alloc((bytes)); \
@@ -43717,7 +43724,14 @@ static ds4_mellum_decode_state *ds4_mellum_decode_state_create(
     const uint64_t kv_bytes = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
     const uint64_t mid_bytes =
         (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float);
-    bool ok = ds4_gpu_set_model_map(e->model.map, e->model.size) != 0;
+    /* Ask for the range the open path already mapped so the mapper's
+     * identical-tuple early return fires instead of appending a second model
+     * view (P19 finding, F4 mechanism). */
+    bool ok = ds4_gpu_set_model_map_range(e->model.map,
+                                          e->model.size,
+                                          e->model.tensor_data_pos,
+                                          e->model.size - e->model.tensor_data_pos,
+                                          e->model.max_tensor_bytes) != 0;
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (!ds4_mellum_q8_layer_desc(e, il, &state->desc[il])) {

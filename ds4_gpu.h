@@ -268,6 +268,12 @@ enum {
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
+/* Test oracles for the model-view table: how many overlapping shared buffers
+ * the mapper currently holds, and a reset so a test can start from a known
+ * state. Used to pin that a re-map of an already mapped range appends no
+ * second view (P20). */
+uint32_t ds4_gpu_test_model_view_count(void);
+void ds4_gpu_test_model_views_reset(void);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
