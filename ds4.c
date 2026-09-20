@@ -73982,6 +73982,27 @@ uint64_t ds4_test_laguna_xs21_scratch_bytes(uint32_t prefill_cap) {
     return bytes;
 }
 
+/* Read ds4_engine_sampling_defaults() as it answers for one model shape,
+ * without an engine or a model: the function ignores its engine argument and
+ * reads only the global shape, so select the shape, call, and restore.
+ * Returns 0, or -1 for a variant this hook does not select. */
+int ds4_test_sampling_defaults_for_variant(ds4_variant variant,
+                                           float *temperature, int *top_k,
+                                           float *top_p, float *min_p) {
+    const ds4_shape *shape = NULL;
+    switch (variant) {
+    case DS4_VARIANT_FLASH:       shape = &DS4_SHAPE_FLASH; break;
+    case DS4_VARIANT_LAGUNA_XS21: shape = &DS4_SHAPE_LAGUNA_XS21; break;
+    case DS4_VARIANT_MELLUM2:     shape = &DS4_SHAPE_MELLUM2; break;
+    default: return -1;
+    }
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = *shape;
+    ds4_engine_sampling_defaults(NULL, temperature, top_k, top_p, min_p);
+    g_ds4_shape = saved;
+    return 0;
+}
+
 size_t ds4_test_per_tier_graph_overhead_bytes_with_prefill(
         int placement_ctx_hint,
         uint32_t prefill_chunk) {
@@ -76497,6 +76518,21 @@ void ds4_engine_sampling_defaults(ds4_engine *e, float *temperature,
         *min_p = 0.0f;
     } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
         *top_k = 20;
+        *min_p = 0.0f;
+    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        /* The Quickstart sampling example on the model card of the PUBLIC
+         * release JetBrains/Mellum2-12B-A2.5B-Thinking (revision
+         * a7311550557e93cc706ab5dd3d879c1a11703ab4, README.md:222-225):
+         * temperature 0.6, top_p 0.95, top_k 20.  The card gives no min_p,
+         * so it is 0.  Neither the public release's nor this repo's
+         * generation_config.json carries any sampling value, and the RL
+         * snapshot (swe-pi-m23) publishes no recommendation: these are the
+         * public release's documented starting point, not values tuned for
+         * that snapshot.  Every output is set explicitly rather than left to
+         * the generic defaults above. */
+        *temperature = 0.6f;
+        *top_k = 20;
+        *top_p = 0.95f;
         *min_p = 0.0f;
     }
 }

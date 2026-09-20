@@ -695,6 +695,9 @@ int ds4_test_speculative_delta_sample(const float *target_logits,
                                       float *target_probs);
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
+int ds4_test_sampling_defaults_for_variant(ds4_variant variant,
+                                           float *temperature, int *top_k,
+                                           float *top_p, float *min_p);
 uint64_t ds4_test_mixed_native_count(void);
 uint64_t ds4_test_ds41_batch_count(void);
 #endif

@@ -354,7 +354,45 @@ static void check_speculative_distribution(void) {
            (double)counts[2] / trials);
 }
 
+/* ds4_engine_sampling_defaults() is the single source of sampler defaults
+ * (no Rust or Python table may duplicate it), so each model family's answer
+ * is pinned here.  Model-free: the hook selects the shape, not a GGUF. */
+static void check_sampling_defaults_case(const char *name,
+                                         ds4_variant variant,
+                                         float temperature, int top_k,
+                                         float top_p, float min_p) {
+    float t = -1.0f, p = -1.0f, m = -1.0f;
+    int k = -1;
+    CHECK(ds4_test_sampling_defaults_for_variant(variant, &t, &k, &p, &m) == 0,
+          "%s: sampling-defaults hook refused variant %d", name, (int)variant);
+    printf("sampling defaults %s: temperature=%.9g top_k=%d top_p=%.9g "
+           "min_p=%.9g\n", name, (double)t, k, (double)p, (double)m);
+    CHECK(t == temperature, "%s temperature %.9g != %.9g",
+          name, (double)t, (double)temperature);
+    CHECK(k == top_k, "%s top_k %d != %d", name, k, top_k);
+    CHECK(p == top_p, "%s top_p %.9g != %.9g",
+          name, (double)p, (double)top_p);
+    CHECK(m == min_p, "%s min_p %.9g != %.9g",
+          name, (double)m, (double)min_p);
+}
+
+static void check_sampling_defaults(void) {
+    /* Flash (DeepSeek4): the generic defaults, unchanged. */
+    check_sampling_defaults_case("flash", DS4_VARIANT_FLASH,
+                                 DS4_DEFAULT_TEMPERATURE, 0,
+                                 DS4_DEFAULT_TOP_P, DS4_DEFAULT_MIN_P);
+    /* Laguna XS 2.1: top_k 20, min_p 0, generic temperature and top_p. */
+    check_sampling_defaults_case("laguna-xs21", DS4_VARIANT_LAGUNA_XS21,
+                                 DS4_DEFAULT_TEMPERATURE, 20,
+                                 DS4_DEFAULT_TOP_P, 0.0f);
+    /* Mellum 2: the public model card's Quickstart values (revision
+     * a7311550557e93cc706ab5dd3d879c1a11703ab4, README.md:222-225). */
+    check_sampling_defaults_case("mellum2", DS4_VARIANT_MELLUM2,
+                                 0.6f, 20, 0.95f, 0.0f);
+}
+
 int main(void) {
+    check_sampling_defaults();
     check_speculative_distribution();
     const uint32_t semantic_n = 4096;
     float *logits = malloc((size_t)semantic_n * sizeof(*logits));
