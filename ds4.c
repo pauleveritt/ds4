@@ -45423,10 +45423,15 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         vocab->sop_id = -1;
         vocab->think_start_id = vocab_lookup(vocab, "<think>");
         vocab->think_end_id = vocab_lookup(vocab, "</think>");
-        vocab->tool_call_start_id = -1;
-        vocab->tool_call_end_id = -1;
-        vocab->tool_response_start_id = -1;
-        vocab->tool_response_end_id = -1;
+        /* The four tool-framing spellings are added tokens in Mellum's
+         * tokenizer and its chat template emits them, so resolve them the way
+         * the other ChatML families do (vocab_lookup_optional, not
+         * vocab_lookup: a vocabulary without them stays at -1 rather than
+         * aborting, and special_token_at then skips them). */
+        vocab->tool_call_start_id = vocab_lookup_optional(vocab, "<tool_call>");
+        vocab->tool_call_end_id = vocab_lookup_optional(vocab, "</tool_call>");
+        vocab->tool_response_start_id = vocab_lookup_optional(vocab, "<tool_response>");
+        vocab->tool_response_end_id = vocab_lookup_optional(vocab, "</tool_response>");
         vocab->arg_key_start_id = -1;
         vocab->arg_key_end_id = -1;
         vocab->arg_value_start_id = -1;
@@ -45905,11 +45910,16 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
         if (!strcmp(role, "tool") || !strcmp(role, "function")) {
             /* Mellum's template collects consecutive tool responses into one
-             * user turn. The single-message API emits the equivalent wrapper. */
+             * user turn. The single-message API emits the equivalent wrapper.
+             * The wrapper is the engine's own control text, so it goes
+             * through the special-aware tokenizer (as the assistant branch
+             * below does) and its <tool_response>/</tool_response> become the
+             * model's added tokens.  The observation itself stays ordinary
+             * text: a tool result is not trusted to spell control tokens. */
             token_vec_push(tokens, vocab->im_start_id);
-            bpe_tokenize_text(vocab, "user\n<tool_response>\n", tokens);
+            tokenize_rendered_chat_vocab(vocab, "user\n<tool_response>\n", tokens);
             bpe_tokenize_text(vocab, content, tokens);
-            bpe_tokenize_text(vocab, "\n</tool_response>", tokens);
+            tokenize_rendered_chat_vocab(vocab, "\n</tool_response>", tokens);
             token_vec_push(tokens, vocab->im_end_id);
             bpe_tokenize_text(vocab, "\n", tokens);
         } else if (!strcmp(role, "assistant")) {
