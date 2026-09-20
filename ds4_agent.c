@@ -8197,16 +8197,41 @@ static bool agent_test_read_quant_header(uint8_t quant_bits,
 
 /* P19 merge: the Mellum branch asserted that a Q8 record carrying a payload is
  * rejected, because on that line ds4_kvstore_quant_bits_supported() was 2/4
- * only.  This line already supports 5/6/8 (Laguna XS is Q8), so that assertion
- * is false here and was NOT adopted -- adopting it would have narrowed Laguna's
- * KV store.  What the branch's transcript-only clause actually adds is
- * acceptance of a payload-less record whose quant byte is outside the
- * persistent KV ABI; that is what is pinned below. */
+ * only.  This line already supports 5/6/8, so that assertion is false here and
+ * was NOT adopted -- adopting it would have narrowed the store for every
+ * family whose header can carry those bytes.
+ *
+ * Corrected 2026-09-20 (P19 review): an earlier version of this comment said
+ * the 5/6/8 members were there "because Laguna XS is Q8".  That is wrong.  The
+ * only producer of the header's quant byte is ds4_engine_routed_quant_bits()
+ * (ds4.c:65663), which returns 4, 2 or 0 and never 5/6/8; every writer routes
+ * through it (ds4_agent.c:5031,13640; ds4_cli.c:840,2605; ds4_kvstore.c:954,
+ * 1238; ds4_server.c:15895).  The set {2,4,5,6,8} entered this predicate in
+ * commit ccea768 "Add Qwen3.8 Flash Next model support", which replaced an
+ * inline `quant_bits == 2 || quant_bits == 4` test.  The decision stands: do
+ * not narrow the supported set on the strength of a branch assertion.
+ *
+ * What the branch's transcript-only clause actually adds is acceptance of a
+ * payload-less record whose quant byte is outside the persistent KV ABI.  The
+ * matrix below pins this line's admission rule end to end:
+ * ds4_kvstore_read_header() accepts iff tokens != 0 and
+ * (ds4_kvstore_quant_bits_supported(q) || (payload == 0 && q != 0)). */
 static void test_agent_q8_transcript_only_header(void) {
-    AGENT_TEST_ASSERT(agent_test_read_quant_header(8, 0));
-    AGENT_TEST_ASSERT(agent_test_read_quant_header(8, 1));
-    AGENT_TEST_ASSERT(agent_test_read_quant_header(3, 0));
-    AGENT_TEST_ASSERT(!agent_test_read_quant_header(3, 1));
+    /* Supported quantizations: accepted with or without a payload. */
+    static const uint8_t supported[] = {2, 4, 5, 6, 8};
+    for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); i++) {
+        AGENT_TEST_ASSERT(agent_test_read_quant_header(supported[i], 1));
+        AGENT_TEST_ASSERT(agent_test_read_quant_header(supported[i], 0));
+    }
+    /* Unsupported non-zero quantizations: rejected once a payload is present,
+     * accepted when payload-less (the branch's transcript-only clause). */
+    static const uint8_t unsupported[] = {3, 7};
+    for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
+        AGENT_TEST_ASSERT(!agent_test_read_quant_header(unsupported[i], 1));
+        AGENT_TEST_ASSERT(agent_test_read_quant_header(unsupported[i], 0));
+    }
+    /* A zero quant byte is not transcript-only: rejected either way. */
+    AGENT_TEST_ASSERT(!agent_test_read_quant_header(0, 1));
     AGENT_TEST_ASSERT(!agent_test_read_quant_header(0, 0));
 }
 
