@@ -727,6 +727,11 @@ int ds4_test_mellum_memory_plan(uint32_t ctx_size, uint32_t prefill_cap,
                                 uint64_t weights_bytes,
                                 ds4_test_mellum_memory *out);
 int ds4_test_mellum_admit(uint64_t planned, uint64_t budget);
+/* The exact-bytes suffix the Mellum startup plan line prints, rendered by the
+ * same parts-and-formatter pair the printer uses.  Returns the length written
+ * (never truncated), or -1. */
+int ds4_test_mellum_plan_bytes_suffix(uint32_t ctx_size, uint64_t weights_bytes,
+                                      char *buf, size_t cap);
 uint64_t ds4_test_mixed_native_count(void);
 uint64_t ds4_test_ds41_batch_count(void);
 #endif

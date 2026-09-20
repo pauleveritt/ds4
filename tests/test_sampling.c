@@ -512,6 +512,40 @@ static void check_mellum_memory_plan(void) {
            (unsigned long long)MELLUM_PREFILL_BYTES_PER_TOKEN,
            (unsigned long long)(32u * MELLUM_PREFILL_BYTES_PER_TOKEN));
 
+    /* The exact byte counts appended to the printed startup plan line
+     * (P20 review, F5).  The human part of that line rounds weights and KV
+     * to two decimals of a GiB and scratch to two decimals of a MiB, so an
+     * eye-sum of the printed figures can disagree with the printed total;
+     * these integers must satisfy the identity exactly.  Parse them back out
+     * of the rendered string rather than recomputing them, so the test binds
+     * what a reader actually sees. */
+    char suffix[192];
+    memset(suffix, 0, sizeof(suffix));
+    CHECK(ds4_test_mellum_plan_bytes_suffix(4096, weights, suffix,
+                                            sizeof(suffix)) > 0,
+          "mellum plan-bytes suffix hook refused ctx 4096");
+    printf("mellum plan bytes suffix:%s\n", suffix);
+    unsigned long long p_total = 0, p_weights = 0, p_kv = 0, p_scratch = 0;
+    CHECK(sscanf(suffix,
+                 " (bytes: total %llu = weights %llu + kv %llu + scratch %llu)",
+                 &p_total, &p_weights, &p_kv, &p_scratch) == 4,
+          "mellum plan-bytes suffix did not parse: %s", suffix);
+    CHECK(p_total == p_weights + p_kv + p_scratch,
+          "mellum plan-bytes identity broken: %llu != %llu + %llu + %llu",
+          p_total, p_weights, p_kv, p_scratch);
+    CHECK(p_weights == (unsigned long long)weights,
+          "mellum plan-bytes weights %llu != %llu",
+          p_weights, (unsigned long long)weights);
+    CHECK(p_kv == (unsigned long long)MELLUM_KV_BYTES_CTX4096,
+          "mellum plan-bytes kv %llu != %llu",
+          p_kv, (unsigned long long)MELLUM_KV_BYTES_CTX4096);
+    CHECK(p_scratch == (unsigned long long)(MELLUM_DECODE_SCRATCH_BYTES +
+                                            MELLUM_DECODE_OUTPUT_BYTES),
+          "mellum plan-bytes scratch %llu != %llu",
+          p_scratch,
+          (unsigned long long)(MELLUM_DECODE_SCRATCH_BYTES +
+                               MELLUM_DECODE_OUTPUT_BYTES));
+
     /* Admission truth table: a zero budget means the device did not answer,
      * so the plan is print-only and admits. */
     CHECK(ds4_test_mellum_admit(100, 100) == 1, "admit: equal must admit");

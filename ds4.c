@@ -43330,6 +43330,46 @@ static bool ds4_mellum_admit(uint64_t planned, uint64_t budget) {
     return budget == 0 || planned <= budget;
 }
 
+/* The four figures the startup plan line reports, computed once so the human
+ * text and the exact byte counts beside it cannot describe different sums
+ * (P20 review, F5).  prefill_cap is 0: no product Mellum session allocates a
+ * prefill scratch. */
+typedef struct {
+    uint64_t weights;
+    uint64_t kv;
+    uint64_t scratch;
+    uint64_t planned;
+} ds4_mellum_plan_parts;
+
+static ds4_mellum_plan_parts ds4_mellum_plan_parts_for(uint64_t weights_bytes,
+                                                       uint32_t ctx_size) {
+    ds4_mellum_plan_parts p;
+    p.weights = weights_bytes;
+    p.kv = ds4_mellum_kv_bytes(ctx_size);
+    p.scratch = ds4_add_sat_u64(ds4_mellum_decode_scratch_bytes(),
+                                ds4_mellum_decode_output_bytes(DS4_N_VOCAB));
+    p.planned = ds4_mellum_planned_bytes(weights_bytes, ctx_size, 0);
+    return p;
+}
+
+/* The exact byte counts appended to the plan line.  The human figures beside
+ * them are rounded to two decimals, and weights/KV are printed in GiB while
+ * scratch is printed in MiB, so an eye-sum of the printed numbers can
+ * disagree with the printed total by tens of MiB; these integers let a
+ * scorer check total == weights + kv + scratch exactly (P20 review, F5).
+ * Pure: formats into the caller's buffer, allocates nothing, prints nothing.
+ * Returns what snprintf returns. */
+static int ds4_mellum_format_plan_bytes(char *buf, size_t cap,
+                                        ds4_mellum_plan_parts p) {
+    return snprintf(buf, cap,
+                    " (bytes: total %llu = weights %llu + kv %llu"
+                    " + scratch %llu)",
+                    (unsigned long long)p.planned,
+                    (unsigned long long)p.weights,
+                    (unsigned long long)p.kv,
+                    (unsigned long long)p.scratch);
+}
+
 #ifndef DS4_NO_GPU
 /* Construct the diagnostic Q8 layer contract once per real Mellum layer.
  * The full-attention phase deliberately differs from the preceding three
@@ -44517,28 +44557,31 @@ static uint64_t ds4_mellum_memory_budget_bytes(void) {
  */
 static void ds4_mellum_print_memory_plan(const ds4_engine *e, int ctx_size) {
     const uint32_t ctx = (uint32_t)ctx_size;
-    const uint64_t weights = e->startup_model_span_bytes;
-    const uint64_t kv = ds4_mellum_kv_bytes(ctx);
-    const uint64_t scratch =
-        ds4_add_sat_u64(ds4_mellum_decode_scratch_bytes(),
-                        ds4_mellum_decode_output_bytes(DS4_N_VOCAB));
     /* prefill_cap 0: no product Mellum session allocates a prefill scratch
      * (its only callers are the probes). */
-    const uint64_t planned = ds4_mellum_planned_bytes(weights, ctx, 0);
+    const ds4_mellum_plan_parts p =
+        ds4_mellum_plan_parts_for(e->startup_model_span_bytes, ctx);
+    const uint64_t weights = p.weights;
+    const uint64_t kv = p.kv;
+    const uint64_t scratch = p.scratch;
+    const uint64_t planned = p.planned;
     const uint64_t budget = ds4_mellum_memory_budget_bytes();
+    char exact[192];
+    ds4_mellum_format_plan_bytes(exact, sizeof(exact), p);
 
     const bool color = ds4_log_is_tty(stderr);
     const char *green = color ? "\x1b[32m" : "";
     const char *reset = color ? "\x1b[0m" : "";
     fprintf(stderr,
             "%sds4: Mellum memory plan: weights %.2f GiB + KV %.2f GiB "
-            "(ctx %u) + scratch %.2f MiB = %.2f GiB planned",
+            "(ctx %u) + scratch %.2f MiB = %.2f GiB planned%s",
             green,
             ds4_bytes_to_gib(weights),
             ds4_bytes_to_gib(kv),
             ctx,
             (double)scratch / 1048576.0,
-            ds4_bytes_to_gib(planned));
+            ds4_bytes_to_gib(planned),
+            exact);
     if (budget != 0) {
         fprintf(stderr, " (device recommended working set %.2f GiB)%s\n",
                 ds4_bytes_to_gib(budget), reset);
@@ -74325,6 +74368,22 @@ int ds4_test_mellum_memory_plan(uint32_t ctx_size, uint32_t prefill_cap,
 
 int ds4_test_mellum_admit(uint64_t planned, uint64_t budget) {
     return ds4_mellum_admit(planned, budget) ? 1 : 0;
+}
+
+/* Render the exact-bytes suffix of the startup plan line exactly as
+ * ds4_mellum_print_memory_plan renders it — same parts, same formatter — so
+ * a model-free test can check the printed integers satisfy
+ * total == weights + kv + scratch (P20 review, F5). */
+int ds4_test_mellum_plan_bytes_suffix(uint32_t ctx_size, uint64_t weights_bytes,
+                                      char *buf, size_t cap) {
+    if (!buf || cap == 0) return -1;
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_MELLUM2;
+    const ds4_mellum_plan_parts p =
+        ds4_mellum_plan_parts_for(weights_bytes, ctx_size);
+    const int n = ds4_mellum_format_plan_bytes(buf, cap, p);
+    g_ds4_shape = saved;
+    return (n < 0 || (size_t)n >= cap) ? -1 : n;
 }
 
 size_t ds4_test_per_tier_graph_overhead_bytes_with_prefill(
