@@ -274,6 +274,12 @@ test-mellum-tokenizer: tests/test_mellum_tokenizer
 	fi
 	DS4_TEST_MELLUM_MODEL="$(DS4_TEST_MELLUM_MODEL)" ./tests/test_mellum_tokenizer
 
+tests/dump_chat_transcript.o: tests/dump_chat_transcript.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/dump_chat_transcript.c
+
+tests/dump_chat_transcript: tests/dump_chat_transcript.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_cases.o ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)

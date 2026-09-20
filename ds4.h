@@ -544,6 +544,21 @@ int ds4_dump_chat_tokenization(const char *model_path,
                                ds4_think_mode think_mode,
                                int ctx_size,
                                FILE *fp);
+/* Tokenize a whole multi-turn transcript for inspection.  Opens the model for
+ * inspection only (no GPU, no generation, exactly as the two calls above),
+ * then drives the public chat builders: ds4_chat_begin, one
+ * ds4_chat_append_message per (role, content) pair, and — when
+ * add_generation_prompt is true — ds4_chat_append_assistant_prefix.  The id
+ * list is written in the same form ds4_dump_chat_tokenization uses.  This is
+ * the only route to the assistant and tool rendering branches without a
+ * generation host. */
+int ds4_dump_chat_transcript_tokenization(const char *model_path,
+                                          const char *const *roles,
+                                          const char *const *contents,
+                                          size_t count,
+                                          ds4_think_mode think_mode,
+                                          bool add_generation_prompt,
+                                          FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 bool ds4_engine_is_deepseek41(ds4_engine *e);
 const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode);

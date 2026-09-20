@@ -67706,6 +67706,42 @@ int ds4_dump_chat_tokenization(const char *model_path,
     return 0;
 }
 
+int ds4_dump_chat_transcript_tokenization(const char *model_path,
+                                          const char *const *roles,
+                                          const char *const *contents,
+                                          size_t count,
+                                          ds4_think_mode think_mode,
+                                          bool add_generation_prompt,
+                                          FILE *fp) {
+    token_vec tokens = {0};
+
+    if (!fp) fp = stdout;
+    if (count && (!roles || !contents)) return 2;
+
+    /* The chat builders take a ds4_engine; only its model and vocab are read
+     * on this path, so the handle is opened for inspection exactly as
+     * ds4_dump_chat_tokenization opens its model and nothing else is set up. */
+    ds4_engine *e = xcalloc(1, sizeof(*e));
+    model_open(&e->model, model_path, false, false);
+    config_validate_model(&e->model);
+    vocab_load(&e->vocab, &e->model);
+
+    ds4_chat_begin(e, &tokens);
+    for (size_t i = 0; i < count; i++) {
+        ds4_chat_append_message(e, &tokens, roles[i], contents[i]);
+    }
+    if (add_generation_prompt) {
+        ds4_chat_append_assistant_prefix(e, &tokens, think_mode);
+    }
+
+    dump_tokens_fp(fp, &e->vocab, &tokens);
+    token_vec_free(&tokens);
+    vocab_free(&e->vocab);
+    model_close(&e->model);
+    free(e);
+    return 0;
+}
+
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_DEEPSEEK41_GPU
 static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cache);
