@@ -77,6 +77,7 @@ typedef struct {
     bool min_p_set;
     uint64_t seed;
     bool dump_tokens;
+    bool dump_chat_tokens;
     const char *dump_logits_path;
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
@@ -93,6 +94,26 @@ typedef struct {
     bool metal_graph_test;
     bool metal_graph_full_test;
     bool metal_graph_prompt_test;
+    bool mellum_layer0_probe;
+    const char *mellum_layer0_probe_out;
+    bool mellum_all_layers_probe;
+    const char *mellum_all_layers_probe_out;
+    const char *mellum_all_layers_trace_out;
+    const char *mellum_all_layers_attention_trace_out;
+    const char *mellum_all_layers_qk_trace_out;
+    bool mellum_kv_layout_probe;
+    bool mellum_session_lifecycle_probe;
+    bool mellum_session_decode_probe;
+    const char *mellum_session_decode_probe_out;
+    bool mellum_session_isolation_probe;
+    bool mellum_interactive_session_probe;
+    bool mellum_swa_boundary_probe;
+    bool mellum_resident_profile;
+    bool mellum_true_prefill_probe;
+    bool mellum_true_prefill_swa_probe;
+    bool mellum_logits_probe;
+    const char *mellum_logits_probe_out;
+    int mellum_logits_probe_top_k;
 } cli_generation_options;
 
 typedef struct {
@@ -2144,6 +2165,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.cuda_tensor_parallel = true;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
+        } else if (!strcmp(arg, "--dump-chat-tokens")) {
+            c.gen.dump_chat_tokens = true;
         } else if (!strcmp(arg, "--dump-logits")) {
             c.gen.dump_logits_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-logprobs")) {
@@ -2202,6 +2225,96 @@ static cli_config parse_options(int argc, char **argv) {
 #else
             c.engine.backend = DS4_BACKEND_METAL;
 #endif
+        } else if (!strcmp(arg, "--mellum-layer0-probe")) {
+            c.gen.mellum_layer0_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-layer0-probe-out")) {
+            c.gen.mellum_layer0_probe = true;
+            c.gen.mellum_layer0_probe_out = need_arg(&i, argc, argv, arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-all-layers-probe")) {
+            c.gen.mellum_all_layers_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-all-layers-probe-out")) {
+            c.gen.mellum_all_layers_probe = true;
+            c.gen.mellum_all_layers_probe_out = need_arg(&i, argc, argv, arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-all-layers-trace-out")) {
+            c.gen.mellum_all_layers_probe = true;
+            c.gen.mellum_all_layers_trace_out = need_arg(&i, argc, argv, arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-all-layers-attention-trace-out")) {
+            c.gen.mellum_all_layers_probe = true;
+            c.gen.mellum_all_layers_attention_trace_out = need_arg(&i, argc, argv, arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-all-layers-qk-trace-out")) {
+            c.gen.mellum_all_layers_probe = true;
+            c.gen.mellum_all_layers_qk_trace_out = need_arg(&i, argc, argv, arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-kv-layout-probe")) {
+            c.gen.mellum_kv_layout_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-session-lifecycle-probe")) {
+            c.gen.mellum_session_lifecycle_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-session-decode-probe")) {
+            c.gen.mellum_session_decode_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-session-decode-probe-out")) {
+            c.gen.mellum_session_decode_probe = true;
+            c.gen.mellum_session_decode_probe_out =
+                need_arg(&i, argc, argv, arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-session-isolation-probe")) {
+            c.gen.mellum_session_isolation_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-interactive-session-probe")) {
+            c.gen.mellum_interactive_session_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-swa-boundary-probe")) {
+            c.gen.mellum_swa_boundary_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-resident-profile")) {
+            c.gen.mellum_resident_profile = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-true-prefill-probe")) {
+            c.gen.mellum_true_prefill_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-true-prefill-swa-probe")) {
+            c.gen.mellum_true_prefill_swa_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-logits-probe")) {
+            c.gen.mellum_logits_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-logits-probe-out")) {
+            c.gen.mellum_logits_probe = true;
+            c.gen.mellum_logits_probe_out = need_arg(&i, argc, argv, arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-logits-probe-top-k")) {
+            c.gen.mellum_logits_probe = true;
+            c.gen.mellum_logits_probe_top_k =
+                parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--metal-graph-generate")) {
             fprintf(stderr, "ds4: --metal-graph-generate was removed; --metal is the graph path\n");
             exit(2);
@@ -2268,7 +2381,14 @@ static cli_config parse_options(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
-    if (cfg.gen.dump_tokens) {
+    if (cfg.gen.dump_tokens || cfg.gen.dump_chat_tokens) {
+        if (cfg.gen.dump_tokens && cfg.gen.dump_chat_tokens) {
+            fprintf(stderr, "ds4: choose either --dump-tokens or --dump-chat-tokens\n");
+            ds4_prompt_prefix_free(&cfg.gen.prefix);
+            ds4_dist_options_free(cfg.dist);
+            free(cfg.prompt_owned);
+            return 2;
+        }
         if (cfg.gen.prefix.count != 0) {
             fprintf(stderr, "ds4: --dump-tokens does not support --prefix-file\n");
             ds4_prompt_prefix_free(&cfg.gen.prefix);
@@ -2284,7 +2404,14 @@ int main(int argc, char **argv) {
             return 2;
         }
         int rc;
-        if (cfg.gen.raw_prompt || is_rendered_chat_prompt(cfg.gen.prompt)) {
+        if (cfg.gen.dump_chat_tokens) {
+            rc = ds4_dump_chat_tokenization(cfg.engine.model_path,
+                                            cfg.gen.system,
+                                            cfg.gen.prompt,
+                                            cli_effective_think_mode(&cfg.gen),
+                                            cfg.gen.ctx_size,
+                                            stdout);
+        } else if (cfg.gen.raw_prompt || is_rendered_chat_prompt(cfg.gen.prompt)) {
             rc = ds4_dump_text_tokenization(cfg.engine.model_path,
                                             cfg.gen.prompt,
                                             stdout);
@@ -2357,6 +2484,105 @@ int main(int argc, char **argv) {
         return 2;
     }
     cli_apply_model_sampling_defaults(engine, &cfg.gen);
+    if (cfg.gen.mellum_layer0_probe) {
+        int rc = ds4_engine_mellum_layer0_probe(engine, stdout,
+                                                 cfg.gen.mellum_layer0_probe_out);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_all_layers_probe) {
+        int rc = ds4_engine_mellum_all_layers_probe(
+            engine, stdout, cfg.gen.mellum_all_layers_probe_out,
+            cfg.gen.mellum_all_layers_trace_out,
+            cfg.gen.mellum_all_layers_attention_trace_out,
+            cfg.gen.mellum_all_layers_qk_trace_out);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_kv_layout_probe) {
+        int rc = ds4_engine_mellum_kv_layout_probe(
+            engine, stdout, cfg.gen.ctx_size);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_session_lifecycle_probe) {
+        int rc = ds4_engine_mellum_session_lifecycle_probe(
+            engine, stdout, cfg.gen.ctx_size);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_session_decode_probe) {
+        int rc = ds4_engine_mellum_session_decode_probe(
+            engine, stdout, cfg.gen.ctx_size,
+            cfg.gen.mellum_session_decode_probe_out);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_session_isolation_probe) {
+        int rc = ds4_engine_mellum_session_isolation_probe(
+            engine, stdout, cfg.gen.ctx_size);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_interactive_session_probe) {
+        int rc = ds4_engine_mellum_interactive_session_probe(
+            engine, stdout, cfg.gen.ctx_size);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_swa_boundary_probe) {
+        int rc = ds4_engine_mellum_swa_boundary_probe(
+            engine, stdout, cfg.gen.ctx_size);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_resident_profile) {
+        int rc = ds4_engine_mellum_resident_profile(
+            engine, stdout, cfg.gen.ctx_size);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_true_prefill_probe) {
+        int rc = ds4_engine_mellum_true_prefill_probe(engine, stdout);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_true_prefill_swa_probe) {
+        int rc = ds4_engine_mellum_true_prefill_swa_probe(engine, stdout);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_logits_probe) {
+        int rc = ds4_engine_mellum_logits_probe(
+            engine, stdout, cfg.gen.mellum_logits_probe_out,
+            (uint32_t)cfg.gen.mellum_logits_probe_top_k);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
     if (!cfg.gen.system_set) {
         cfg.gen.system = ds4_engine_default_system_prompt(engine);
     }

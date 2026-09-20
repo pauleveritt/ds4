@@ -1,0 +1,76 @@
+**Phase 2 Delegation Packet**
+
+**Files to create (NEW):**
+- `models.py`
+- `templates/complaints.html`
+
+**Files to modify (SHARED):**
+- `app.py`
+- `tests/test_app.py`
+
+---
+
+**models.py (NEW)**
+- Must import `datetime`, `timezone` from `datetime`
+- Define `Complaint` dataclass with fields: `agent_name: str`, `text: str`, `timestamp: datetime`
+- Set `timestamp` default to `datetime.now(timezone.utc)`
+- Create module-level list `complaints: list[Complaint]`
+- Populate with 3-5 seed complaints (e.g., "Instructions were unclear", "Feedback was contradictory", "Scope changed mid-task")
+
+---
+
+**templates/complaints.html (NEW)**
+- Extends `base.html`
+- Heading: `<h1>Complaints Board</h1>`
+- Loop through `complaints` and render each as a Bootstrap card with:
+  - `agent_name`
+  - `timestamp` formatted (e.g., `{{ c.timestamp.isoformat() }}`)
+  - `text`
+
+---
+
+**app.py (SHARED)**
+- Import `Complaint` and `complaints` from `models`
+- Add route: `@app.get("/complaints")`
+- Return `templates/complaints.html` with context `{"complaints": complaints}`
+
+---
+
+**tests/test_app.py (SHARED)**
+- Add test: `test_get_complaints()`
+- Use `TestClient` to GET `/complaints`
+- Assert status 200
+- Assert response body contains at least one seed complaint text
+
+---
+
+**Validation command:**
+```bash
+.venv/bin/python -m pytest tests/
+```
+
+---
+
+**Framework semantic trap:**
+- `datetime.now(timezone.utc)` returns aware datetime; ensure `timestamp` is timezone-aware for consistency.
+- Bootstrap 5 CDN expects `datetime` objects to be formatted; use `{{ c.timestamp.isoformat() }}` or `{{ c.timestamp.strftime('%Y-%m-%d %H:%M:%S') }}`.
+
+---
+
+**Exact literals required:**
+- `agent_name`, `text`, `timestamp` field names in `Complaint`
+- Heading text: "Complaints Board"
+- Seed complaint texts (as populated in `models.py`)
+- Route path: `/complaints`
+- Template path: `templates/complaints.html`
+
+---
+
+**Surviving SHARED elements:**
+- `templates/base.html` (extends)
+- `templates/home.html` (unchanged)
+- `app.py` route imports
+- `tests/test_app.py` existing smoke test
+- `models.py` module-level list name
+
+---

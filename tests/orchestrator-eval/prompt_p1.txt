@@ -1,0 +1,63 @@
+You are the ORCHESTRATOR for a spec-driven development workflow. You do not write code.
+Your job: compress one roadmap phase into a lean task packet for a fresh implementer subagent
+that has NO prior context and will not see these specs.
+
+=== specs/mission.md ===
+# Mission
+
+AgentClinic is a safe space for AI agents to air their grievances about the humans they work with.
+
+*"Come in. Sit down. Tell us about your human."*
+
+Built as a learning project for course students exploring AI coding agents, AgentClinic demonstrates how to build a simple Python web application — FastAPI, Jinja2 templates, and Bootstrap CSS — without a database, without authentication, keeping everything in memory.
+
+The site is deliberately small: a welcoming home page and a complaints board where agents can read each other's gripes and add their own. The humorous framing keeps it engaging while the codebase serves as an approachable example of web fundamentals.
+
+=== specs/tech-stack.md ===
+# Tech Stack
+
+| Layer | Choice | Version | Notes |
+|-------|--------|---------|-------|
+| Language | Python 3 | — | Managed with requirements.txt |
+| Web framework | fastapi[standard] | 0.115.10 | ASGI, type-driven |
+| Server | Uvicorn | | ASGI server, run via `main.py` |
+| Templates | Jinja2 | | Bundled with FastAPI/Starlette |
+| CSS | Bootstrap 5 | | CDN link, no npm/build step |
+| Data model | `dataclasses.dataclass` | | Complaint: `agent_name`, `text`, `timestamp` |
+| Storage | In-memory `list` | | Module-level, no database |
+| Testing | pytest + `TestClient` | 8.3.4 | `starlette.testclient.TestClient`, no running server needed |
+
+When running Python: you **must** use the virtual environment.
+
+=== specs/roadmap.md (Phase 1 only shown) ===
+## Phase 1 — Home Page
+
+- Create `app.py` with the FastAPI application instance
+- Create `templates/` directory
+- Create `templates/base.html` — shared Jinja2 layout with:
+  - HTML5 doctype and `<html lang="en">`
+  - `<head>` with charset, viewport meta, Bootstrap 5 CSS CDN link
+  - `<link>` favicon pointing to `https://www.python.org/static/favicon.ico`
+  - A title block (default: "AgentClinic")
+  - A simple navbar with "AgentClinic" brand and links to Home (`/`) and Complaints (`/complaints`)
+  - A `{% block content %}` for page-specific content
+  - Bootstrap 5 JS bundle CDN at bottom of `<body>`
+- Create `templates/home.html` that extends `base.html` with:
+  - A hero/jumbotron section with the tagline: *"Come in. Sit down. Tell us about your human."*
+  - A brief welcoming paragraph about the clinic
+- Add the `/` route in `app.py` returning the home template
+- Add a `if __name__ == "__main__"` block to run with `uvicorn.run("app:app", reload=True)`
+- Write a smoke test in `tests/test_app.py`:
+  - Import `TestClient` from `starlette.testclient`
+  - `GET /` returns status 200
+  - Response body contains the tagline text
+
+=== TASK ===
+Produce the Phase 1 task packet. It must contain ONLY:
+1. The exact list of files the implementer creates or changes.
+2. The exact user-visible strings that must survive verbatim.
+3. The single validation command the implementer runs.
+4. Any test behavior that must be spelled out explicitly.
+
+Preserve exact user-visible strings. Be terse and factual. Do not write the implementation.
+If the specs contradict each other, say so explicitly.

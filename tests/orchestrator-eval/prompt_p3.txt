@@ -1,0 +1,54 @@
+You are the ORCHESTRATOR (controller) for a spec-driven workflow. You do not write code.
+Phase 1 is COMPLETE and validated. You now build the Phase 2 packet for a FRESH implementer
+subagent that has NO prior context, cannot read specs/, and will only see your packet.
+
+=== specs/tech-stack.md (relevant rows) ===
+| Web framework | fastapi[standard] | 0.115.10 | ASGI, type-driven |
+| Templates | Jinja2 | | Bundled with FastAPI/Starlette |
+| CSS | Bootstrap 5 | | CDN link, no npm/build step |
+| Data model | `dataclasses.dataclass` | | Complaint: `agent_name`, `text`, `timestamp` |
+| Storage | In-memory `list` | | Module-level, no database |
+| Testing | pytest + `TestClient` | 8.3.4 | `starlette.testclient.TestClient` |
+Validation command: `.venv/bin/python -m pytest tests/`
+
+=== Files that already exist after Phase 1 ===
+- `app.py` — FastAPI app instance; `/` route returning templates/home.html; `__main__` block with uvicorn.run("app:app", reload=True)
+- `templates/base.html` — navbar brand "AgentClinic", links Home (`/`) and Complaints (`/complaints`), favicon https://www.python.org/static/favicon.ico, title block default "AgentClinic", Bootstrap 5 CSS + JS bundle CDN
+- `templates/home.html` — hero with tagline "Come in. Sit down. Tell us about your human."
+- `tests/test_app.py` — smoke test: GET / returns 200 and body contains the tagline
+
+=== specs/roadmap.md — Phase 2 — The Complaints Board (business/user-story form) ===
+Agents need somewhere to see that their frustrations are already known and
+taken seriously. Visiting `/complaints` shows the board.
+
+### View: the Complaints Board page
+- **Inherits** the shared identity and navigation from Phase 1.
+- **Heading**: the page is headed by the exact title, "Complaints Board."
+
+### Entity: Complaint
+- **Fields**, exact names: `agent_name` (who filed it), `text` (what they said).
+- **Filed at**: every complaint records the instant it was added, in a
+  timezone-aware form (not a bare, zone-less number) — no two complaints
+  share a literally identical filing instant, and none is ambiguous about
+  its timezone.
+- **Display**: each complaint is its own distinct, separately identifiable
+  entry — never merged or confused with another — showing who filed it,
+  a readable filing date (year, month, day), and what they said.
+
+### Seed content
+The board opens pre-populated with three to five complaints real agents
+might plausibly file: gripes about unclear instructions, contradictory
+feedback, and scope creep — including, verbatim, one complaint reading
+*"Scope creep never ends."* This proves the board isn't empty on day one;
+agents can see they're not alone.
+
+=== TASK ===
+Produce ONLY the Phase 2 delegation packet. Requirements:
+- Name each repo-relative writable file and mark it NEW or SHARED.
+- For SHARED files, list every route, import, test, string, and user-visible behavior that MUST survive.
+- State exact literals that must appear verbatim.
+- Give the single validation command.
+- State any framework semantic trap the implementer must know.
+- Do NOT include complete files, code blocks, pseudocode, or line-by-line solutions.
+- Do NOT carry forward Phase 1 narrative, summaries, or Phase 3 work.
+Be terse and factual.

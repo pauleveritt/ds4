@@ -1,0 +1,86 @@
+diff --git a/examples/eval-callback/eval-callback.cpp b/examples/eval-callback/eval-callback.cpp
+--- a/examples/eval-callback/eval-callback.cpp
++++ b/examples/eval-callback/eval-callback.cpp
+@@ -5,9 +5,38 @@
+ #include "llama.h"
+ 
+ #include <clocale>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <string>
+ #include <vector>
+ 
++static bool dump_mellum_tensor(struct ggml_tensor * tensor, bool ask, void *) {
++    const char * tensor_name = std::getenv("MELLUM_DUMP_TENSOR");
++    const char * output_path = std::getenv("MELLUM_DUMP_PATH");
++    if (!tensor_name || !output_path || std::strcmp(tensor->name, tensor_name) != 0) {
++        return false;
++    }
++    if (ask) {
++        return true;
++    }
++
++    const size_t bytes = ggml_nbytes(tensor);
++    std::vector<uint8_t> data(bytes);
++    if (ggml_backend_buffer_is_host(tensor->buffer)) {
++        std::memcpy(data.data(), tensor->data, bytes);
++    } else {
++        ggml_backend_tensor_get(tensor, data.data(), 0, bytes);
++    }
++    FILE * file = std::fopen(output_path, "wb");
++    if (!file) {
++        return false;
++    }
++    const bool complete = std::fwrite(data.data(), 1, bytes, file) == bytes;
++    const bool closed = std::fclose(file) == 0;
++    return complete && closed;
++}
++
+ static bool run(llama_context * ctx, const common_params & params) {
+     const llama_model * model = llama_get_model(ctx);
+     const llama_vocab * vocab = llama_model_get_vocab(model);
+@@ -26,9 +55,18 @@
+         LOG_INF("  %d\n", tokens[i]);
+     }
+ 
+-    if (llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size()))) {
+-        LOG_ERR("%s : failed to eval\n", __func__);
+-        return false;
++    if (std::getenv("MELLUM_TOKENWISE")) {
++        for (llama_token token : tokens) {
++            if (llama_decode(ctx, llama_batch_get_one(&token, 1))) {
++                LOG_ERR("%s : failed to eval\n", __func__);
++                return false;
++            }
++        }
++    } else {
++        if (llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size()))) {
++            LOG_ERR("%s : failed to eval\n", __func__);
++            return false;
++        }
+     }
+ 
+     return true;
+@@ -37,8 +75,6 @@
+ int main(int argc, char ** argv) {
+     std::setlocale(LC_NUMERIC, "C");
+ 
+-    common_debug_cb_user_data cb_data;
+-
+     common_params params;
+ 
+     common_init();
+@@ -51,9 +87,9 @@
+     llama_numa_init(params.numa);
+ 
+     // pass the callback to the backend scheduler
+-    // it will be executed for each node during the graph computation
+-    params.cb_eval = common_debug_cb_eval;
+-    params.cb_eval_user_data = &cb_data;
++    // and retrieve only the Mellum tensor selected by the environment.
++    params.cb_eval = dump_mellum_tensor;
++    params.cb_eval_user_data = nullptr;
+     params.warmup = false;
+ 
+     // init

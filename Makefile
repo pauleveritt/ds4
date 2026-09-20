@@ -69,7 +69,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-mellum-oracle-checker test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -259,6 +259,20 @@ tests/test_metal_dense_mpp: tests/test_metal_dense_mpp.o $(CORE_OBJS)
 
 test-metal-dense-mpp: tests/test_metal_dense_mpp
 	./tests/test_metal_dense_mpp
+
+
+tests/test_mellum_tokenizer.o: tests/test_mellum_tokenizer.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_mellum_tokenizer.c
+
+tests/test_mellum_tokenizer: tests/test_mellum_tokenizer.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-mellum-tokenizer: tests/test_mellum_tokenizer
+	@if [ -z "$(strip $(DS4_TEST_MELLUM_MODEL))" ]; then \
+		echo "error: set DS4_TEST_MELLUM_MODEL to the Mellum Q8 GGUF"; \
+		exit 2; \
+	fi
+	DS4_TEST_MELLUM_MODEL="$(DS4_TEST_MELLUM_MODEL)" ./tests/test_mellum_tokenizer
 
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_cases.o ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -479,6 +493,9 @@ tests/test_qwen4_cuda: tests/test_qwen4_cuda.o ds4_cuda.o ds4_image.o $(MMQ_OBJS
 test-qwen4-cuda: tests/test_qwen4_cuda
 	./tests/test_qwen4_cuda
 endif
+
+test-mellum-oracle-checker:
+	python3 tests/test_check_mellum_layer0_oracle.py
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_linux_memory.h ds4_engram.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
@@ -991,11 +1008,16 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
+	# The Mellum grouped (expert-major) MoE is env-gated, so the default run
+	# never reaches it.  Re-run the Metal kernel suite with it enabled: its
+	# batch-equals-decode checks are what hold grouped output bit-exact.
+	DS4_MELLUM_GROUPED_MOE=1 ./ds4_test --metal-kernels
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args
 	./tests/test_gpu_args_cli.sh
 	./tests/test_prompt_prefix
+	$(MAKE) test-mellum-oracle-checker
 	./tests/test_sampling
 	./tests/test_deepseek4_vision_image
 

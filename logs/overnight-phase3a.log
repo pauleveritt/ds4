@@ -1,0 +1,30 @@
+=== PHASE 3a dot4 2026-08-01T21:32:35Z ===
+-- GATE 1: bitwise batch==decode --
+metal-kernels: OK
+ds4 tests: ok
+ds4 tests: ok
+-- GATE 2: batch vs decode on real model (EXACT) --
+Mellum true-prefill probe tokens=26 chunk=26 layers=28 hidden max_abs=0 rms=0 logits max_abs=0 rms=0
+-- GATE 3: llama.cpp envelopes (tightened) --
+Mellum layer-0 oracle values=59904 max_abs=0.00493812561 rms=9.80443814e-05 mae=3.69404279e-05 max_at=(15, 1236)
+rc_l0=0
+Mellum layer-27-tokenwise oracle values=2304 max_abs=1.23608398 rms=0.0454834355 mae=0.0287036989 max_at=(0, 368)
+rc_l27=0
+Mellum layer-logits-tokenwise oracle values=98304 max_abs=0.0177469254 rms=0.00911324309 mae=0.00890643715 max_at=8514
+rc_lg=0
+Mellum resident profile tokens=64 repeats=3 no-head=6.529ms 153.2t/s with-head=6.954ms 143.8t/s output-head-delta=0.426ms
+Mellum resident prefill tokens=1024 chunk=1024 exact=0 repeats=3 batch=3860.9ms 265.2t/s
+
+PHASE 3a VERDICT: REVERTED.
+Bitwise batch==decode held (decode+batch+grouped changed symmetrically), but
+the llama.cpp envelopes breached badly:
+  layer-27 max 0.404175 -> 1.23608 (limit 0.55)
+  layer-27 rms 0.0347506 -> 0.0454834 (limit 0.045)
+  logits  max 0.00976753 -> 0.0177469 (limit 0.013)
+  logits  rms 0.00178922 -> 0.00911324 (limit 0.0024)  == 5.1x regression
+Grouping four CONTIGUOUS elements per thread changes intra-row summation order
+away from the strided order, and the strided order is what produced the 5.3x
+accuracy gain.  Speed and this accuracy gain are in direct tension: the scale
+hoist requires contiguity, contiguity costs the accuracy.
+NOTE: the gate command used `cmd | tail -1; $?` which reports tail's status.
+Read the numbers, not the exit code.  Fixed in later phases.

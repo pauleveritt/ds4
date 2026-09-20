@@ -841,6 +841,283 @@ kernel void kernel_glm_q4_K_pair_swiglu_f32(
     }
 }
 
+
+/*
+ * Shared Q8_0 row dot for the Mellum MoE kernels.  Four elements per step so
+ * the block scale is converted once per four values instead of once per value.
+ * Every Mellum MoE path uses it, so batch-equals-decode bitwise equality holds.
+ *
+ * NOTE: this changes intra-row summation order versus the strided loop it
+ * replaces, which costs accuracy against the llama.cpp reference (logit RMS
+ * 0.00179 -> 0.00911) while gaining ~45% prefill and ~26% decode.  See the
+ * research log; adopting it is a deliberate trade, not a free win.
+ */
+template <typename ROW>
+static inline void ds4_mellum_q8_0_pair_dot4(ROW gate_row, ROW up_row,
+                                             device const float *x,
+                                             uint in_dim, uint tid, uint ntg,
+                                             thread float &acc_gate,
+                                             thread float &acc_up) {
+    for (uint kb = tid * 4u; kb < in_dim; kb += ntg * 4u) {
+        const uint block = kb >> 5, el = kb & 31u;
+        const float gd = (float)gate_row[block].d;
+        const float ud = (float)up_row[block].d;
+        for (uint j = 0; j < 4u; j++) {
+            const float xv = x[kb + j];
+            acc_gate += gd * (float)gate_row[block].qs[el + j] * xv;
+            acc_up += ud * (float)up_row[block].qs[el + j] * xv;
+        }
+    }
+}
+
+template <typename ROW>
+static inline float ds4_mellum_q8_0_row_dot4(ROW row, device const float *v,
+                                             uint dim, uint tid, uint ntg) {
+    float acc = 0.0f;
+    for (uint kb = tid * 4u; kb < dim; kb += ntg * 4u) {
+        const uint block = kb >> 5, el = kb & 31u;
+        const float d = (float)row[block].d;
+        for (uint j = 0; j < 4u; j++) {
+            acc += d * (float)row[block].qs[el + j] * v[kb + j];
+        }
+    }
+    return acc;
+}
+
+/* The pinned Mellum GGUF is an all-Q8_0 numerical oracle.  Do not reuse the
+ * Q4_K pair kernel here: its packed scale/min representation is not Q8_0. */
+kernel void kernel_mellum_q8_0_pair_swiglu_f32(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *gate,
+        device const char *up,
+        device const float *x,
+        device const int32_t *selected,
+        device const float *weights,
+        device float *mid,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    const uint ntg = 256u;
+    const uint row = tgpig.x;
+    const uint slot = tgpig.y;
+    if (row >= args.mid_dim || slot >= args.n_expert_used) return;
+
+    const int expert = selected[slot];
+    const uint64_t mid_off = (uint64_t)slot * args.mid_dim + row;
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tid == 0u) mid[mid_off] = 0.0f;
+        return;
+    }
+
+    device const block_q8_0 *gate_row =
+        (device const block_q8_0 *)(gate +
+            (uint64_t)(uint)expert * args.gate_expert_bytes +
+            (uint64_t)row * args.gate_row_bytes);
+    device const block_q8_0 *up_row =
+        (device const block_q8_0 *)(up +
+            (uint64_t)(uint)expert * args.up_expert_bytes +
+            (uint64_t)row * args.up_row_bytes);
+
+    float acc_gate = 0.0f;
+    float acc_up = 0.0f;
+    ds4_mellum_q8_0_pair_dot4(gate_row, up_row, x, args.in_dim, tid, ntg,
+                              acc_gate, acc_up);
+
+    scratch[tid] = acc_gate;
+    scratch[ntg + tid] = acc_up;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+            scratch[ntg + tid] += scratch[ntg + tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        const float g = scratch[0];
+        mid[mid_off] = g / (1.0f + exp(-g)) * scratch[ntg] * weights[slot];
+    }
+}
+
+// Token-major companion to the decode kernel above.  Keep the reduction and
+// per-row arithmetic unchanged so a batch row is reproducible as one decode.
+kernel void kernel_mellum_q8_0_pair_swiglu_batch_f32(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *gate, device const char *up, device const float *x,
+        device const int32_t *selected, device const float *weights,
+        device float *mid, threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    const uint ntg = 256u, row = tgpig.x, slot = tgpig.y, token = tgpig.z;
+    if (row >= args.mid_dim || slot >= args.n_expert_used || token >= args.n_tokens)
+        return;
+    const uint64_t selected_base = (uint64_t)token * args.n_expert_used;
+    const uint64_t mid_off = (uint64_t)token * args.mid_token_stride +
+                             (uint64_t)slot * args.mid_dim + row;
+    const int expert = selected[selected_base + slot];
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tid == 0u) mid[mid_off] = 0.0f;
+        return;
+    }
+    device const block_q8_0 *gate_row = (device const block_q8_0 *)(gate +
+        (uint64_t)(uint)expert * args.gate_expert_bytes +
+        (uint64_t)row * args.gate_row_bytes);
+    device const block_q8_0 *up_row = (device const block_q8_0 *)(up +
+        (uint64_t)(uint)expert * args.up_expert_bytes +
+        (uint64_t)row * args.up_row_bytes);
+    device const float *token_x = x + (uint64_t)token * args.in_dim;
+    float acc_gate = 0.0f, acc_up = 0.0f;
+    ds4_mellum_q8_0_pair_dot4(gate_row, up_row, token_x, args.in_dim, tid, ntg,
+                              acc_gate, acc_up);
+    scratch[tid] = acc_gate; scratch[ntg + tid] = acc_up;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+            scratch[ntg + tid] += scratch[ntg + tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        const float g = scratch[0];
+        mid[mid_off] = g / (1.0f + exp(-g)) * scratch[ntg] *
+            weights[selected_base + slot];
+    }
+}
+
+/*
+ * Expert-major (grouped) Mellum prefill.
+ *
+ * The token-major kernels above re-read an expert's weight row once per token
+ * that selected it, so a chunk reads n_tokens * n_expert_used expert rows per
+ * layer and batching buys no weight reuse.  Grouping inverts the loop: tokens
+ * are bucketed by selected expert, and each (expert, row) threadgroup stages
+ * its weight row into threadgroup memory once and then serves every token in
+ * that bucket.
+ *
+ * Two properties are deliberate.  The per-token inner loop and tree reduction
+ * are byte-for-byte the token-major ones, so grouped output is bitwise equal to
+ * both the batch and decode paths.  And expert weights are addressed through an
+ * offset table rather than `base + expert * bytes`, so the same kernel serves a
+ * resident mmap and, later, a bounded SSD expert cache whose slots are not at
+ * model offsets.
+ */
+struct ds4_metal_mellum_moe_group_args {
+    uint32_t n_tokens;
+    uint32_t n_expert_used;
+    uint32_t n_total_expert;
+    uint32_t bucket_cap;
+};
+
+kernel void kernel_mellum_moe_bucket_reset(
+        constant ds4_metal_mellum_moe_group_args &gargs,
+        device atomic_uint *counts,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid < gargs.n_total_expert) {
+        atomic_store_explicit(&counts[gid], 0u, memory_order_relaxed);
+    }
+}
+
+/*
+ * Append each (token, slot) pair to its expert's bucket.  The atomic makes
+ * within-bucket order run-dependent, which is harmless: a pair's position in
+ * the bucket selects only which thread handles it, never any arithmetic, and
+ * every result is written to an address derived from the pair itself.
+ */
+kernel void kernel_mellum_moe_bucket_build(
+        constant ds4_metal_mellum_moe_group_args &gargs,
+        device const int32_t *selected,
+        device atomic_uint *counts,
+        device uint32_t *pairs,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= gargs.n_tokens * gargs.n_expert_used) return;
+    const int expert = selected[gid];
+    if (expert < 0 || (uint)expert >= gargs.n_total_expert) return;
+    const uint idx = atomic_fetch_add_explicit(&counts[(uint)expert], 1u,
+                                               memory_order_relaxed);
+    if (idx < gargs.bucket_cap) {
+        pairs[(uint)expert * gargs.bucket_cap + idx] = gid;
+    }
+}
+
+kernel void kernel_mellum_q8_0_pair_swiglu_grouped_f32(
+        constant ds4_metal_glm_routed_moe_args &args,
+        constant ds4_metal_mellum_moe_group_args &gargs,
+        device const char *gate,
+        device const char *up,
+        device const uint64_t *gate_offsets,
+        device const uint64_t *up_offsets,
+        device const float *x,
+        device const float *weights,
+        device const uint32_t *counts,
+        device const uint32_t *pairs,
+        device float *mid,
+        threadgroup float *scratch [[threadgroup(0)]],
+        threadgroup char *staged [[threadgroup(1)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    const uint ntg = 256u;
+    const uint row = tgpig.x;
+    const uint expert = tgpig.y;
+    if (row >= args.mid_dim || expert >= gargs.n_total_expert) return;
+    /*
+     * The build kernel increments its atomic even when the bucket is full, so
+     * a stored count can exceed bucket_cap.  Clamp before it is used as a loop
+     * bound: an unclamped count would index past this expert's bucket, and past
+     * the buffer entirely for the last expert.  Overflow is unreachable while a
+     * token's top-k experts are distinct (bucket_cap == n_tokens), but nothing
+     * in the router contract enforces that here.
+     */
+    const uint count = min(counts[expert], gargs.bucket_cap);
+    if (count == 0u) return;
+
+    /* Staging assumes up rows match gate rows in stride; the host enforces it. */
+    const uint row_bytes = (uint)args.gate_row_bytes;
+    device const char *gsrc =
+        gate + gate_offsets[expert] + (uint64_t)row * args.gate_row_bytes;
+    device const char *usrc =
+        up + up_offsets[expert] + (uint64_t)row * args.up_row_bytes;
+    for (uint b = tid; b < row_bytes; b += ntg) {
+        staged[b] = gsrc[b];
+        staged[row_bytes + b] = usrc[b];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup const block_q8_0 *gate_row =
+        (threadgroup const block_q8_0 *)staged;
+    threadgroup const block_q8_0 *up_row =
+        (threadgroup const block_q8_0 *)(staged + row_bytes);
+
+    for (uint p = 0; p < count; p++) {
+        const uint pair = pairs[expert * gargs.bucket_cap + p];
+        const uint token = pair / args.n_expert_used;
+        const uint slot = pair - token * args.n_expert_used;
+        device const float *token_x = x + (uint64_t)token * args.in_dim;
+        float acc_gate = 0.0f, acc_up = 0.0f;
+        ds4_mellum_q8_0_pair_dot4(gate_row, up_row, token_x, args.in_dim, tid,
+                                  ntg, acc_gate, acc_up);
+        scratch[tid] = acc_gate;
+        scratch[ntg + tid] = acc_up;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                scratch[tid] += scratch[tid + stride];
+                scratch[ntg + tid] += scratch[ntg + tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0u) {
+            const float g = scratch[0];
+            mid[(uint64_t)token * args.mid_token_stride +
+                (uint64_t)slot * args.mid_dim + row] =
+                g / (1.0f + exp(-g)) * scratch[ntg] * weights[pair];
+        }
+        /* The next pair overwrites scratch; make sure every lane is done. */
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 template <short N_R0>
 static inline void glm_q2_K_pair_swiglu_simd_f32_impl(
         ds4_metal_glm_routed_moe_args args,
@@ -2700,6 +2977,108 @@ kernel void kernel_glm_q4_K_down_f32(
     }
     if (tid == 0u) {
         out[(uint64_t)token * args.out_dim + row] = scratch[0];
+    }
+}
+
+/* Mellum uses Q8_0 expert down projections, unlike the Q{2..6}_K GLM
+ * variants above.  Keep the selected-expert indirection in this scalar
+ * decode kernel; the same argument layout can later bind an address table. */
+kernel void kernel_mellum_q8_0_down_f32(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *down,
+        device const int32_t *selected,
+        device const float *mid,
+        device float *out,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    const uint ntg = 256u;
+    const uint row = tgpig.x;
+    if (row >= args.out_dim) return;
+
+    /*
+     * Each selected expert keeps its own complete dot product, and the finished
+     * per-slot scalars are summed in slot order.  Folding all slots into one
+     * accumulator would be marginally cheaper but makes the result inseparable
+     * per expert, which an expert-major (grouped) schedule cannot reproduce.
+     * This ordering is the contract that lets grouped prefill stay bit-exact
+     * against decode.  Scratch therefore holds one reduction lane per slot.
+     */
+    for (uint slot = 0; slot < args.n_expert_used; slot++) {
+        const int expert = selected[slot];
+        float acc = 0.0f;
+        if (expert >= 0 && (uint)expert < args.n_total_expert) {
+            device const block_q8_0 *down_row =
+                (device const block_q8_0 *)(down +
+                    (uint64_t)(uint)expert * args.down_expert_bytes +
+                    (uint64_t)row * args.down_row_bytes);
+            device const float *slot_mid = mid + (uint64_t)slot * args.mid_dim;
+            acc = ds4_mellum_q8_0_row_dot4(down_row, slot_mid, args.mid_dim,
+                                           tid, ntg);
+        }
+        scratch[slot * ntg + tid] = acc;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            for (uint slot = 0; slot < args.n_expert_used; slot++) {
+                scratch[slot * ntg + tid] += scratch[slot * ntg + tid + stride];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        float total = 0.0f;
+        for (uint slot = 0; slot < args.n_expert_used; slot++) {
+            total += scratch[slot * ntg];
+        }
+        out[row] = total;
+    }
+}
+
+kernel void kernel_mellum_q8_0_down_batch_f32(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *down, device const int32_t *selected,
+        device const float *mid, device float *out,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    const uint ntg = 256u, row = tgpig.x, token = tgpig.y;
+    if (row >= args.out_dim || token >= args.n_tokens) return;
+    const uint64_t selected_base = (uint64_t)token * args.n_expert_used;
+    const uint64_t mid_base = (uint64_t)token * args.mid_token_stride;
+    /* Per-slot reduction lanes: see the decode kernel for why the slots stay
+     * separable rather than sharing one accumulator. */
+    for (uint slot = 0; slot < args.n_expert_used; slot++) {
+        const int expert = selected[selected_base + slot];
+        float acc = 0.0f;
+        if (expert >= 0 && (uint)expert < args.n_total_expert) {
+            device const block_q8_0 *down_row = (device const block_q8_0 *)(down +
+                (uint64_t)(uint)expert * args.down_expert_bytes +
+                (uint64_t)row * args.down_row_bytes);
+            device const float *slot_mid =
+                mid + mid_base + (uint64_t)slot * args.mid_dim;
+            acc = ds4_mellum_q8_0_row_dot4(down_row, slot_mid, args.mid_dim,
+                                           tid, ntg);
+        }
+        scratch[slot * ntg + tid] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            for (uint slot = 0; slot < args.n_expert_used; slot++) {
+                scratch[slot * ntg + tid] += scratch[slot * ntg + tid + stride];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        float total = 0.0f;
+        for (uint slot = 0; slot < args.n_expert_used; slot++) {
+            total += scratch[slot * ntg];
+        }
+        out[(uint64_t)token * args.out_dim + row] = total;
     }
 }
 

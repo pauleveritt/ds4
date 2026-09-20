@@ -1,0 +1,147 @@
+We are given a spec for Phase 2: Complaints Board.
+ We are to produce a delegation packet for a fresh implementer (subagent) that has no prior context.
+
+ Steps from the spec:
+ 1. Create `models.py` with a `Complaint` dataclass (fields: agent_name, text, timestamp) and set default for timestamp to datetime.now(timezone.utc).
+ 2. Create a module-level list `complaints` in `models.py` and populate with 3-5 seed complaints.
+ 3. In `app.py`, add a GET /complaints route that returns templates/complaints.html with the complaints list as context.
+ 4. Create `templates/complaints.html` that extends base.html and displays the complaints in Bootstrap cards.
+ 5. Write tests in `tests/test_app.py` for the new route.
+
+ We are to list:
+   - Each repo-relative writable file and mark it NEW or SHARED.
+   - For SHARED files, list every route, import, test, string, and user-visible behavior that MUST survive.
+   - State exact literals that must appear verbatim.
+   - Give the single validation command.
+   - State any framework semantic trap.
+
+ Important: We are only to produce the Phase 2 packet. Do not include Phase 1 or Phase 3.
+
+ Files that already exist after Phase 1 (so we don't create them again, but we might modify):
+   - app.py (we are adding a route to it, so it's SHARED and we must note the additions)
+   - tests/test_app.py (we are adding a test, so it's SHARED and we must note the new test)
+
+ New files to create:
+   - models.py
+   - templates/complaints.html
+
+ For SHARED files (app.py and tests/test_app.py), we must list every route, import, test, string, and user-visible behavior that must survive.
+
+ Let's break it down:
+
+ 1. models.py (NEW):
+    - Must contain:
+        from datetime import datetime, timezone
+        from dataclasses import dataclass
+
+        @dataclass
+        class Complaint:
+            agent_name: str
+            text: str
+            timestamp: datetime = datetime.now(timezone.utc)
+
+        complaints: list[Complaint] = [ ... ]  # 3-5 seed complaints
+
+    - Seed complaints: must be generic AI-agent gripes (e.g., "unclear instructions", "contradictory feedback", "scope creep"). We'll use 3 for brevity.
+
+ 2. app.py (SHARED):
+    - We are adding a new route: GET /complaints
+    - We must import: from models import complaints
+    - We must add: 
+        @app.get("/complaints")
+        def complaints_board():
+            return templates.TemplateResponse("complaints.html", {"complaints": complaints})
+
+    - Note: The existing app.py already has a route for "/" and the __main__ block. We are only adding the new route.
+
+ 3. tests/test_app.py (SHARED):
+    - We are adding a test for GET /complaints:
+        def test_complaints_board():
+            response = client.get("/complaints")
+            assert response.status_code == 200
+            # Check for one of the seed complaint texts (e.g., "unclear instructions")
+            assert "unclear instructions" in response.text
+
+ 4. templates/complaints.html (NEW):
+    - Must extend base.html
+    - Must have a heading: "Complaints Board"
+    - Must loop through complaints and render each as a Bootstrap card with:
+        - agent name
+        - timestamp (formatted)
+        - complaint text
+
+    - Formatting of timestamp: we can use `{{ complaint.timestamp.strftime('%Y-%m-%d %H:%M:%S') }}` but note the spec doesn't specify format. However, the spec says "formatted", so we'll use a standard format.
+
+    - The template must be valid and use Bootstrap 5 (which is already included in base.html).
+
+ 5. Validation command: .venv/bin/python -m pytest tests/
+
+ 6. Framework semantic trap: 
+    - The `datetime.now(timezone.utc)` sets the timestamp to the current time when the module is loaded (not when the complaint is created). 
+      This is a common pitfall. We want the timestamp to be when the complaint is created, but the default in the dataclass is evaluated at import time.
+
+    Correction: The spec says "set `timestamp` default to `datetime.now(timezone.utc)`". However, note that in dataclasses, if you set a default value that is a mutable object (or in this case, a function call) it will be evaluated once at the time of class definition.
+
+    But the spec says: "set `timestamp` default to `datetime.now(timezone.utc)`". This means that every time a Complaint is created without specifying a timestamp, it will use the same timestamp (the time when the module was imported). 
+
+    However, the intended behavior is to have the timestamp when the complaint is created. The correct way is to use a default_factory.
+
+    But the spec says: "set `timestamp` default to `datetime.now(timezone.utc)`". So we must follow the spec literally? 
+
+    Actually, the spec says: "set `timestamp` default to `datetime.now(timezone.utc)`". This is ambiguous. In Python, if we write:
+
+        timestamp: datetime = datetime.now(timezone.utc)
+
+    then the default is the current time at the moment the class is defined (when the module is imported). 
+
+    However, the intended behavior is to have the time when the complaint is created. The spec might have a mistake, but we are to follow the spec.
+
+    But note: the spec says "set `timestamp` default to `datetime.now(timezone.utc)`", meaning we are to set the default to the result of that function call at the time of class definition.
+
+    However, the implementer must be aware that this will set the same timestamp for all complaints created after the module is loaded? Actually, no: because the default value is the time when the module was imported, so every time we create a Complaint without a timestamp, it will use that same time (the time when the module was imported). 
+
+    But the seed complaints are created when the module is imported (at the time of defining the list). So they will all have the same timestamp (the time when the module was imported). 
+
+    However, the spec says: "Populate `complaints` with 3-5 seed complaints". So we are creating the seed complaints at the time of module import. Therefore, they will all have the same timestamp (the time when the module was imported). 
+
+    But the spec says: "set `timestamp` default to `datetime.now(timezone.utc)`", so we are doing exactly that.
+
+    The trap: if the implementer uses `default_factory` they might get a different behavior, but the spec says to set the default to `datetime.now(timezone.utc)`, so we must not use `default_factory`.
+
+    However, the spec might have intended to have the timestamp at the time of creation. But the spec says "default to", meaning the value of the function call at the time of class definition.
+
+    So the trap is: the timestamp for all seed complaints will be the same (the time when the module was loaded). This is acceptable for seed data.
+
+    But note: the spec says "set `timestamp` default to `datetime.now(timezone.utc)`", so we are to write:
+
+        timestamp: datetime = datetime.now(timezone.utc)
+
+    and not use a default factory.
+
+    The implementer must know that this sets the default to the time of module import, not the time of each instance creation.
+
+ 7. Exact literals:
+    - The heading in complaints.html must be exactly: "Complaints Board"
+    - The seed complaints must be generic (we'll choose three: "unclear instructions", "contradictory feedback", "scope creep")
+
+ 8. Validation command: .venv/bin/python -m pytest tests/
+
+ Now, let's structure the packet:
+
+ We are to list:
+   - Each repo-relative writable file and mark NEW or SHARED.
+
+   NEW:
+     - models.py
+     - templates/complaints.html
+
+   SHARED:
+     - app.py
+     - tests/test_app.py
+
+ For SHARED files, we list:
+
+   app.py:
+     - Must add a route: GET /complaints that returns templates/complaints.html with the complaints list as context.
+     - Must import: from models import complaints
+     - The route function must be named appropriately (we can choose, but the spec doesn't specify) and must use Template

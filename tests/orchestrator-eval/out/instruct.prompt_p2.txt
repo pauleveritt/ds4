@@ -1,0 +1,39 @@
+**Phase 2 Delegation Packet**
+
+**NEW Files**  
+- `models.py`  
+- `templates/complaints.html`  
+
+**SHARED Files**  
+- `app.py`  
+  - Routes: `GET /complaints`  
+  - Imports: `Complaint` from `models`, `templates.complaints.html`  
+  - Behavior: Returns `200` and renders `complaints.html` with `complaints` context  
+
+- `tests/test_app.py`  
+  - Tests: `GET /complaints` returns `200` and contains seed complaint text  
+  - String: Must contain verbatim seed complaint text (e.g., "unclear instructions")  
+
+- `templates/base.html`  
+  - Strings: Navbar brand "AgentClinic", links Home (`/`) and Complaints (`/complaints`), favicon `https://www.python.org/static/favicon.ico`, title block default "AgentClinic"  
+
+- `templates/home.html`  
+  - String: Must contain verbatim tagline "Come in. Sit down. Tell us about your human."  
+
+**Literals Verbatim**  
+- `agent_name: str`, `text: str`, `timestamp: datetime`  
+- `from datetime import datetime, timezone`  
+- `timestamp` default: `datetime.now(timezone.utc)`  
+- `complaints: list[Complaint]`  
+- Seed complaints: Generic AI-agent gripes (e.g., "unclear instructions", "contradictory feedback", "scope creep")  
+- Heading: "Complaints Board"  
+- Bootstrap card fields: agent name, timestamp (formatted), complaint text  
+
+**Validation Command**  
+`.venv/bin/python -m pytest tests/`
+
+**Framework Semantic Trap**  
+`datetime.now(timezone.utc)` must be used as the default; `datetime.utcnow()` is deprecated and not timezone-aware.  
+
+---  
+*End of packet.*

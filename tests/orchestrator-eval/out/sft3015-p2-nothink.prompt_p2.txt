@@ -1,0 +1,90 @@
+**Phase 2 Delegation Packet**
+
+---
+
+**Files to Create (NEW):**
+
+1. `models.py` — dataclass `Complaint` + module-level list `complaints`
+2. `templates/complaints.html` — Bootstrap card layout for complaints
+
+**Files to Modify (SHARED):**
+
+- `app.py` — add `GET /complaints` route
+- `tests/test_app.py` — add test for `/complaints`
+
+---
+
+**models.py (NEW)**
+```python
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+@dataclass
+class Complaint:
+    agent_name: str
+    text: str
+    timestamp: datetime = datetime.now(timezone.utc)
+
+complaints: list[Complaint] = [
+    Complaint(agent_name="Alice", text="Instructions were unclear."),
+    Complaint(agent_name="Bob", text="Feedback was contradictory."),
+    Complaint(agent_name="Charlie", text="Scope creep caused delays."),
+    Complaint(agent_name="Dana", text="Response time was too slow."),
+    Complaint(agent_name="Eli", text="Output format inconsistent.")
+]
+```
+
+**templates/complaints.html (NEW)**
+```html
+{% extends "base.html" %}
+{% block content %}
+<h1>Complaints Board</h1>
+{% for c in complaints %}
+<div class="card mb-3">
+  <div class="card-body">
+    <h5 class="card-title">{{ c.agent_name }}</h5>
+    <p class="card-text">{{ c.text }}</p>
+    <small class="text-muted">{{ c.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC') }}</small>
+  </div>
+</div>
+{% endfor %}
+{% endblock %}
+```
+
+**app.py (SHARED)**
+- Import `Complaint` and `complaints` from `models`
+- Add route:
+```python
+@app.get("/complaints")
+def complaints_page():
+    return templates.TemplateResponse("complaints.html", {"complaints": complaints})
+```
+
+**tests/test_app.py (SHARED)**
+- Add test:
+```python
+def test_get_complaints(client):
+    resp = client.get("/complaints")
+    assert resp.status_code == 200
+    assert "Instructions were unclear." in resp.text
+```
+
+---
+
+**Validation Command:**
+```bash
+.venv/bin/python -m pytest tests/
+```
+
+**Framework Semantic Trap:**
+- `datetime.now(timezone.utc)` returns a timezone-aware datetime; ensure `strftime` uses UTC format.
+- Bootstrap 5 CDN requires no build step; ensure `base.html` includes the correct CDN links.
+
+---
+
+**Surviving Elements (SHARED):**
+- All existing routes (`/`, `/complaints` after addition)
+- `templates/base.html` structure and favicon
+- `templates/home.html` content
+- Test client usage and 200 status checks
+- Seed complaint texts in `models.py`

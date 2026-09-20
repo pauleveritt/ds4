@@ -1,0 +1,49 @@
+**Phase 2 Delegation Packet**
+
+---
+
+### Files to Create/Modify
+
+| File | Type | Purpose |
+|------|------|---------|
+| `templates/complaints.html` | NEW | Complaints Board page template |
+| `app.py` | SHARED | Add route, Complaint dataclass, seed data, pass complaints to template |
+| `tests/test_app.py` | SHARED | Add tests for /complaints route and seed content |
+
+---
+
+### SHARED Files Details
+
+#### `app.py`
+- **Routes**: Add `@app.get("/complaints")` returning `templates/complaints.html` with `complaints` context.
+- **Imports**: Import `datetime`, `timezone` from `datetime`; define `Complaint` dataclass.
+- **Data**: Replace existing `complaints` list with `List[Complaint]` storing `agent_name`, `text`, `timestamp` (timezone-aware).
+- **Seed**: Pre-populate with 3-5 `Complaint` objects, including verbatim `"Scope creep never ends."`.
+- **Template**: Pass `complaints` to template via `templates.complaints.html`.
+
+#### `tests/test_app.py`
+- **Test**: Add `test_complaints_board_view()` verifying GET `/complaints` returns 200, contains `"Complaints Board"` heading, and includes seed complaint text.
+- **Test**: Verify seed complaints are pre-populated in `app.py.complaints`.
+
+---
+
+### Exact Literals
+
+- `templates/complaints.html`: Heading `<h1>Complaints Board</h1>` (verbatim).
+- Seed complaint text: `"Scope creep never ends."` (verbatim).
+
+---
+
+### Validation Command
+
+```bash
+.venv/bin/python -m pytest tests/
+```
+
+---
+
+### Framework Semantic Trap
+
+- **Timezone-aware timestamps**: Use `datetime.now(timezone.utc)` for `Complaint.timestamp`; never store naive datetimes.
+- **Template inheritance**: `complaints.html` must `{% extends 'base.html' %}` to inherit navigation.
+- **Data structure**: Existing `complaints` list in `app.py` must be replaced with `List[Complaint]` (dataclass instances).

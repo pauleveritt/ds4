@@ -28,6 +28,9 @@ typedef enum {
     DS4_MODEL_FAMILY_LAGUNA    = 2,
     DS4_MODEL_FAMILY_DEEPSEEK41 = 3,
     DS4_MODEL_FAMILY_QWEN4_EXP = 4,
+    /* P19 merge: the Mellum branch numbered MELLUM 3, which this line
+     * already owns (DEEPSEEK41).  Mellum takes the next free value. */
+    DS4_MODEL_FAMILY_MELLUM    = 5,
 } ds4_model_family;
 
 typedef enum {
@@ -40,6 +43,9 @@ typedef enum {
     DS4_VARIANT_FLASH41 = 6,
     DS4_VARIANT_QWEN4_EXP = 7,
     DS4_VARIANT_QWEN4_MINI = 8,
+    /* P19 merge: the Mellum branch numbered MELLUM2 5, already taken here
+     * (LAGUNA_XS21).  Mellum takes the next free value. */
+    DS4_VARIANT_MELLUM2 = 9,
 } ds4_variant;
 
 /* Per-model-shape constants. Most of ds4.c's shape table stays private
@@ -115,6 +121,13 @@ typedef struct {
 
 extern const ds4_shape DS4_SHAPE_LAGUNA_S21;
 extern const ds4_shape DS4_SHAPE_LAGUNA_XS21;
+extern const ds4_shape DS4_SHAPE_MELLUM2;
+
+/* Mellum's 28 layers repeat [sliding, sliding, sliding, full]. Sliding
+ * layers use ordinary RoPE; full-attention layers use the model's YaRN RoPE
+ * parameters. Invalid layer indices return false from both helpers. */
+bool ds4_mellum_layer_uses_sliding_attention(uint32_t layer_index);
+bool ds4_mellum_layer_uses_yarn_rope(uint32_t layer_index);
 
 typedef enum {
     DS4_THINK_NONE,
@@ -315,6 +328,84 @@ typedef struct {
 } ds4_session_payload_file;
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
+/* Agent-owned engines may opt into model-family session paths that are not
+ * exposed by the generic CLI/server entry points yet. */
+int ds4_engine_open_for_agent(ds4_engine **out,
+                              const ds4_engine_options *opt);
+
+/* Diagnostic-only Mellum oracle probe.  Replays the pinned 26-token fixture
+ * through layer 0 without creating a session or enabling generation. */
+int ds4_engine_mellum_layer0_probe(ds4_engine *engine,
+                                   FILE       *out,
+                                   const char *raw_output_path);
+
+/* Diagnostic-only Mellum whole-model oracle. Replays the same pinned fixture
+ * through all 28 layers without creating a session or enabling generation. */
+int ds4_engine_mellum_all_layers_probe(ds4_engine *engine,
+                                       FILE       *out,
+                                       const char *raw_output_path,
+                                       const char *trace_output_path,
+                                       const char *attention_trace_output_path,
+                                       const char *qk_trace_output_path);
+
+/* Inspect-only Mellum KV allocation gate. Allocates and frees the exact
+ * per-layer F16 layout without creating a session or evaluating a token. */
+int ds4_engine_mellum_kv_layout_probe(ds4_engine *engine,
+                                      FILE       *out,
+                                      int         ctx_size);
+
+/* Inspect-only Mellum session gate. Creates and releases a layout-only
+ * ds4_session; all token execution APIs reject that session. */
+int ds4_engine_mellum_session_lifecycle_probe(ds4_engine *engine,
+                                              FILE       *out,
+                                              int         ctx_size);
+
+/* Inspect-only Mellum session decode gate. Replays the fixed fixture through
+ * session-owned KV/scratch and raw logits, while token selection stays off. */
+int ds4_engine_mellum_session_decode_probe(ds4_engine *engine,
+                                           FILE       *out,
+                                           int         ctx_size,
+                                           const char *raw_output_path);
+
+/* Inspect-only Mellum session isolation gate. Interleaves two independent
+ * decode sessions over the fixed fixture and requires bit-identical logits. */
+int ds4_engine_mellum_session_isolation_probe(ds4_engine *engine,
+                                              FILE       *out,
+                                              int         ctx_size);
+
+/* Inspect-only Mellum interactive-session gate. Exercises sequential replay,
+ * selection, interruption, divergent rebuild, and reset without authorizing
+ * ordinary inspect sessions or another frontend. */
+int ds4_engine_mellum_interactive_session_probe(ds4_engine *engine,
+                                                FILE       *out,
+                                                int         ctx_size);
+
+/* Inspect-only Mellum long-context gate. Compares the ordinary decode schedule
+ * with command-batched sequential sync across the 1,024-token SWA boundary. */
+int ds4_engine_mellum_swa_boundary_probe(ds4_engine *engine,
+                                         FILE       *out,
+                                         int         ctx_size);
+
+/* Inspect-only Mellum resident microprofile. Separates decode-layer cost from
+ * final RMSNorm/output-head cost without authorizing generation. */
+int ds4_engine_mellum_resident_profile(ds4_engine *engine, FILE *out,
+                                       int ctx_size);
+
+/* Inspect-only Mellum true-prefill gate. Runs the fixed fixture as one
+ * layer-major batch and compares its raw final logits with sequential decode. */
+int ds4_engine_mellum_true_prefill_probe(ds4_engine *engine, FILE *out);
+
+/* Inspect-only Mellum true-prefill ring evidence probe. Compares an
+ * SWA-window+6 chunk schedule with sequential decode across the boundary;
+ * it does not currently define an acceptance envelope. */
+int ds4_engine_mellum_true_prefill_swa_probe(ds4_engine *engine, FILE *out);
+
+/* Diagnostic-only Mellum output-head oracle. Replays the fixed fixture through
+ * final RMSNorm and the Q8 output projection, but does not select a token. */
+int ds4_engine_mellum_logits_probe(ds4_engine *engine,
+                                   FILE       *out,
+                                   const char *raw_output_path,
+                                   uint32_t    report_top_k);
 
 /* Multi-GPU pipeline-parallel entry point (wave 2).
  *
@@ -503,6 +594,8 @@ void ds4_engine_tp_unbind(ds4_engine *e);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
+/* False when the session can be restored only by replaying its transcript. */
+bool ds4_session_supports_payload(ds4_session *s);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
 float ds4_session_directional_steering_ffn(ds4_session *s);

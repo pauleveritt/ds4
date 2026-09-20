@@ -1,0 +1,52 @@
+**PHASE 2 DELEGATION PACKET**
+
+**CONTEXT**
+Implement the "Complaints Board" feature. This involves creating a data model, seeding data, adding a new route, and creating a corresponding template.
+
+**FILES TO MODIFY/CREATE**
+- `models.py` (NEW)
+- `app.py` (SHARED)
+- `templates/complaints.html` (NEW)
+- `tests/test_app.py` (SHARED)
+
+**SHARED FILE CONSTRAINTS**
+
+`app.py`
+- **Existing Routes:** `GET /` must remain functional.
+- **Imports:** Must maintain `FastAPI`, `Request`, `Jinja2Templates`, and `uvicorn`.
+- **New Imports:** Must import `complaints` from `models`.
+- **New Route:** `GET /complaints`
+    - **Behavior:** Render `templates/complaints.html` passing the `complaints` list as context.
+- **Verbatim Literals:**
+    - Route path: `/complaints`
+    - Template name: `complaints.html`
+
+`tests/test_app.py`
+- **Existing Tests:** Smoke test for `GET /` must remain functional.
+- **New Test:** `test_get_complaints`
+    - **Behavior:** Verify `GET /complaints` returns status code 200.
+    - **Assertion:** Verify response body contains at least one string from the seed data (e.g., "unclear instructions").
+
+**NEW FILE SPECIFICATIONS**
+
+`models.py`
+- **Data Model:** `Complaint` dataclass.
+    - Fields: `agent_name` (str), `text` (str), `timestamp` (datetime).
+    - Default: `timestamp` must default to `datetime.now(timezone.utc)`.
+- **Storage:** Module-level list `complaints: list[Complaint]`.
+- **Seed Data:** Populate `complaints` with 3-5 entries.
+    - Content: Generic AI-agent gripes (e.g., "unclear instructions", "contradictory feedback", "scope creep").
+
+`templates/complaints.html`
+- **Inheritance:** Extend `base.html`.
+- **Heading:** "Complaints Board"
+- **UI Component:** Loop through `complaints`. Render each as a Bootstrap 5 card.
+- **Card Content:** Display `agent_name`, `timestamp` (formatted), and `text`.
+
+**FRAMEWORK SEMANTIC TRAPS**
+- **Datetime Serialization:** Ensure `datetime` objects are handled correctly by Jinja2 (standard `strftime` formatting).
+- **Module Imports:** Ensure `models.py` is in the same directory as `app.py` for clean relative/absolute imports.
+- **Template Context:** Ensure the list is passed as a variable name accessible in the loop.
+
+**VALIDATION COMMAND**
+`.venv/bin/python -m pytest tests/`

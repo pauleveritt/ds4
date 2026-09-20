@@ -1,0 +1,16 @@
+NEW:
+models.py
+templates/complaints.html
+
+SHARED:
+app.py
+  Routes: 
+    GET / (must return 200 and response body must contain "Come in. Sit down. Tell us about your human.")
+  Imports: 
+    All existing imports (must not remove any used for home route)
+  Tests: 
+    None (tests in tests/test_app.py)
+  Strings: 
+    None (tagline in templates/home.html, not app.py)
+  User-visible behavior: 
+    Home page must display tagline "Come in. Sit down

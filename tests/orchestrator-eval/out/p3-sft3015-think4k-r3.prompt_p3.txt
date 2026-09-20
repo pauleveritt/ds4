@@ -1,0 +1,87 @@
+**Phase 2 Delegation Packet**
+
+---
+
+### NEW FILES
+- `templates/complaints.html` (NEW)
+
+---
+
+### SHARED FILES (existing)
+- `app.py`  
+  - Must retain existing `/` route and `base.html` integration  
+  - Must add new `/complaints` route  
+  - Must define `Complaint` dataclass with fields: `agent_name`, `text`, `timestamp`  
+  - Must initialize in-memory `complaints` list  
+  - Must seed pre-populated complaints at startup  
+
+- `templates/base.html`  
+  - Must retain navbar with brand "AgentClinic", links Home (`/`) and Complaints (`/complaints`), favicon `https://www.python.org/static/favicon.ico`  
+  - Must maintain title block default "AgentClinic" (overridden in complaints template)  
+
+- `tests/test_app.py`  
+  - Must retain existing home page smoke test  
+  - Must add test for `/complaints` route (200 status, contains "Complaints Board" heading)  
+
+---
+
+### VERBATIM LITERALS
+- `templates/complaints.html` heading: **"Complaints Board"**  
+- Seed complaint text: **"Scope creep never ends."**  
+- `base.html` favicon: `https://www.python.org/static/favicon.ico`  
+- `base.html` navbar brand: **"AgentClinic"**  
+
+---
+
+### SEED CONTENT
+Pre-populate `complaints` list with 4 complaints:  
+1. `agent_name: "Agent1", text: "The instructions were unclear."`  
+2. `agent_name: "Agent2", text: "The feedback was contradictory."`  
+3. `agent_name: "Agent3", text: "Scope creep never ends."`  
+4. `agent_name: "Agent4", text: "There was too much scope creep."`  
+
+---
+
+### ROUTE
+- `GET /complaints` → renders `complaints.html` with complaints list  
+
+---
+
+### DATA MODEL
+```python
+@dataclass
+class Complaint:
+    agent_name: str
+    text: str
+    timestamp: datetime  # timezone-aware (e.g., datetime.now(timezone.utc))
+```
+
+---
+
+### STORAGE
+- Module-level `complaints: list[Complaint] = []`  
+- Seed complaints appended at module initialization  
+
+---
+
+### TEMPLATE (`templates/complaints.html`)
+- Inherits `base.html`  
+- Displays heading "Complaints Board"  
+- Lists complaints with:  
+  - `agent_name`  
+  - Formatted date (year-month-day)  
+  - `text`  
+
+---
+
+### VALIDATION COMMAND
+```bash
+.venv/bin/python -m pytest tests/
+```
+
+---
+
+### FRAMEWORK TRAP
+- **Timezone handling**: `timestamp` must be timezone-aware (use `datetime.now(timezone.utc)`).  
+- **Template inheritance**: `complaints.html` must extend `base.html` without overriding navbar links.  
+- **Data serialization**: Convert `datetime` to string in template (e.g., `complaint.timestamp.strftime("%Y-%m-%d")`).
