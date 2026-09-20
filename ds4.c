@@ -43409,6 +43409,30 @@ static bool ds4_mellum_write_atomic(const char *path,
     free(tmp_path);
     return ok;
 }
+
+/*
+ * The one home for the plain-range model map (P20, review finding F3).
+ *
+ * The open path, ds4_mellum_decode_state_create and the layer-0 probe must
+ * ask the mapper for the SAME tuple, or the mapper's identical-tuple early
+ * return does not fire and a second overlapping view enters the residency
+ * set (P19 finding, F4 mechanism).  Before this, the three argument
+ * expressions were written out three times, so a caller could drift back to
+ * a different range without any test noticing: tests/ds4_test.c's
+ * test_metal_model_map_range_dedupe binds the mapper, not its callers.
+ * Keeping the expressions here makes that drift impossible to write.
+ *
+ * Not used by the span-mapped branches (TP expert shards, selective load):
+ * those deliberately map a set of spans, not the whole tensor region.
+ */
+static bool ds4_engine_bind_model_map(const ds4_engine *e) {
+    if (!e) return false;
+    return ds4_gpu_set_model_map_range(e->model.map,
+                                       e->model.size,
+                                       e->model.tensor_data_pos,
+                                       e->model.size - e->model.tensor_data_pos,
+                                       e->model.max_tensor_bytes) != 0;
+}
 #endif
 
 int ds4_engine_mellum_layer0_probe(ds4_engine  *e,
@@ -43468,12 +43492,8 @@ int ds4_engine_mellum_layer0_probe(ds4_engine  *e,
     float weights_cpu[8] = {0};
     /* Ask for the range the open path already mapped so the mapper's
      * identical-tuple early return fires instead of appending a second model
-     * view (P19 finding, F4 mechanism). */
-    int ok = ds4_gpu_set_model_map_range(e->model.map,
-                                         e->model.size,
-                                         e->model.tensor_data_pos,
-                                         e->model.size - e->model.tensor_data_pos,
-                                         e->model.max_tensor_bytes) != 0;
+     * view (P19 finding, F4 mechanism).  One home: ds4_engine_bind_model_map. */
+    int ok = ds4_engine_bind_model_map(e) ? 1 : 0;
 #define DS4_MELLUM_PROBE_ALLOC(name, bytes) \
     do { \
         (name) = ds4_gpu_tensor_alloc((bytes)); \
@@ -43854,12 +43874,8 @@ static ds4_mellum_decode_state *ds4_mellum_decode_state_create(
         (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float);
     /* Ask for the range the open path already mapped so the mapper's
      * identical-tuple early return fires instead of appending a second model
-     * view (P19 finding, F4 mechanism). */
-    bool ok = ds4_gpu_set_model_map_range(e->model.map,
-                                          e->model.size,
-                                          e->model.tensor_data_pos,
-                                          e->model.size - e->model.tensor_data_pos,
-                                          e->model.max_tensor_bytes) != 0;
+     * view (P19 finding, F4 mechanism).  One home: ds4_engine_bind_model_map. */
+    bool ok = ds4_engine_bind_model_map(e);
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (!ds4_mellum_q8_layer_desc(e, il, &state->desc[il])) {
@@ -75770,11 +75786,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
         } else {
             e->startup_model_span_bytes = e->model.size > e->model.tensor_data_pos ?
                 e->model.size - e->model.tensor_data_pos : 0;
-            model_map_ok = ds4_gpu_set_model_map_range(e->model.map,
-                                                       e->model.size,
-                                                       e->model.tensor_data_pos,
-                                                       e->model.size - e->model.tensor_data_pos,
-                                                       e->model.max_tensor_bytes);
+            /* One home for this tuple, shared with the Mellum decode-state
+             * create and the layer-0 probe (P20 review, F3). */
+            model_map_ok = ds4_engine_bind_model_map(e) ? 1 : 0;
         }
         if (!model_map_ok) {
             fprintf(stderr,
