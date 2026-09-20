@@ -8,8 +8,12 @@
  *
  * TRANSCRIPT is UTF-8.  Each record is the role name, a newline, then the
  * content, then the record separator byte 0x1E (so content may contain
- * newlines).  A trailing separator is optional.  Roles are passed through to
- * ds4_chat_append_message verbatim (system, user, assistant, tool, ...).
+ * newlines).  A trailing separator is optional.  A CR before the role line's
+ * newline is stripped, so a CRLF transcript renders the same ids as an LF
+ * one; CRs inside content are content and are left alone.  The role must be
+ * one of system, developer, user, assistant, tool, function — anything else
+ * exits 2 rather than being passed to ds4_chat_append_message, whose Mellum
+ * branch silently treats an unknown role as user.
  *
  * The model is opened for inspection only — no GPU, no generation, never
  * --raw-prompt.  A generation prompt (ds4_chat_append_assistant_prefix) is
@@ -56,8 +60,23 @@ static char *read_whole_file(const char *path, size_t *len_out) {
     return grown;
 }
 
+/* The roles ds4_chat_append_message distinguishes.  Anything else reaches
+ * its Mellum branch's final `else`, which wraps the content as a USER turn
+ * without a word of complaint (ds4.c, mellum_chat_append_wrapped) — so a
+ * typo, or an unstripped CR, would silently change what is being compared. */
+static bool role_is_known(const char *role) {
+    static const char *const known[] = {
+        "system", "developer", "user", "assistant", "tool", "function",
+    };
+    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+        if (!strcmp(role, known[i])) return true;
+    }
+    return false;
+}
+
 /* Split the buffer in place.  Returns the record count, or -1 on a malformed
- * record (one with no newline separating role from content). */
+ * record (one with no newline separating role from content, or one whose
+ * role is not a known role). */
 static int split_records(char *buf, size_t len, char ***roles_out, char ***contents_out) {
     size_t count = 0;
     for (size_t i = 0; i < len; i++) {
@@ -84,6 +103,18 @@ static int split_records(char *buf, size_t len, char ***roles_out, char ***conte
         }
         *nl = '\0';
         *record_end = '\0';
+        /* A CRLF transcript must render the same ids as an LF one: without
+         * this, role "tool\r" is unknown and silently becomes a user turn. */
+        if (nl > p && nl[-1] == '\r') nl[-1] = '\0';
+        if (!role_is_known(p)) {
+            fprintf(stderr,
+                    "dump_chat_transcript: record %zu has unknown role \"%s\" "
+                    "(expected one of system, developer, user, assistant, "
+                    "tool, function)\n",
+                    n, p);
+            free(roles); free(contents);
+            return -1;
+        }
         roles[n] = p;
         contents[n] = nl + 1;
         n++;

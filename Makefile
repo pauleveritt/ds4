@@ -287,6 +287,44 @@ tests/dump_chat_transcript.o: tests/dump_chat_transcript.c ds4.h
 tests/dump_chat_transcript: tests/dump_chat_transcript.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+# Two properties of the transcript dumper's own parsing (P20 review, F8/F9),
+# not of the engine.  The bad-role leg needs no model: the role check runs
+# before the GGUF is touched, so MODEL can be a path that does not exist.
+# The CRLF leg does load the model (inspect-only, one process at a time) and
+# is skipped unless DS4_TEST_MELLUM_MODEL is set.
+.PHONY: test-dump-chat-transcript
+test-dump-chat-transcript: tests/dump_chat_transcript
+	@set -e; \
+	tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	printf 'system\nbe brief\x1etoool\nhi' > "$$tmp/bad.txt"; \
+	rc=0; \
+	./tests/dump_chat_transcript /nonexistent.gguf "$$tmp/bad.txt" \
+	        > "$$tmp/bad.out" 2> "$$tmp/bad.err" || rc=$$?; \
+	if [ "$$rc" != "2" ]; then \
+	  echo "FAIL: unknown role exited $$rc, expected 2"; cat "$$tmp/bad.err"; \
+	  exit 1; \
+	fi; \
+	grep -q 'unknown role' "$$tmp/bad.err" || \
+	  { echo "FAIL: no 'unknown role' message"; cat "$$tmp/bad.err"; exit 1; }; \
+	echo "dump_chat_transcript bad role: exit 2, $$(cat "$$tmp/bad.err")"; \
+	if [ -z "$(strip $(DS4_TEST_MELLUM_MODEL))" ]; then \
+	  echo "dump_chat_transcript CRLF vs LF: skipped (set DS4_TEST_MELLUM_MODEL)"; \
+	  exit 0; \
+	fi; \
+	printf 'system\nbe brief\x1euser\nwhat is 2+2?\x1eassistant\n4\x1etool\nok' \
+	  > "$$tmp/lf.txt"; \
+	printf 'system\r\nbe brief\x1euser\r\nwhat is 2+2?\x1eassistant\r\n4\x1etool\r\nok' \
+	  > "$$tmp/crlf.txt"; \
+	./tests/dump_chat_transcript "$(DS4_TEST_MELLUM_MODEL)" "$$tmp/lf.txt" \
+	  > "$$tmp/lf.ids" 2>/dev/null; \
+	./tests/dump_chat_transcript "$(DS4_TEST_MELLUM_MODEL)" "$$tmp/crlf.txt" \
+	  > "$$tmp/crlf.ids" 2>/dev/null; \
+	diff "$$tmp/lf.ids" "$$tmp/crlf.ids" || \
+	  { echo "FAIL: CRLF transcript rendered different ids"; exit 1; }; \
+	echo "dump_chat_transcript CRLF vs LF: identical ids"; \
+	head -c 120 "$$tmp/lf.ids"; echo
+
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_cases.o ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
