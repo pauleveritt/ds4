@@ -13282,6 +13282,8 @@ uint32_t ds4_gpu_test_model_view_count(void) {
     return g_model_view_count;
 }
 
+#ifdef DS4_TEST_ORACLES
+/* Destructive; compiled only into the test-oracle object (ds4_gpu.h). */
 void ds4_gpu_test_model_views_reset(void) {
     if (!g_initialized) return;
     @autoreleasepool {
@@ -13294,6 +13296,7 @@ void ds4_gpu_test_model_views_reset(void) {
         g_model_mapped_max_tensor_bytes = 0;
     }
 }
+#endif
 
 static int ds4_gpu_model_views_cover_spans(
         const void     *model_map,

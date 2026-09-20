@@ -268,12 +268,20 @@ enum {
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
-/* Test oracles for the model-view table: how many overlapping shared buffers
- * the mapper currently holds, and a reset so a test can start from a known
- * state. Used to pin that a re-map of an already mapped range appends no
- * second view (P20). */
+/* Test oracle for the model-view table: how many overlapping shared buffers
+ * the mapper currently holds. Used to pin that a re-map of an already mapped
+ * range appends no second view (P20). Non-mutating, like every other
+ * ds4_gpu_test_* oracle above, so it is declared unconditionally. */
 uint32_t ds4_gpu_test_model_view_count(void);
+#ifdef DS4_TEST_ORACLES
+/* DESTRUCTIVE: drops residency and every model view, so a test can start from
+ * a known state. Unlike its neighbours this one mutates engine state, and a
+ * stray call inside a product binary would unmap the weights under a running
+ * session. It therefore exists only in the objects built with
+ * -DDS4_TEST_ORACLES (Makefile: ds4_metal_test.o, linked only by ds4_test),
+ * and is absent from ds4, ds4-agent, ds4-server and the Rust engine build. */
 void ds4_gpu_test_model_views_reset(void);
+#endif
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
