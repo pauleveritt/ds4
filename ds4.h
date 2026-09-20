@@ -713,6 +713,20 @@ int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
 int ds4_test_sampling_defaults_for_variant(ds4_variant variant,
                                            float *temperature, int *top_k,
                                            float *top_p, float *min_p);
+/* Mellum's planned-memory parts (P20).  All figures are bytes requested, not
+ * a physical footprint. */
+typedef struct {
+    uint64_t kv_bytes;
+    uint64_t decode_scratch_bytes;
+    uint64_t decode_output_bytes;
+    uint64_t decode_state_bytes;
+    uint64_t prefill_scratch_bytes;
+    uint64_t planned_bytes;
+} ds4_test_mellum_memory;
+int ds4_test_mellum_memory_plan(uint32_t ctx_size, uint32_t prefill_cap,
+                                uint64_t weights_bytes,
+                                ds4_test_mellum_memory *out);
+int ds4_test_mellum_admit(uint64_t planned, uint64_t budget);
 uint64_t ds4_test_mixed_native_count(void);
 uint64_t ds4_test_ds41_batch_count(void);
 #endif

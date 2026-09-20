@@ -391,7 +391,140 @@ static void check_sampling_defaults(void) {
                                  0.6f, 20, 0.95f, 0.0f);
 }
 
+/*
+ * Mellum memory accounting (P20).  The engine plans weights + KV + scratch at
+ * open and refuses the session when the plan exceeds the device's recommended
+ * working set.  The arithmetic is shared with the allocators, so it is pinned
+ * here against literals derived BY HAND from the Mellum 2 shape
+ * (DS4_SHAPE_MELLUM2: n_layer 28, n_embd 2304, n_vocab 98304, n_head 32,
+ * n_head_kv 4, n_head_dim 128, n_expert 64, n_expert_used 8, n_ff_exp 896,
+ * n_swa 1024) and the allocation list in ds4_mellum_decode_state_create /
+ * ds4_mellum_decode_output_prepare / ds4_mellum_prefill_scratch_create.
+ * Model-free: the hook selects the shape, not a GGUF.
+ */
+
+/* kv_dim = n_head_kv 4 * n_head_dim 128 = 512 elements, 2 bytes each.
+ * ds4_mellum_layer_uses_sliding_attention is (il & 3) != 3, so of 28 layers
+ * 21 slide (cap = n_swa 1024) and 7 are full (cap = ctx).  K and V each.
+ *   21 * 2 * (1024 * 512 * 2) = 44,040,192
+ * +  7 * 2 * (4096 * 512 * 2) = 58,720,256
+ *                             = 102,760,448 */
+#define MELLUM_KV_BYTES_CTX4096 UINT64_C(102760448)
+/* ctx 1024: every layer's cap is 1024, so 28 * 2 * (1024 * 512 * 2). */
+#define MELLUM_KV_BYTES_CTX1024 UINT64_C(58720256)
+
+/* Decode-state GPU tensors other than the caches and the output head
+ * (ds4_mellum_decode_state_create):
+ *   7 x embd   (hidden, layer_out, attention_out, attention_norm, projected,
+ *               ffn_norm, moe_out)  7 * 2304 * 4          =  64,512
+ *   2 x q      (q, heads)           2 * 32 * 128 * 4      =  32,768
+ *   2 x kv     (k, v)               2 * 4 * 128 * 4       =   4,096
+ *   2 x expert (router_logits, router_probs) 2 * 64 * 4   =     512
+ *   router_selected                 8 * 4                 =      32
+ *   router_weights                  8 * 4                 =      32
+ *   moe_mid                         8 * 896 * 4           =  28,672
+ *                                                         = 130,624
+ * hidden_cpu is a host malloc, not a GPU tensor, and is not counted. */
+#define MELLUM_DECODE_SCRATCH_BYTES UINT64_C(130624)
+/* Output head (ds4_mellum_decode_output_prepare):
+ *   output_norm  2304 * 4    =   9,216
+ *   logits      98304 * 4    = 393,216
+ *                            = 402,432 */
+#define MELLUM_DECODE_OUTPUT_BYTES UINT64_C(402432)
+
+/* Prefill scratch per token (ds4_mellum_prefill_scratch_create):
+ *   tokens                 4          staged_key   4*128*2 =  1,024
+ *   7 x embd        64,512            staged_value         =  1,024
+ *   2 x q (q,heads) 32,768            2 x expert f32       =    512
+ *   2 x kv (k,v)     4,096            router_selected      =     32
+ *   moe_mid         28,672            router_weights       =     32
+ * total per token = 132,676 */
+#define MELLUM_PREFILL_BYTES_PER_TOKEN UINT64_C(132676)
+
+static void check_mellum_memory_plan(void) {
+    ds4_test_mellum_memory m;
+    memset(&m, 0, sizeof(m));
+    /* ctx 4096, no prefill scratch (the product session allocates none), a
+     * round weights figure so the sum is checkable by eye. */
+    const uint64_t weights = UINT64_C(12000000000);
+    CHECK(ds4_test_mellum_memory_plan(4096, 0, weights, &m) == 0,
+          "mellum memory-plan hook refused ctx 4096");
+    printf("mellum plan ctx=4096: kv=%llu decode_scratch=%llu output=%llu "
+           "state=%llu prefill=%llu planned=%llu\n",
+           (unsigned long long)m.kv_bytes,
+           (unsigned long long)m.decode_scratch_bytes,
+           (unsigned long long)m.decode_output_bytes,
+           (unsigned long long)m.decode_state_bytes,
+           (unsigned long long)m.prefill_scratch_bytes,
+           (unsigned long long)m.planned_bytes);
+    CHECK(m.kv_bytes == MELLUM_KV_BYTES_CTX4096,
+          "mellum kv(4096) %llu != %llu",
+          (unsigned long long)m.kv_bytes,
+          (unsigned long long)MELLUM_KV_BYTES_CTX4096);
+    CHECK(m.decode_scratch_bytes == MELLUM_DECODE_SCRATCH_BYTES,
+          "mellum decode scratch %llu != %llu",
+          (unsigned long long)m.decode_scratch_bytes,
+          (unsigned long long)MELLUM_DECODE_SCRATCH_BYTES);
+    CHECK(m.decode_output_bytes == MELLUM_DECODE_OUTPUT_BYTES,
+          "mellum decode output %llu != %llu",
+          (unsigned long long)m.decode_output_bytes,
+          (unsigned long long)MELLUM_DECODE_OUTPUT_BYTES);
+    CHECK(m.decode_state_bytes == MELLUM_KV_BYTES_CTX4096 +
+                                  MELLUM_DECODE_SCRATCH_BYTES +
+                                  MELLUM_DECODE_OUTPUT_BYTES,
+          "mellum decode state %llu != %llu",
+          (unsigned long long)m.decode_state_bytes,
+          (unsigned long long)(MELLUM_KV_BYTES_CTX4096 +
+                               MELLUM_DECODE_SCRATCH_BYTES +
+                               MELLUM_DECODE_OUTPUT_BYTES));
+    CHECK(m.prefill_scratch_bytes == 0, "mellum prefill(0) %llu != 0",
+          (unsigned long long)m.prefill_scratch_bytes);
+    CHECK(m.planned_bytes == weights + m.decode_state_bytes,
+          "mellum planned %llu != %llu",
+          (unsigned long long)m.planned_bytes,
+          (unsigned long long)(weights + m.decode_state_bytes));
+
+    /* ctx 1024: no layer exceeds the sliding window, so every cap is 1024. */
+    memset(&m, 0, sizeof(m));
+    CHECK(ds4_test_mellum_memory_plan(1024, 0, 0, &m) == 0,
+          "mellum memory-plan hook refused ctx 1024");
+    CHECK(m.kv_bytes == MELLUM_KV_BYTES_CTX1024,
+          "mellum kv(1024) %llu != %llu",
+          (unsigned long long)m.kv_bytes,
+          (unsigned long long)MELLUM_KV_BYTES_CTX1024);
+
+    /* Prefill scratch is linear in cap and allocated only by the probes. */
+    memset(&m, 0, sizeof(m));
+    CHECK(ds4_test_mellum_memory_plan(1024, 1, 0, &m) == 0,
+          "mellum memory-plan hook refused prefill cap 1");
+    CHECK(m.prefill_scratch_bytes == MELLUM_PREFILL_BYTES_PER_TOKEN,
+          "mellum prefill(1) %llu != %llu",
+          (unsigned long long)m.prefill_scratch_bytes,
+          (unsigned long long)MELLUM_PREFILL_BYTES_PER_TOKEN);
+    memset(&m, 0, sizeof(m));
+    CHECK(ds4_test_mellum_memory_plan(1024, 32, 0, &m) == 0,
+          "mellum memory-plan hook refused prefill cap 32");
+    CHECK(m.prefill_scratch_bytes == 32u * MELLUM_PREFILL_BYTES_PER_TOKEN,
+          "mellum prefill(32) %llu != %llu",
+          (unsigned long long)m.prefill_scratch_bytes,
+          (unsigned long long)(32u * MELLUM_PREFILL_BYTES_PER_TOKEN));
+    printf("mellum prefill scratch: cap1=%llu cap32=%llu\n",
+           (unsigned long long)MELLUM_PREFILL_BYTES_PER_TOKEN,
+           (unsigned long long)(32u * MELLUM_PREFILL_BYTES_PER_TOKEN));
+
+    /* Admission truth table: a zero budget means the device did not answer,
+     * so the plan is print-only and admits. */
+    CHECK(ds4_test_mellum_admit(100, 100) == 1, "admit: equal must admit");
+    CHECK(ds4_test_mellum_admit(99, 100) == 1, "admit: under must admit");
+    CHECK(ds4_test_mellum_admit(101, 100) == 0, "admit: over must refuse");
+    CHECK(ds4_test_mellum_admit(0, 0) == 1, "admit: unknown budget admits");
+    CHECK(ds4_test_mellum_admit(UINT64_MAX, 0) == 1,
+          "admit: unknown budget admits any plan");
+    printf("mellum admit truth table: ok\n");
+}
+
 int main(void) {
+    check_mellum_memory_plan();
     check_sampling_defaults();
     check_speculative_distribution();
     const uint32_t semantic_n = 4096;

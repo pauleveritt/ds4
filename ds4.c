@@ -43196,6 +43196,129 @@ static bool ds4_engine_bind_mellum_decode_contract(ds4_engine *e,
     return true;
 }
 
+/*
+ * Mellum memory accounting (P20, spec Scope 4).
+ *
+ * One arithmetic serves both the allocators below and the plan printed at
+ * open, so a change to a buffer's size cannot drift away from the figure the
+ * admission gate decides on.  These are pure functions of the active model
+ * shape: they read g_ds4_shape, allocate nothing, touch no GPU, and are
+ * therefore reachable from the DS4_NO_GPU test-hook build.
+ *
+ * They describe BYTES REQUESTED, not a physical footprint.  The Metal
+ * allocator may round a buffer up, the mapped weights are file pages the
+ * kernel faults in on demand, and nothing here observes resident memory: the
+ * total is an estimate used to decline obviously impossible sessions, not a
+ * measurement.
+ */
+
+/* One layer's key (or value) cache.  Sliding layers hold the window, full
+ * layers hold the context; ds4_mellum_layer_uses_sliding_attention is the
+ * same predicate e->mellum_layer[il].sliding_attention is bound from above. */
+static uint64_t ds4_mellum_layer_cache_bytes(uint32_t layer_index,
+                                             uint32_t ctx_size) {
+    const uint32_t cap = ds4_mellum_layer_uses_sliding_attention(layer_index)
+        ? DS4_N_SWA : ctx_size;
+    return (uint64_t)cap * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
+}
+
+/* Every per-layer key and value cache of one session, whichever of the two
+ * mutually exclusive session shapes allocates them (the decode state's own
+ * caches, or ds4_mellum_kv_layout_alloc's; never both). */
+static uint64_t ds4_mellum_kv_bytes(uint32_t ctx_size) {
+    if (ctx_size == 0) return 0;
+    uint64_t total = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        total = ds4_add_sat_u64(
+                total, 2u * ds4_mellum_layer_cache_bytes(il, ctx_size));
+    }
+    return total;
+}
+
+/* The decode state's GPU tensors other than the caches and the output head
+ * (ds4_mellum_decode_state_create).  hidden_cpu is a host malloc and is not
+ * counted here. */
+static uint64_t ds4_mellum_decode_scratch_bytes(void) {
+    const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t q_bytes =
+        (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t kv_bytes =
+        (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t mid_bytes =
+        (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float);
+    uint64_t total = 7u * embd_bytes;  /* hidden, layer_out, attention_out,
+                                        * attention_norm, projected, ffn_norm,
+                                        * moe_out */
+    total += 2u * q_bytes;                                 /* q, heads */
+    total += 2u * kv_bytes;                                /* k, v */
+    total += 2u * (uint64_t)DS4_N_EXPERT * sizeof(float);  /* router logits,
+                                                            * router probs */
+    total += (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t);  /* selected */
+    total += (uint64_t)DS4_N_EXPERT_USED * sizeof(float);    /* weights */
+    total += mid_bytes;                                      /* moe_mid */
+    return total;
+}
+
+/* The output head ds4_mellum_decode_output_prepare adds to a decode state.
+ * vocab_dim is the output tensor's second dimension at runtime; the plan uses
+ * the shape's vocabulary, which is what a well-formed Mellum GGUF carries. */
+static uint64_t ds4_mellum_decode_output_bytes(uint64_t vocab_dim) {
+    return (uint64_t)DS4_N_EMBD * sizeof(float) + vocab_dim * sizeof(float);
+}
+
+static uint64_t ds4_mellum_decode_state_bytes(uint32_t cap) {
+    uint64_t total = ds4_mellum_kv_bytes(cap);
+    total = ds4_add_sat_u64(total, ds4_mellum_decode_scratch_bytes());
+    total = ds4_add_sat_u64(total,
+                            ds4_mellum_decode_output_bytes(DS4_N_VOCAB));
+    return total;
+}
+
+/* ds4_mellum_prefill_scratch_create's nineteen tensors.  No product path
+ * allocates one: the only callers are the resident-profile and prefill
+ * probes, which size it from DS4_MELLUM_PREFILL_CHUNK (ds4_mellum_probe_chunk)
+ * rather than from e->prefill_chunk.  It is accounted here so a probe's plan
+ * can include it. */
+static uint64_t ds4_mellum_prefill_scratch_bytes(uint32_t cap) {
+    if (cap == 0) return 0;
+    const uint64_t c = cap;
+    const uint64_t embd_bytes = c * DS4_N_EMBD * sizeof(float);
+    const uint64_t q_bytes = c * DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t kv_bytes =
+        c * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t staged_bytes =
+        c * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
+    const uint64_t mid_bytes =
+        c * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float);
+    uint64_t total = c * sizeof(int32_t);                  /* tokens */
+    total += 7u * embd_bytes;
+    total += 2u * q_bytes;                                 /* q, heads */
+    total += 2u * kv_bytes;                                /* k, v */
+    total += 2u * staged_bytes;            /* staged_key, staged_value */
+    total += 2u * c * DS4_N_EXPERT * sizeof(float);
+    total += c * DS4_N_EXPERT_USED * sizeof(int32_t);      /* selected */
+    total += c * DS4_N_EXPERT_USED * sizeof(float);        /* weights */
+    total += mid_bytes;
+    return total;
+}
+
+static uint64_t ds4_mellum_planned_bytes(uint64_t weights_bytes,
+                                         uint32_t ctx_size,
+                                         uint32_t prefill_cap) {
+    uint64_t total = weights_bytes;
+    total = ds4_add_sat_u64(total, ds4_mellum_decode_state_bytes(ctx_size));
+    total = ds4_add_sat_u64(total,
+                            ds4_mellum_prefill_scratch_bytes(prefill_cap));
+    return total;
+}
+
+/* A zero budget means the device did not answer; the plan is then print-only
+ * and admits, because refusing on an unknown budget would decline every
+ * session on a backend that cannot report one. */
+static bool ds4_mellum_admit(uint64_t planned, uint64_t budget) {
+    return budget == 0 || planned <= budget;
+}
+
 #ifndef DS4_NO_GPU
 /* Construct the diagnostic Q8 layer contract once per real Mellum layer.
  * The full-attention phase deliberately differs from the preceding three
@@ -43502,7 +43625,9 @@ static bool ds4_mellum_kv_layout_alloc(const ds4_engine *e,
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t cap = e->mellum_layer[il].sliding_attention
             ? DS4_N_SWA : ctx_size;
-        const uint64_t cache_bytes = (uint64_t)cap * kv_dim * sizeof(uint16_t);
+        /* One formula for the allocator and the plan (P20). */
+        const uint64_t cache_bytes =
+            ds4_mellum_layer_cache_bytes(il, ctx_size);
         if (cache_bytes > (UINT64_MAX - total) / 2u) {
             ds4_mellum_kv_layout_free(layout);
             return false;
@@ -43605,6 +43730,9 @@ struct ds4_mellum_decode_state {
     ds4_gpu_tensor *output_norm;
     ds4_gpu_tensor *logits;
     float *hidden_cpu;
+    /* Bytes handed to ds4_gpu_tensor_alloc for this state, so the printed
+     * plan can be checked against what was actually requested (P20). */
+    uint64_t gpu_bytes_requested;
 };
 
 /* Workspace for an inspect-only layer-major batch. It deliberately owns no KV
@@ -43741,14 +43869,18 @@ static ds4_mellum_decode_state *ds4_mellum_decode_state_create(
         }
         state->cache_cap[il] = e->mellum_layer[il].sliding_attention
             ? DS4_N_SWA : full_cache_cap;
-        const uint64_t cache_bytes = (uint64_t)state->cache_cap[il] *
-            DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
+        /* One formula for the allocator and the plan (P20). */
+        const uint64_t cache_bytes =
+            ds4_mellum_layer_cache_bytes(il, full_cache_cap);
         state->key_cache[il] = ds4_gpu_tensor_alloc(cache_bytes);
         state->value_cache[il] = ds4_gpu_tensor_alloc(cache_bytes);
+        state->gpu_bytes_requested += 2u * cache_bytes;
         if (!state->key_cache[il] || !state->value_cache[il]) ok = false;
     }
 #define DS4_MELLUM_STATE_ALLOC(name, bytes) \
-    do { state->name = ds4_gpu_tensor_alloc(bytes); if (!state->name) ok = false; } while (0)
+    do { state->name = ds4_gpu_tensor_alloc(bytes); \
+         state->gpu_bytes_requested += (uint64_t)(bytes); \
+         if (!state->name) ok = false; } while (0)
     DS4_MELLUM_STATE_ALLOC(hidden, embd_bytes);
     DS4_MELLUM_STATE_ALLOC(layer_out, embd_bytes);
     DS4_MELLUM_STATE_ALLOC(attention_out, embd_bytes);
@@ -43808,6 +43940,9 @@ static bool ds4_mellum_decode_output_prepare(
     state->output_norm = NULL;
     state->output_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     state->logits = ds4_gpu_tensor_alloc(e->weights.output->dim[1] * sizeof(float));
+    /* Same two buffers ds4_mellum_decode_output_bytes() plans for (P20). */
+    state->gpu_bytes_requested +=
+        ds4_mellum_decode_output_bytes(e->weights.output->dim[1]);
     if (state->output_norm && state->logits) return true;
     fprintf(stderr, "ds4: Mellum logits probe output allocation failed\n");
     ds4_gpu_tensor_free(state->logits);
@@ -44336,10 +44471,86 @@ static uint64_t ds4_engine_streaming_transient_guard_bytes(
     return total;
 }
 
+/* The device's recommended working set, or 0 when this build or backend
+ * cannot answer. */
+static uint64_t ds4_mellum_memory_budget_bytes(void) {
+#ifdef DS4_NO_GPU
+    return 0;
+#else
+    return ds4_gpu_recommended_working_set_size();
+#endif
+}
+
+/*
+ * Mellum's own startup plan (P20, spec Scope 4).  The GLM/DSA context
+ * estimator this function otherwise calls describes a model Mellum is not:
+ * it is never consulted for this family.  Every part is printed so the sum
+ * can be recomputed by eye.
+ */
+static void ds4_mellum_print_memory_plan(const ds4_engine *e, int ctx_size) {
+    const uint32_t ctx = (uint32_t)ctx_size;
+    const uint64_t weights = e->startup_model_span_bytes;
+    const uint64_t kv = ds4_mellum_kv_bytes(ctx);
+    const uint64_t scratch =
+        ds4_add_sat_u64(ds4_mellum_decode_scratch_bytes(),
+                        ds4_mellum_decode_output_bytes(DS4_N_VOCAB));
+    /* prefill_cap 0: no product Mellum session allocates a prefill scratch
+     * (its only callers are the probes). */
+    const uint64_t planned = ds4_mellum_planned_bytes(weights, ctx, 0);
+    const uint64_t budget = ds4_mellum_memory_budget_bytes();
+
+    const bool color = ds4_log_is_tty(stderr);
+    const char *green = color ? "\x1b[32m" : "";
+    const char *reset = color ? "\x1b[0m" : "";
+    fprintf(stderr,
+            "%sds4: Mellum memory plan: weights %.2f GiB + KV %.2f GiB "
+            "(ctx %u) + scratch %.2f MiB = %.2f GiB planned",
+            green,
+            ds4_bytes_to_gib(weights),
+            ds4_bytes_to_gib(kv),
+            ctx,
+            (double)scratch / 1048576.0,
+            ds4_bytes_to_gib(planned));
+    if (budget != 0) {
+        fprintf(stderr, " (device recommended working set %.2f GiB)%s\n",
+                ds4_bytes_to_gib(budget), reset);
+    } else {
+        fprintf(stderr,
+                " (device recommended working set unknown: print-only, "
+                "no admission check)%s\n", reset);
+    }
+}
+
+/*
+ * The Mellum admission gate.  Called at open, after the model map has fixed
+ * the weights span and before any ds4_gpu_tensor_alloc on the Mellum path
+ * (they all happen in ds4_mellum_session_create).  Print-only when the device
+ * reports no budget.
+ */
+static bool ds4_mellum_memory_admit_at_open(const ds4_engine *e,
+                                            int ctx_size) {
+    if (!e || ctx_size <= 0) return true;
+    const uint64_t budget = ds4_mellum_memory_budget_bytes();
+    const uint64_t planned =
+        ds4_mellum_planned_bytes(e->startup_model_span_bytes,
+                                 (uint32_t)ctx_size, 0);
+    if (ds4_mellum_admit(planned, budget)) return true;
+    fprintf(stderr,
+            "ds4: Mellum 2 needs %.2f GiB (weights + KV + scratch) but this "
+            "device recommends at most %.2f GiB; use a smaller --ctx\n",
+            ds4_bytes_to_gib(planned), ds4_bytes_to_gib(budget));
+    return false;
+}
+
 static void ds4_engine_print_startup_memory(
         const ds4_engine *e,
         int               ctx_size) {
     if (!e || ctx_size <= 0) return;
+
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        ds4_mellum_print_memory_plan(e, ctx_size);
+        return;
+    }
 
     ds4_context_memory mem;
 #ifndef DS4_NO_GPU
@@ -74063,6 +74274,31 @@ int ds4_test_sampling_defaults_for_variant(ds4_variant variant,
     return 0;
 }
 
+/* Read the Mellum memory accounting as it answers for the Mellum 2 shape,
+ * without an engine or a model: the helpers read only the global shape, so
+ * select the shape, call, and restore (the pattern of
+ * ds4_test_sampling_defaults_for_variant above). */
+int ds4_test_mellum_memory_plan(uint32_t ctx_size, uint32_t prefill_cap,
+                                uint64_t weights_bytes,
+                                ds4_test_mellum_memory *out) {
+    if (!out) return -1;
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_MELLUM2;
+    out->kv_bytes = ds4_mellum_kv_bytes(ctx_size);
+    out->decode_scratch_bytes = ds4_mellum_decode_scratch_bytes();
+    out->decode_output_bytes = ds4_mellum_decode_output_bytes(DS4_N_VOCAB);
+    out->decode_state_bytes = ds4_mellum_decode_state_bytes(ctx_size);
+    out->prefill_scratch_bytes = ds4_mellum_prefill_scratch_bytes(prefill_cap);
+    out->planned_bytes =
+        ds4_mellum_planned_bytes(weights_bytes, ctx_size, prefill_cap);
+    g_ds4_shape = saved;
+    return 0;
+}
+
+int ds4_test_mellum_admit(uint64_t planned, uint64_t budget) {
+    return ds4_mellum_admit(planned, budget) ? 1 : 0;
+}
+
 size_t ds4_test_per_tier_graph_overhead_bytes_with_prefill(
         int placement_ctx_hint,
         uint32_t prefill_chunk) {
@@ -75661,6 +75897,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
 
     if (!opt->inspect_only) {
         ds4_engine_print_startup_memory(e, opt->context_size);
+        /* Mellum admission (P20, spec Scope 4).  This is the first point with
+         * both the weights span and the session context in hand, and it is
+         * still ahead of every Mellum GPU allocation, which all happen in
+         * ds4_mellum_session_create. */
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM &&
+            !ds4_mellum_memory_admit_at_open(e, opt->context_size)) {
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
     }
     *out = e;
     return 0;
@@ -76791,6 +77037,20 @@ static int ds4_mellum_session_create(ds4_session **out, ds4_engine *e,
         fprintf(stderr, "ds4: Mellum session allocation failed\n");
         free(s);
         return 1;
+    }
+    /* Diagnostic, not a verdict (P20): what the plan said against what the
+     * session actually handed to ds4_gpu_tensor_alloc.  A non-zero delta
+     * means the accounting has drifted from the allocators. */
+    if (s->mellum->decode) {
+        const uint64_t requested = s->mellum->decode->gpu_bytes_requested;
+        const uint64_t planned =
+            ds4_mellum_decode_state_bytes((uint32_t)ctx_size);
+        fprintf(stderr,
+                "ds4: Mellum session tensors: requested %.2f MiB, "
+                "planned %.2f MiB, delta %lld bytes\n",
+                (double)requested / 1048576.0,
+                (double)planned / 1048576.0,
+                (long long)requested - (long long)planned);
     }
     if (decode_enabled) {
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
