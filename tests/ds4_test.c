@@ -9497,6 +9497,11 @@ static void test_mellum_content_segmentation(void) {
         /* Class #3's residual: `n1` was mellum-guarded but `n2` was still
          * lower-cased, so 'rE, 'vE and 'lL were swallowed as contractions.
          * GPT-2's alternatives are lowercase-only in BOTH characters. */
+        { "'rE",                         "'" US "rE" },  /* contraction 'rE */
+        { "'vE",                         "'" US "vE" },  /* contraction 'vE */
+        { "'lL",                         "'" US "lL" },  /* contraction 'lL */
+        { "he'VE go",                    "he" US "'" US "VE" US " go" },
+        { "'re",                         "'re" },  /* ... the lower form still is one */
         { "e\314\201\302\275",           "e" US "\314\201" US "\302\275" },  /* NFD then No */
     };
 

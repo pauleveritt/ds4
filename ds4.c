@@ -45314,7 +45314,9 @@ static void bpe_tokenize_text_glm4_pieces(const char    *text,
             }
             if (next.valid && next.next < len) {
                 glm4_char_info next2 = glm4_char_at(text, len, next.next, mellum);
-                uint32_t n2 = ascii_tolower_cp(next2.cp);
+                /* P21.2: GPT-2's 're/'ve/'ll are lowercase-only in BOTH
+                 * characters; only n1 was guarded before. */
+                uint32_t n2 = mellum ? next2.cp : ascii_tolower_cp(next2.cp);
                 if ((n1 == 'r' && n2 == 'e') ||
                     (n1 == 'v' && n2 == 'e') ||
                     (n1 == 'l' && n2 == 'l')) {
