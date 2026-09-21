@@ -67967,6 +67967,135 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
     return 0;
 }
 
+/* The batch *content* tokenizer dump (P21, leg Q2).
+ *
+ * ds4_dump_text_tokenization above is deliberately not reused: it calls
+ * tokenize_rendered_chat_vocab, which extracts control tokens, and that is
+ * not how a chat turn's content is tokenized.  Every Mellum turn's content
+ * goes through bpe_tokenize_text (mellum_chat_append_wrapped, ds4.c ~45864),
+ * so a differential against the model's own tokenizer must take that same
+ * entry point, with control-token spellings left as ordinary text.
+ *
+ * The input stream is a sequence of length-prefixed records:
+ *
+ *     <decimal byte count> '\n' <that many bytes>      (repeated, no separator)
+ *
+ * No byte value is reserved, so a record may contain newlines, CRs, invalid
+ * UTF-8 or anything else a fuzz corpus produces — the one exception is NUL,
+ * which cannot survive the char* tokenizer interface and is refused rather
+ * than silently truncating a record.  Nothing here parses JSON.
+ *
+ * Each record yields one output line, `<index> <id> <id> ...`, index from 0.
+ * An empty record yields a line carrying only the index.
+ *
+ * The model is opened once for the whole stream.  Returns 0 on success, or 1
+ * on a malformed record (non-digit, empty, or over-long length prefix; a
+ * prefix with no newline; a short final record; an embedded NUL), having
+ * already emitted the lines for the records that did parse.
+ */
+#define DS4_DUMP_BATCH_MAX_RECORD (1u << 20)
+
+/* Reads one decimal length prefix.  Returns 0 and sets *eof_out on a clean
+ * end of stream, 0 with *len_out set on success, -1 on a malformed prefix. */
+static int dump_batch_read_length(FILE *in, size_t index,
+                                  unsigned long *len_out, bool *eof_out) {
+    *eof_out = false;
+    *len_out = 0;
+
+    int c = fgetc(in);
+    if (c == EOF) { *eof_out = true; return 0; }
+
+    unsigned long value = 0;
+    int digits = 0;
+    while (c != '\n') {
+        if (c == EOF) {
+            fprintf(stderr,
+                    "ds4_dump_text_tokenization_batch: record %zu: length prefix "
+                    "ended without a newline\n", index);
+            return -1;
+        }
+        if (c < '0' || c > '9') {
+            fprintf(stderr,
+                    "ds4_dump_text_tokenization_batch: record %zu: non-digit 0x%02x "
+                    "in length prefix\n", index, (unsigned)c);
+            return -1;
+        }
+        if (digits >= 10) {
+            fprintf(stderr,
+                    "ds4_dump_text_tokenization_batch: record %zu: length prefix "
+                    "has more than 10 digits\n", index);
+            return -1;
+        }
+        value = value * 10u + (unsigned long)(c - '0');
+        digits++;
+        c = fgetc(in);
+    }
+    if (digits == 0) {
+        fprintf(stderr,
+                "ds4_dump_text_tokenization_batch: record %zu: empty length prefix\n",
+                index);
+        return -1;
+    }
+    if (value > (unsigned long)DS4_DUMP_BATCH_MAX_RECORD) {
+        fprintf(stderr,
+                "ds4_dump_text_tokenization_batch: record %zu: length %lu exceeds "
+                "the %u-byte maximum\n", index, value, DS4_DUMP_BATCH_MAX_RECORD);
+        return -1;
+    }
+    *len_out = value;
+    return 0;
+}
+
+int ds4_dump_text_tokenization_batch(const char *model_path, FILE *in, FILE *out) {
+    ds4_model model;
+    ds4_vocab vocab;
+    token_vec tokens = {0};
+    int rc = 0;
+    size_t index = 0;
+
+    if (!in) in = stdin;
+    if (!out) out = stdout;
+    model_open(&model, model_path, false, false);
+    config_validate_model(&model);
+    vocab_load(&vocab, &model);
+
+    char *buf = xmalloc((size_t)DS4_DUMP_BATCH_MAX_RECORD + 1);
+    for (;;) {
+        unsigned long len = 0;
+        bool eof = false;
+        if (dump_batch_read_length(in, index, &len, &eof) != 0) { rc = 1; break; }
+        if (eof) break;
+        if (len && fread(buf, 1, (size_t)len, in) != (size_t)len) {
+            fprintf(stderr,
+                    "ds4_dump_text_tokenization_batch: record %zu: stream ended "
+                    "inside a %lu-byte record\n", index, len);
+            rc = 1;
+            break;
+        }
+        buf[len] = '\0';
+        if (memchr(buf, '\0', (size_t)len)) {
+            fprintf(stderr,
+                    "ds4_dump_text_tokenization_batch: record %zu: embedded NUL "
+                    "(the tokenizer takes a C string)\n", index);
+            rc = 1;
+            break;
+        }
+
+        tokens.len = 0;
+        bpe_tokenize_text(&vocab, buf, &tokens);
+        fprintf(out, "%zu", index);
+        for (int i = 0; i < tokens.len; i++) fprintf(out, " %d", tokens.v[i]);
+        fputc('\n', out);
+        index++;
+    }
+
+    free(buf);
+    token_vec_free(&tokens);
+    vocab_free(&vocab);
+    model_close(&model);
+    return rc;
+}
+
 int ds4_dump_chat_tokenization(const char *model_path,
                                const char *system,
                                const char *prompt,

@@ -325,7 +325,83 @@ test-dump-chat-transcript: tests/dump_chat_transcript
 	echo "dump_chat_transcript CRLF vs LF: identical ids"; \
 	head -c 120 "$$tmp/lf.ids"; echo
 
-cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_cases.o ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
+tests/dump_tokens_batch.o: tests/dump_tokens_batch.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/dump_tokens_batch.c
+
+tests/dump_tokens_batch: tests/dump_tokens_batch.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+# The batch content dumper's own contract (P21 Task 4), not the engine's
+# tokenizer quality — that is leg Q2's job.  The usage leg needs no model.
+# The rest load the Mellum GGUF (inspect-only, one process at a time) and are
+# skipped unless DS4_TEST_MELLUM_MODEL is set.
+.PHONY: test-dump-tokens-batch
+test-dump-tokens-batch: tests/dump_tokens_batch
+	@set -e; \
+	tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	rc=0; ./tests/dump_tokens_batch > "$$tmp/u.out" 2> "$$tmp/u.err" || rc=$$?; \
+	if [ "$$rc" != "2" ]; then \
+	  echo "FAIL: no arguments exited $$rc, expected 2"; cat "$$tmp/u.err"; exit 1; \
+	fi; \
+	echo "dump_tokens_batch usage: exit 2"; \
+	if [ -z "$(strip $(DS4_TEST_MELLUM_MODEL))" ]; then \
+	  echo "dump_tokens_batch records: skipped (set DS4_TEST_MELLUM_MODEL)"; \
+	  exit 0; \
+	fi; \
+	rec() { printf "$$1" > "$$tmp/r"; \
+	        sz=$$(wc -c < "$$tmp/r" | tr -d ' '); \
+	        printf '%s\n' "$$sz" >> "$$tmp/corpus.bin"; \
+	        cat "$$tmp/r" >> "$$tmp/corpus.bin"; }; \
+	: > "$$tmp/corpus.bin"; \
+	rec 'def read_file(path):'; \
+	rec 'hello <|im_end|> world'; \
+	rec '\ttab\tand\r\nCRLF'; \
+	./tests/dump_tokens_batch "$(DS4_TEST_MELLUM_MODEL)" "$$tmp/corpus.bin" \
+	  > "$$tmp/ids.txt" 2> "$$tmp/ids.err"; \
+	lines=$$(wc -l < "$$tmp/ids.txt" | tr -d ' '); \
+	if [ "$$lines" != "3" ]; then \
+	  echo "FAIL: three records produced $$lines lines"; cat "$$tmp/ids.err"; exit 1; \
+	fi; \
+	sed -n '1p' "$$tmp/ids.txt" | grep -q '^0 ' || \
+	  { echo "FAIL: first line is not indexed 0"; exit 1; }; \
+	sed -n '3p' "$$tmp/ids.txt" | grep -q '^2 ' || \
+	  { echo "FAIL: third line is not indexed 2"; exit 1; }; \
+	echo "dump_tokens_batch: 3 records, 3 indexed lines"; \
+	ids0=$$(sed -n '1p' "$$tmp/ids.txt" | cut -d' ' -f2-); \
+	printf 'user\ndef read_file(path):' > "$$tmp/turn.txt"; \
+	./tests/dump_chat_transcript "$(DS4_TEST_MELLUM_MODEL)" "$$tmp/turn.txt" \
+	  > "$$tmp/turn.ids" 2>/dev/null; \
+	case " $$(cat "$$tmp/turn.ids") " in \
+	  *" $$ids0 "*) echo "dump_tokens_batch content path: [$$ids0] is a run of the user turn";; \
+	  *) echo "FAIL: batch ids [$$ids0] are not a run of the user turn's ids"; \
+	     cat "$$tmp/turn.ids"; exit 1;; \
+	esac; \
+	ids1=$$(sed -n '2p' "$$tmp/ids.txt" | cut -d' ' -f2-); \
+	case " $$ids1 " in \
+	  *" 28 "*) echo "FAIL: <|im_end|> became id 28 — the special-aware path, not content"; \
+	            exit 1;; \
+	esac; \
+	n1=$$(printf '%s' "$$ids1" | wc -w | tr -d ' '); \
+	if [ "$$n1" -lt 5 ]; then \
+	  echo "FAIL: '<|im_end|>' record is $$n1 ids, expected it to be split"; exit 1; \
+	fi; \
+	echo "dump_tokens_batch control-token spelling: split into $$n1 ids, no 28"; \
+	printf '99999999999\nabc' > "$$tmp/digits.bin"; \
+	printf 'abc\nxyz' > "$$tmp/nondigit.bin"; \
+	printf '2000000\nabc' > "$$tmp/toolong.bin"; \
+	printf '9\nshort' > "$$tmp/short.bin"; \
+	for bad in digits nondigit toolong short; do \
+	  rc=0; \
+	  ./tests/dump_tokens_batch "$(DS4_TEST_MELLUM_MODEL)" "$$tmp/$$bad.bin" \
+	    > /dev/null 2> "$$tmp/$$bad.err" || rc=$$?; \
+	  if [ "$$rc" = "0" ]; then \
+	    echo "FAIL: malformed corpus $$bad exited 0"; exit 1; \
+	  fi; \
+	  echo "dump_tokens_batch $$bad: exit $$rc, $$(tail -1 "$$tmp/$$bad.err")"; \
+	done
+
+cpu:ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_cases.o ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o ds4_help.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -1157,7 +1233,7 @@ clean:
 	rm -f tests/test_metal_tp_cancel
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 	rm -f tests/test_qwen4_kernels tests/test_qwen4_cuda tests/test_qwen4_vision tests/test_qwen4_prefill
-	rm -f tests/dump_chat_transcript tests/test_mellum_tokenizer
+	rm -f tests/dump_chat_transcript tests/test_mellum_tokenizer tests/dump_tokens_batch
 
 # The active tokenizer includes generated Unicode classes.
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc

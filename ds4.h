@@ -538,6 +538,13 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                int min_expert_samples);
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
+/* One model open, N strings: reads length-prefixed records (a decimal byte
+ * count, a newline, then that many bytes) from `in` and writes one
+ * `<index> <id> <id> ...` line per record to `out`.  Records go through the
+ * *content* tokenizer (bpe_tokenize_text), the entry point a chat turn's
+ * content takes, so control-token spellings stay ordinary text.  Returns 1 on
+ * a malformed record.  This is the engine side of P21's Q2 differential. */
+int ds4_dump_text_tokenization_batch(const char *model_path, FILE *in, FILE *out);
 int ds4_dump_chat_tokenization(const char *model_path,
                                const char *system,
                                const char *prompt,
