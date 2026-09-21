@@ -972,7 +972,15 @@ kernel void kernel_mellum_attention_decode_gqa8_split_f16(
         if (lane == 0u) {
             const uint64_t stat = (uint64_t)row * 2u * args.nwg + 2u * iwg;
             stats[stat] = merged_sum;
-            stats[stat + 1u] = global_max;
+            /*
+             * A workgroup that drew no keys leaves global_max at -INFINITY,
+             * and kernel_flash_attn_ext_vec_reduce feeds the stat straight
+             * into exp(M - m) with no guard.  Metal compiles with fast math,
+             * where exp(-inf) is not contractually 0, so publish a finite
+             * sentinel instead -- the same reason ggml's vec kernels use
+             * -FLT_MAX/2 rather than an infinity.
+             */
+            stats[stat + 1u] = max(global_max, -FLT_MAX / 2.0f);
         }
     }
 }
