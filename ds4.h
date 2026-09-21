@@ -405,6 +405,14 @@ int ds4_engine_mellum_resident_profile(ds4_engine *engine, FILE *out,
 
 /* Inspect-only Mellum true-prefill gate. Runs the fixed fixture as one
  * layer-major batch and compares its raw final logits with sequential decode. */
+/* Diagnostic-only: replay the probe fixture twice on one open — once in the
+ * 32-token command batches a session's prefill uses, once tokenwise — and
+ * write both final-position raw logit vectors. */
+int ds4_engine_mellum_sync_vs_decode_probe(ds4_engine *engine,
+                                           FILE       *out,
+                                           const char *sync_output_path,
+                                           const char *decode_output_path);
+
 int ds4_engine_mellum_true_prefill_probe(ds4_engine *engine, FILE *out);
 
 /* Inspect-only Mellum true-prefill ring evidence probe. Compares an

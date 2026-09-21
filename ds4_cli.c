@@ -109,6 +109,9 @@ typedef struct {
     bool mellum_interactive_session_probe;
     bool mellum_swa_boundary_probe;
     bool mellum_resident_profile;
+    bool mellum_sync_vs_decode_probe;
+    const char *mellum_sync_out;
+    const char *mellum_decode_out;
     bool mellum_true_prefill_probe;
     bool mellum_true_prefill_swa_probe;
     bool mellum_logits_probe;
@@ -2293,6 +2296,20 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.mellum_resident_profile = true;
             c.inspect = true;
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-sync-vs-decode-probe")) {
+            c.gen.mellum_sync_vs_decode_probe = true;
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-sync-out")) {
+            c.gen.mellum_sync_vs_decode_probe = true;
+            c.gen.mellum_sync_out = need_arg(&i, argc, argv, arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-decode-out")) {
+            c.gen.mellum_sync_vs_decode_probe = true;
+            c.gen.mellum_decode_out = need_arg(&i, argc, argv, arg);
+            c.inspect = true;
+            c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--mellum-true-prefill-probe")) {
             c.gen.mellum_true_prefill_probe = true;
             c.inspect = true;
@@ -2563,6 +2580,15 @@ int main(int argc, char **argv) {
     if (cfg.gen.mellum_resident_profile) {
         int rc = ds4_engine_mellum_resident_profile(
             engine, stdout, cfg.gen.ctx_size);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
+    }
+    if (cfg.gen.mellum_sync_vs_decode_probe) {
+        int rc = ds4_engine_mellum_sync_vs_decode_probe(
+            engine, stdout, cfg.gen.mellum_sync_out,
+            cfg.gen.mellum_decode_out);
         ds4_engine_close(engine);
         ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);

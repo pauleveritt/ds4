@@ -78594,6 +78594,154 @@ static uint32_t ds4_mellum_probe_chunk(uint32_t fallback, uint32_t max_chunk) {
 }
 #endif
 
+/*
+ * Prefill-as-a-session versus tokenwise decode (P21, Q6).
+ *
+ * The product path's prefill is NOT the layer-major "true prefill" kernel
+ * above: no session runs it.  What a session runs is tokenwise
+ * ds4_mellum_decode_token inside bounded 32-token command batches
+ * (ds4_session_sync's Mellum branch).  This probe replays the fixture twice
+ * on one open — path A shaped exactly like that loop, path B one token per
+ * submission — and writes both final-position logit vectors.
+ *
+ * The two paths call the identical kernel and differ only in where the
+ * command batch boundaries fall, so bitwise equality is the expectation and
+ * anything else is a finding.  Diagnostic only: no session, no sampling, no
+ * emitted token.
+ */
+int ds4_engine_mellum_sync_vs_decode_probe(ds4_engine *e,
+                                           FILE       *out,
+                                           const char *sync_output_path,
+                                           const char *decode_output_path) {
+#ifdef DS4_NO_GPU
+    (void)e;
+    (void)out;
+    (void)sync_output_path;
+    (void)decode_output_path;
+    fprintf(stderr, "ds4: Mellum sync-vs-decode probe requires Metal support\n");
+    return 1;
+#else
+    uint32_t n_tokens = 0u;
+    const int *fixture_tokens = ds4_mellum_probe_fixture(&n_tokens);
+    if (!e || !out || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
+        e->backend != DS4_BACKEND_METAL || !e->mellum_decode_contract_ready ||
+        !e->weights.output || e->weights.output->dim[1] == 0 ||
+        e->weights.output->dim[1] > SIZE_MAX / sizeof(float)) {
+        fprintf(stderr, "ds4: Mellum sync-vs-decode probe requires an inspect-loaded Q8 Metal Mellum engine\n");
+        return 1;
+    }
+    const uint64_t vocab_dim = e->weights.output->dim[1];
+    const size_t logits_bytes = (size_t)vocab_dim * sizeof(float);
+    float *sync_logits = xmalloc(logits_bytes);
+    float *decode_logits = xmalloc(logits_bytes);
+    ds4_mellum_decode_state *sync_state =
+        ds4_mellum_decode_state_create(e, n_tokens);
+    ds4_mellum_decode_state *decode_state =
+        ds4_mellum_decode_state_create(e, n_tokens);
+    bool ok = sync_logits && decode_logits && sync_state && decode_state &&
+              ds4_mellum_decode_output_prepare(e, sync_state) &&
+              ds4_mellum_decode_output_prepare(e, decode_state);
+
+    /* Path A: the session's own shape. Keep this loop structurally identical
+     * to ds4_session_sync's Mellum branch — same batch cap, same
+     * compute_logits-on-last, same allow_existing_batch — or the probe stops
+     * measuring the path users hit. */
+    static const int sync_batch_tokens = 32;
+    for (int i = 0; ok && i < (int)n_tokens;) {
+        const int end = (int)n_tokens - i > sync_batch_tokens ?
+            i + sync_batch_tokens : (int)n_tokens;
+        const bool batch_started = ds4_gpu_begin_commands() != 0;
+        ok = batch_started;
+        for (; ok && i < end; i++) {
+            const bool last = i + 1 == (int)n_tokens;
+            ok = ds4_mellum_decode_token(e, sync_state, fixture_tokens[i],
+                                         NULL, NULL, NULL, NULL, NULL, NULL,
+                                         NULL, last, true);
+        }
+        const bool batch_ok = !batch_started || ds4_gpu_end_commands() != 0;
+        if (!ok || !batch_ok) {
+            fprintf(stderr, "ds4: Mellum sync-vs-decode probe batched path failed\n");
+            ok = false;
+            break;
+        }
+    }
+    if (ok && ds4_gpu_tensor_read(sync_state->logits, 0, sync_logits,
+                                  logits_bytes) == 0) {
+        fprintf(stderr, "ds4: Mellum sync-vs-decode probe could not read batched logits\n");
+        ok = false;
+    }
+
+    /* Path B: one token per submission, the single-token decode shape. */
+    for (uint32_t pos = 0; ok && pos < n_tokens; pos++) {
+        ok = ds4_mellum_decode_token(e, decode_state, fixture_tokens[pos],
+                                     NULL, NULL, NULL, NULL, NULL, NULL,
+                                     NULL, pos + 1u == n_tokens, false);
+        if (!ok) {
+            fprintf(stderr, "ds4: Mellum sync-vs-decode probe tokenwise path failed at token %u\n",
+                    pos);
+        }
+    }
+    if (ok && ds4_gpu_tensor_read(decode_state->logits, 0, decode_logits,
+                                  logits_bytes) == 0) {
+        fprintf(stderr, "ds4: Mellum sync-vs-decode probe could not read tokenwise logits\n");
+        ok = false;
+    }
+
+    float max_abs = 0.0f;
+    double sum_sq = 0.0;
+    uint64_t sync_argmax = 0, decode_argmax = 0;
+    if (ok) {
+        for (uint64_t i = 0; i < vocab_dim; i++) {
+            if (!isfinite(sync_logits[i]) || !isfinite(decode_logits[i])) {
+                fprintf(stderr, "ds4: Mellum sync-vs-decode probe produced a non-finite logit at %llu\n",
+                        (unsigned long long)i);
+                ok = false;
+                break;
+            }
+            const float delta = sync_logits[i] - decode_logits[i];
+            max_abs = fmaxf(max_abs, fabsf(delta));
+            sum_sq += (double)delta * delta;
+            if (sync_logits[i] > sync_logits[sync_argmax]) sync_argmax = i;
+            if (decode_logits[i] > decode_logits[decode_argmax]) decode_argmax = i;
+        }
+    }
+    const bool identical = ok &&
+        memcmp(sync_logits, decode_logits, logits_bytes) == 0;
+    if (ok && sync_output_path && sync_output_path[0] &&
+        !ds4_mellum_write_atomic(sync_output_path, sync_logits, logits_bytes)) {
+        fprintf(stderr, "ds4: could not write Mellum sync-vs-decode batched logits\n");
+        ok = false;
+    }
+    if (ok && decode_output_path && decode_output_path[0] &&
+        !ds4_mellum_write_atomic(decode_output_path, decode_logits,
+                                 logits_bytes)) {
+        fprintf(stderr, "ds4: could not write Mellum sync-vs-decode tokenwise logits\n");
+        ok = false;
+    }
+    if (ok) {
+        fprintf(out,
+                "Mellum sync-vs-decode probe tokens=%u batch=%d vocab=%llu\n",
+                n_tokens, sync_batch_tokens, (unsigned long long)vocab_dim);
+        fprintf(out,
+                "Mellum sync-vs-decode max_abs=%g rms=%g identical=%s\n",
+                max_abs, sqrt(sum_sq / (double)vocab_dim),
+                identical ? "yes" : "no");
+        fprintf(out,
+                "Mellum sync-vs-decode sync_argmax=%llu decode_argmax=%llu argmax_equal=%s\n",
+                (unsigned long long)sync_argmax,
+                (unsigned long long)decode_argmax,
+                sync_argmax == decode_argmax ? "yes" : "no");
+    } else {
+        fprintf(stderr, "ds4: Mellum sync-vs-decode probe execution failed\n");
+    }
+    ds4_mellum_decode_state_free(decode_state);
+    ds4_mellum_decode_state_free(sync_state);
+    free(decode_logits);
+    free(sync_logits);
+    return ok ? 0 : 1;
+#endif
+}
+
 int ds4_engine_mellum_true_prefill_probe(ds4_engine *e, FILE *out) {
 #ifdef DS4_NO_GPU
     (void)e;

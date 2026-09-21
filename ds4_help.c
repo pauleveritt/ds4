@@ -304,6 +304,9 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--mellum-logits-probe", "Mellum diagnostic: replay the fixed fixture through final norm and output logits.");
     opt(fp, c, "--mellum-logits-probe-out FILE", "Write its final raw F32 logits without selecting a token.");
     opt(fp, c, "--mellum-logits-probe-top-k N", "Report N highest raw logits without sampling or emitting a token.");
+    opt(fp, c, "--mellum-sync-vs-decode-probe", "Mellum diagnostic: replay the fixture in the session's 32-token command batches and tokenwise, and compare the final logits.");
+    opt(fp, c, "--mellum-sync-out FILE", "Write the batched path's final raw F32 logits.");
+    opt(fp, c, "--mellum-decode-out FILE", "Write the tokenwise path's final raw F32 logits.");
     opt(fp, c, "--mellum-true-prefill-probe", "Mellum inspect gate: compare the fixed layer-major batch against sequential raw logits.");
     opt(fp, c, "--mellum-true-prefill-swa-probe", "Mellum inspect evidence: compare SWA-window+6 true-prefill chunks across the sliding-window boundary.");
     opt(fp, c, "--mellum-all-layers-probe", "Mellum diagnostic: replay the fixture through all 28 layers.");
