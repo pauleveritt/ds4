@@ -43486,6 +43486,121 @@ static bool ds4_engine_bind_model_map(const ds4_engine *e) {
 }
 #endif
 
+/*
+ * The Mellum probe fixture, in one place (P21, spec item 2).
+ *
+ * Each Mellum probe used to carry its own `static const int
+ * fixture_tokens[]` holding the same 26 rendered `python_add` ChatML ids, so
+ * pointing a probe at a longer fixture meant editing five arrays and hoping
+ * they stayed equal.  One accessor now owns the list.  The pinned ids are its
+ * default and nothing else sets them, so with no file loaded every probe
+ * replays exactly the ids, in the order and the count, that it replayed
+ * before — which is what the P20 default-fixture trace hash guards.
+ *
+ * Deliberately not a session or generation path: this only chooses which ids
+ * a diagnostic probe replays.
+ */
+static const int ds4_mellum_probe_fixture_pinned[] = {
+    27, 1397, 233, 12998, 497, 2717, 669, 60, 783, 846, 42, 99, 46,
+    321, 800, 28, 233, 27, 8091, 233, 23, 233, 233, 24, 233, 233,
+};
+static int     *ds4_mellum_probe_fixture_ids = NULL;
+static uint32_t ds4_mellum_probe_fixture_n = 0u;
+
+/* A probe allocates per-token KV for every layer, so refuse a fixture that
+ * would ask for an unreasonable cache rather than failing later inside the
+ * allocator. */
+#define DS4_MELLUM_PROBE_FIXTURE_MAX 65536u
+
+const int *ds4_mellum_probe_fixture(uint32_t *n_out) {
+    if (ds4_mellum_probe_fixture_ids) {
+        if (n_out) *n_out = ds4_mellum_probe_fixture_n;
+        return ds4_mellum_probe_fixture_ids;
+    }
+    if (n_out) {
+        *n_out = (uint32_t)(sizeof(ds4_mellum_probe_fixture_pinned) /
+                            sizeof(ds4_mellum_probe_fixture_pinned[0]));
+    }
+    return ds4_mellum_probe_fixture_pinned;
+}
+
+void ds4_mellum_probe_fixture_reset(void) {
+    free(ds4_mellum_probe_fixture_ids);
+    ds4_mellum_probe_fixture_ids = NULL;
+    ds4_mellum_probe_fixture_n = 0u;
+}
+
+int ds4_mellum_probe_fixture_load(const char *path) {
+    if (!path || !path[0]) {
+        fprintf(stderr, "ds4: Mellum fixture token file needs a path\n");
+        return 1;
+    }
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "ds4: could not open Mellum fixture token file %s\n",
+                path);
+        return 1;
+    }
+    int *ids = NULL;
+    uint32_t n = 0u, cap = 0u;
+    int rc = 0;
+    unsigned long lineno = 0;
+    char line[4096];
+    while (!rc && fgets(line, sizeof(line), fp)) {
+        lineno++;
+        char *comment = strchr(line, '#');
+        if (comment) *comment = '\0';
+        const char *p = line;
+        while (!rc) {
+            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+            if (!*p) break;
+            char *end = NULL;
+            errno = 0;
+            const long value = strtol(p, &end, 10);
+            if (end == p || errno == ERANGE || value < 0 || value > INT_MAX) {
+                fprintf(stderr,
+                        "ds4: Mellum fixture token file %s line %lu is not a "
+                        "non-negative decimal token id\n", path, lineno);
+                rc = 1;
+                break;
+            }
+            if (n == DS4_MELLUM_PROBE_FIXTURE_MAX) {
+                fprintf(stderr,
+                        "ds4: Mellum fixture token file %s has more than %u "
+                        "ids\n", path, DS4_MELLUM_PROBE_FIXTURE_MAX);
+                rc = 1;
+                break;
+            }
+            if (n == cap) {
+                cap = cap ? cap * 2u : 64u;
+                ids = xrealloc(ids, (size_t)cap * sizeof(*ids));
+            }
+            ids[n++] = (int)value;
+            p = end;
+        }
+    }
+    if (!rc && ferror(fp)) {
+        fprintf(stderr, "ds4: could not read Mellum fixture token file %s\n",
+                path);
+        rc = 1;
+    }
+    fclose(fp);
+    if (!rc && n == 0u) {
+        fprintf(stderr, "ds4: Mellum fixture token file %s holds no ids\n",
+                path);
+        rc = 1;
+    }
+    if (rc) {
+        /* Refusal changes nothing: whatever fixture was in force stays. */
+        free(ids);
+        return 1;
+    }
+    ds4_mellum_probe_fixture_reset();
+    ds4_mellum_probe_fixture_ids = ids;
+    ds4_mellum_probe_fixture_n = n;
+    return 0;
+}
+
 int ds4_engine_mellum_layer0_probe(ds4_engine  *e,
                                    FILE        *out,
                                    const char  *raw_output_path) {
@@ -43496,15 +43611,12 @@ int ds4_engine_mellum_layer0_probe(ds4_engine  *e,
     fprintf(stderr, "ds4: Mellum layer-0 probe requires Metal support\n");
     return 1;
 #else
-    /* These are the exact rendered `python_add` ChatML fixture IDs recorded
-     * from the pinned Mellum Q8 GGUF. Keep this probe session-free and fixed:
-     * it is a numerical checkpoint tool, not a partial generation path. */
-    static const int fixture_tokens[] = {
-        27, 1397, 233, 12998, 497, 2717, 669, 60, 783, 846, 42, 99, 46,
-        321, 800, 28, 233, 27, 8091, 233, 23, 233, 233, 24, 233, 233,
-    };
-    const uint32_t n_tokens = (uint32_t)(sizeof(fixture_tokens) /
-                                          sizeof(fixture_tokens[0]));
+    /* The fixture defaults to the exact rendered `python_add` ChatML IDs
+     * recorded from the pinned Mellum Q8 GGUF; --mellum-fixture-tokens can
+     * substitute a longer recorded list. Keep this probe session-free: it is
+     * a numerical checkpoint tool, not a partial generation path. */
+    uint32_t n_tokens = 0u;
+    const int *fixture_tokens = ds4_mellum_probe_fixture(&n_tokens);
     if (!e || !out || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
         !e->mellum_decode_contract_ready || e->backend != DS4_BACKEND_METAL ||
         !e->weights.token_embd) {
@@ -44322,12 +44434,8 @@ int ds4_engine_mellum_all_layers_probe(ds4_engine *e,
     /* Keep the first whole-model pass as a fixed oracle diagnostic. It reuses
      * private engine-owned scratch/KV state, but creates no session, enables
      * no normal Mellum execution, and never reaches the shared KV store. */
-    static const int fixture_tokens[] = {
-        27, 1397, 233, 12998, 497, 2717, 669, 60, 783, 846, 42, 99, 46,
-        321, 800, 28, 233, 27, 8091, 233, 23, 233, 233, 24, 233, 233,
-    };
-    const uint32_t n_tokens = (uint32_t)(sizeof(fixture_tokens) /
-                                          sizeof(fixture_tokens[0]));
+    uint32_t n_tokens = 0u;
+    const int *fixture_tokens = ds4_mellum_probe_fixture(&n_tokens);
     if (!e || !out || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
         !e->mellum_decode_contract_ready || e->backend != DS4_BACKEND_METAL ||
         !e->weights.token_embd || e->weights.token_embd->type != DS4_TENSOR_Q8_0) {
@@ -44455,12 +44563,8 @@ int ds4_engine_mellum_logits_probe(ds4_engine *e,
 #else
     /* This deliberately stops at raw logits. It is a fixed numerical seam,
      * not an implicit authorization to sample, emit, or generate a token. */
-    static const int fixture_tokens[] = {
-        27, 1397, 233, 12998, 497, 2717, 669, 60, 783, 846, 42, 99, 46,
-        321, 800, 28, 233, 27, 8091, 233, 23, 233, 233, 24, 233, 233,
-    };
-    const uint32_t n_tokens = (uint32_t)(sizeof(fixture_tokens) /
-                                          sizeof(fixture_tokens[0]));
+    uint32_t n_tokens = 0u;
+    const int *fixture_tokens = ds4_mellum_probe_fixture(&n_tokens);
     if (!e || !out || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
         !e->mellum_decode_contract_ready || e->backend != DS4_BACKEND_METAL ||
         !e->weights.token_embd || e->weights.token_embd->type != DS4_TENSOR_Q8_0 ||
@@ -77889,12 +77993,8 @@ int ds4_engine_mellum_session_decode_probe(ds4_engine *e,
     fprintf(stderr, "ds4: Mellum session decode probe requires Metal support\n");
     return 1;
 #else
-    static const int fixture_tokens[] = {
-        27, 1397, 233, 12998, 497, 2717, 669, 60, 783, 846, 42, 99, 46,
-        321, 800, 28, 233, 27, 8091, 233, 23, 233, 233, 24, 233, 233,
-    };
-    const uint32_t n_tokens = (uint32_t)(sizeof(fixture_tokens) /
-                                          sizeof(fixture_tokens[0]));
+    uint32_t n_tokens = 0u;
+    const int *fixture_tokens = ds4_mellum_probe_fixture(&n_tokens);
     if (!e || !out || ctx_size < (int)n_tokens ||
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
         e->backend != DS4_BACKEND_METAL || !e->mellum_decode_contract_ready) {
@@ -78501,12 +78601,8 @@ int ds4_engine_mellum_true_prefill_probe(ds4_engine *e, FILE *out) {
     fprintf(stderr, "ds4: Mellum true-prefill probe requires Metal support\n");
     return 1;
 #else
-    static const int fixture_tokens[] = {
-        27, 1397, 233, 12998, 497, 2717, 669, 60, 783, 846, 42, 99, 46,
-        321, 800, 28, 233, 27, 8091, 233, 23, 233, 233, 24, 233, 233,
-    };
-    const uint32_t n_tokens = (uint32_t)(sizeof(fixture_tokens) /
-                                          sizeof(fixture_tokens[0]));
+    uint32_t n_tokens = 0u;
+    const int *fixture_tokens = ds4_mellum_probe_fixture(&n_tokens);
     if (!e || !out || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_MELLUM ||
         e->backend != DS4_BACKEND_METAL || !e->mellum_decode_contract_ready ||
         !e->weights.output || e->weights.output->dim[1] == 0 ||

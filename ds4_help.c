@@ -298,6 +298,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--metal-graph-test", "Compare first GPU-resident graph stages with CPU.");
     opt(fp, c, "--metal-graph-full-test", "Run the GPU-resident self-token graph across all layers.");
     opt(fp, c, "--metal-graph-prompt-test", "Compare CPU and GPU graph logits for the full prompt.");
+    opt(fp, c, "--mellum-fixture-tokens FILE", "Replay the Mellum probes on decimal token ids from FILE instead of the pinned 26.");
     opt(fp, c, "--mellum-layer0-probe", "Mellum diagnostic: replay the pinned layer-0 oracle fixture.");
     opt(fp, c, "--mellum-layer0-probe-out FILE", "Write its 26 F32 layer outputs for oracle comparison.");
     opt(fp, c, "--mellum-logits-probe", "Mellum diagnostic: replay the fixed fixture through final norm and output logits.");

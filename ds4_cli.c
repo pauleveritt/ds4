@@ -114,6 +114,7 @@ typedef struct {
     bool mellum_logits_probe;
     const char *mellum_logits_probe_out;
     int mellum_logits_probe_top_k;
+    const char *mellum_fixture_tokens;
 } cli_generation_options;
 
 typedef struct {
@@ -2309,6 +2310,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.mellum_logits_probe_out = need_arg(&i, argc, argv, arg);
             c.inspect = true;
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--mellum-fixture-tokens")) {
+            c.gen.mellum_fixture_tokens = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mellum-logits-probe-top-k")) {
             c.gen.mellum_logits_probe = true;
             c.gen.mellum_logits_probe_top_k =
@@ -2332,6 +2335,11 @@ static cli_config parse_options(int argc, char **argv) {
         }
     }
 
+    if (c.gen.mellum_fixture_tokens &&
+        ds4_mellum_probe_fixture_load(c.gen.mellum_fixture_tokens) != 0) {
+        fprintf(stderr, "ds4: --mellum-fixture-tokens was refused\n");
+        exit(2);
+    }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }

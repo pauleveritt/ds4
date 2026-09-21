@@ -333,6 +333,18 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 int ds4_engine_open_for_agent(ds4_engine **out,
                               const ds4_engine_options *opt);
 
+/* The token fixture every diagnostic-only Mellum probe replays.  Returns the
+ * pinned 26-id `python_add` list unless a file has been loaded, and writes
+ * the count to *n_out when n_out is non-NULL.  The returned pointer stays
+ * valid until the next successful load or reset. */
+const int *ds4_mellum_probe_fixture(uint32_t *n_out);
+/* Replace that fixture with whitespace-separated decimal token ids read from
+ * FILE (`#` starts a comment).  Returns 0 on success; on any refusal it
+ * returns non-zero and leaves the fixture in force unchanged. */
+int ds4_mellum_probe_fixture_load(const char *path);
+/* Drop a loaded fixture and restore the pinned default. */
+void ds4_mellum_probe_fixture_reset(void);
+
 /* Diagnostic-only Mellum oracle probe.  Replays the pinned 26-token fixture
  * through layer 0 without creating a session or enabling generation. */
 int ds4_engine_mellum_layer0_probe(ds4_engine *engine,

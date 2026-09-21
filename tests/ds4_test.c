@@ -9359,9 +9359,102 @@ static void test_dspark_verify_depth(void) {
 }
 #endif
 
+/* Write `text` to a fresh temporary file and return its path in `out`
+ * (caller unlinks).  Model-free helper for the Mellum fixture-file test. */
+static bool test_write_temp_file(const char *text, char *out, size_t out_len) {
+    const char *dir = getenv("TMPDIR");
+    if (!dir || !dir[0]) dir = "/tmp";
+    const size_t sep = strlen(dir) && dir[strlen(dir) - 1u] == '/' ? 0u : 1u;
+    if (snprintf(out, out_len, "%s%sds4-mellum-fixture-XXXXXX",
+                 dir, sep ? "/" : "") >= (int)out_len) {
+        return false;
+    }
+    const int fd = mkstemp(out);
+    if (fd < 0) return false;
+    FILE *fp = fdopen(fd, "w");
+    if (!fp) {
+        close(fd);
+        return false;
+    }
+    const size_t len = strlen(text);
+    const bool ok = fwrite(text, 1, len, fp) == len;
+    return fclose(fp) == 0 && ok;
+}
+
+/* P21 Task 7: the five Mellum probes read their fixture through one
+ * accessor, so a long fixture does not mean editing five arrays.  The
+ * default must stay byte-for-byte the pinned 26-id list — that is what the
+ * P20 default-fixture trace hash guards. */
+static void test_mellum_probe_fixture_file(void) {
+    static const int pinned[] = {
+        27, 1397, 233, 12998, 497, 2717, 669, 60, 783, 846, 42, 99, 46,
+        321, 800, 28, 233, 27, 8091, 233, 23, 233, 233, 24, 233, 233,
+    };
+    const uint32_t pinned_n = (uint32_t)(sizeof(pinned) / sizeof(pinned[0]));
+
+    uint32_t n = 0u;
+    const int *ids = ds4_mellum_probe_fixture(&n);
+    TEST_ASSERT(n == pinned_n);
+    TEST_ASSERT(n == 26u);
+    for (uint32_t i = 0; i < pinned_n && i < n; i++) {
+        TEST_ASSERT(ids[i] == pinned[i]);
+    }
+
+    /* A refusal before any load leaves the pinned default in force. */
+    char empty_path[PATH_MAX];
+    TEST_ASSERT(test_write_temp_file("\n# nothing but a comment\n",
+                                     empty_path, sizeof(empty_path)));
+    TEST_ASSERT(ds4_mellum_probe_fixture_load(empty_path) != 0);
+    ids = ds4_mellum_probe_fixture(&n);
+    TEST_ASSERT(n == pinned_n && ids[0] == 27);
+
+    /* A well-formed file replaces the list: comments, blank lines and
+     * several ids on one line are all accepted. */
+    char good_path[PATH_MAX];
+    TEST_ASSERT(test_write_temp_file("# three ids\n11 22\n\n33  # trailing\n",
+                                     good_path, sizeof(good_path)));
+    TEST_ASSERT(ds4_mellum_probe_fixture_load(good_path) == 0);
+    ids = ds4_mellum_probe_fixture(&n);
+    TEST_ASSERT(n == 3u);
+    if (n == 3u) {
+        TEST_ASSERT(ids[0] == 11 && ids[1] == 22 && ids[2] == 33);
+    }
+
+    /* A malformed file is refused and leaves the loaded list intact. */
+    char bad_path[PATH_MAX];
+    TEST_ASSERT(test_write_temp_file("11 oops\n", bad_path, sizeof(bad_path)));
+    TEST_ASSERT(ds4_mellum_probe_fixture_load(bad_path) != 0);
+    ids = ds4_mellum_probe_fixture(&n);
+    TEST_ASSERT(n == 3u && ids[0] == 11);
+
+    /* So is a negative id, and a path that does not exist. */
+    char negative_path[PATH_MAX];
+    TEST_ASSERT(test_write_temp_file("11 -22\n", negative_path,
+                                     sizeof(negative_path)));
+    TEST_ASSERT(ds4_mellum_probe_fixture_load(negative_path) != 0);
+    TEST_ASSERT(ds4_mellum_probe_fixture_load(
+        "/nonexistent/ds4-mellum-fixture-absent") != 0);
+    ids = ds4_mellum_probe_fixture(&n);
+    TEST_ASSERT(n == 3u && ids[0] == 11);
+
+    /* Reset restores the pinned default for the rest of the process. */
+    ds4_mellum_probe_fixture_reset();
+    ids = ds4_mellum_probe_fixture(&n);
+    TEST_ASSERT(n == pinned_n);
+    for (uint32_t i = 0; i < pinned_n && i < n; i++) {
+        TEST_ASSERT(ids[i] == pinned[i]);
+    }
+
+    unlink(empty_path);
+    unlink(good_path);
+    unlink(bad_path);
+    unlink(negative_path);
+}
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
     test_laguna_variant_shapes();
+    test_mellum_probe_fixture_file();
 }
 
 typedef void (*test_fn)(void);
