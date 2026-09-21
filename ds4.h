@@ -345,6 +345,17 @@ int ds4_mellum_probe_fixture_load(const char *path);
 /* Drop a loaded fixture and restore the pinned default. */
 void ds4_mellum_probe_fixture_reset(void);
 
+/* P21 Q2.  The piece boundaries the Mellum *content* pre-tokenizer produces
+ * for `text`, with no model, no GGUF and no vocabulary: the pieces are
+ * written to `out` separated by 0x1f (US) and NUL-terminated.  This runs the
+ * same segmentation a Mellum turn's content goes through in
+ * bpe_tokenize_text -- only the sink differs -- so a boundary asserted
+ * against it is the boundary BPE is fed.  Returns the number of pieces, or
+ * -1 if `cap` is too small.  Diagnostic and test use only; it is
+ * unconditional rather than a DS4_TEST_HOOKS declaration because ds4_test
+ * links the ordinary ds4.o. */
+int ds4_mellum_segment_content_probe(const char *text, char *out, size_t cap);
+
 /* Diagnostic-only Mellum oracle probe.  Replays the pinned 26-token fixture
  * through layer 0 without creating a session or enabling generation. */
 int ds4_engine_mellum_layer0_probe(ds4_engine *engine,

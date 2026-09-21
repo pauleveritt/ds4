@@ -45250,13 +45250,33 @@ static uint32_t ascii_tolower_cp(uint32_t cp) {
     return cp;
 }
 
+/* Where a segmenter's pieces go.  The product path hands them to BPE; a
+ * model-free test collects the boundaries themselves (ds4.h's
+ * ds4_test_mellum_segment_content), so both read the same segmentation. */
+typedef void (*bpe_piece_sink)(void *ctx, const char *s, uint64_t len);
+
+typedef struct {
+    const ds4_vocab *vocab;
+    token_vec       *out;
+} bpe_vocab_sink_ctx;
+
+static void bpe_vocab_sink(void *ctx, const char *s, uint64_t len) {
+    bpe_vocab_sink_ctx *c = (bpe_vocab_sink_ctx *)ctx;
+    bpe_emit_piece(c->vocab, (ds4_str){ s, len }, c->out);
+}
+
 /* ChatGLM4/GLM pre-tokenization.  GLM GGUFs use tokenizer.ggml.pre="glm4",
- * which shares the llama3-style split shape used by llama.cpp's CHATGLM4 path. */
-static void bpe_tokenize_text_glm4_segment(const ds4_vocab *vocab,
-                                           const char      *text,
-                                           uint64_t         len,
-                                           int              max_digits,
-                                           token_vec       *out) {
+ * which shares the llama3-style split shape used by llama.cpp's CHATGLM4 path.
+ *
+ * `mellum` selects the Mellum-only corrections P21's Q2 differential
+ * required; it is false for every other family and those paths are
+ * byte-identical to the pre-P21 segmenter. */
+static void bpe_tokenize_text_glm4_pieces(const char    *text,
+                                          uint64_t       len,
+                                          int            max_digits,
+                                          bool           mellum,
+                                          bpe_piece_sink emit,
+                                          void          *ctx) {
     uint64_t pos = 0;
 
     while (pos < len) {
@@ -45267,10 +45287,10 @@ static void bpe_tokenize_text_glm4_segment(const ds4_vocab *vocab,
 
         if (cur.cp == '\'' && cur.next < len) {
             glm4_char_info next = glm4_char_at(text, len, cur.next);
-            uint32_t n1 = ascii_tolower_cp(next.cp);
+            uint32_t n1 = mellum ? next.cp : ascii_tolower_cp(next.cp);
             if (n1 == 's' || n1 == 't' || n1 == 'm' || n1 == 'd') {
                 pos = next.next;
-                bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+                emit(ctx, text + start, pos - start);
                 continue;
             }
             if (next.valid && next.next < len) {
@@ -45280,7 +45300,7 @@ static void bpe_tokenize_text_glm4_segment(const ds4_vocab *vocab,
                     (n1 == 'v' && n2 == 'e') ||
                     (n1 == 'l' && n2 == 'l')) {
                     pos = next2.next;
-                    bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+                    emit(ctx, text + start, pos - start);
                     continue;
                 }
             }
@@ -45288,14 +45308,20 @@ static void bpe_tokenize_text_glm4_segment(const ds4_vocab *vocab,
 
         if (!(cur.cp == '\r' || cur.cp == '\n' || cur.is_number)) {
             glm4_char_info next = glm4_char_at(text, len, cur.next);
-            if (cur.is_letter || next.is_letter) {
+            /* GLM4's `[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+` lets any character
+             * lead a letter run, so "\tb" and "'S" become one piece.  mellum2's
+             * alternative is ` ?\p{L}+`: the optional prefix is one ASCII
+             * space and nothing else (P21 Q2, divergence class #1).  Without
+             * this the class #2 and #3 corrections below are unreachable. */
+            const bool prefix_ok = !mellum || cur.cp == ' ';
+            if (cur.is_letter || (prefix_ok && next.is_letter)) {
                 pos = cur.next;
                 while (pos < len) {
                     glm4_char_info scan = glm4_char_at(text, len, pos);
                     if (!scan.valid || !scan.is_letter) break;
                     pos = scan.next;
                 }
-                bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+                emit(ctx, text + start, pos - start);
                 continue;
             }
         }
@@ -45308,7 +45334,7 @@ static void bpe_tokenize_text_glm4_segment(const ds4_vocab *vocab,
                 pos = scan.next;
                 ndigits++;
             }
-            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            emit(ctx, text + start, pos - start);
             continue;
         }
 
@@ -45333,12 +45359,18 @@ static void bpe_tokenize_text_glm4_segment(const ds4_vocab *vocab,
                 }
                 pos = scan.next;
             }
-            while (pos < len) {
-                glm4_char_info scan = glm4_char_at(text, len, pos);
-                if (!scan.valid || !(scan.cp == '\r' || scan.cp == '\n')) break;
-                pos = scan.next;
+            /* The GLM4 rule keeps a punctuation run's trailing newlines in the
+             * same BPE word (">;\n").  mellum2's expression does not: its
+             * ` ?[\p{P}\p{S}]+` has no `[\r\n]*` tail, so the newlines fall to
+             * the whitespace alternatives below (P21 Q2, divergence class #2). */
+            if (!mellum) {
+                while (pos < len) {
+                    glm4_char_info scan = glm4_char_at(text, len, pos);
+                    if (!scan.valid || !(scan.cp == '\r' || scan.cp == '\n')) break;
+                    pos = scan.next;
+                }
             }
-            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            emit(ctx, text + start, pos - start);
             continue;
         }
 
@@ -45355,21 +45387,89 @@ static void bpe_tokenize_text_glm4_segment(const ds4_vocab *vocab,
                 p = scan.next;
                 nspace++;
             }
-            if (last_newline_end) {
+            if (mellum) {
+                /* `\s+(?!\S)` then `\s+`, with no `\s*[\r\n]+` alternative
+                 * before them: a run that reaches the end of the split is one
+                 * piece, otherwise its last character starts the next one, and
+                 * a one-character run stays whole.  The GLM4 rule instead cuts
+                 * the run after its last newline, which splits "\r\n" as one
+                 * piece where the reference splits "\r" then "\n" (P21 Q2,
+                 * divergence class #2). */
+                pos = (p >= len || last_ws_start == start) ? p : last_ws_start;
+            } else if (last_newline_end) {
                 pos = last_newline_end;
             } else if (nspace > 1 && p < len) {
                 pos = last_ws_start;
             } else {
                 pos = p;
             }
-            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            emit(ctx, text + start, pos - start);
             continue;
         }
 
         pos = cur.next;
         if (pos == start) pos = next_utf8_char(text, len, pos);
-        bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+        emit(ctx, text + start, pos - start);
     }
+}
+
+static void bpe_tokenize_text_glm4_segment(const ds4_vocab *vocab,
+                                           const char      *text,
+                                           uint64_t         len,
+                                           int              max_digits,
+                                           token_vec       *out) {
+    bpe_vocab_sink_ctx sink = { vocab, out };
+    bpe_tokenize_text_glm4_pieces(text, len, max_digits, false,
+                                  bpe_vocab_sink, &sink);
+}
+
+/* Mellum (`tokenizer.ggml.pre = "mellum2"`) content pre-tokenization: the
+ * GLM4 segmenter with the Mellum-only corrections above. */
+static void mellum_segment_pieces(const char    *text,
+                                  uint64_t       len,
+                                  bpe_piece_sink emit,
+                                  void          *ctx) {
+    bpe_tokenize_text_glm4_pieces(text, len, 1, true, emit, ctx);
+}
+
+static void bpe_tokenize_text_mellum(const ds4_vocab *vocab,
+                                     const char      *text,
+                                     token_vec       *out) {
+    bpe_vocab_sink_ctx sink = { vocab, out };
+    mellum_segment_pieces(text, strlen(text), bpe_vocab_sink, &sink);
+}
+
+typedef struct {
+    char   *out;
+    size_t  cap;
+    size_t  used;
+    int     pieces;
+    bool    overflow;
+} mellum_segment_probe;
+
+static void mellum_segment_probe_sink(void *ctx, const char *s, uint64_t len) {
+    mellum_segment_probe *p = (mellum_segment_probe *)ctx;
+    const size_t sep = p->pieces ? 1u : 0u;
+    if (p->overflow || p->used + sep + (size_t)len + 1u > p->cap) {
+        p->overflow = true;
+        return;
+    }
+    if (sep) p->out[p->used++] = '\x1f';
+    memcpy(p->out + p->used, s, (size_t)len);
+    p->used += (size_t)len;
+    p->out[p->used] = '\0';
+    p->pieces++;
+}
+
+int ds4_mellum_segment_content_probe(const char *text, char *out, size_t cap) {
+    if (!text || !out || cap == 0) return -1;
+    mellum_segment_probe probe;
+    memset(&probe, 0, sizeof(probe));
+    probe.out = out;
+    probe.cap = cap;
+    out[0] = '\0';
+    mellum_segment_pieces(text, strlen(text), mellum_segment_probe_sink, &probe);
+    return probe.overflow ? -1 : probe.pieces;
 }
 
 static void bpe_tokenize_text_laguna(const ds4_vocab *vocab,
@@ -45579,9 +45679,10 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
-        /* llama.cpp's `mellum2` pre-tokenizer uses the StarCoder/GPT-2
-         * expression with an individual-digit branch. */
-        bpe_tokenize_text_glm4_segment(vocab, text, strlen(text), 1, out);
+        /* The `mellum2` pre-tokenizer is Digits(individual) then the GPT-2
+         * ByteLevel expression, which the shared GLM4 segmenter only
+         * approximates; P21's Q2 differential counted the difference. */
+        bpe_tokenize_text_mellum(vocab, text, out);
         return;
     }
 

@@ -9385,6 +9385,72 @@ static bool test_write_temp_file(const char *text, char *out, size_t out_len) {
  * accessor, so a long fixture does not mean editing five arrays.  The
  * default must stay byte-for-byte the pinned 26-id list — that is what the
  * P20 default-fixture trace hash guards. */
+/* P21 Q2: the Mellum *content* pre-tokenizer's piece boundaries.
+ *
+ * Model-free and vocabulary-free: ds4_mellum_segment_content_probe runs the
+ * same mellum_segment_pieces the product path runs in bpe_tokenize_text and
+ * collects the boundaries instead of handing them to BPE, so a boundary
+ * asserted here is the boundary BPE is fed.
+ *
+ * Every expectation below is the snapshot tokenizer.json's own
+ * pre_tokenizer output -- Digits(individual_digits) then ByteLevel(use_regex)
+ * -- read off `pre_tokenize_str` and transcribed, not derived from this
+ * implementation.  Pieces are separated by 0x1f.
+ */
+#define US "\x1f"
+static void test_mellum_content_segmentation(void) {
+    static const struct { const char *text; const char *pieces; } cases[] = {
+        /* Contractions are lowercase-only in the GPT-2 expression; the shared
+         * GLM4 rule lower-cases first and so swallows 'S, 'T, 'LL ...
+         * (divergence class #3, 14 of 4,000 corpus strings). */
+        { "IT'SVocab",       "IT" US "'" US "SVocab" },
+        { "don'T stop",      "don" US "'" US "T" US " stop" },
+        { "he'LL go",        "he" US "'" US "LL" US " go" },
+        /* ... but the lowercase forms are still contractions. */
+        { "it'svocab",       "it" US "'s" US "vocab" },
+        { "he'll go",        "he" US "'ll" US " go" },
+
+        /* Whitespace runs follow `\s+(?!\S)` then `\s+`, with no
+         * `\s*[\r\n]+` alternative before them, so CR and LF part company
+         * before a non-space; and a punctuation run does not keep its
+         * trailing newlines (divergence class #2, 159 of 4,000). */
+        { "parse\r\ntoken",  "parse" US "\r" US "\n" US "token" },
+        { "x\r\r\ny",        "x" US "\r\r" US "\n" US "y" },
+        { "end\r\n",         "end" US "\r\n" },
+        { ">;\nnext",        ">;" US "\n" US "next" },
+        { "  \n  x",         "  \n " US " x" },
+        { "\n\n\n  Prefill", "\n\n\n " US " Prefill" },
+        { "a  b",            "a" US " " US " b" },
+        { "a\tb",            "a" US "\t" US "b" },
+        { "    Vocab",       "   " US " Vocab" },
+
+        { " 123abc",           " " US "1" US "2" US "3" US "abc" },
+        { "a1b2",              "a" US "1" US "b" US "2" },
+        { "x = 1",             "x" US " =" US " " US "1" },
+    };
+
+    char buf[512];
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const int n = ds4_mellum_segment_content_probe(cases[i].text, buf,
+                                                      sizeof(buf));
+        TEST_ASSERT(n > 0);
+        if (strcmp(buf, cases[i].pieces)) {
+            fprintf(stderr,
+                    "  mellum segmentation [%zu] %s:\n    want %s\n    got  %s\n",
+                    i, cases[i].text, cases[i].pieces, buf);
+            TEST_ASSERT(!strcmp(buf, cases[i].pieces));
+        }
+    }
+
+    /* A buffer too small is refused, not truncated. */
+    char tiny[4];
+    TEST_ASSERT(ds4_mellum_segment_content_probe("hello world", tiny,
+                                                sizeof(tiny)) == -1);
+    /* Empty input is zero pieces, not a refusal. */
+    TEST_ASSERT(ds4_mellum_segment_content_probe("", buf, sizeof(buf)) == 0);
+}
+#undef US
+
 static void test_mellum_probe_fixture_file(void) {
     static const int pinned[] = {
         27, 1397, 233, 12998, 497, 2717, 669, 60, 783, 846, 42, 99, 46,
@@ -9455,6 +9521,7 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
     test_laguna_variant_shapes();
     test_mellum_probe_fixture_file();
+    test_mellum_content_segmentation();
 }
 
 typedef void (*test_fn)(void);
