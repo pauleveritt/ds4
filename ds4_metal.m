@@ -40632,6 +40632,44 @@ int ds4_gpu_mellum_router_select_batch_tensor(
 }
 
 /*
+ * Which Q4_K gate/up pair kernel a Mellum layer runs (P24).  Rung 2 (default,
+ * "K2") is the simd kernel kernel_glm_q4_K_pair_swiglu2_f32: two 32-lane
+ * simdgroups per threadgroup, two rows each, 64 threads, no threadgroup
+ * scratch.  Rung 1 ("K1") is the scalar Mellum kernel, the correctness oracle.
+ * DS4_MELLUM_Q4K_PAIR=scalar (or 1) selects K1, an opt-out like the other
+ * Mellum switches; it is read on every call so a test can flip it.
+ */
+int ds4_gpu_mellum_q4k_pair_rung(void) {
+    const char *env = getenv("DS4_MELLUM_Q4K_PAIR");
+    if (env && (strcmp(env, "scalar") == 0 || strcmp(env, "1") == 0)) return 1;
+    return 2;
+}
+
+static bool ds4_gpu_mellum_q4k_pair_select(
+        uint32_t mid_dim, id<MTLComputePipelineState> __autoreleasing *pipeline,
+        NSUInteger *x_groups, NSUInteger *threads, NSUInteger *tg_bytes) {
+    if (ds4_gpu_mellum_q4k_pair_rung() == 1) {
+        if (!g_mellum_q4_K_pair_swiglu_scalar_f32_pipeline) {
+            g_mellum_q4_K_pair_swiglu_scalar_f32_pipeline = ds4_gpu_get_pipeline(
+                "kernel_mellum_q4_K_pair_swiglu_scalar_f32");
+        }
+        *pipeline = ds4_gpu_hot_pipeline(
+            g_mellum_q4_K_pair_swiglu_scalar_f32_pipeline,
+            "kernel_mellum_q4_K_pair_swiglu_scalar_f32");
+        *x_groups = (NSUInteger)mid_dim;
+        *threads = 256u;
+        *tg_bytes = 512u * sizeof(float);
+    } else {
+        *pipeline = ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu2_f32_pipeline,
+                                         "kernel_glm_q4_K_pair_swiglu2_f32");
+        *x_groups = ((NSUInteger)mid_dim + 1u) / 2u;
+        *threads = 64u;
+        *tg_bytes = 0u;
+    }
+    return *pipeline != nil;
+}
+
+/*
  * P24 review B2: a Mellum MoE wrapper is written for ONE gate/up storage type,
  * and a caller that hands it the other type's strides used to get a bare
  * `return 0` with no diagnostic.  This names the mismatch on stderr.  Returns
@@ -40749,16 +40787,13 @@ int ds4_gpu_mellum_routed_moe_one_tensor(
             model_map, model_size, down_offset, down_bytes, &down_inner);
         if (!gatebuf || !upbuf || !downbuf) return 0;
 
-        /* K1, the scalar rung (P24): the Mellum-guarded copy of the GLM scalar
-         * kernel, so an out-of-range router id zero-fills instead of reading
-         * out of bounds (review B3). */
-        if (!g_mellum_q4_K_pair_swiglu_scalar_f32_pipeline) {
-            g_mellum_q4_K_pair_swiglu_scalar_f32_pipeline = ds4_gpu_get_pipeline(
-                "kernel_mellum_q4_K_pair_swiglu_scalar_f32");
-        }
-        id<MTLComputePipelineState> pair_pipeline = ds4_gpu_hot_pipeline(
-            g_mellum_q4_K_pair_swiglu_scalar_f32_pipeline,
-            "kernel_mellum_q4_K_pair_swiglu_scalar_f32");
+        /* Rung K2 by default, K1 (the Mellum-guarded scalar copy, review B3)
+         * with DS4_MELLUM_Q4K_PAIR=scalar; both zero-fill an out-of-range id. */
+        id<MTLComputePipelineState> pair_pipeline = nil;
+        NSUInteger pair_x_groups = 0, pair_threads = 0, pair_tg_bytes = 0;
+        if (!ds4_gpu_mellum_q4k_pair_select(expert_mid_dim, &pair_pipeline,
+                                            &pair_x_groups, &pair_threads,
+                                            &pair_tg_bytes)) return 0;
         if (!g_mellum_q8_0_down_f32_pipeline) {
             g_mellum_q8_0_down_f32_pipeline =
                 ds4_gpu_get_pipeline("kernel_mellum_q8_0_down_f32");
@@ -40801,10 +40836,9 @@ int ds4_gpu_mellum_routed_moe_one_tensor(
         [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:6];
         [enc useResource:gatebuf usage:MTLResourceUsageRead];
         [enc useResource:upbuf usage:MTLResourceUsageRead];
-        [enc setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)expert_mid_dim,
-                                              (NSUInteger)n_expert, 1)
-             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        if (pair_tg_bytes) [enc setThreadgroupMemoryLength:pair_tg_bytes atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(pair_x_groups, (NSUInteger)n_expert, 1)
+             threadsPerThreadgroup:MTLSizeMake(pair_threads, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
         enc = ds4_gpu_compute_encoder(cb);
@@ -41566,19 +41600,18 @@ int ds4_gpu_mellum_routed_moe_batch_tensor(
         id<MTLBuffer> downbuf = ds4_gpu_wrap_model_exact_range(
             model_map, model_size, down_offset, down_bytes, &down_inner);
         if (!gatebuf || !upbuf || !downbuf) return 0;
-        if (!g_mellum_q4_K_pair_swiglu_scalar_f32_pipeline)
-            g_mellum_q4_K_pair_swiglu_scalar_f32_pipeline = ds4_gpu_get_pipeline(
-                "kernel_mellum_q4_K_pair_swiglu_scalar_f32");
+        id<MTLComputePipelineState> pair_pipeline = nil;
+        NSUInteger pair_x_groups = 0, pair_threads = 0, pair_tg_bytes = 0;
+        if (!ds4_gpu_mellum_q4k_pair_select(expert_mid_dim, &pair_pipeline,
+                                            &pair_x_groups, &pair_threads,
+                                            &pair_tg_bytes)) return 0;
         if (!g_mellum_q8_0_down_batch_f32_pipeline)
             g_mellum_q8_0_down_batch_f32_pipeline = ds4_gpu_get_pipeline(
                 "kernel_mellum_q8_0_down_batch_f32");
-        id<MTLComputePipelineState> pair_pipeline = ds4_gpu_hot_pipeline(
-            g_mellum_q4_K_pair_swiglu_scalar_f32_pipeline,
-            "kernel_mellum_q4_K_pair_swiglu_scalar_f32");
         id<MTLComputePipelineState> down_pipeline = ds4_gpu_hot_pipeline(
             g_mellum_q8_0_down_batch_f32_pipeline,
             "kernel_mellum_q8_0_down_batch_f32");
-        if (!pair_pipeline || !down_pipeline) return 0;
+        if (!down_pipeline) return 0;
         unsigned down_rowtile = ds4_gpu_mellum_down_rowtile();
         if (down_rowtile) {
             const char *rt_name = (down_rowtile == 4)
@@ -41624,9 +41657,9 @@ int ds4_gpu_mellum_routed_moe_batch_tensor(
         [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:6];
         [enc useResource:gatebuf usage:MTLResourceUsageRead];
         [enc useResource:upbuf usage:MTLResourceUsageRead];
-        [enc setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(expert_mid_dim, n_expert, n_tokens)
-             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        if (pair_tg_bytes) [enc setThreadgroupMemoryLength:pair_tg_bytes atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(pair_x_groups, n_expert, n_tokens)
+             threadsPerThreadgroup:MTLSizeMake(pair_threads, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:down_pipeline];

@@ -2730,6 +2730,11 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens);
 
+/* Which Q4_K gate/up pair kernel a Mellum layer runs: 2 = the simd kernel
+ * (default, "K2"), 1 = the scalar correctness oracle ("K1", selected by
+ * DS4_MELLUM_Q4K_PAIR=scalar).  Read on every call. */
+int ds4_gpu_mellum_q4k_pair_rung(void);
+
 /* Token-major Q4_K gate/up + Q8_0 down Mellum MoE (P24a): the correct-but-
  * not-fast route a Q4_K layer's prefill takes until the expert-major Q4_K
  * kernel exists.  Same contract as the Q8_0 wrapper above. */

@@ -3030,6 +3030,39 @@ static void test_q4k_real_reference(const test_q4k_real *f, const int32_t *sel,
 /* One decode-shaped call of the Q4_K/Q8_0 primitive against the double
  * reference.  D7 (preregistered): mid max_abs <= 4e-5, out max_abs <= 1e-4.
  * Returns the observed maxima so a caller can compare rungs. */
+/* Run the decode primitive once and hand back mid/out (n_sel * mid_dim and
+ * out_dim floats); mid is pre-filled with a garbage pattern so a slot the kernel
+ * fails to write shows up.  Returns false on any harness or engine failure. */
+static bool test_q4k_real_run(const test_q4k_real *f, const int32_t *sel,
+                              const float *rw, uint32_t n_sel, const float *x_h,
+                              float *mid_h, float *out_h) {
+    const uint64_t x_bytes = (uint64_t)f->in_dim * sizeof(float);
+    const uint64_t mid_bytes = (uint64_t)n_sel * f->mid_dim * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)f->out_dim * sizeof(float);
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(mid_bytes);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_bytes);
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc((uint64_t)n_sel * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc((uint64_t)n_sel * sizeof(float));
+    bool ok = x && mid && out && selected && weights;
+    if (ok) {
+        memset(mid_h, 0x7f, (size_t)mid_bytes);
+        ok = ds4_gpu_tensor_write(x, 0, x_h, x_bytes) != 0 &&
+             ds4_gpu_tensor_write(mid, 0, mid_h, mid_bytes) != 0 &&
+             ds4_gpu_tensor_write(selected, 0, sel, (uint64_t)n_sel * sizeof(int32_t)) != 0 &&
+             ds4_gpu_tensor_write(weights, 0, rw, (uint64_t)n_sel * sizeof(float)) != 0 &&
+             ds4_gpu_mellum_routed_moe_one_tensor(
+                out, mid, f->model, f->model_bytes, f->gate_off, f->up_off, f->down_off,
+                f->gate_expert, f->gate_row, f->down_expert, f->down_row, f->in_dim,
+                f->mid_dim, f->out_dim, selected, weights, f->n_total, n_sel, x) != 0 &&
+             ds4_gpu_tensor_read(mid, 0, mid_h, mid_bytes) != 0 &&
+             ds4_gpu_tensor_read(out, 0, out_h, out_bytes) != 0;
+    }
+    ds4_gpu_tensor_free(weights); ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(x);
+    return ok;
+}
+
 static void test_q4k_real_decode_case(const test_q4k_real *f, const int32_t *sel,
                                       const float *rw, uint32_t n_sel,
                                       const char *label, float *mid_max_out,
@@ -3109,6 +3142,84 @@ static void test_metal_mellum_q4_real_shape_decode(void) {
          * out of bounds (P24 review B3). */
         const int32_t sel_oor[8] = {5, -1, 17, 64, 0, 200, 63, 9};
         test_q4k_real_decode_case(&f, sel_oor, rw8, 8u, "out-of-range ids -1, 64, 200", NULL, NULL);
+    }
+    free(f.model);
+}
+
+/*
+ * Rung K2 (the shipping decode rung, preregistered): the simd Q4_K pair kernel
+ * kernel_glm_q4_K_pair_swiglu2_f32 by host swap, against K1 (the scalar oracle)
+ * and against the double reference, at the real shape and with the cases the
+ * existing Q4_K test never had: nb = 9 (not a multiple of the simd kernel's
+ * 4-block stride), expert ids 0 and 63, n_expert 1 and 8, and out-of-range ids.
+ * D7: mid max_abs <= 4e-5, out max_abs <= 1e-4.  A miss is a finding, not a
+ * tolerance to loosen.
+ */
+static void test_metal_mellum_q4_k2_vs_k1(void) {
+    /* Which rung runs is asked of the implementation, not derived from env. */
+    unsetenv("DS4_MELLUM_Q4K_PAIR");
+    TEST_ASSERT(ds4_gpu_mellum_q4k_pair_rung() == 2);
+    setenv("DS4_MELLUM_Q4K_PAIR", "scalar", 1);
+    TEST_ASSERT(ds4_gpu_mellum_q4k_pair_rung() == 1);
+    unsetenv("DS4_MELLUM_Q4K_PAIR");
+
+    test_q4k_real f;
+    const bool built = test_q4k_real_build(&f);
+    TEST_ASSERT(built);
+    if (built) {
+        static const int32_t top8[8] = {63, 0, 17, 5, 42, 30, 9, 58};
+        static const int32_t one_hi[1] = {63};
+        static const int32_t one_lo[1] = {0};
+        static const int32_t oor[8] = {5, -1, 17, 64, 0, 200, 63, 9};
+        static const int32_t neg_only[2] = {-7, 17};
+        static const float rw[8] = {0.31f, 0.05f, 0.22f, 0.12f, 0.08f, 0.17f, 0.09f, 0.14f};
+        const struct { const int32_t *sel; uint32_t n; const char *label; } cases[] = {
+            {top8, 8u, "top8 incl 0 and 63"}, {one_hi, 1u, "one id 63"},
+            {one_lo, 1u, "one id 0"}, {oor, 8u, "out-of-range -1, 64, 200"},
+            {neg_only, 2u, "negative id + valid"},
+        };
+        float *x_h = malloc((size_t)f.in_dim * sizeof(float));
+        TEST_ASSERT(x_h);
+        for (uint32_t i = 0; x_h && i < f.in_dim; i++)
+            x_h[i] = (float)((int)((i * 19u + (i >> 2u) * 7u) % 41u) - 20) / 32.0f;
+        for (size_t c = 0; x_h && c < sizeof(cases) / sizeof(cases[0]); c++) {
+            const uint32_t n = cases[c].n;
+            const size_t mid_n = (size_t)n * f.mid_dim;
+            float *mid1 = malloc(mid_n * sizeof(float)), *out1 = malloc(f.out_dim * sizeof(float));
+            float *mid2 = malloc(mid_n * sizeof(float)), *out2 = malloc(f.out_dim * sizeof(float));
+            float *midr = malloc(mid_n * sizeof(float)), *outr = malloc(f.out_dim * sizeof(float));
+            const bool ok = mid1 && out1 && mid2 && out2 && midr && outr;
+            TEST_ASSERT(ok);
+            if (ok) {
+                setenv("DS4_MELLUM_Q4K_PAIR", "scalar", 1);
+                TEST_ASSERT(test_q4k_real_run(&f, cases[c].sel, rw, n, x_h, mid1, out1));
+                unsetenv("DS4_MELLUM_Q4K_PAIR");
+                TEST_ASSERT(test_q4k_real_run(&f, cases[c].sel, rw, n, x_h, mid2, out2));
+                test_q4k_real_reference(&f, cases[c].sel, rw, n, x_h, midr, outr);
+                const float k2k1_mid = test_mellum_max_abs(mid2, mid1, (uint32_t)mid_n);
+                const float k2k1_out = test_mellum_max_abs(out2, out1, f.out_dim);
+                const float k2ref_mid = test_mellum_max_abs(mid2, midr, (uint32_t)mid_n);
+                const float k2ref_out = test_mellum_max_abs(out2, outr, f.out_dim);
+                fprintf(stderr, "ds4-test: Mellum Q4_K K2 [%s]: vs K1 mid=%g out=%g; "
+                        "vs reference mid=%g out=%g\n", cases[c].label,
+                        (double)k2k1_mid, (double)k2k1_out, (double)k2ref_mid,
+                        (double)k2ref_out);
+                TEST_ASSERT(k2k1_mid <= 4.0e-5f && k2k1_out <= 1.0e-4f);
+                TEST_ASSERT(k2ref_mid <= 4.0e-5f && k2ref_out <= 1.0e-4f);
+                for (uint32_t sl = 0; sl < n; sl++) {
+                    if (cases[c].sel[sl] >= 0 && (uint32_t)cases[c].sel[sl] < f.n_total) continue;
+                    uint32_t nz1 = 0, nz2 = 0;
+                    for (uint32_t r = 0; r < f.mid_dim; r++) {
+                        nz1 += mid1[(size_t)sl * f.mid_dim + r] != 0.0f;
+                        nz2 += mid2[(size_t)sl * f.mid_dim + r] != 0.0f;
+                    }
+                    TEST_ASSERT(nz1 == 0u);
+                    TEST_ASSERT(nz2 == 0u); /* K1 and K2 agree at an out-of-range id */
+                }
+            }
+            free(outr); free(midr); free(out2); free(mid2); free(out1); free(mid1);
+        }
+        free(x_h);
     }
     free(f.model);
 }
@@ -7920,6 +8031,7 @@ static void test_metal_kernel_group(void) {
     test_metal_mellum_q4_q8_routed_moe();
     test_metal_mellum_q4_real_shape_decode();
     test_metal_mellum_q4_real_shape_batch();
+    test_metal_mellum_q4_k2_vs_k1();
     test_metal_mellum_moe_wrong_type_is_loud();
     test_metal_mellum_q8_q8_routed_moe();
     test_metal_mellum_batch_layer_offset_tables();
