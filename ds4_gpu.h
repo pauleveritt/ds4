@@ -2893,7 +2893,16 @@ typedef struct {
     uint32_t n_expert;
     uint32_t n_expert_used;
     bool     router_is_f32;
+    /* P24: the layer's routed gate/up storage type.  Zero-initialised is Q8_0,
+     * so every initialiser that predates it is unchanged.  Down is always Q8_0.
+     * Kept here, not in ds4.h: the pin's header hash must not move. */
+    uint32_t gate_up_type;
 } ds4_gpu_mellum_q8_0_layer_desc;
+
+enum {
+    DS4_GPU_MELLUM_GATE_UP_Q8_0 = 0,
+    DS4_GPU_MELLUM_GATE_UP_Q4_K = 1,
+};
 
 int ds4_gpu_mellum_q8_0_layer_decode_tensor(
         ds4_gpu_tensor                         *out,

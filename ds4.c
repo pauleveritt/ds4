@@ -6197,6 +6197,22 @@ static void weights_validate_laguna_layout(
     }
 }
 
+/*
+ * Which routed-expert type triples a Mellum file may carry (P24).  Exactly two:
+ * the all-Q8_0 oracle and the mixed file whose routed gate and up are Q4_K over
+ * a Q8_0 down.  Gate and up must share a type because every Metal MoE path
+ * addresses them with one stride (gate_expert_bytes == up_expert_bytes).  Down
+ * stays Q8_0: it is 896 wide, and 896 % 256 != 0 makes it un-K-quantizable.
+ * Attention, embeddings, the output head and the router keep their pins in
+ * weights_validate_mellum_layout.  Declared by extern in tests/test_sampling.c,
+ * deliberately not in ds4.h (the pin's header hash must not move).
+ */
+bool ds4_mellum_expert_types_supported(uint32_t gate, uint32_t up,
+                                       uint32_t down) {
+    if (down != DS4_TENSOR_Q8_0 || gate != up) return false;
+    return gate == DS4_TENSOR_Q8_0 || gate == DS4_TENSOR_Q4_K;
+}
+
 static void weights_validate_mellum_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
@@ -6252,11 +6268,26 @@ static void weights_validate_mellum_layout(
                              1, DS4_N_EMBD, 0, 0);
         tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32,
                              2, DS4_N_EMBD, DS4_N_EXPERT, 0);
-        tensor_expect_layout(l->ffn_gate_exps, DS4_TENSOR_Q8_0,
+        const uint32_t gate_type = l->ffn_gate_exps->type;
+        const uint32_t up_type = l->ffn_up_exps->type;
+        const uint32_t down_type = l->ffn_down_exps->type;
+        if (!ds4_mellum_expert_types_supported(gate_type, up_type, down_type)) {
+            fprintf(stderr,
+                    "ds4: Mellum layer %u routed experts have types "
+                    "gate=%s up=%s down=%s; supported: gate=up=q8_0 with "
+                    "down=q8_0, or gate=up=q4_k with down=q8_0 (down is "
+                    "896 wide and cannot be K-quantized)\n",
+                    il,
+                    tensor_type_name(gate_type),
+                    tensor_type_name(up_type),
+                    tensor_type_name(down_type));
+            exit(1);
+        }
+        tensor_expect_layout(l->ffn_gate_exps, gate_type,
                              3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_layout(l->ffn_up_exps, DS4_TENSOR_Q8_0,
+        tensor_expect_layout(l->ffn_up_exps, up_type,
                              3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_layout(l->ffn_down_exps, DS4_TENSOR_Q8_0,
+        tensor_expect_layout(l->ffn_down_exps, down_type,
                              3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
     }
 }
@@ -43388,9 +43419,9 @@ static bool ds4_mellum_q8_layer_desc(const ds4_engine                  *e,
         layer->attn_v->type != DS4_TENSOR_Q8_0 ||
         layer->attn_output->type != DS4_TENSOR_Q8_0 ||
         layer->router->type != DS4_TENSOR_F32 ||
-        layer->gate_experts->type != DS4_TENSOR_Q8_0 ||
-        layer->up_experts->type != DS4_TENSOR_Q8_0 ||
-        layer->down_experts->type != DS4_TENSOR_Q8_0) {
+        !ds4_mellum_expert_types_supported(layer->gate_experts->type,
+                                           layer->up_experts->type,
+                                           layer->down_experts->type)) {
         return false;
     }
     const bool sliding = layer->sliding_attention;
@@ -43433,6 +43464,8 @@ static bool ds4_mellum_q8_layer_desc(const ds4_engine                  *e,
         .n_expert = DS4_N_EXPERT,
         .n_expert_used = DS4_N_EXPERT_USED,
         .router_is_f32 = true,
+        .gate_up_type = layer->gate_experts->type == DS4_TENSOR_Q4_K ?
+            DS4_GPU_MELLUM_GATE_UP_Q4_K : DS4_GPU_MELLUM_GATE_UP_Q8_0,
     };
     return true;
 }
@@ -43627,7 +43660,7 @@ int ds4_engine_mellum_layer0_probe(ds4_engine  *e,
     ds4_gpu_mellum_q8_0_layer_desc desc;
     if (e->weights.token_embd->type != DS4_TENSOR_Q8_0 ||
         !ds4_mellum_q8_layer_desc(e, 0u, &desc)) {
-        fprintf(stderr, "ds4: Mellum layer-0 probe requires Q8_0 dense/expert tensors and an F32 router\n");
+        fprintf(stderr, "ds4: Mellum layer-0 probe requires Q8_0 dense tensors, Q8_0 or Q4_K routed gate/up over Q8_0 down, and an F32 router\n");
         return 1;
     }
 
@@ -74855,6 +74888,89 @@ int ds4_test_mellum_memory_plan(uint32_t ctx_size, uint32_t prefill_cap,
         ds4_mellum_planned_bytes(weights_bytes, ctx_size, prefill_cap);
     g_ds4_shape = saved;
     return 0;
+}
+
+/* Synthetic one-layer Mellum weight table with the given tensor types, run
+ * through the REAL weights_validate_mellum_layout in a forked child: the
+ * validator exits on a refusal.  Returns 0 accepted, 1 refused, -1 harness
+ * failure; the child's stderr lands in msg. */
+#include <sys/wait.h>
+static void ds4_test_fake_tensor_fill(ds4_tensor *t, const char *name,
+                                      uint32_t type, uint32_t ndim,
+                                      uint64_t d0, uint64_t d1, uint64_t d2) {
+    memset(t, 0, sizeof(*t));
+    t->name.ptr = name;
+    t->name.len = (uint64_t)strlen(name);
+    t->type = type;
+    t->ndim = ndim;
+    t->dim[0] = d0;
+    t->dim[1] = d1;
+    t->dim[2] = d2;
+}
+
+int ds4_test_mellum_layout_refusal(uint32_t token_embd_type,
+                                   uint32_t attn_q_type,
+                                   uint32_t router_type,
+                                   uint32_t gate_type, uint32_t up_type,
+                                   uint32_t down_type,
+                                   char *msg, size_t msg_cap) {
+    if (msg && msg_cap) msg[0] = '\0';
+    int fds[2];
+    if (pipe(fds) != 0) return -1;
+    fflush(NULL);
+    const pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return -1; }
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], 2);
+        g_ds4_shape = DS4_SHAPE_MELLUM2;
+        const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+        const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+        ds4_weights *w = calloc(1, sizeof(*w));
+        ds4_tensor *t = calloc(16, sizeof(*t));
+        if (!w || !t) _exit(3);
+        ds4_tensor *te = &t[0];
+        ds4_test_fake_tensor_fill(te, "token_embd.weight", token_embd_type, 2,
+                                  DS4_N_EMBD, DS4_N_VOCAB, 0);
+        w->token_embd = te;
+        ds4_layer_weights *l = &w->layer[0];
+        ds4_test_fake_tensor_fill(&t[1], "blk.0.attn_norm.weight", DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        ds4_test_fake_tensor_fill(&t[2], "blk.0.attn_q.weight", attn_q_type, 2, DS4_N_EMBD, q_dim, 0);
+        ds4_test_fake_tensor_fill(&t[3], "blk.0.attn_q_norm.weight", DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
+        ds4_test_fake_tensor_fill(&t[4], "blk.0.attn_k.weight", DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, kv_dim, 0);
+        ds4_test_fake_tensor_fill(&t[5], "blk.0.attn_k_norm.weight", DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
+        ds4_test_fake_tensor_fill(&t[6], "blk.0.attn_v.weight", DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, kv_dim, 0);
+        ds4_test_fake_tensor_fill(&t[7], "blk.0.attn_output.weight", DS4_TENSOR_Q8_0, 2, q_dim, DS4_N_EMBD, 0);
+        ds4_test_fake_tensor_fill(&t[8], "blk.0.ffn_norm.weight", DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        ds4_test_fake_tensor_fill(&t[9], "blk.0.ffn_gate_inp.weight", router_type, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+        ds4_test_fake_tensor_fill(&t[10], "blk.0.ffn_gate_exps.weight", gate_type, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        ds4_test_fake_tensor_fill(&t[11], "blk.0.ffn_up_exps.weight", up_type, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        ds4_test_fake_tensor_fill(&t[12], "blk.0.ffn_down_exps.weight", down_type, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+        l->attn_norm = &t[1]; l->attn_q = &t[2]; l->attn_q_norm = &t[3];
+        l->attn_k = &t[4]; l->attn_k_norm = &t[5]; l->attn_v = &t[6];
+        l->attn_output = &t[7]; l->ffn_norm = &t[8]; l->ffn_gate_inp = &t[9];
+        l->ffn_gate_exps = &t[10]; l->ffn_up_exps = &t[11]; l->ffn_down_exps = &t[12];
+        weights_validate_mellum_layout(w, 0, 0, true, false);
+        _exit(0);
+    }
+    close(fds[1]);
+    size_t got = 0;
+    char buf[256];
+    ssize_t n;
+    while ((n = read(fds[0], buf, sizeof(buf))) > 0) {
+        if (msg && msg_cap && got + 1 < msg_cap) {
+            size_t take = (size_t)n < msg_cap - 1 - got ? (size_t)n : msg_cap - 1 - got;
+            memcpy(msg + got, buf, take);
+            got += take;
+            msg[got] = '\0';
+        }
+    }
+    close(fds[0]);
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    if (!WIFEXITED(status)) return -1;
+    const int code = WEXITSTATUS(status);
+    return code == 0 ? 0 : (code == 1 ? 1 : -1);
 }
 
 int ds4_test_mellum_admit(uint64_t planned, uint64_t budget) {

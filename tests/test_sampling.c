@@ -557,7 +557,86 @@ static void check_mellum_memory_plan(void) {
     printf("mellum admit truth table: ok\n");
 }
 
+/*
+ * P24: which routed-expert type triples a Mellum file may carry.
+ *
+ * Both symbols live in ds4.c and are declared HERE, not in ds4.h, so the header
+ * closure hash the engine pin records is unchanged (the pin's hash therefore
+ * does not cover this surface -- stated in the P24 spec).  GGUF tensor type
+ * ids: F32 0, Q4_0 2, Q8_0 8, Q4_K 12, Q6_K 14.
+ */
+extern bool ds4_mellum_expert_types_supported(uint32_t gate, uint32_t up,
+                                              uint32_t down);
+/* Builds a one-layer synthetic Mellum weight table with the given tensor types
+ * and runs the REAL weights_validate_mellum_layout on it in a forked child
+ * (the validator exits on refusal).  Returns 0 accepted, 1 refused, and copies
+ * the child's stderr into msg. */
+extern int ds4_test_mellum_layout_refusal(uint32_t token_embd_type,
+                                          uint32_t attn_q_type,
+                                          uint32_t router_type,
+                                          uint32_t gate_type, uint32_t up_type,
+                                          uint32_t down_type,
+                                          char *msg, size_t msg_cap);
+
+enum { GGUF_F32 = 0, GGUF_Q4_0 = 2, GGUF_Q8_0 = 8, GGUF_Q4_K = 12, GGUF_Q6_K = 14 };
+
+static void check_mellum_expert_types(void) {
+    /* The two supported triples. */
+    CHECK(ds4_mellum_expert_types_supported(GGUF_Q8_0, GGUF_Q8_0, GGUF_Q8_0),
+          "(Q8_0,Q8_0,Q8_0) must be supported");
+    CHECK(ds4_mellum_expert_types_supported(GGUF_Q4_K, GGUF_Q4_K, GGUF_Q8_0),
+          "(Q4_K,Q4_K,Q8_0) must be supported");
+    /* Everything else is refused. */
+    CHECK(!ds4_mellum_expert_types_supported(GGUF_Q4_K, GGUF_Q4_K, GGUF_Q4_K),
+          "(Q4_K,Q4_K,Q4_K) must be refused: down is 896 wide, not K-quantizable");
+    CHECK(!ds4_mellum_expert_types_supported(GGUF_Q4_K, GGUF_Q8_0, GGUF_Q8_0),
+          "(Q4_K,Q8_0,Q8_0) must be refused: gate != up");
+    CHECK(!ds4_mellum_expert_types_supported(GGUF_Q8_0, GGUF_Q4_K, GGUF_Q8_0),
+          "(Q8_0,Q4_K,Q8_0) must be refused: gate != up");
+    CHECK(!ds4_mellum_expert_types_supported(GGUF_Q6_K, GGUF_Q6_K, GGUF_Q8_0),
+          "(Q6_K,Q6_K,Q8_0) must be refused: no Q6_K path");
+    CHECK(!ds4_mellum_expert_types_supported(GGUF_Q8_0, GGUF_Q8_0, GGUF_Q4_K),
+          "(Q8_0,Q8_0,Q4_K) must be refused");
+    CHECK(!ds4_mellum_expert_types_supported(GGUF_Q4_0, GGUF_Q4_0, GGUF_Q8_0),
+          "(Q4_0,Q4_0,Q8_0) must be refused");
+    CHECK(!ds4_mellum_expert_types_supported(GGUF_F32, GGUF_F32, GGUF_F32),
+          "(F32,F32,F32) must be refused");
+
+    /* The real layout validator, on synthetic tensors. */
+    char msg[1024];
+    CHECK(ds4_test_mellum_layout_refusal(GGUF_Q8_0, GGUF_Q8_0, GGUF_F32,
+              GGUF_Q8_0, GGUF_Q8_0, GGUF_Q8_0, msg, sizeof(msg)) == 0,
+          "all-Q8_0 layout must be accepted: %s", msg);
+    CHECK(ds4_test_mellum_layout_refusal(GGUF_Q8_0, GGUF_Q8_0, GGUF_F32,
+              GGUF_Q4_K, GGUF_Q4_K, GGUF_Q8_0, msg, sizeof(msg)) == 0,
+          "Q4_K gate/up over Q8_0 down layout must be accepted: %s", msg);
+    /* Refusals that must survive the relaxation. */
+    CHECK(ds4_test_mellum_layout_refusal(GGUF_Q8_0, GGUF_Q8_0, GGUF_F32,
+              GGUF_Q4_K, GGUF_Q4_K, GGUF_Q4_K, msg, sizeof(msg)) == 1,
+          "Q4_K down must be refused");
+    CHECK(strstr(msg, "supported") != NULL && strstr(msg, "down") != NULL,
+          "Q4_K down refusal must be the typed message, got: %s", msg);
+    CHECK(ds4_test_mellum_layout_refusal(GGUF_Q8_0, GGUF_Q8_0, GGUF_F32,
+              GGUF_Q4_K, GGUF_Q8_0, GGUF_Q8_0, msg, sizeof(msg)) == 1,
+          "gate Q4_K with up Q8_0 must be refused");
+    CHECK(ds4_test_mellum_layout_refusal(GGUF_Q8_0, GGUF_Q8_0, GGUF_F32,
+              GGUF_Q6_K, GGUF_Q6_K, GGUF_Q8_0, msg, sizeof(msg)) == 1,
+          "Q6_K gate/up must be refused");
+    CHECK(ds4_test_mellum_layout_refusal(GGUF_Q8_0, GGUF_Q4_K, GGUF_F32,
+              GGUF_Q4_K, GGUF_Q4_K, GGUF_Q8_0, msg, sizeof(msg)) == 1,
+          "a Q4_K attention tensor must still be refused");
+    CHECK(strstr(msg, "attn_q") != NULL,
+          "attention refusal must name the tensor, got: %s", msg);
+    CHECK(ds4_test_mellum_layout_refusal(GGUF_Q4_K, GGUF_Q8_0, GGUF_F32,
+              GGUF_Q4_K, GGUF_Q4_K, GGUF_Q8_0, msg, sizeof(msg)) == 1,
+          "a Q4_K token embedding must still be refused");
+    CHECK(ds4_test_mellum_layout_refusal(GGUF_Q8_0, GGUF_Q8_0, GGUF_Q8_0,
+              GGUF_Q4_K, GGUF_Q4_K, GGUF_Q8_0, msg, sizeof(msg)) == 1,
+          "a non-F32 router must still be refused");
+}
+
 int main(void) {
+    check_mellum_expert_types();
     check_mellum_memory_plan();
     check_sampling_defaults();
     check_speculative_distribution();
