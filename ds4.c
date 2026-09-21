@@ -78866,6 +78866,28 @@ static uint32_t ds4_mellum_probe_chunk(uint32_t fallback, uint32_t max_chunk) {
  * command batch boundaries fall, so bitwise equality is the expectation and
  * anything else is a finding.  Diagnostic only: no session, no sampling, no
  * emitted token.
+ *
+ * 2026-09-21 (P22, S2): the paragraph above is kept as it was written, and
+ * its first sentence is now false.  Porting d6e4808 gave the session sync a
+ * layer-major path: ds4_session_sync_internal's Mellum branch calls
+ * ds4_mellum_prefill_tokens over a per-session prefill workspace whenever the
+ * unsynced span is at least sync_batch_min_tokens (64) tokens, and that is
+ * the default.  A session does now reach the layer-major kernel.
+ *
+ * What this probe's path A still describes accurately is the *tokenwise*
+ * path -- bounded 32-token command batches around ds4_mellum_decode_token --
+ * which a session still takes in four cases: spans shorter than 64 tokens;
+ * the remainder after the chunk loop has consumed what it can; under
+ * DS4_MELLUM_SYNC_BATCH=0, which is the opt-out that forces it; and when the
+ * prefill workspace fails to allocate, where the sync falls back to it rather
+ * than failing.
+ *
+ * The probe's own arithmetic is untouched by that port -- both of its paths
+ * still call ds4_mellum_decode_token and still differ only in command batch
+ * boundaries -- so bitwise A/B equality remains the expectation and no gate
+ * this probe feeds moves.  A second probe shaped like the *new* session sync
+ * (layer-major chunks against tokenwise over the same span) is owed; it is
+ * backlog, not P22, and is not built here.
  */
 int ds4_engine_mellum_sync_vs_decode_probe(ds4_engine *e,
                                            FILE       *out,
