@@ -441,6 +441,36 @@ static void check_sampling_defaults(void) {
  * total per token = 132,676 */
 #define MELLUM_PREFILL_BYTES_PER_TOKEN UINT64_C(132676)
 
+/*
+ * P24: the memory plan is type-generic -- `weights` is the model file's tensor
+ * span, so a smaller file shrinks the plan by exactly the byte difference with
+ * nothing else added.  The two spans are the Q8_0 file's 12,921,828,352 (P20)
+ * and the mixed Q4_K-gate/up artifact's 9,222,452,224 (tools/mellum/README.md);
+ * the live plan line is checked against the same numbers by the P24 evidence.
+ */
+static void check_mellum_memory_plan_q4k_artifact(void) {
+    const uint64_t q8_span = UINT64_C(12921828352);
+    const uint64_t q4k_span = UINT64_C(9222452224);
+    ds4_test_mellum_memory a, b;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+    CHECK(ds4_test_mellum_memory_plan(8192, 0, q8_span, &a) == 0, "plan q8 span");
+    CHECK(ds4_test_mellum_memory_plan(8192, 0, q4k_span, &b) == 0, "plan q4k span");
+    CHECK(a.planned_bytes == UINT64_C(13083842112),
+          "q8 planned %llu != 13083842112 (P20 plan line)",
+          (unsigned long long)a.planned_bytes);
+    CHECK(b.planned_bytes == UINT64_C(9384465984),
+          "q4k planned %llu != 9384465984", (unsigned long long)b.planned_bytes);
+    CHECK(a.planned_bytes - b.planned_bytes == UINT64_C(3699376128),
+          "plan delta %llu != 3699376128",
+          (unsigned long long)(a.planned_bytes - b.planned_bytes));
+    CHECK(b.planned_bytes == q4k_span + b.decode_state_bytes + b.prefill_scratch_bytes,
+          "q4k planned is not weights + decode state + prefill scratch");
+    printf("mellum plan q4k artifact ctx=8192: planned=%llu delta_vs_q8=%llu\n",
+           (unsigned long long)b.planned_bytes,
+           (unsigned long long)(a.planned_bytes - b.planned_bytes));
+}
+
 static void check_mellum_memory_plan(void) {
     ds4_test_mellum_memory m;
     memset(&m, 0, sizeof(m));
@@ -638,6 +668,7 @@ static void check_mellum_expert_types(void) {
 int main(void) {
     check_mellum_expert_types();
     check_mellum_memory_plan();
+    check_mellum_memory_plan_q4k_artifact();
     check_sampling_defaults();
     check_speculative_distribution();
     const uint32_t semantic_n = 4096;
