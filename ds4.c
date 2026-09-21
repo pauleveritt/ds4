@@ -45423,13 +45423,38 @@ static void bpe_tokenize_text_glm4_segment(const ds4_vocab *vocab,
                                   bpe_vocab_sink, &sink);
 }
 
-/* Mellum (`tokenizer.ggml.pre = "mellum2"`) content pre-tokenization: the
- * GLM4 segmenter with the Mellum-only corrections above. */
+/* Mellum (`tokenizer.ggml.pre = "mellum2"`) content pre-tokenization.
+ *
+ * The snapshot's `tokenizer.json` pre_tokenizer is a Sequence of
+ * `Digits { individual_digits: true }` and then `ByteLevel { use_regex }`,
+ * so the digit split runs FIRST and the GPT-2 expression is applied to each
+ * split independently.  That ordering is observable: in "    0x1f" the four
+ * spaces are a whole split, so `\s+(?!\S)` matches all four, where applying
+ * the expression to the joined text would cut the last space off to start
+ * " 0".  P21's Q2 differential counted 56 of 4,000 strings diverging exactly
+ * this way; the loop below is the missing Digits stage. */
 static void mellum_segment_pieces(const char    *text,
                                   uint64_t       len,
                                   bpe_piece_sink emit,
                                   void          *ctx) {
-    bpe_tokenize_text_glm4_pieces(text, len, 1, true, emit, ctx);
+    uint64_t pos = 0;
+    while (pos < len) {
+        const uint64_t start = pos;
+        glm4_char_info cur = glm4_char_at(text, len, pos);
+        if (!cur.valid) break;
+        if (cur.is_number) {
+            pos = cur.next;                 /* one digit, one split */
+        } else {
+            while (pos < len) {
+                glm4_char_info scan = glm4_char_at(text, len, pos);
+                if (!scan.valid || scan.is_number) break;
+                pos = scan.next;
+            }
+        }
+        if (pos <= start) break;            /* every char advances; be sure */
+        bpe_tokenize_text_glm4_pieces(text + start, pos - start, 1, true,
+                                      emit, ctx);
+    }
 }
 
 static void bpe_tokenize_text_mellum(const ds4_vocab *vocab,

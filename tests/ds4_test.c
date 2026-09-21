@@ -9424,6 +9424,11 @@ static void test_mellum_content_segmentation(void) {
         { "a\tb",            "a" US "\t" US "b" },
         { "    Vocab",       "   " US " Vocab" },
 
+        /* Digits split first, so a whitespace run before a number is a split
+         * of its own and keeps its last space -- the 56 strings the
+         * differential could not classify. */
+        { "              32,", "              " US "3" US "2" US "," },
+        { "    0x1f,",         "    " US "0" US "x" US "1" US "f" US "," },
         { " 123abc",           " " US "1" US "2" US "3" US "abc" },
         { "a1b2",              "a" US "1" US "b" US "2" },
         { "x = 1",             "x" US " =" US " " US "1" },
