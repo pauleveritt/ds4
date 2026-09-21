@@ -843,6 +843,80 @@ kernel void kernel_glm_q4_K_pair_swiglu_f32(
 
 
 /*
+ * Mellum Q4_K gate/up pair, scalar rung K1 (P24): the correctness oracle for the
+ * fast Q4_K decode kernel, and the token-major Q4_K prefill kernel.  Same
+ * arithmetic and buffer layout as kernel_glm_q4_K_pair_swiglu_f32 (per-element
+ * ds4_glm_q4_K_value, strided 256-thread dot, tree reduce) with the two Mellum
+ * differences: no tensor-parallel ownership test, and the out-of-range-expert
+ * zero-fill the Mellum Q8_0 kernels have.  The GLM kernel guards only
+ * ds4_tp_owns_expert, which is true unconditionally at tp_world <= 1, so an
+ * out-of-range router id there is an out-of-bounds device read.  A separate
+ * kernel, not an edit of the GLM one: Laguna keeps its exact behaviour.
+ * The SwiGLU epilogue is the Q8_0 kernels' (g / (1 + exp(-g)) * u * weight).
+ * Grid (mid_dim, n_expert_used, n_tokens), 256 threads, 512 floats of scratch.
+ */
+kernel void kernel_mellum_q4_K_pair_swiglu_scalar_f32(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *gate,
+        device const char *up,
+        device const float *x,
+        device const int32_t *selected,
+        device const float *weights,
+        device float *mid,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    const uint ntg = 256u;
+    const uint row = tgpig.x;
+    const uint slot = tgpig.y;
+    const uint token = tgpig.z;
+    if (row >= args.mid_dim || slot >= args.n_expert_used || token >= args.n_tokens) return;
+
+    const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
+    const uint64_t mid_off = (uint64_t)token * args.mid_token_stride +
+                             (uint64_t)slot * args.mid_dim + row;
+    const int expert = selected[selected_off];
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tid == 0u) mid[mid_off] = 0.0f;
+        return;
+    }
+
+    device const block_q4_K *gate_row =
+        (device const block_q4_K *)(gate +
+            (uint64_t)(uint)expert * args.gate_expert_bytes +
+            (uint64_t)row * args.gate_row_bytes);
+    device const block_q4_K *up_row =
+        (device const block_q4_K *)(up +
+            (uint64_t)(uint)expert * args.up_expert_bytes +
+            (uint64_t)row * args.up_row_bytes);
+
+    float acc_gate = 0.0f;
+    float acc_up = 0.0f;
+    device const float *token_x = x + (uint64_t)token * args.in_dim;
+    for (uint k = tid; k < args.in_dim; k += ntg) {
+        const float xv = token_x[k];
+        acc_gate += ds4_glm_q4_K_value(gate_row, k) * xv;
+        acc_up += ds4_glm_q4_K_value(up_row, k) * xv;
+    }
+
+    scratch[tid] = acc_gate;
+    scratch[ntg + tid] = acc_up;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+            scratch[ntg + tid] += scratch[ntg + tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        const float g = scratch[0];
+        mid[mid_off] = g / (1.0f + exp(-g)) * scratch[ntg] * weights[selected_off];
+    }
+}
+
+/*
  * Shared Q8_0 row dot for the Mellum MoE kernels.  Four elements per step so
  * the block scale is converted once per four values instead of once per value.
  * Every Mellum MoE path uses it, so batch-equals-decode bitwise equality holds.

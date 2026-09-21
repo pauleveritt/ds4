@@ -2354,7 +2354,10 @@ static void test_metal_mellum_attention_prelude(void) {
     free(model);
 }
 
-static void test_metal_mellum_q8_layer(void) {
+/* q4k_gate_up = false is the original all-Q8_0 layer; true runs the SAME layer
+ * (same wiring, same tolerances) with Q4_K routed gate/up over a Q8_0 down and
+ * gate_up_type = Q4_K in the descriptor (P24). */
+static void test_metal_mellum_q8_layer_typed(bool q4k_gate_up) {
     /* Attention is deliberately zero-projected here: its independently tested
      * composition returns the residual unchanged, letting this test isolate
      * the complete layer's post-attention norm/router/MoE residual wiring. */
@@ -2368,7 +2371,8 @@ static void test_metal_mellum_q8_layer(void) {
     const uint64_t kv_bytes = (uint64_t)kv_dim * sizeof(float);
     const uint64_t q_row = (uint64_t)(n_embd / 32u) * 34u;
     const uint64_t out_row = (uint64_t)(q_dim / 32u) * 34u;
-    const uint64_t gate_row = (uint64_t)(n_embd / 32u) * 34u;
+    const uint64_t gate_row = q4k_gate_up ? (uint64_t)(n_embd / 256u) * 144u
+                                          : (uint64_t)(n_embd / 32u) * 34u;
     const uint64_t gate_expert = (uint64_t)mid_dim * gate_row;
     const uint64_t down_row = (uint64_t)(mid_dim / 32u) * 34u;
     const uint64_t down_expert = (uint64_t)n_embd * down_row;
@@ -2461,10 +2465,17 @@ static void test_metal_mellum_q8_layer(void) {
             }
         }
         for (uint32_t expert = 0; expert < n_total; expert++) {
-            test_fill_q8_0_weights((uint8_t *)model + gate_offset +
-                (uint64_t)expert * gate_expert, n_embd, mid_dim, expert + 11u);
-            test_fill_q8_0_weights((uint8_t *)model + up_offset +
-                (uint64_t)expert * gate_expert, n_embd, mid_dim, expert + 29u);
+            if (q4k_gate_up) {
+                test_fill_mellum_q4_k_weights((uint8_t *)model + gate_offset +
+                    (uint64_t)expert * gate_expert, n_embd, mid_dim, expert + 11u);
+                test_fill_mellum_q4_k_weights((uint8_t *)model + up_offset +
+                    (uint64_t)expert * gate_expert, n_embd, mid_dim, expert + 29u);
+            } else {
+                test_fill_q8_0_weights((uint8_t *)model + gate_offset +
+                    (uint64_t)expert * gate_expert, n_embd, mid_dim, expert + 11u);
+                test_fill_q8_0_weights((uint8_t *)model + up_offset +
+                    (uint64_t)expert * gate_expert, n_embd, mid_dim, expert + 29u);
+            }
             test_fill_q8_0_weights((uint8_t *)model + down_offset +
                 (uint64_t)expert * down_expert, mid_dim, n_embd, expert + 47u);
         }
@@ -2517,10 +2528,12 @@ static void test_metal_mellum_q8_layer(void) {
             const uint8_t *up = (uint8_t *)model + up_offset +
                 (uint64_t)expert * gate_expert;
             for (uint32_t row = 0; row < mid_dim; row++) {
-                const float g = test_mellum_q8_dot(gate + row * gate_row,
-                                                    n_embd, ffn_ref);
-                const float u = test_mellum_q8_dot(up + row * gate_row,
-                                                    n_embd, ffn_ref);
+                const float g = q4k_gate_up ?
+                    test_mellum_q4_dot(gate + row * gate_row, n_embd, ffn_ref) :
+                    test_mellum_q8_dot(gate + row * gate_row, n_embd, ffn_ref);
+                const float u = q4k_gate_up ?
+                    test_mellum_q4_dot(up + row * gate_row, n_embd, ffn_ref) :
+                    test_mellum_q8_dot(up + row * gate_row, n_embd, ffn_ref);
                 mid_ref[(uint64_t)slot * mid_dim + row] =
                     g / (1.0f + expf(-g)) * u * weights_ref[slot];
             }
@@ -2553,6 +2566,8 @@ static void test_metal_mellum_q8_layer(void) {
             .down_row_bytes = down_row, .expert_mid_dim = mid_dim,
             .n_expert = n_total, .n_expert_used = n_selected,
             .router_is_f32 = true,
+            .gate_up_type = q4k_gate_up ? DS4_GPU_MELLUM_GATE_UP_Q4_K
+                                        : DS4_GPU_MELLUM_GATE_UP_Q8_0,
         };
         TEST_ASSERT(ds4_gpu_tensor_write(hidden_t, 0, hidden, embd_bytes) != 0);
         TEST_ASSERT(ds4_gpu_set_model_map(model, model_bytes) != 0);
@@ -2748,6 +2763,14 @@ static void test_metal_mellum_q8_layer(void) {
     ds4_gpu_tensor_free(hidden_t); free(model);
 }
 
+static void test_metal_mellum_q8_layer(void) {
+    test_metal_mellum_q8_layer_typed(false);
+}
+
+static void test_metal_mellum_q4_layer(void) {
+    test_metal_mellum_q8_layer_typed(true);
+}
+
 static void test_metal_mellum_q4_q8_routed_moe(void) {
     /* 288 mirrors the relevant property of Mellum's 896 intermediate width:
      * Q8_0-compatible but not divisible by Q4_K's 256. Both projections also
@@ -2849,6 +2872,432 @@ static void test_metal_mellum_q4_q8_routed_moe(void) {
     free(out_ref); free(mid_ref); free(out_host); free(mid_host); free(x_host);
     ds4_gpu_tensor_free(weights); ds4_gpu_tensor_free(selected);
     ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(x);
+    free(model);
+}
+
+/* ------------------------------------------------------------------------
+ * P24: Q4_K gate/up + Q8_0 down routed MoE at the REAL Mellum shape
+ * (in 2,304 = 9 Q4_K blocks, mid 896, out 2,304, 64 experts).  The small test
+ * above uses 2 blocks and 4 experts, which never exercises an odd block count
+ * (9 is not a multiple of the simd kernel's 4-block stride), an expert id
+ * near the top of the table, or an out-of-range id.
+ *
+ * Weights are pseudo-random Q4_K blocks with varying d, dmin and all twelve
+ * scale bytes, sized like real weights (sigma ~0.05), so gate/up dots are O(1).
+ * References accumulate in double.  Only the experts a case selects are
+ * filled; every other expert stays zero.
+ * ---------------------------------------------------------------------- */
+static uint32_t test_lcg_next(uint32_t *s) {
+    *s = *s * 1664525u + 1013904223u;
+    return *s >> 8;
+}
+
+static void test_fill_mellum_q4_k_random(uint8_t *weights, uint32_t in_dim,
+                                         uint32_t rows, uint32_t seed) {
+    const uint32_t blocks = in_dim / 256u;
+    for (uint32_t row = 0; row < rows; row++) {
+        for (uint32_t block = 0; block < blocks; block++) {
+            test_mellum_block_q4_k *b = (test_mellum_block_q4_k *)(weights +
+                (uint64_t)row * blocks * sizeof(test_mellum_block_q4_k)) + block;
+            uint32_t st = seed * 2654435761u + row * 40503u + block * 9973u + 1u;
+            const float d = 2.0e-4f + 3.0e-4f * (float)(test_lcg_next(&st) % 1000u) / 1000.0f;
+            const float dmin = d * (6.0f + 3.0f * (float)(test_lcg_next(&st) % 1000u) / 1000.0f);
+            b->d = test_float_to_f16(d);
+            b->dmin = test_float_to_f16(dmin);
+            for (uint32_t i = 0; i < sizeof(b->scales); i++)
+                b->scales[i] = (uint8_t)test_lcg_next(&st);
+            for (uint32_t i = 0; i < sizeof(b->qs); i++)
+                b->qs[i] = (uint8_t)test_lcg_next(&st);
+        }
+    }
+}
+
+static double test_mellum_q4_dot_d(const uint8_t *row, uint32_t width,
+                                   const float *x) {
+    const test_mellum_block_q4_k *blocks = (const test_mellum_block_q4_k *)row;
+    double sum = 0.0;
+    for (uint32_t block = 0; block < width / 256u; block++) {
+        const test_mellum_block_q4_k *b = blocks + block;
+        const double d = (double)test_f16_to_f32(b->d);
+        const double dmin = (double)test_f16_to_f32(b->dmin);
+        for (uint32_t group = 0; group < 8u; group++) {
+            uint32_t scale, min;
+            if (group < 4u) {
+                scale = b->scales[group] & 63u;
+                min = b->scales[4u + group] & 63u;
+            } else {
+                scale = (b->scales[4u + group] & 15u) |
+                    ((b->scales[group - 4u] & 0xc0u) >> 2u);
+                min = (b->scales[4u + group] >> 4u) |
+                    ((b->scales[group] & 0xc0u) >> 2u);
+            }
+            for (uint32_t lane = 0; lane < 32u; lane++) {
+                const uint32_t byte = (group >> 1u) * 32u + lane;
+                const uint32_t q = (b->qs[byte] >> ((group & 1u) * 4u)) & 15u;
+                sum += (d * (double)scale * (double)q - dmin * (double)min) *
+                    (double)x[(uint64_t)block * 256u + group * 32u + lane];
+            }
+        }
+    }
+    return sum;
+}
+
+static double test_mellum_q8_dot_d(const uint8_t *row, uint32_t width,
+                                   const double *v) {
+    double sum = 0.0;
+    for (uint32_t b = 0; b < width / 32u; b++) {
+        uint16_t sbits;
+        memcpy(&sbits, row + (uint64_t)b * 34u, sizeof(sbits));
+        const double scale = (double)test_f16_to_f32(sbits);
+        const int8_t *qs = (const int8_t *)(row + (uint64_t)b * 34u + 2u);
+        for (uint32_t i = 0; i < 32u; i++) sum += scale * (double)qs[i] * v[b * 32u + i];
+    }
+    return sum;
+}
+
+typedef struct {
+    uint32_t in_dim, mid_dim, out_dim, n_total;
+    uint64_t gate_row, gate_expert, down_row, down_expert;
+    uint64_t gate_off, up_off, down_off, model_bytes;
+    void *model;
+} test_q4k_real;
+
+/* The experts the real-shape cases select from; every other expert is zero. */
+static const uint32_t test_q4k_filled[] = {0, 1, 5, 9, 17, 30, 33, 42, 47, 58, 62, 63};
+
+static bool test_q4k_real_build(test_q4k_real *f) {
+    memset(f, 0, sizeof(*f));
+    f->in_dim = 2304u; f->mid_dim = 896u; f->out_dim = 2304u; f->n_total = 64u;
+    const uint64_t page = (uint64_t)getpagesize();
+    f->gate_row = (uint64_t)(f->in_dim / 256u) * 144u;
+    f->gate_expert = (uint64_t)f->mid_dim * f->gate_row;
+    f->down_row = (uint64_t)(f->mid_dim / 32u) * 34u;
+    f->down_expert = (uint64_t)f->out_dim * f->down_row;
+    f->gate_off = 0;
+    f->up_off = test_round_up_u64(f->n_total * f->gate_expert, page);
+    f->down_off = test_round_up_u64(f->up_off + f->n_total * f->gate_expert, page);
+    f->model_bytes = test_round_up_u64(f->down_off + f->n_total * f->down_expert, page);
+    if (posix_memalign(&f->model, (size_t)page, (size_t)f->model_bytes) != 0) return false;
+    memset(f->model, 0, (size_t)f->model_bytes);
+    for (size_t i = 0; i < sizeof(test_q4k_filled) / sizeof(test_q4k_filled[0]); i++) {
+        const uint32_t e = test_q4k_filled[i];
+        test_fill_mellum_q4_k_random((uint8_t *)f->model + f->gate_off +
+            (uint64_t)e * f->gate_expert, f->in_dim, f->mid_dim, e + 1u);
+        test_fill_mellum_q4_k_random((uint8_t *)f->model + f->up_off +
+            (uint64_t)e * f->gate_expert, f->in_dim, f->mid_dim, e + 101u);
+        test_fill_q8_0_weights((uint8_t *)f->model + f->down_off +
+            (uint64_t)e * f->down_expert, f->mid_dim, f->out_dim, e + 31u);
+    }
+    return ds4_gpu_set_model_map(f->model, f->model_bytes) != 0;
+}
+
+/* Reference for one token: mid[slot][row] and out[row]; an out-of-range id
+ * contributes a zero mid row and nothing to out (what the Q8_0 kernels do). */
+static void test_q4k_real_reference(const test_q4k_real *f, const int32_t *sel,
+                                    const float *rw, uint32_t n_sel,
+                                    const float *x, float *mid_ref,
+                                    float *out_ref) {
+    double *mid_d = calloc((size_t)n_sel * f->mid_dim, sizeof(double));
+    double *out_d = calloc(f->out_dim, sizeof(double));
+    if (!mid_d || !out_d) { free(mid_d); free(out_d); return; }
+    for (uint32_t slot = 0; slot < n_sel; slot++) {
+        if (sel[slot] < 0 || (uint32_t)sel[slot] >= f->n_total) continue;
+        const uint32_t e = (uint32_t)sel[slot];
+        const uint8_t *gate = (const uint8_t *)f->model + f->gate_off + (uint64_t)e * f->gate_expert;
+        const uint8_t *up = (const uint8_t *)f->model + f->up_off + (uint64_t)e * f->gate_expert;
+        for (uint32_t row = 0; row < f->mid_dim; row++) {
+            const double g = test_mellum_q4_dot_d(gate + row * f->gate_row, f->in_dim, x);
+            const double u = test_mellum_q4_dot_d(up + row * f->gate_row, f->in_dim, x);
+            mid_d[(uint64_t)slot * f->mid_dim + row] =
+                g / (1.0 + exp(-g)) * u * (double)rw[slot];
+        }
+    }
+    for (uint32_t row = 0; row < f->out_dim; row++) {
+        double acc = 0.0;
+        for (uint32_t slot = 0; slot < n_sel; slot++) {
+            if (sel[slot] < 0 || (uint32_t)sel[slot] >= f->n_total) continue;
+            const uint8_t *down = (const uint8_t *)f->model + f->down_off +
+                (uint64_t)(uint32_t)sel[slot] * f->down_expert + row * f->down_row;
+            acc += test_mellum_q8_dot_d(down, f->mid_dim, mid_d + (uint64_t)slot * f->mid_dim);
+        }
+        out_d[row] = acc;
+    }
+    for (uint64_t i = 0; i < (uint64_t)n_sel * f->mid_dim; i++) mid_ref[i] = (float)mid_d[i];
+    for (uint32_t i = 0; i < f->out_dim; i++) out_ref[i] = (float)out_d[i];
+    free(out_d); free(mid_d);
+}
+
+/* One decode-shaped call of the Q4_K/Q8_0 primitive against the double
+ * reference.  D7 (preregistered): mid max_abs <= 4e-5, out max_abs <= 1e-4.
+ * Returns the observed maxima so a caller can compare rungs. */
+static void test_q4k_real_decode_case(const test_q4k_real *f, const int32_t *sel,
+                                      const float *rw, uint32_t n_sel,
+                                      const char *label, float *mid_max_out,
+                                      float *out_max_out) {
+    const uint64_t x_bytes = (uint64_t)f->in_dim * sizeof(float);
+    const uint64_t mid_bytes = (uint64_t)n_sel * f->mid_dim * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)f->out_dim * sizeof(float);
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(mid_bytes);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_bytes);
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc((uint64_t)n_sel * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc((uint64_t)n_sel * sizeof(float));
+    float *x_h = malloc((size_t)x_bytes), *mid_h = malloc((size_t)mid_bytes);
+    float *out_h = malloc((size_t)out_bytes), *mid_r = malloc((size_t)mid_bytes);
+    float *out_r = malloc((size_t)out_bytes);
+    const bool ok = x && mid && out && selected && weights && x_h && mid_h && out_h &&
+                    mid_r && out_r;
+    TEST_ASSERT(ok);
+    if (ok) {
+        for (uint32_t i = 0; i < f->in_dim; i++)
+            x_h[i] = (float)((int)((i * 19u + (i >> 2u) * 7u) % 41u) - 20) / 32.0f;
+        memset(mid_h, 0x7f, (size_t)mid_bytes); /* stale garbage: zero-fill must overwrite */
+        TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_h, x_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(mid, 0, mid_h, mid_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(selected, 0, sel, (uint64_t)n_sel * sizeof(int32_t)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(weights, 0, rw, (uint64_t)n_sel * sizeof(float)) != 0);
+        test_q4k_real_reference(f, sel, rw, n_sel, x_h, mid_r, out_r);
+        TEST_ASSERT(ds4_gpu_mellum_routed_moe_one_tensor(
+            out, mid, f->model, f->model_bytes, f->gate_off, f->up_off, f->down_off,
+            f->gate_expert, f->gate_row, f->down_expert, f->down_row, f->in_dim,
+            f->mid_dim, f->out_dim, selected, weights, f->n_total, n_sel, x) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(mid, 0, mid_h, mid_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_h, out_bytes) != 0);
+        const float mid_max = test_mellum_max_abs(mid_h, mid_r, n_sel * f->mid_dim);
+        const float out_max = test_mellum_max_abs(out_h, out_r, f->out_dim);
+        float ref_scale = 0.0f;
+        for (uint32_t i = 0; i < f->out_dim; i++) ref_scale = fmaxf(ref_scale, fabsf(out_r[i]));
+        fprintf(stderr, "ds4-test: Mellum Q4_K/Q8_0 real-shape decode [%s] n_sel=%u "
+                "mid_max_abs=%g out_max_abs=%g (max|out_ref|=%g)\n",
+                label, n_sel, (double)mid_max, (double)out_max, (double)ref_scale);
+        TEST_ASSERT(isfinite(mid_max) && isfinite(out_max));
+        TEST_ASSERT(mid_max <= 4.0e-5f);
+        TEST_ASSERT(out_max <= 1.0e-4f);
+        for (uint32_t slot = 0; slot < n_sel; slot++) {
+            if (sel[slot] >= 0 && (uint32_t)sel[slot] < f->n_total) continue;
+            /* out-of-range id: the row must be exactly zero, not stale or garbage */
+            uint32_t nonzero = 0;
+            for (uint32_t row = 0; row < f->mid_dim; row++)
+                nonzero += mid_h[(uint64_t)slot * f->mid_dim + row] != 0.0f;
+            if (nonzero) fprintf(stderr, "ds4-test: out-of-range slot %u (id %d): %u of %u mid values not zero\n",
+                                 slot, (int)sel[slot], nonzero, f->mid_dim);
+            TEST_ASSERT(nonzero == 0u);
+        }
+        if (mid_max_out) *mid_max_out = mid_max;
+        if (out_max_out) *out_max_out = out_max;
+    }
+    free(out_r); free(mid_r); free(out_h); free(mid_h); free(x_h);
+    ds4_gpu_tensor_free(weights); ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(x);
+}
+
+static void test_metal_mellum_q4_real_shape_decode(void) {
+    test_q4k_real f;
+    const bool built = test_q4k_real_build(&f);
+    TEST_ASSERT(built);
+    if (built) {
+        const int32_t sel8[8] = {63, 0, 17, 5, 42, 30, 9, 58};
+        const float rw8[8] = {0.31f, 0.05f, 0.22f, 0.12f, 0.08f, 0.17f, 0.09f, 0.14f};
+        test_q4k_real_decode_case(&f, sel8, rw8, 8u, "top8 ids 0..63", NULL, NULL);
+        const int32_t sel1a[1] = {63};
+        const int32_t sel1b[1] = {0};
+        const float rw1[1] = {0.5f};
+        test_q4k_real_decode_case(&f, sel1a, rw1, 1u, "one id 63", NULL, NULL);
+        test_q4k_real_decode_case(&f, sel1b, rw1, 1u, "one id 0", NULL, NULL);
+        /* Out-of-range router ids: negative and >= n_total_expert.  The Q8_0
+         * kernels zero-fill these slots; the scalar Q4_K kernel used to index
+         * out of bounds (P24 review B3). */
+        const int32_t sel_oor[8] = {5, -1, 17, 64, 0, 200, 63, 9};
+        test_q4k_real_decode_case(&f, sel_oor, rw8, 8u, "out-of-range ids -1, 64, 200", NULL, NULL);
+    }
+    free(f.model);
+}
+
+/*
+ * The token-major Q4_K batch wrapper (P24a's prefill route) at the real shape.
+ * Correctness: n_tokens 1 and 3 against the double reference (D7 bounds).
+ * Consistency: every token of an n_tokens 1/3/33/257 batch against the decode
+ * primitive on that token, bit for bit (the batch kernels are the decode kernel
+ * with grid z = token, and the down reduction order is the same).
+ */
+static void test_metal_mellum_q4_real_shape_batch(void) {
+    test_q4k_real f;
+    const bool built = test_q4k_real_build(&f);
+    TEST_ASSERT(built);
+    const uint32_t counts[4] = {1u, 3u, 33u, 257u};
+    const uint32_t n_sel = 8u;
+    for (uint32_t ci = 0; built && ci < 4u; ci++) {
+        const uint32_t nt = counts[ci];
+        const uint64_t x_bytes = (uint64_t)nt * f.in_dim * sizeof(float);
+        const uint64_t mid_tok = (uint64_t)n_sel * f.mid_dim * sizeof(float);
+        const uint64_t out_tok = (uint64_t)f.out_dim * sizeof(float);
+        const uint64_t sel_tok = (uint64_t)n_sel * sizeof(int32_t);
+        const uint64_t w_tok = (uint64_t)n_sel * sizeof(float);
+        ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
+        ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(nt * mid_tok);
+        ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(nt * out_tok);
+        ds4_gpu_tensor *sel = ds4_gpu_tensor_alloc(nt * sel_tok);
+        ds4_gpu_tensor *wts = ds4_gpu_tensor_alloc(nt * w_tok);
+        float *x_h = malloc((size_t)x_bytes), *mid_h = malloc(nt * mid_tok);
+        float *out_h = malloc(nt * out_tok), *mid_r = malloc(nt * mid_tok);
+        float *out_r = malloc(nt * out_tok);
+        int32_t *sel_h = malloc(nt * sel_tok);
+        float *w_h = malloc(nt * w_tok);
+        const bool ok = x && mid && out && sel && wts && x_h && mid_h && out_h &&
+                        mid_r && out_r && sel_h && w_h;
+        TEST_ASSERT(ok);
+        if (ok) {
+            for (uint32_t t = 0; t < nt; t++) {
+                for (uint32_t i = 0; i < f.in_dim; i++)
+                    x_h[(uint64_t)t * f.in_dim + i] =
+                        (float)((int)((i * 19u + (i >> 2u) * 7u) % 41u) - 20) / 32.0f +
+                        (float)(t % 11u) / 97.0f;
+                for (uint32_t sl = 0; sl < n_sel; sl++) {
+                    sel_h[t * n_sel + sl] = (int32_t)test_q4k_filled[(t + sl) % 12u];
+                    w_h[t * n_sel + sl] = 0.05f + 0.03f * (float)((t * 7u + sl * 3u) % 9u);
+                }
+            }
+            TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_h, x_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(sel, 0, sel_h, nt * sel_tok) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(wts, 0, w_h, nt * w_tok) != 0);
+            TEST_ASSERT(ds4_gpu_mellum_routed_moe_batch_tensor(
+                out, mid, f.model, f.model_bytes, f.gate_off, f.up_off, f.down_off,
+                f.gate_expert, f.gate_row, f.down_expert, f.down_row, f.in_dim,
+                f.mid_dim, f.out_dim, sel, wts, f.n_total, n_sel, x, nt) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(mid, 0, mid_h, nt * mid_tok) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_h, nt * out_tok) != 0);
+            float worst_mid = 0.0f, worst_out = 0.0f;
+            if (nt <= 3u) {
+                for (uint32_t t = 0; t < nt; t++) {
+                    test_q4k_real_reference(&f, sel_h + t * n_sel, w_h + t * n_sel, n_sel,
+                        x_h + (uint64_t)t * f.in_dim, mid_r + (uint64_t)t * n_sel * f.mid_dim,
+                        out_r + (uint64_t)t * f.out_dim);
+                }
+                worst_mid = test_mellum_max_abs(mid_h, mid_r, nt * n_sel * f.mid_dim);
+                worst_out = test_mellum_max_abs(out_h, out_r, nt * f.out_dim);
+                fprintf(stderr, "ds4-test: Mellum Q4_K/Q8_0 real-shape batch n_tokens=%u vs "
+                        "reference mid_max_abs=%g out_max_abs=%g\n", nt,
+                        (double)worst_mid, (double)worst_out);
+                TEST_ASSERT(worst_mid <= 4.0e-5f);
+                TEST_ASSERT(worst_out <= 1.0e-4f);
+            }
+            /* every token against the decode primitive, bitwise */
+            uint32_t bad_tokens = 0;
+            ds4_gpu_tensor *d_mid = ds4_gpu_tensor_alloc(mid_tok);
+            ds4_gpu_tensor *d_out = ds4_gpu_tensor_alloc(out_tok);
+            float *d_mid_h = malloc(mid_tok), *d_out_h = malloc(out_tok);
+            TEST_ASSERT(d_mid && d_out && d_mid_h && d_out_h);
+            for (uint32_t t = 0; d_mid && d_out && d_mid_h && d_out_h && t < nt; t++) {
+                ds4_gpu_tensor *one_x = ds4_gpu_tensor_view(x, (uint64_t)t * f.in_dim * sizeof(float),
+                                                            (uint64_t)f.in_dim * sizeof(float));
+                ds4_gpu_tensor *one_s = ds4_gpu_tensor_view(sel, t * sel_tok, sel_tok);
+                ds4_gpu_tensor *one_w = ds4_gpu_tensor_view(wts, t * w_tok, w_tok);
+                TEST_ASSERT(one_x && one_s && one_w);
+                if (one_x && one_s && one_w) {
+                    TEST_ASSERT(ds4_gpu_mellum_routed_moe_one_tensor(
+                        d_out, d_mid, f.model, f.model_bytes, f.gate_off, f.up_off,
+                        f.down_off, f.gate_expert, f.gate_row, f.down_expert, f.down_row,
+                        f.in_dim, f.mid_dim, f.out_dim, one_s, one_w, f.n_total, n_sel,
+                        one_x) != 0);
+                    TEST_ASSERT(ds4_gpu_tensor_read(d_mid, 0, d_mid_h, mid_tok) != 0);
+                    TEST_ASSERT(ds4_gpu_tensor_read(d_out, 0, d_out_h, out_tok) != 0);
+                    if (memcmp(d_mid_h, mid_h + (uint64_t)t * n_sel * f.mid_dim, mid_tok) != 0 ||
+                        memcmp(d_out_h, out_h + (uint64_t)t * f.out_dim, out_tok) != 0)
+                        bad_tokens++;
+                }
+                ds4_gpu_tensor_free(one_w); ds4_gpu_tensor_free(one_s); ds4_gpu_tensor_free(one_x);
+            }
+            fprintf(stderr, "ds4-test: Mellum Q4_K/Q8_0 real-shape batch n_tokens=%u vs decode: "
+                    "%u tokens not bit-identical\n", nt, bad_tokens);
+            TEST_ASSERT(bad_tokens == 0u);
+            free(d_out_h); free(d_mid_h);
+            ds4_gpu_tensor_free(d_out); ds4_gpu_tensor_free(d_mid);
+        }
+        free(w_h); free(sel_h); free(out_r); free(mid_r); free(out_h); free(mid_h); free(x_h);
+        ds4_gpu_tensor_free(wts); ds4_gpu_tensor_free(sel); ds4_gpu_tensor_free(out);
+        ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(x);
+    }
+    free(f.model);
+}
+
+/* Capture what a call writes to stderr, to prove a rejected shape is LOUD. */
+typedef struct { int saved; FILE *tf; } test_stderr_capture;
+static bool test_stderr_capture_begin(test_stderr_capture *c) {
+    fflush(stderr);
+    c->tf = tmpfile();
+    c->saved = dup(2);
+    if (!c->tf || c->saved < 0) return false;
+    return dup2(fileno(c->tf), 2) >= 0;
+}
+static void test_stderr_capture_end(test_stderr_capture *c, char *buf, size_t cap) {
+    fflush(stderr);
+    dup2(c->saved, 2);
+    close(c->saved);
+    rewind(c->tf);
+    size_t n = fread(buf, 1, cap - 1, c->tf);
+    buf[n] = '\0';
+    fclose(c->tf);
+}
+
+/* P24 review B2: the Q8_0 wrappers used to `return 0` on a Q4_K stride with no
+ * diagnostic, and a Q4_K wrapper fed Q8_0 strides must not succeed silently
+ * either.  Each mismatch must fail (0) AND say why on stderr. */
+static void test_metal_mellum_moe_wrong_type_is_loud(void) {
+    const uint32_t in_dim = 2304u, mid_dim = 896u, out_dim = 2304u;
+    const uint32_t n_total = 64u, n_sel = 8u, n_tokens = 2u;
+    const uint64_t q4_gate_row = (uint64_t)(in_dim / 256u) * 144u;
+    const uint64_t q8_gate_row = (uint64_t)(in_dim / 32u) * 34u;
+    const uint64_t down_row = (uint64_t)(mid_dim / 32u) * 34u;
+    const uint64_t down_expert = (uint64_t)out_dim * down_row;
+    /* A shape rejection returns before any model byte is read. */
+    const uint64_t model_bytes = 4u * (uint64_t)getpagesize();
+    void *model = NULL;
+    TEST_ASSERT(posix_memalign(&model, (size_t)getpagesize(), (size_t)model_bytes) == 0);
+    if (!model) return;
+    memset(model, 0, (size_t)model_bytes);
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)n_tokens * in_dim * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_sel * mid_dim * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)n_tokens * out_dim * sizeof(float));
+    ds4_gpu_tensor *sel = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_sel * sizeof(int32_t));
+    ds4_gpu_tensor *wts = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_sel * sizeof(float));
+    TEST_ASSERT(x && mid && out && sel && wts);
+    if (x && mid && out && sel && wts) {
+        TEST_ASSERT(ds4_gpu_set_model_map(model, model_bytes) != 0);
+        char msg[2048];
+        test_stderr_capture cap;
+        /* Q8_0 batch wrapper, Q4_K strides. */
+        TEST_ASSERT(test_stderr_capture_begin(&cap));
+        const int r1 = ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
+            out, mid, model, model_bytes, 0, 0, 0, (uint64_t)mid_dim * q4_gate_row,
+            q4_gate_row, down_expert, down_row, in_dim, mid_dim, out_dim, sel, wts,
+            n_total, n_sel, x, n_tokens);
+        test_stderr_capture_end(&cap, msg, sizeof(msg));
+        TEST_ASSERT(r1 == 0);
+        TEST_ASSERT(strstr(msg, "gate_row_bytes") != NULL);
+        fprintf(stderr, "ds4-test: Q8_0 batch wrapper fed Q4_K strides -> %d, stderr: %s", r1, msg);
+        /* Q8_0 decode wrapper, Q4_K strides. */
+        TEST_ASSERT(test_stderr_capture_begin(&cap));
+        const int r2 = ds4_gpu_mellum_q8_0_routed_moe_one_tensor(
+            out, mid, model, model_bytes, 0, 0, 0, (uint64_t)mid_dim * q4_gate_row,
+            q4_gate_row, down_expert, down_row, in_dim, mid_dim, out_dim, sel, wts,
+            n_total, n_sel, x);
+        test_stderr_capture_end(&cap, msg, sizeof(msg));
+        TEST_ASSERT(r2 == 0);
+        TEST_ASSERT(strstr(msg, "gate_row_bytes") != NULL);
+        fprintf(stderr, "ds4-test: Q8_0 decode wrapper fed Q4_K strides -> %d, stderr: %s", r2, msg);
+        /* Q4_K decode wrapper, Q8_0 strides. */
+        TEST_ASSERT(test_stderr_capture_begin(&cap));
+        const int r3 = ds4_gpu_mellum_routed_moe_one_tensor(
+            out, mid, model, model_bytes, 0, 0, 0, (uint64_t)mid_dim * q8_gate_row,
+            q8_gate_row, down_expert, down_row, in_dim, mid_dim, out_dim, sel, wts,
+            n_total, n_sel, x);
+        test_stderr_capture_end(&cap, msg, sizeof(msg));
+        TEST_ASSERT(r3 == 0);
+        TEST_ASSERT(strstr(msg, "gate_row_bytes") != NULL);
+        fprintf(stderr, "ds4-test: Q4_K decode wrapper fed Q8_0 strides -> %d, stderr: %s", r3, msg);
+    }
+    ds4_gpu_tensor_free(wts); ds4_gpu_tensor_free(sel); ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(x);
     free(model);
 }
 
@@ -7467,7 +7916,11 @@ static void test_metal_kernel_group(void) {
     test_metal_mellum_gqa_prefill();
     test_metal_mellum_attention_prelude();
     test_metal_mellum_q8_layer();
+    test_metal_mellum_q4_layer();
     test_metal_mellum_q4_q8_routed_moe();
+    test_metal_mellum_q4_real_shape_decode();
+    test_metal_mellum_q4_real_shape_batch();
+    test_metal_mellum_moe_wrong_type_is_loud();
     test_metal_mellum_q8_q8_routed_moe();
     test_metal_mellum_batch_layer_offset_tables();
     test_metal_q8_0_output_nr4_exact();

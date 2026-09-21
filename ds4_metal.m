@@ -591,6 +591,7 @@ static id<MTLComputePipelineState> g_glm_q3_k_down_addr_test_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_down_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_pair_swiglu_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_down_f32_pipeline;
+static id<MTLComputePipelineState> g_mellum_q4_K_pair_swiglu_scalar_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_pair_swiglu_batch_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_down_batch_f32_pipeline;
 static id<MTLComputePipelineState> g_mellum_q8_0_pair_swiglu_grouped_f32_pipeline;
@@ -12398,6 +12399,7 @@ void ds4_gpu_cleanup(void) {
         g_glm_q4_k_down_f32_pipeline = nil;
         g_mellum_q8_0_pair_swiglu_f32_pipeline = nil;
         g_mellum_q8_0_down_f32_pipeline = nil;
+        g_mellum_q4_K_pair_swiglu_scalar_f32_pipeline = nil;
         g_mellum_q8_0_pair_swiglu_batch_f32_pipeline = nil;
         g_mellum_q8_0_down_batch_f32_pipeline = nil;
         g_mellum_router_select_one_pipeline = nil;
@@ -40333,6 +40335,14 @@ int ds4_gpu_mellum_attention_prefill_tensor(
                               (uint32_t)hidden_values) != 0;
 }
 
+/* A descriptor type outside the two known values is refused with a message,
+ * never treated as Q8_0 (P24: no silent fallthrough into the wrong kernels). */
+static bool ds4_gpu_mellum_gate_up_type_known(uint32_t t) {
+    if (t == DS4_GPU_MELLUM_GATE_UP_Q8_0 || t == DS4_GPU_MELLUM_GATE_UP_Q4_K) return true;
+    fprintf(stderr, "ds4: Metal Mellum layer descriptor has unknown gate_up_type %u\n", t);
+    return false;
+}
+
 int ds4_gpu_mellum_q8_0_layer_decode_tensor(
         ds4_gpu_tensor                         *out,
         ds4_gpu_tensor                         *attention_out,
@@ -40366,6 +40376,7 @@ int ds4_gpu_mellum_q8_0_layer_decode_tensor(
         desc->attention.n_embd == 0 || desc->expert_mid_dim == 0 ||
         desc->n_expert == 0 || desc->n_expert > 256u ||
         desc->n_expert_used == 0 || desc->n_expert_used > desc->n_expert ||
+        !ds4_gpu_mellum_gate_up_type_known(desc->gate_up_type) ||
         ds4_gpu_tensor_bytes(out) <
             (uint64_t)desc->attention.n_embd * sizeof(float) ||
         ds4_gpu_tensor_bytes(attention_out) <
@@ -40405,13 +40416,21 @@ int ds4_gpu_mellum_q8_0_layer_decode_tensor(
            ds4_gpu_mellum_router_select_tensor(
                router_selected, router_weights, router_probs, router_logits,
                desc->n_expert, desc->n_expert_used) != 0 &&
-           ds4_gpu_mellum_q8_0_routed_moe_one_tensor(
+           (desc->gate_up_type == DS4_GPU_MELLUM_GATE_UP_Q4_K ?
+                ds4_gpu_mellum_routed_moe_one_tensor(
                moe_out, moe_mid, model_map, model_size, desc->gate_offset,
                desc->up_offset, desc->down_offset, desc->gate_expert_bytes,
                desc->gate_row_bytes, desc->down_expert_bytes,
                desc->down_row_bytes, n_embd, desc->expert_mid_dim, n_embd,
                router_selected, router_weights, desc->n_expert,
-               desc->n_expert_used, ffn_norm) != 0 &&
+               desc->n_expert_used, ffn_norm) :
+                ds4_gpu_mellum_q8_0_routed_moe_one_tensor(
+               moe_out, moe_mid, model_map, model_size, desc->gate_offset,
+               desc->up_offset, desc->down_offset, desc->gate_expert_bytes,
+               desc->gate_row_bytes, desc->down_expert_bytes,
+               desc->down_row_bytes, n_embd, desc->expert_mid_dim, n_embd,
+               router_selected, router_weights, desc->n_expert,
+               desc->n_expert_used, ffn_norm)) != 0 &&
            ds4_gpu_add_tensor(out, attention_out, moe_out, n_embd) != 0;
 }
 
@@ -40435,6 +40454,7 @@ int ds4_gpu_mellum_q8_0_layer_prefill_tensor(
         n_tokens == 0 || desc->attention.n_embd == 0 ||
         desc->expert_mid_dim == 0 || desc->n_expert == 0 ||
         desc->n_expert_used == 0 || desc->n_expert_used > desc->n_expert ||
+        !ds4_gpu_mellum_gate_up_type_known(desc->gate_up_type) ||
         n_tokens > UINT32_MAX / desc->attention.n_embd) return 0;
     const uint32_t n_embd = desc->attention.n_embd;
     const uint64_t hidden_bytes = (uint64_t)n_tokens * n_embd * sizeof(float);
@@ -40472,13 +40492,21 @@ int ds4_gpu_mellum_q8_0_layer_prefill_tensor(
            ds4_gpu_mellum_router_select_batch_tensor(
                router_selected, router_weights, router_probs, router_logits,
                desc->n_expert, desc->n_expert_used, n_tokens) != 0 &&
-           ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
+           (desc->gate_up_type == DS4_GPU_MELLUM_GATE_UP_Q4_K ?
+                ds4_gpu_mellum_routed_moe_batch_tensor(
                moe_out, moe_mid, model_map, model_size, desc->gate_offset,
                desc->up_offset, desc->down_offset, desc->gate_expert_bytes,
                desc->gate_row_bytes, desc->down_expert_bytes,
                desc->down_row_bytes, n_embd, desc->expert_mid_dim, n_embd,
                router_selected, router_weights, desc->n_expert,
-               desc->n_expert_used, ffn_norm, n_tokens) != 0 &&
+               desc->n_expert_used, ffn_norm, n_tokens) :
+                ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
+               moe_out, moe_mid, model_map, model_size, desc->gate_offset,
+               desc->up_offset, desc->down_offset, desc->gate_expert_bytes,
+               desc->gate_row_bytes, desc->down_expert_bytes,
+               desc->down_row_bytes, n_embd, desc->expert_mid_dim, n_embd,
+               router_selected, router_weights, desc->n_expert,
+               desc->n_expert_used, ffn_norm, n_tokens)) != 0 &&
            ds4_gpu_add_tensor(out, attention_out, moe_out,
                               n_tokens * n_embd) != 0;
 }
@@ -40603,6 +40631,44 @@ int ds4_gpu_mellum_router_select_batch_tensor(
     return 1;
 }
 
+/*
+ * P24 review B2: a Mellum MoE wrapper is written for ONE gate/up storage type,
+ * and a caller that hands it the other type's strides used to get a bare
+ * `return 0` with no diagnostic.  This names the mismatch on stderr.  Returns
+ * true (after printing) when the strides do not describe `wrapper_type` rows;
+ * the wrappers' own validation still runs after it and stays authoritative.
+ * gate_block_elems / gate_block_bytes: Q8_0 32 / 34, Q4_K 256 / 144.  Down is
+ * always Q8_0 (32 / 34).
+ */
+static bool ds4_gpu_mellum_moe_stride_mismatch(
+        const char *wrapper, const char *wrapper_type,
+        uint32_t gate_block_elems, uint32_t gate_block_bytes,
+        uint32_t in_dim, uint32_t mid_dim, uint64_t gate_row_bytes,
+        uint64_t gate_expert_bytes, uint64_t down_row_bytes) {
+    if (in_dim == 0 || mid_dim == 0) return false;
+    const bool in_ok = (in_dim % gate_block_elems) == 0;
+    const bool mid_ok = (mid_dim % 32u) == 0;
+    const uint64_t want_gate_row = in_ok ?
+        (uint64_t)(in_dim / gate_block_elems) * gate_block_bytes : 0;
+    const uint64_t want_down_row = mid_ok ? (uint64_t)(mid_dim / 32u) * 34u : 0;
+    if (in_ok && mid_ok && gate_row_bytes == want_gate_row &&
+        down_row_bytes == want_down_row &&
+        gate_expert_bytes == (uint64_t)mid_dim * gate_row_bytes) return false;
+    fprintf(stderr,
+            "ds4: Metal Mellum %s routed MoE (%s gate/up, Q8_0 down) rejected "
+            "the layout: in_dim %u (need a multiple of %u), mid_dim %u, "
+            "gate_row_bytes %llu (want %llu), gate_expert_bytes %llu "
+            "(want %llu), down_row_bytes %llu (want %llu).  A layer whose "
+            "gate/up is the other type must be routed by the descriptor's "
+            "gate_up_type, not fed to this wrapper.\n",
+            wrapper, wrapper_type, in_dim, gate_block_elems, mid_dim,
+            (unsigned long long)gate_row_bytes, (unsigned long long)want_gate_row,
+            (unsigned long long)gate_expert_bytes,
+            (unsigned long long)((uint64_t)mid_dim * want_gate_row),
+            (unsigned long long)down_row_bytes, (unsigned long long)want_down_row);
+    return true;
+}
+
 int ds4_gpu_mellum_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
@@ -40624,6 +40690,9 @@ int ds4_gpu_mellum_routed_moe_one_tensor(
         uint32_t                n_expert,
         const ds4_gpu_tensor *x) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (ds4_gpu_mellum_moe_stride_mismatch(
+            "decode", "Q4_K", 256u, 144u, expert_in_dim, expert_mid_dim,
+            gate_row_bytes, gate_expert_bytes, down_row_bytes)) return 0;
     if (!out || !mid || !model_map || !selected || !weights || !x ||
         n_total_expert == 0 || n_expert == 0 || n_expert > n_total_expert ||
         /* Down scratch is n_expert * 256 floats; keep it inside 32 KiB. */
@@ -40680,9 +40749,16 @@ int ds4_gpu_mellum_routed_moe_one_tensor(
             model_map, model_size, down_offset, down_bytes, &down_inner);
         if (!gatebuf || !upbuf || !downbuf) return 0;
 
+        /* K1, the scalar rung (P24): the Mellum-guarded copy of the GLM scalar
+         * kernel, so an out-of-range router id zero-fills instead of reading
+         * out of bounds (review B3). */
+        if (!g_mellum_q4_K_pair_swiglu_scalar_f32_pipeline) {
+            g_mellum_q4_K_pair_swiglu_scalar_f32_pipeline = ds4_gpu_get_pipeline(
+                "kernel_mellum_q4_K_pair_swiglu_scalar_f32");
+        }
         id<MTLComputePipelineState> pair_pipeline = ds4_gpu_hot_pipeline(
-            g_glm_q4_k_pair_swiglu_f32_pipeline,
-            "kernel_glm_q4_K_pair_swiglu_f32");
+            g_mellum_q4_K_pair_swiglu_scalar_f32_pipeline,
+            "kernel_mellum_q4_K_pair_swiglu_scalar_f32");
         if (!g_mellum_q8_0_down_f32_pipeline) {
             g_mellum_q8_0_down_f32_pipeline =
                 ds4_gpu_get_pipeline("kernel_mellum_q8_0_down_f32");
@@ -40770,6 +40846,9 @@ int ds4_gpu_mellum_q8_0_routed_moe_one_tensor(
         uint32_t                n_expert,
         const ds4_gpu_tensor *x) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (ds4_gpu_mellum_moe_stride_mismatch(
+            "decode", "Q8_0", 32u, 34u, expert_in_dim, expert_mid_dim,
+            gate_row_bytes, gate_expert_bytes, down_row_bytes)) return 0;
     if (!out || !mid || !model_map || !selected || !weights || !x ||
         n_total_expert == 0 || n_expert == 0 || n_expert > n_total_expert ||
         /* Down scratch is n_expert * 256 floats; keep it inside 32 KiB. */
@@ -41139,6 +41218,9 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
         uint32_t n_total_expert, uint32_t n_expert, const ds4_gpu_tensor *x,
         uint32_t n_tokens) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (ds4_gpu_mellum_moe_stride_mismatch(
+            "batch", "Q8_0", 32u, 34u, expert_in_dim, expert_mid_dim,
+            gate_row_bytes, gate_expert_bytes, down_row_bytes)) return 0;
     if (!out || !mid || !model_map || !selected || !weights || !x ||
         n_total_expert == 0 || n_expert == 0 || n_expert > n_total_expert ||
         /* Down scratch is n_expert * 256 floats; keep it inside 32 KiB. */
@@ -41399,6 +41481,167 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Mellum Q8_0 batch routed MoE"))
+            return 0;
+    }
+    return 1;
+}
+
+/*
+ * Token-major Q4_K gate/up + Q8_0 down Mellum MoE for a batch of tokens (P24a).
+ * The fallback route: it runs the scalar rung K1 with grid z = tokens and the
+ * existing Q8_0 token-major down kernel, exactly the shape of the Q8_0 wrapper
+ * with DS4_MELLUM_MOE_GEMM=0.  It is correct and NOT fast; the expert-major
+ * Q4_K kernel is P24b's.  Env: DS4_MELLUM_DOWN_ROWTILE is honoured as in the
+ * Q8_0 wrapper; DS4_MELLUM_MOE_GEMM / _GROUPED_MOE have no Q4_K path and are
+ * not consulted.
+ */
+int ds4_gpu_mellum_routed_moe_batch_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *mid, const void *model_map,
+        uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t down_offset, uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes, uint64_t down_expert_bytes,
+        uint64_t down_row_bytes, uint32_t expert_in_dim,
+        uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, const ds4_gpu_tensor *x,
+        uint32_t n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (ds4_gpu_mellum_moe_stride_mismatch(
+            "batch", "Q4_K", 256u, 144u, expert_in_dim, expert_mid_dim,
+            gate_row_bytes, gate_expert_bytes, down_row_bytes)) return 0;
+    if (!out || !mid || !model_map || !selected || !weights || !x ||
+        n_total_expert == 0 || n_expert == 0 || n_expert > n_total_expert ||
+        /* Down scratch is n_expert * 256 floats; keep it inside 32 KiB. */
+        n_expert > 32u ||
+        expert_in_dim == 0 || expert_mid_dim == 0 || out_dim == 0 || n_tokens == 0 ||
+        n_expert > UINT32_MAX / expert_mid_dim ||
+        (expert_in_dim % 256u) != 0 || (expert_mid_dim % 32u) != 0 ||
+        gate_row_bytes != (uint64_t)(expert_in_dim / 256u) * 144u ||
+        down_row_bytes != (uint64_t)(expert_mid_dim / 32u) * 34u ||
+        gate_expert_bytes != (uint64_t)expert_mid_dim * gate_row_bytes ||
+        down_expert_bytes != (uint64_t)out_dim * down_row_bytes) {
+        fprintf(stderr, "ds4: Metal Mellum Q4_K batch routed MoE rejected its arguments\n");
+        return 0;
+    }
+    if ((uint64_t)n_total_expert > UINT64_MAX / gate_expert_bytes ||
+        (uint64_t)n_total_expert > UINT64_MAX / down_expert_bytes) {
+        fprintf(stderr, "ds4: Metal Mellum Q4_K batch routed MoE tensor byte size overflow\n");
+        return 0;
+    }
+    const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
+    const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
+    if (gate_offset > model_size || gate_bytes > model_size - gate_offset ||
+        up_offset > model_size || gate_bytes > model_size - up_offset ||
+        down_offset > model_size || down_bytes > model_size - down_offset) {
+        fprintf(stderr, "ds4: Metal Mellum Q4_K batch routed MoE tensor range is outside the mapped model\n");
+        return 0;
+    }
+    const uint64_t x_values = (uint64_t)n_tokens * expert_in_dim;
+    const uint64_t route_values = (uint64_t)n_tokens * n_expert;
+    const uint64_t out_values = (uint64_t)n_tokens * out_dim;
+    if (x_values > UINT64_MAX / sizeof(float) ||
+        route_values > UINT64_MAX / expert_mid_dim ||
+        route_values > UINT64_MAX / sizeof(float) ||
+        out_values > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t mid_values = route_values * expert_mid_dim;
+    if (mid_values > UINT64_MAX / sizeof(float) ||
+        route_values > UINT64_MAX / sizeof(int32_t) ||
+        !ds4_gpu_tensor_buffer(x) || !ds4_gpu_tensor_buffer(mid) ||
+        !ds4_gpu_tensor_buffer(out) || !ds4_gpu_tensor_buffer(selected) ||
+        !ds4_gpu_tensor_buffer(weights) ||
+        ds4_gpu_tensor_bytes(x) < x_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(mid) < mid_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) < out_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(selected) < route_values * sizeof(int32_t) ||
+        ds4_gpu_tensor_bytes(weights) < route_values * sizeof(float)) {
+        fprintf(stderr, "ds4: Metal Mellum Q4_K batch routed MoE received undersized activation buffers\n");
+        return 0;
+    }
+    @autoreleasepool {
+        uint64_t gate_inner = 0, up_inner = 0, down_inner = 0;
+        id<MTLBuffer> gatebuf = ds4_gpu_wrap_model_exact_range(
+            model_map, model_size, gate_offset, gate_bytes, &gate_inner);
+        id<MTLBuffer> upbuf = ds4_gpu_wrap_model_exact_range(
+            model_map, model_size, up_offset, gate_bytes, &up_inner);
+        id<MTLBuffer> downbuf = ds4_gpu_wrap_model_exact_range(
+            model_map, model_size, down_offset, down_bytes, &down_inner);
+        if (!gatebuf || !upbuf || !downbuf) return 0;
+        if (!g_mellum_q4_K_pair_swiglu_scalar_f32_pipeline)
+            g_mellum_q4_K_pair_swiglu_scalar_f32_pipeline = ds4_gpu_get_pipeline(
+                "kernel_mellum_q4_K_pair_swiglu_scalar_f32");
+        if (!g_mellum_q8_0_down_batch_f32_pipeline)
+            g_mellum_q8_0_down_batch_f32_pipeline = ds4_gpu_get_pipeline(
+                "kernel_mellum_q8_0_down_batch_f32");
+        id<MTLComputePipelineState> pair_pipeline = ds4_gpu_hot_pipeline(
+            g_mellum_q4_K_pair_swiglu_scalar_f32_pipeline,
+            "kernel_mellum_q4_K_pair_swiglu_scalar_f32");
+        id<MTLComputePipelineState> down_pipeline = ds4_gpu_hot_pipeline(
+            g_mellum_q8_0_down_batch_f32_pipeline,
+            "kernel_mellum_q8_0_down_batch_f32");
+        if (!pair_pipeline || !down_pipeline) return 0;
+        unsigned down_rowtile = ds4_gpu_mellum_down_rowtile();
+        if (down_rowtile) {
+            const char *rt_name = (down_rowtile == 4)
+                ? "kernel_mellum_q8_0_down_batch_rowtile4_f32"
+                : "kernel_mellum_q8_0_down_batch_rowtile2_f32";
+            id<MTLComputePipelineState> rt = nil;
+            if (down_rowtile == 4) {
+                if (!g_mellum_down_rowtile4_pipeline)
+                    g_mellum_down_rowtile4_pipeline = ds4_gpu_get_pipeline(rt_name);
+                rt = ds4_gpu_hot_pipeline(g_mellum_down_rowtile4_pipeline, rt_name);
+            } else {
+                if (!g_mellum_down_rowtile2_pipeline)
+                    g_mellum_down_rowtile2_pipeline = ds4_gpu_get_pipeline(rt_name);
+                rt = ds4_gpu_hot_pipeline(g_mellum_down_rowtile2_pipeline, rt_name);
+            }
+            if (rt) down_pipeline = rt; else down_rowtile = 0;
+        }
+        ds4_gpu_glm_routed_moe_args args = {
+            .in_dim = expert_in_dim, .mid_dim = expert_mid_dim, .out_dim = out_dim,
+            .n_total_expert = n_total_expert, .n_expert_used = n_expert,
+            .n_tokens = n_tokens, .mid_token_stride = n_expert * expert_mid_dim,
+            .down_type = DS4_METAL_TENSOR_Q8_0, .tp_world = 1,
+            .gate_expert_bytes = gate_expert_bytes, .gate_row_bytes = gate_row_bytes,
+            .up_expert_bytes = gate_expert_bytes, .up_row_bytes = gate_row_bytes,
+            .down_expert_bytes = down_expert_bytes, .down_row_bytes = down_row_bytes,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> midbuf = ds4_gpu_tensor_buffer(mid);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
+        id<MTLBuffer> weightsbuf = ds4_gpu_tensor_buffer(weights);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pair_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:gatebuf offset:(NSUInteger)gate_inner atIndex:1];
+        [enc setBuffer:upbuf offset:(NSUInteger)up_inner atIndex:2];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
+        [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:4];
+        [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:5];
+        [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:6];
+        [enc useResource:gatebuf usage:MTLResourceUsageRead];
+        [enc useResource:upbuf usage:MTLResourceUsageRead];
+        [enc setThreadgroupMemoryLength:512u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(expert_mid_dim, n_expert, n_tokens)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:down_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:downbuf offset:(NSUInteger)down_inner atIndex:1];
+        [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+        [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:3];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        [enc useResource:downbuf usage:MTLResourceUsageRead];
+        const NSUInteger rt_rows = down_rowtile ? down_rowtile : 1u;
+        [enc setThreadgroupMemoryLength:rt_rows * (NSUInteger)n_expert * 256u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((out_dim + rt_rows - 1u) / rt_rows, n_tokens, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Mellum Q4_K batch routed MoE"))
             return 0;
     }
     return 1;
