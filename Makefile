@@ -325,6 +325,104 @@ test-dump-chat-transcript: tests/dump_chat_transcript
 	echo "dump_chat_transcript CRLF vs LF: identical ids"; \
 	head -c 120 "$$tmp/lf.ids"; echo
 
+tests/dump_segments_batch.o: tests/dump_segments_batch.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/dump_segments_batch.c
+
+tests/dump_segments_batch: tests/dump_segments_batch.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+# The model-free batch segment dumper's own contract (P21.2 Task 3).  Every
+# leg here runs WITHOUT a model and WITHOUT a vocabulary -- the segmenter's
+# boundary decision is reachable on its own -- so this target is
+# unconditional: there is no DS4_TEST_MELLUM_MODEL gate to skip past.
+.PHONY: test-dump-segments-batch
+test-dump-segments-batch: tests/dump_segments_batch
+	@set -e; \
+	tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	rc=0; ./tests/dump_segments_batch a b 2> "$$tmp/u.err" || rc=$$?; \
+	if [ "$$rc" != "2" ]; then \
+	  echo "FAIL: two arguments exited $$rc, expected 2"; cat "$$tmp/u.err"; \
+	  exit 1; \
+	fi; \
+	rc=0; ./tests/dump_segments_batch --help 2> "$$tmp/u2.err" || rc=$$?; \
+	if [ "$$rc" != "2" ]; then \
+	  echo "FAIL: --help exited $$rc, expected 2"; cat "$$tmp/u2.err"; exit 1; \
+	fi; \
+	echo "dump_segments_batch usage: exit 2"; \
+	rec() { printf "$$1" > "$$tmp/r"; \
+	        sz=$$(wc -c < "$$tmp/r" | tr -d ' '); \
+	        printf '%s\n' "$$sz" >> "$$tmp/corpus.bin"; \
+	        printf '%s\n' "$$sz" >> "$$tmp/sizes.txt"; \
+	        cat "$$tmp/r" >> "$$tmp/corpus.bin"; }; \
+	: > "$$tmp/corpus.bin"; : > "$$tmp/sizes.txt"; \
+	rec 'parse\r\ntoken'; \
+	rec ''; \
+	rec '              32,'; \
+	rec 'a\x1fb'; \
+	./tests/dump_segments_batch "$$tmp/corpus.bin" > "$$tmp/seg.txt" \
+	  2> "$$tmp/seg.err"; \
+	lines=$$(wc -l < "$$tmp/seg.txt" | tr -d ' '); \
+	if [ "$$lines" != "4" ]; then \
+	  echo "FAIL: four records produced $$lines lines"; cat "$$tmp/seg.err"; \
+	  exit 1; \
+	fi; \
+	got=$$(sed -n '1p' "$$tmp/seg.txt"); \
+	if [ "$$got" != "0 4 5 1 1 5" ]; then \
+	  echo "FAIL: 'parse\\r\\ntoken' printed [$$got], want [0 4 5 1 1 5]"; \
+	  exit 1; \
+	fi; \
+	echo "dump_segments_batch boundaries: $$got"; \
+	got=$$(sed -n '2p' "$$tmp/seg.txt"); \
+	if [ "$$got" != "1 0" ]; then \
+	  echo "FAIL: the empty record printed [$$got], want [1 0]"; exit 1; \
+	fi; \
+	echo "dump_segments_batch empty record: $$got"; \
+	got=$$(sed -n '3p' "$$tmp/seg.txt"); \
+	if [ "$$got" != "2 4 14 1 1 1" ]; then \
+	  echo "FAIL: '              32,' printed [$$got], want [2 4 14 1 1 1]"; \
+	  exit 1; \
+	fi; \
+	got=$$(sed -n '4p' "$$tmp/seg.txt"); \
+	if [ "$$got" != "3 3 1 1 1" ]; then \
+	  echo "FAIL: a 0x1f-bearing record printed [$$got], want [3 3 1 1 1]"; \
+	  exit 1; \
+	fi; \
+	echo "dump_segments_batch 0x1f byte: lengths, not a separator: $$got"; \
+	awk 'NR == FNR { want[FNR] = $$1; next } \
+	     { if ($$1 != FNR - 1) { \
+	         print "FAIL: line " FNR " is indexed " $$1; exit 1 } \
+	       if (NF != $$2 + 2) { \
+	         print "FAIL: line " FNR " says " $$2 " pieces, has " NF-2; exit 1 } \
+	       s = 0; for (i = 3; i <= NF; i++) s += $$i; \
+	       if (s != want[FNR]) { \
+	         print "FAIL: line " FNR " lengths sum to " s ", record is " \
+	               want[FNR] " bytes"; exit 1 } }' \
+	    "$$tmp/sizes.txt" "$$tmp/seg.txt" || exit 1; \
+	echo "dump_segments_batch: 4 indexed lines, counts agree, lengths sum to the record bytes"
+	@set -e; \
+	tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	printf '99999999999\nabc' > "$$tmp/digits.bin"; \
+	printf 'abc\nxyz' > "$$tmp/nondigit.bin"; \
+	printf '2000000\nabc' > "$$tmp/toolong.bin"; \
+	printf '9\nshort' > "$$tmp/short.bin"; \
+	printf '3\na\0b' > "$$tmp/nul.bin"; \
+	for bad in digits nondigit toolong short nul; do \
+	  rc=0; \
+	  ./tests/dump_segments_batch "$$tmp/$$bad.bin" > /dev/null \
+	    2> "$$tmp/$$bad.err" || rc=$$?; \
+	  if [ "$$rc" != "1" ]; then \
+	    echo "FAIL: malformed corpus $$bad exited $$rc, expected 1"; exit 1; \
+	  fi; \
+	  echo "dump_segments_batch $$bad: exit $$rc, $$(tail -1 "$$tmp/$$bad.err")"; \
+	done; \
+	rc=0; ./tests/dump_segments_batch /nonexistent/corpus.bin 2>/dev/null || rc=$$?; \
+	if [ "$$rc" != "2" ]; then \
+	  echo "FAIL: unreadable corpus exited $$rc, expected 2"; exit 1; \
+	fi; \
+	echo "dump_segments_batch unreadable corpus: exit 2"
+
 tests/dump_tokens_batch.o: tests/dump_tokens_batch.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/dump_tokens_batch.c
 
@@ -1234,6 +1332,7 @@ clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 	rm -f tests/test_qwen4_kernels tests/test_qwen4_cuda tests/test_qwen4_vision tests/test_qwen4_prefill
 	rm -f tests/dump_chat_transcript tests/test_mellum_tokenizer tests/dump_tokens_batch
+	rm -f tests/dump_segments_batch tests/dump_segments_batch.o
 
 # The active tokenizer includes generated Unicode classes.
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc

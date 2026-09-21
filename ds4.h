@@ -576,6 +576,14 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
  * content takes, so control-token spellings stay ordinary text.  Returns 1 on
  * a malformed record.  This is the engine side of P21's Q2 differential. */
 int ds4_dump_text_tokenization_batch(const char *model_path, FILE *in, FILE *out);
+/* No model, no vocabulary, N strings: the same length-prefixed record format,
+ * but each record is run through the Mellum *content* segmenter
+ * (mellum_segment_pieces, what ds4_mellum_segment_content_probe probes) and
+ * written as `<index> <npieces> <len> <len> ...` -- piece BYTE LENGTHS, not
+ * bytes, because a piece may hold newlines, CRs, 0x1f or invalid UTF-8 and
+ * the caller already holds the record it sent.  Returns 1 on a malformed
+ * record.  This is the engine side of P21.2's exhaustive R1 sweep. */
+int ds4_dump_mellum_segments_batch(FILE *in, FILE *out);
 int ds4_dump_chat_tokenization(const char *model_path,
                                const char *system,
                                const char *prompt,

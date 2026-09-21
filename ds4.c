@@ -68326,6 +68326,101 @@ int ds4_dump_text_tokenization_batch(const char *model_path, FILE *in, FILE *out
     return rc;
 }
 
+/* The Mellum content segmenter over many records on one process, with no
+ * model and no vocabulary: mellum_segment_pieces takes only bytes, so the
+ * boundary decision P21.2's sweep is about is reachable on its own.
+ *
+ * Lengths rather than pieces.  ds4_mellum_segment_content_probe joins its
+ * pieces with 0x1f, which is fine for hand-written cases but cannot be parsed
+ * back when a record *contains* 0x1f -- "a\x1fb" segmented as ("a\x1f", "b")
+ * and as ("a", "\x1fb") produce the same joined string.  The sweep covers
+ * U+001F like every other codepoint, so the sink here counts bytes instead. */
+typedef struct {
+    FILE     *out;
+    uint64_t  total;
+    size_t    pieces;
+} mellum_segment_len_sink_ctx;
+
+static void mellum_segment_len_sink(void *ctx, const char *s, uint64_t len) {
+    (void)s;
+    mellum_segment_len_sink_ctx *c = (mellum_segment_len_sink_ctx *)ctx;
+    fprintf(c->out, " %llu", (unsigned long long)len);
+    c->total += len;
+    c->pieces++;
+}
+
+int ds4_dump_mellum_segments_batch(FILE *in, FILE *out) {
+    int    rc    = 0;
+    size_t index = 0;
+
+    if (!in) in = stdin;
+    if (!out) out = stdout;
+
+    char *buf  = xmalloc((size_t)DS4_DUMP_BATCH_MAX_RECORD + 1);
+    char *line = xmalloc((size_t)DS4_DUMP_BATCH_MAX_RECORD * 12u + 64u);
+    for (;;) {
+        unsigned long len = 0;
+        bool eof = false;
+        if (dump_batch_read_length(in, index, &len, &eof) != 0) { rc = 1; break; }
+        if (eof) break;
+        if (len && fread(buf, 1, (size_t)len, in) != (size_t)len) {
+            fprintf(stderr,
+                    "ds4_dump_mellum_segments_batch: record %zu: stream ended "
+                    "inside a %lu-byte record\n", index, len);
+            rc = 1;
+            break;
+        }
+        buf[len] = '\0';
+        if (memchr(buf, '\0', (size_t)len)) {
+            fprintf(stderr,
+                    "ds4_dump_mellum_segments_batch: record %zu: embedded NUL "
+                    "(the segmenter takes a C string)\n", index);
+            rc = 1;
+            break;
+        }
+
+        /* The piece lengths are written to a memory stream first so the count
+         * can be printed before them without segmenting twice. */
+        FILE *mem = fmemopen(line, (size_t)DS4_DUMP_BATCH_MAX_RECORD * 12u + 64u,
+                             "w");
+        if (!mem) {
+            fprintf(stderr,
+                    "ds4_dump_mellum_segments_batch: record %zu: cannot open "
+                    "the piece buffer\n", index);
+            rc = 1;
+            break;
+        }
+        mellum_segment_len_sink_ctx sink = { mem, 0, 0 };
+        mellum_segment_pieces(buf, (uint64_t)len, mellum_segment_len_sink,
+                              &sink);
+        const int mem_err = ferror(mem);
+        fclose(mem);
+        if (mem_err) {
+            fprintf(stderr,
+                    "ds4_dump_mellum_segments_batch: record %zu: piece buffer "
+                    "overflowed\n", index);
+            rc = 1;
+            break;
+        }
+        /* mellum_segment_pieces stops on a byte it cannot decode, so the
+         * pieces need not cover the record.  That is a boundary difference
+         * for the caller to diff against the reference, not a driver error:
+         * the line is printed and the shortfall is named on stderr. */
+        if (sink.total != (uint64_t)len) {
+            fprintf(stderr,
+                    "ds4_dump_mellum_segments_batch: record %zu: pieces cover "
+                    "%llu of %lu bytes\n", index,
+                    (unsigned long long)sink.total, len);
+        }
+        fprintf(out, "%zu %zu%s\n", index, sink.pieces, line);
+        index++;
+    }
+
+    free(line);
+    free(buf);
+    return rc;
+}
+
 int ds4_dump_chat_tokenization(const char *model_path,
                                const char *system,
                                const char *prompt,
