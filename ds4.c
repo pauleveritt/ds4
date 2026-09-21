@@ -45225,13 +45225,32 @@ static bool glm4_unicode_punct_symbol(uint32_t cp) {
            (cp >= 0x1f000 && cp <= 0x1faff);
 }
 
-static glm4_char_info glm4_char_at(const char *s, uint64_t len, uint64_t pos) {
+/* The Mellum-only classification, derived from the reference tokenizer's own
+ * behaviour rather than hand-written (P21.2).  Regenerate with
+ * tools/mellum/gen_mellum_unicode.py; never edit it by hand. */
+#include "ds4_mellum_unicode.inc"
+
+/* `mellum` selects the derived tables.  For every other family the three
+ * flags below are byte-for-byte what they were before P21.2: the Nd-only
+ * number table, the ten whitespace clauses, the ASCII `ascii_alpha` branch
+ * and, outside ASCII, `is_letter` as a negation of the punctuation table.
+ * The negation is exactly what P21's Q2 differential caught misclassifying
+ * marks, format controls, PUA and emoji as letters, so on the Mellum path it
+ * stops being a negation and becomes a lookup. */
+static glm4_char_info glm4_char_at(const char *s, uint64_t len, uint64_t pos,
+                                   bool mellum) {
     glm4_char_info info;
     memset(&info, 0, sizeof(info));
     if (pos >= len) return info;
 
     info.valid = true;
     info.cp = utf8_peek_one(s, len, pos, &info.next);
+    if (mellum) {
+        info.is_whitespace = mellum_unicode_space(info.cp);
+        info.is_number = mellum_unicode_number(info.cp);
+        info.is_letter = mellum_unicode_letter(info.cp);
+        return info;
+    }
     info.is_whitespace = glm4_unicode_whitespace(info.cp);
     info.is_number = glm4_unicode_number(info.cp);
     if (info.cp < 128) {
@@ -45281,12 +45300,12 @@ static void bpe_tokenize_text_glm4_pieces(const char    *text,
 
     while (pos < len) {
         uint64_t start = pos;
-        glm4_char_info cur = glm4_char_at(text, len, pos);
+        glm4_char_info cur = glm4_char_at(text, len, pos, mellum);
 
         if (!cur.valid) break;
 
         if (cur.cp == '\'' && cur.next < len) {
-            glm4_char_info next = glm4_char_at(text, len, cur.next);
+            glm4_char_info next = glm4_char_at(text, len, cur.next, mellum);
             uint32_t n1 = mellum ? next.cp : ascii_tolower_cp(next.cp);
             if (n1 == 's' || n1 == 't' || n1 == 'm' || n1 == 'd') {
                 pos = next.next;
@@ -45294,7 +45313,7 @@ static void bpe_tokenize_text_glm4_pieces(const char    *text,
                 continue;
             }
             if (next.valid && next.next < len) {
-                glm4_char_info next2 = glm4_char_at(text, len, next.next);
+                glm4_char_info next2 = glm4_char_at(text, len, next.next, mellum);
                 uint32_t n2 = ascii_tolower_cp(next2.cp);
                 if ((n1 == 'r' && n2 == 'e') ||
                     (n1 == 'v' && n2 == 'e') ||
@@ -45307,7 +45326,7 @@ static void bpe_tokenize_text_glm4_pieces(const char    *text,
         }
 
         if (!(cur.cp == '\r' || cur.cp == '\n' || cur.is_number)) {
-            glm4_char_info next = glm4_char_at(text, len, cur.next);
+            glm4_char_info next = glm4_char_at(text, len, cur.next, mellum);
             /* GLM4's `[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+` lets any character
              * lead a letter run, so "\tb" and "'S" become one piece.  mellum2's
              * alternative is ` ?\p{L}+`: the optional prefix is one ASCII
@@ -45317,7 +45336,7 @@ static void bpe_tokenize_text_glm4_pieces(const char    *text,
             if (cur.is_letter || (prefix_ok && next.is_letter)) {
                 pos = cur.next;
                 while (pos < len) {
-                    glm4_char_info scan = glm4_char_at(text, len, pos);
+                    glm4_char_info scan = glm4_char_at(text, len, pos, mellum);
                     if (!scan.valid || !scan.is_letter) break;
                     pos = scan.next;
                 }
@@ -45329,7 +45348,7 @@ static void bpe_tokenize_text_glm4_pieces(const char    *text,
         if (cur.is_number) {
             int ndigits = 0;
             while (pos < len && ndigits < max_digits) {
-                glm4_char_info scan = glm4_char_at(text, len, pos);
+                glm4_char_info scan = glm4_char_at(text, len, pos, mellum);
                 if (!scan.valid || !scan.is_number) break;
                 pos = scan.next;
                 ndigits++;
@@ -45342,7 +45361,7 @@ static void bpe_tokenize_text_glm4_pieces(const char    *text,
         uint64_t punct_pos = pos;
         if (cur.cp == ' ') {
             punct_pos = cur.next;
-            punct = glm4_char_at(text, len, punct_pos);
+            punct = glm4_char_at(text, len, punct_pos, mellum);
         }
         if (punct.valid &&
             !punct.is_whitespace &&
@@ -45350,7 +45369,7 @@ static void bpe_tokenize_text_glm4_pieces(const char    *text,
             !punct.is_number) {
             pos = punct_pos;
             while (pos < len) {
-                glm4_char_info scan = glm4_char_at(text, len, pos);
+                glm4_char_info scan = glm4_char_at(text, len, pos, mellum);
                 if (!scan.valid ||
                     scan.is_whitespace ||
                     scan.is_letter ||
@@ -45365,7 +45384,7 @@ static void bpe_tokenize_text_glm4_pieces(const char    *text,
              * the whitespace alternatives below (P21 Q2, divergence class #2). */
             if (!mellum) {
                 while (pos < len) {
-                    glm4_char_info scan = glm4_char_at(text, len, pos);
+                    glm4_char_info scan = glm4_char_at(text, len, pos, mellum);
                     if (!scan.valid || !(scan.cp == '\r' || scan.cp == '\n')) break;
                     pos = scan.next;
                 }
@@ -45380,7 +45399,7 @@ static void bpe_tokenize_text_glm4_pieces(const char    *text,
             uint64_t last_ws_start = pos;
             int nspace = 0;
             while (p < len) {
-                glm4_char_info scan = glm4_char_at(text, len, p);
+                glm4_char_info scan = glm4_char_at(text, len, p, mellum);
                 if (!scan.valid || !scan.is_whitespace) break;
                 last_ws_start = p;
                 if (scan.cp == '\r' || scan.cp == '\n') last_newline_end = scan.next;
@@ -45440,13 +45459,13 @@ static void mellum_segment_pieces(const char    *text,
     uint64_t pos = 0;
     while (pos < len) {
         const uint64_t start = pos;
-        glm4_char_info cur = glm4_char_at(text, len, pos);
+        glm4_char_info cur = glm4_char_at(text, len, pos, true);
         if (!cur.valid) break;
         if (cur.is_number) {
             pos = cur.next;                 /* one digit, one split */
         } else {
             while (pos < len) {
-                glm4_char_info scan = glm4_char_at(text, len, pos);
+                glm4_char_info scan = glm4_char_at(text, len, pos, true);
                 if (!scan.valid || scan.is_number) break;
                 pos = scan.next;
             }

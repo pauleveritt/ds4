@@ -9432,6 +9432,72 @@ static void test_mellum_content_segmentation(void) {
         { " 123abc",           " " US "1" US "2" US "3" US "abc" },
         { "a1b2",              "a" US "1" US "b" US "2" },
         { "x = 1",             "x" US " =" US " " US "1" },
+
+        /* P21.2: the classification cases.  Every expectation below was read
+         * off the snapshot's own pre_tokenizer and transcribed, never derived
+         * from this implementation -- the one-liner that produced them is
+         *
+         *   pre = Tokenizer.from_str(json.dumps(spec)).pre_tokenizer
+         *   pieces = lambda s: [s[a:b] for _, (a, b) in
+         *                       pre.pre_tokenize_str(s)]
+         *
+         * with `spec` the snapshot's tokenizer.json and `added_tokens`
+         * emptied (content mode).  They cover the general categories the
+         * engine's negation used to get wrong: a letter is `\p{L}`, a number
+         * is `\p{N}` (Nd, Nl AND No), whitespace is the regex's own `\s`, and
+         * everything else -- marks, format controls, PUA, noncharacters,
+         * unassigned codepoints, emoji -- is punctuation. */
+        { "a\344\270\200b",              "a\344\270\200b" },  /* Lo Han */
+        { "a\327\220b",                  "a\327\220b" },  /* Lo Hebrew */
+        { "a\352\260\200b",              "a\352\260\200b" },  /* Lo Hangul */
+        { "a\342\270\257b",              "a\342\270\257b" },  /* Lm modifier letter */
+        { "a\342\204\202b",              "a\342\204\202b" },  /* Lu letterlike */
+        { "a\342\205\240b",              "a" US "\342\205\240" US "b" },  /* Nl Roman numeral */
+        { "1\342\205\2402",              "1" US "\342\205\240" US "2" },  /* Nl between digits */
+        { "a\343\200\207b",              "a" US "\343\200\207" US "b" },  /* Nl ideographic zero */
+        { "a\302\275b",                  "a" US "\302\275" US "b" },  /* No fraction */
+        { "a\302\262b",                  "a" US "\302\262" US "b" },  /* No superscript */
+        { "a\314\201b",                  "a" US "\314\201" US "b" },  /* Mn combining acute */
+        { "a\340\244\203b",              "a" US "\340\244\203" US "b" },  /* Mc spacing mark */
+        { "a\322\210b",                  "a" US "\322\210" US "b" },  /* Me enclosing mark */
+        { "a\342\200\213b",              "a" US "\342\200\213" US "b" },  /* Cf ZWSP */
+        { "a\357\273\277b",              "a" US "\357\273\277" US "b" },  /* Cf BOM */
+        { "a\357\270\217b",              "a" US "\357\270\217" US "b" },  /* Cf VS16 */
+        { "a\356\200\200b",              "a" US "\356\200\200" US "b" },  /* Co PUA */
+        { "a\357\277\276b",              "a" US "\357\277\276" US "b" },  /* Cn noncharacter */
+        { "a\315\270b",                  "a" US "\315\270" US "b" },  /* Cn unassigned */
+        { "a\302\240b",                  "a" US "\302\240" US "b" },  /* Zs NBSP */
+        { "a\342\200\250b",              "a" US "\342\200\250" US "b" },  /* Zl line separator */
+        { "a\342\200\251b",              "a" US "\342\200\251" US "b" },  /* Zp paragraph separator */
+        { "a\302\205b",                  "a" US "\302\205" US "b" },  /* NEL U+0085 */
+        { "a\360\237\230\200b",          "a" US "\360\237\230\200" US "b" },  /* emoji */
+        { "\360\237\221\215\360\237\217\275",
+          "\360\237\221\215\360\237\217\275" },  /* emoji with skin tone */
+        { "\342\235\244\357\270\217!",   "\342\235\244\357\270\217!" },  /* emoji with VS16 */
+        { "a\340\245\246b",              "a" US "\340\245\246" US "b" },  /* Devanagari digit */
+        { "x\340\245\246\340\245\2472",
+          "x" US "\340\245\246" US "\340\245\247" US "2" },  /* Devanagari digit run */
+        { "1\331\2402",                  "1" US "\331\240" US "2" },  /* Arabic-Indic digit */
+        { " \302\263 x",                 " " US "\302\263" US " x" },  /* minimal superscript */
+        { " \302\275 x",                 " " US "\302\275" US " x" },  /* minimal fraction */
+
+        /* Non-ASCII whitespace next to punctuation.  "a<NBSP>b" alone cannot
+         * tell whitespace from punctuation -- both cut in the same three
+         * places -- so these are the cases that actually pin the space table:
+         * a punctuation run would swallow the NBSP, and two NBSPs would merge
+         * into one piece. */
+        { ".\302\240x",                  "." US "\302\240" US "x" },  /* NBSP after punctuation */
+        { "a\302\240\302\240b",          "a" US "\302\240" US "\302\240" US "b" },  /* NBSP run */
+        { "a\302\240.b",                 "a" US "\302\240" US "." US "b" },  /* NBSP then punctuation */
+        { ".\342\200\250x",              "." US "\342\200\250" US "x" },  /* U+2028 after punctuation */
+        { ".\302\205x",                  "." US "\302\205" US "x" },  /* U+0085 after punctuation */
+        { ".\343\200\200x",              "." US "\343\200\200" US "x" },  /* U+3000 after punctuation */
+        { "a\302\240",                   "a" US "\302\240" },  /* NBSP at the end */
+
+        /* Class #3's residual: `n1` was mellum-guarded but `n2` was still
+         * lower-cased, so 'rE, 'vE and 'lL were swallowed as contractions.
+         * GPT-2's alternatives are lowercase-only in BOTH characters. */
+        { "e\314\201\302\275",           "e" US "\314\201" US "\302\275" },  /* NFD then No */
     };
 
     char buf[512];
