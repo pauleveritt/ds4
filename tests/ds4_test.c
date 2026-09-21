@@ -3070,6 +3070,148 @@ static void test_metal_mellum_q8_q8_routed_moe(void) {
     free(model);
 }
 
+/*
+ * Two Mellum "layers" whose routed experts have different byte strides, encoded
+ * into ONE command batch.  This is the shape of the layer-major prefill: all
+ * layers are queued into a single command buffer and nothing runs until the
+ * batch is ended.  The expert-major path addresses expert weights through
+ * per-call offset tables (e * gate_expert_bytes, e * down_expert_bytes).  If the
+ * tables are shared file statics that the CPU rewrites at every call, then by
+ * the time the batch runs every queued dispatch reads whatever the CPU wrote
+ * LAST -- deterministic last-writer-wins aliasing, not a race (P24 review B1).
+ * Two layers of different expert_mid_dim already have different strides, so no
+ * Q4_K support is needed to expose it.
+ *
+ * The layer with the LARGER stride is queued first, so the stale (smaller)
+ * stride it reads stays inside its own weights: wrong data, never a read past
+ * the wrapped range.  Each batch output must equal that layer's own
+ * single-call result bit for bit (same kernels, same order).
+ */
+static void test_metal_mellum_batch_layer_offset_tables(void) {
+    const uint32_t in_dim = 256u, out_dim = 64u;
+    const uint32_t n_total = 8u, n_selected = 3u, n_tokens = 5u;
+    const uint32_t mids[2] = {96u, 64u};
+    const uint64_t page = (uint64_t)getpagesize();
+    uint64_t gate_row = (uint64_t)(in_dim / 32u) * 34u;
+    uint64_t gate_expert[2], down_row[2], down_expert[2];
+    uint64_t gate_off[2], up_off[2], down_off[2];
+    uint64_t cursor = 0;
+    for (uint32_t l = 0; l < 2u; l++) {
+        gate_expert[l] = (uint64_t)mids[l] * gate_row;
+        down_row[l] = (uint64_t)(mids[l] / 32u) * 34u;
+        down_expert[l] = (uint64_t)out_dim * down_row[l];
+        gate_off[l] = cursor;
+        cursor = test_round_up_u64(cursor + n_total * gate_expert[l], page);
+        up_off[l] = cursor;
+        cursor = test_round_up_u64(cursor + n_total * gate_expert[l], page);
+        down_off[l] = cursor;
+        cursor = test_round_up_u64(cursor + n_total * down_expert[l], page);
+    }
+    TEST_ASSERT(gate_expert[0] != gate_expert[1]);
+    TEST_ASSERT(down_expert[0] != down_expert[1]);
+    const uint64_t model_bytes = cursor;
+    void *model = NULL;
+    TEST_ASSERT(posix_memalign(&model, (size_t)page, (size_t)model_bytes) == 0);
+    const uint64_t x_bytes = (uint64_t)n_tokens * in_dim * sizeof(float);
+    const uint64_t route_i_bytes = (uint64_t)n_tokens * n_selected * sizeof(int32_t);
+    const uint64_t route_f_bytes = (uint64_t)n_tokens * n_selected * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)n_tokens * out_dim * sizeof(float);
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(route_i_bytes);
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(route_f_bytes);
+    ds4_gpu_tensor *mid_one[2], *out_one[2], *mid_bat[2], *out_bat[2];
+    float *out_one_h[2], *out_bat_h[2], *mid_one_h[2], *mid_bat_h[2];
+    uint64_t mid_bytes[2];
+    bool ok = model && x && selected && weights;
+    for (uint32_t l = 0; l < 2u; l++) {
+        mid_bytes[l] = (uint64_t)n_tokens * n_selected * mids[l] * sizeof(float);
+        mid_one[l] = ds4_gpu_tensor_alloc(mid_bytes[l]);
+        mid_bat[l] = ds4_gpu_tensor_alloc(mid_bytes[l]);
+        out_one[l] = ds4_gpu_tensor_alloc(out_bytes);
+        out_bat[l] = ds4_gpu_tensor_alloc(out_bytes);
+        out_one_h[l] = malloc((size_t)out_bytes);
+        out_bat_h[l] = malloc((size_t)out_bytes);
+        mid_one_h[l] = malloc((size_t)mid_bytes[l]);
+        mid_bat_h[l] = malloc((size_t)mid_bytes[l]);
+        ok = ok && mid_one[l] && mid_bat[l] && out_one[l] && out_bat[l] &&
+             out_one_h[l] && out_bat_h[l] && mid_one_h[l] && mid_bat_h[l];
+    }
+    TEST_ASSERT(ok);
+    if (ok) {
+        memset(model, 0, (size_t)model_bytes);
+        for (uint32_t l = 0; l < 2u; l++) {
+            for (uint32_t e = 0; e < n_total; e++) {
+                test_fill_q8_0_weights((uint8_t *)model + gate_off[l] +
+                    e * gate_expert[l], in_dim, mids[l], e + 1u + 100u * l);
+                test_fill_q8_0_weights((uint8_t *)model + up_off[l] +
+                    e * gate_expert[l], in_dim, mids[l], e + 17u + 100u * l);
+                test_fill_q8_0_weights((uint8_t *)model + down_off[l] +
+                    e * down_expert[l], mids[l], out_dim, e + 31u + 100u * l);
+            }
+        }
+        float *x_h = malloc((size_t)x_bytes);
+        int32_t *sel_h = malloc((size_t)route_i_bytes);
+        float *w_h = malloc((size_t)route_f_bytes);
+        TEST_ASSERT(x_h && sel_h && w_h);
+        if (x_h && sel_h && w_h) {
+            for (uint32_t i = 0; i < n_tokens * in_dim; i++) {
+                x_h[i] = (float)((int)((i * 19u + (i >> 2u) * 7u) % 41u) - 20) / 32.0f;
+            }
+            for (uint32_t t = 0; t < n_tokens; t++) {
+                for (uint32_t s = 0; s < n_selected; s++) {
+                    sel_h[t * n_selected + s] = (int32_t)((t * 3u + s * 2u + 1u) % n_total);
+                    w_h[t * n_selected + s] = 0.2f + 0.1f * (float)((t + s) % 5u);
+                }
+            }
+            TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_h, x_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(selected, 0, sel_h, route_i_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(weights, 0, w_h, route_f_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_set_model_map(model, model_bytes) != 0);
+            /* Each layer alone: the reference. */
+            for (uint32_t l = 0; l < 2u; l++) {
+                TEST_ASSERT(ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
+                    out_one[l], mid_one[l], model, model_bytes, gate_off[l],
+                    up_off[l], down_off[l], gate_expert[l], gate_row,
+                    down_expert[l], down_row[l], in_dim, mids[l], out_dim,
+                    selected, weights, n_total, n_selected, x, n_tokens) != 0);
+                TEST_ASSERT(ds4_gpu_tensor_read(out_one[l], 0, out_one_h[l], out_bytes) != 0);
+                TEST_ASSERT(ds4_gpu_tensor_read(mid_one[l], 0, mid_one_h[l], mid_bytes[l]) != 0);
+            }
+            /* Both layers in one command batch, like the layer-major prefill. */
+            TEST_ASSERT(ds4_gpu_begin_commands() != 0);
+            for (uint32_t l = 0; l < 2u; l++) {
+                TEST_ASSERT(ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
+                    out_bat[l], mid_bat[l], model, model_bytes, gate_off[l],
+                    up_off[l], down_off[l], gate_expert[l], gate_row,
+                    down_expert[l], down_row[l], in_dim, mids[l], out_dim,
+                    selected, weights, n_total, n_selected, x, n_tokens) != 0);
+            }
+            TEST_ASSERT(ds4_gpu_end_commands() != 0);
+            for (uint32_t l = 0; l < 2u; l++) {
+                TEST_ASSERT(ds4_gpu_tensor_read(out_bat[l], 0, out_bat_h[l], out_bytes) != 0);
+                TEST_ASSERT(ds4_gpu_tensor_read(mid_bat[l], 0, mid_bat_h[l], mid_bytes[l]) != 0);
+                const float mid_d = test_mellum_max_abs(mid_bat_h[l], mid_one_h[l],
+                                                        n_tokens * n_selected * mids[l]);
+                const float out_d = test_mellum_max_abs(out_bat_h[l], out_one_h[l],
+                                                        n_tokens * out_dim);
+                fprintf(stderr, "ds4-test: Mellum batch offset tables layer %u "
+                        "(mid %u): batch-vs-alone mid=%g out=%g\n", l, mids[l],
+                        (double)mid_d, (double)out_d);
+                TEST_ASSERT(memcmp(mid_bat_h[l], mid_one_h[l], (size_t)mid_bytes[l]) == 0);
+                TEST_ASSERT(memcmp(out_bat_h[l], out_one_h[l], (size_t)out_bytes) == 0);
+            }
+        }
+        free(w_h); free(sel_h); free(x_h);
+    }
+    for (uint32_t l = 0; l < 2u; l++) {
+        free(mid_bat_h[l]); free(mid_one_h[l]); free(out_bat_h[l]); free(out_one_h[l]);
+        ds4_gpu_tensor_free(out_bat[l]); ds4_gpu_tensor_free(out_one[l]);
+        ds4_gpu_tensor_free(mid_bat[l]); ds4_gpu_tensor_free(mid_one[l]);
+    }
+    ds4_gpu_tensor_free(weights); ds4_gpu_tensor_free(selected); ds4_gpu_tensor_free(x);
+    free(model);
+}
+
 static void test_metal_q8_0_output_nr4_exact_case(
         uint32_t in_dim,
         uint32_t out_dim,
@@ -7327,6 +7469,7 @@ static void test_metal_kernel_group(void) {
     test_metal_mellum_q8_layer();
     test_metal_mellum_q4_q8_routed_moe();
     test_metal_mellum_q8_q8_routed_moe();
+    test_metal_mellum_batch_layer_offset_tables();
     test_metal_q8_0_output_nr4_exact();
     test_metal_f16_compressor_pair_state_store_exact();
     test_metal_compressor_ape_add_exact();

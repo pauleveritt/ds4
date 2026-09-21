@@ -40920,9 +40920,18 @@ typedef struct {
     ds4_gpu_mellum_moe_group_args args;
     ds4_gpu_tensor *counts;
     ds4_gpu_tensor *pairs;
-    ds4_gpu_tensor *gate_offsets;
-    ds4_gpu_tensor *up_offsets;
-    ds4_gpu_tensor *down_offsets;
+    /*
+     * The offset tables are a PER-CALL transient buffer, never a file static
+     * (P24, review B1).  All layers of a prefill encode into one command
+     * buffer that is not committed until the batch ends, so a table the CPU
+     * rewrites per layer is read by every queued dispatch at its LAST value.
+     * gate and up share one region (up_expert_bytes == gate_expert_bytes);
+     * down has its own.
+     */
+    __unsafe_unretained id<MTLBuffer> offsets;
+    NSUInteger gate_offsets_at;
+    NSUInteger up_offsets_at;
+    NSUInteger down_offsets_at;
     ds4_gpu_tensor *partial;   /* [token][slot][out_dim], expert-major only */
 } ds4_gpu_mellum_moe_group;
 
@@ -41000,10 +41009,9 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
                                            uint32_t out_dim,
                                            id<MTLBuffer> selectedbuf,
                                            uint64_t selected_offset) {
-    static ds4_gpu_tensor *s_counts, *s_pairs, *s_gate_off, *s_up_off;
-    static ds4_gpu_tensor *s_down_off, *s_partial;
+    static ds4_gpu_tensor *s_counts, *s_pairs, *s_partial;
     static uint32_t s_experts, s_cap, s_pairs_experts;
-    static uint64_t s_expert_bytes, s_down_expert_bytes, s_partial_bytes;
+    static uint64_t s_partial_bytes;
 
     if (!g || !cb || !selectedbuf || n_total_expert == 0 || n_tokens == 0 ||
         n_expert_used == 0 || n_expert_used > n_total_expert) return false;
@@ -41014,16 +41022,8 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
     if (!s_counts || s_experts != n_total_expert) {
         if (s_counts && ds4_gpu_commands_active()) return false;
         ds4_gpu_tensor_free(s_counts);
-        ds4_gpu_tensor_free(s_gate_off);
-        ds4_gpu_tensor_free(s_up_off);
         s_counts = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * sizeof(uint32_t));
-        ds4_gpu_tensor_free(s_down_off);
-        s_gate_off = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * sizeof(uint64_t));
-        s_up_off = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * sizeof(uint64_t));
-        s_down_off = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * sizeof(uint64_t));
         s_experts = n_total_expert;
-        s_expert_bytes = 0;
-        s_down_expert_bytes = 0;
     }
     if (!s_pairs || s_cap < cap || s_pairs_experts != n_total_expert) {
         /*
@@ -41039,19 +41039,26 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
         s_cap = cap;
         s_pairs_experts = n_total_expert;
     }
-    if (!s_counts || !s_pairs || !s_gate_off || !s_up_off || !s_down_off) return false;
+    if (!s_counts || !s_pairs) return false;
 
-    if (s_down_expert_bytes != down_expert_bytes) {
-        uint64_t *off = malloc((size_t)n_total_expert * sizeof(*off));
-        if (!off) return false;
+    /*
+     * One transient buffer per call: gate/up table at 0, down table at the next
+     * 256-byte boundary.  n_total_expert * 8 bytes each (512 B at 64 experts).
+     * It is written once, here, and never touched again, so a dispatch queued
+     * now reads these values whenever the batch finally runs.
+     */
+    const uint64_t table_bytes = (uint64_t)n_total_expert * sizeof(uint64_t);
+    const uint64_t table_stride = (table_bytes + 255u) & ~(uint64_t)255u;
+    id<MTLBuffer> tables = ds4_gpu_new_transient_buffer(
+        (NSUInteger)(2u * table_stride), "mellum moe expert offset tables");
+    if (!tables) return false;
+    {
+        uint64_t *gate_tab = (uint64_t *)[tables contents];
+        uint64_t *down_tab = (uint64_t *)((uint8_t *)[tables contents] + table_stride);
         for (uint32_t e = 0; e < n_total_expert; e++) {
-            off[e] = (uint64_t)e * down_expert_bytes;
+            gate_tab[e] = (uint64_t)e * gate_expert_bytes;
+            down_tab[e] = (uint64_t)e * down_expert_bytes;
         }
-        const uint64_t bytes = (uint64_t)n_total_expert * sizeof(*off);
-        const bool ok = ds4_gpu_tensor_write(s_down_off, 0, off, bytes) != 0;
-        free(off);
-        if (!ok) return false;
-        s_down_expert_bytes = down_expert_bytes;
     }
 
     /*
@@ -41069,20 +41076,6 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
             s_partial_bytes = s_partial ? want : 0;
         }
         if (!s_partial) return false;
-    }
-
-    if (s_expert_bytes != gate_expert_bytes) {
-        uint64_t *off = malloc((size_t)n_total_expert * sizeof(*off));
-        if (!off) return false;
-        for (uint32_t e = 0; e < n_total_expert; e++) {
-            off[e] = (uint64_t)e * gate_expert_bytes;
-        }
-        const uint64_t bytes = (uint64_t)n_total_expert * sizeof(*off);
-        const bool ok = ds4_gpu_tensor_write(s_gate_off, 0, off, bytes) != 0 &&
-                        ds4_gpu_tensor_write(s_up_off, 0, off, bytes) != 0;
-        free(off);
-        if (!ok) return false;
-        s_expert_bytes = gate_expert_bytes;
     }
 
     if (!g_mellum_moe_bucket_reset_pipeline) {
@@ -41104,9 +41097,10 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
     };
     g->counts = s_counts;
     g->pairs = s_pairs;
-    g->gate_offsets = s_gate_off;
-    g->up_offsets = s_up_off;
-    g->down_offsets = s_down_off;
+    g->offsets = tables;
+    g->gate_offsets_at = 0;
+    g->up_offsets_at = 0;
+    g->down_offsets_at = (NSUInteger)table_stride;
     g->partial = s_partial;
 
     /* Reset and build are separate encoders: the build must observe the reset. */
@@ -41304,10 +41298,8 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
             [enc setBytes:&ggroup.args length:sizeof(ggroup.args) atIndex:1];
             [enc setBuffer:gatebuf offset:(NSUInteger)gate_inner atIndex:2];
             [enc setBuffer:upbuf offset:(NSUInteger)up_inner atIndex:3];
-            [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.gate_offsets)
-                    offset:ds4_gpu_tensor_offset(ggroup.gate_offsets) atIndex:4];
-            [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.up_offsets)
-                    offset:ds4_gpu_tensor_offset(ggroup.up_offsets) atIndex:5];
+            [enc setBuffer:ggroup.offsets offset:ggroup.gate_offsets_at atIndex:4];
+            [enc setBuffer:ggroup.offsets offset:ggroup.up_offsets_at atIndex:5];
             [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:6];
             [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:7];
             [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.counts)
@@ -41326,10 +41318,8 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
             [enc setBytes:&ggroup.args length:sizeof(ggroup.args) atIndex:1];
             [enc setBuffer:gatebuf offset:(NSUInteger)gate_inner atIndex:2];
             [enc setBuffer:upbuf offset:(NSUInteger)up_inner atIndex:3];
-            [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.gate_offsets)
-                    offset:ds4_gpu_tensor_offset(ggroup.gate_offsets) atIndex:4];
-            [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.up_offsets)
-                    offset:ds4_gpu_tensor_offset(ggroup.up_offsets) atIndex:5];
+            [enc setBuffer:ggroup.offsets offset:ggroup.gate_offsets_at atIndex:4];
+            [enc setBuffer:ggroup.offsets offset:ggroup.up_offsets_at atIndex:5];
             [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:6];
             [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:7];
             [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.counts)
@@ -41365,8 +41355,7 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
             [enc setBytes:&args length:sizeof(args) atIndex:0];
             [enc setBytes:&ggroup.args length:sizeof(ggroup.args) atIndex:1];
             [enc setBuffer:downbuf offset:(NSUInteger)down_inner atIndex:2];
-            [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.down_offsets)
-                    offset:ds4_gpu_tensor_offset(ggroup.down_offsets) atIndex:3];
+            [enc setBuffer:ggroup.offsets offset:ggroup.down_offsets_at atIndex:3];
             [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:4];
             [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.counts)
                     offset:ds4_gpu_tensor_offset(ggroup.counts) atIndex:5];
