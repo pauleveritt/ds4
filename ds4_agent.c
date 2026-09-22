@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_gpu.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
@@ -5336,6 +5337,15 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
                                      publish_progress ? worker_progress_cb : NULL,
                                      publish_progress ? w : NULL);
     ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
+#ifndef DS4_NO_GPU
+    /* P25 Task 2 test hook, additive and opt-in: read the live/peak tensor
+     * counters immediately before and after this sync so a live test can
+     * isolate the prefill-scratch delta from everything else a session
+     * allocates at open. Never touched unless the env var is set. */
+    if (getenv("DS4_MELLUM_MEMORY_CHECKPOINT") != NULL) {
+        ds4_gpu_print_memory_report("P25 checkpoint: before sync");
+    }
+#endif
     double t_sync0 = now_sec();
     int rc;
     if (w->image_count) {
@@ -5351,6 +5361,11 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
         rc = ds4_session_sync(w->session, tokens, err, err_len);
     }
     double t_sync1 = now_sec();
+#ifndef DS4_NO_GPU
+    if (getenv("DS4_MELLUM_MEMORY_CHECKPOINT") != NULL) {
+        ds4_gpu_print_memory_report("P25 checkpoint: after sync");
+    }
+#endif
     ds4_session_set_cancel(w->session, NULL, NULL);
     ds4_session_set_progress(w->session, NULL, NULL);
     ds4_session_set_display_progress(w->session, NULL, NULL);
