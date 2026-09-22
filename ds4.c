@@ -43311,11 +43311,14 @@ static uint64_t ds4_mellum_decode_state_bytes(uint32_t cap) {
     return total;
 }
 
-/* ds4_mellum_prefill_scratch_create's nineteen tensors.  No product path
- * allocates one: the only callers are the resident-profile and prefill
- * probes, which size it from DS4_MELLUM_PREFILL_CHUNK (ds4_mellum_probe_chunk)
- * rather than from e->prefill_chunk.  It is accounted here so a probe's plan
- * can include it. */
+/* ds4_mellum_prefill_scratch_create's nineteen tensors.  P25 Fix 1: the
+ * product session path *does* allocate one -- ds4_session_sync's Mellum
+ * branch (ds4.c, "layer-major prefill, for spans long enough to pay for the
+ * workspace") creates it the first time a sync sees >= 64 pending tokens,
+ * frozen at cap = min(pending, DS4_N_SWA) for the life of the session. The
+ * plan and the admission gate below pass ds4_mellum_effective_prefill_cap's
+ * conservative upper bound, min(ctx_size, DS4_N_SWA), so this is accounted
+ * for every session whose --ctx could reach that path, not only probes. */
 static uint64_t ds4_mellum_prefill_scratch_bytes(uint32_t cap) {
     if (cap == 0) return 0;
     const uint64_t c = cap;
@@ -43356,10 +43359,24 @@ static bool ds4_mellum_admit(uint64_t planned, uint64_t budget) {
     return budget == 0 || planned <= budget;
 }
 
+/* P25 Fix 1.  The plan and the admission gate cannot know the real session's
+ * first-sync pending-token count in advance (it is a property of the prompt,
+ * not the engine), so this is the conservative upper bound: whatever the
+ * product path would freeze its cap at is never more than
+ * min(ctx_size, DS4_N_SWA) (ds4_session_sync's Mellum branch,
+ * "cap = pending < DS4_N_SWA ? pending : DS4_N_SWA"; pending is bounded by
+ * ctx_size). Strictly tighter than a bare DS4_N_SWA at small --ctx. */
+static uint32_t ds4_mellum_effective_prefill_cap(uint32_t ctx_size) {
+    return ctx_size < DS4_N_SWA ? ctx_size : DS4_N_SWA;
+}
+
 /* The four figures the startup plan line reports, computed once so the human
  * text and the exact byte counts beside it cannot describe different sums
- * (P20 review, F5).  prefill_cap is 0: no product Mellum session allocates a
- * prefill scratch. */
+ * (P20 review, F5).  P25 Fix 1: prefill_cap is
+ * ds4_mellum_effective_prefill_cap(ctx_size), not 0 -- a real product Mellum
+ * session's first long-enough sync does allocate a prefill scratch
+ * (ds4_session_sync's Mellum branch), so the plan and the admission gate
+ * below both account for it. */
 typedef struct {
     uint64_t weights;
     uint64_t kv;
@@ -43370,11 +43387,14 @@ typedef struct {
 static ds4_mellum_plan_parts ds4_mellum_plan_parts_for(uint64_t weights_bytes,
                                                        uint32_t ctx_size) {
     ds4_mellum_plan_parts p;
+    const uint32_t prefill_cap = ds4_mellum_effective_prefill_cap(ctx_size);
     p.weights = weights_bytes;
     p.kv = ds4_mellum_kv_bytes(ctx_size);
     p.scratch = ds4_add_sat_u64(ds4_mellum_decode_scratch_bytes(),
                                 ds4_mellum_decode_output_bytes(DS4_N_VOCAB));
-    p.planned = ds4_mellum_planned_bytes(weights_bytes, ctx_size, 0);
+    p.scratch = ds4_add_sat_u64(p.scratch,
+                                ds4_mellum_prefill_scratch_bytes(prefill_cap));
+    p.planned = ds4_mellum_planned_bytes(weights_bytes, ctx_size, prefill_cap);
     return p;
 }
 
@@ -44703,8 +44723,9 @@ static uint64_t ds4_mellum_memory_budget_bytes(void) {
  */
 static void ds4_mellum_print_memory_plan(const ds4_engine *e, int ctx_size) {
     const uint32_t ctx = (uint32_t)ctx_size;
-    /* prefill_cap 0: no product Mellum session allocates a prefill scratch
-     * (its only callers are the probes). */
+    /* P25 Fix 1: ds4_mellum_plan_parts_for now passes
+     * ds4_mellum_effective_prefill_cap(ctx), not a literal 0 -- see that
+     * function's comment. */
     const ds4_mellum_plan_parts p =
         ds4_mellum_plan_parts_for(e->startup_model_span_bytes, ctx);
     const uint64_t weights = p.weights;
@@ -44748,9 +44769,16 @@ static bool ds4_mellum_memory_admit_at_open(const ds4_engine *e,
                                             int ctx_size) {
     if (!e || ctx_size <= 0) return true;
     const uint64_t budget = ds4_mellum_memory_budget_bytes();
+    /* P25 Fix 1: was a literal 0 (see ds4_mellum_effective_prefill_cap's
+     * comment -- the product path does allocate a prefill scratch, and this
+     * gate feeds the admission decision, so undercounting it here let
+     * sessions in that a real open would then overrun). This does shift the
+     * admission boundary: a --ctx that admitted under the old, undercounted
+     * plan can now be refused (P25 spec Risk 6). */
     const uint64_t planned =
         ds4_mellum_planned_bytes(e->startup_model_span_bytes,
-                                 (uint32_t)ctx_size, 0);
+                                 (uint32_t)ctx_size,
+                                 ds4_mellum_effective_prefill_cap((uint32_t)ctx_size));
     if (ds4_mellum_admit(planned, budget)) return true;
     fprintf(stderr,
             "ds4: Mellum 2 needs %.2f GiB (weights + KV + scratch) but this "
