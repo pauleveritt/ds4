@@ -78783,7 +78783,12 @@ int ds4_engine_mellum_swa_boundary_probe(ds4_engine *e,
      * magnitude either way and only demand exactness of the serial path, so
      * this stays a real gate for both rather than a false green for one.
      */
-    const int split = ds4_gpu_mellum_attn_split_enabled();
+    /* P25 Task 10 cosmetic item 2: either the split-K OR the grouped decode
+     * kernel reassociates the softmax above the 256-key boundary -- this
+     * used to key on split alone, which silently fell back to a bitwise
+     * memcmp (and would have failed it) whenever grouped-only ran. */
+    const int split = ds4_gpu_mellum_attn_split_enabled() ||
+        ds4_gpu_mellum_attn_group_enabled();
     double max_abs = 0.0, sum_sq = 0.0;
     if (ok) {
         for (uint64_t i = 0; i < vocab_dim; i++) {
@@ -78947,8 +78952,12 @@ int ds4_engine_mellum_resident_profile(ds4_engine *e, FILE *out,
             ok = false;
         } else {
             depth_n = (uint32_t)decode_depth;
-            depth_chunk = ds4_mellum_probe_chunk(depth_n < 1024u ? depth_n : 1024u,
-                                                 depth_n);
+            /* P25 Task 10 cosmetic item 3: confirmed correct (1024 ==
+             * DS4_N_SWA for the Mellum 2 shape), named instead of a magic
+             * literal so it reads as the same bound the product path's
+             * frozen cap uses, not a coincidence. */
+            depth_chunk = ds4_mellum_probe_chunk(
+                depth_n < DS4_N_SWA ? depth_n : DS4_N_SWA, depth_n);
             depth_toks = xmalloc((size_t)depth_n * sizeof(*depth_toks));
             for (uint32_t i = 0; i < depth_n; i++) {
                 depth_toks[i] = (int)((i * 7919u + 27u) % DS4_N_VOCAB);
@@ -79067,9 +79076,15 @@ static bool ds4_mellum_prefill_chunks(const ds4_engine           *e,
 }
 
 /*
- * Diagnostic chunk size for the prefill probes.  Unset keeps the historical
- * single-batch behaviour; 1 makes every projection use the decode matvec, which
- * separates layer-major graph semantics from batched-kernel precision.
+ * P25 Task 10 cosmetic item 3 (corrected comment): this is NOT probe-only.
+ * The product session path calls it too -- ds4_session_sync's Mellum
+ * branch, "cap = ds4_mellum_probe_chunk(cap, DS4_N_SWA)" (ds4.c:81768) --
+ * to let DS4_MELLUM_PREFILL_CHUNK override the real first-sync scratch cap
+ * for diagnosis, same as it overrides the probes' chunk size below. Unset
+ * keeps the caller's own fallback (the probe's single-batch size, or the
+ * product path's min(pending, DS4_N_SWA)); 1 makes every projection use the
+ * decode matvec, which separates layer-major graph semantics from
+ * batched-kernel precision.
  */
 static uint32_t ds4_mellum_probe_chunk(uint32_t fallback, uint32_t max_chunk) {
     const char *env = getenv("DS4_MELLUM_PREFILL_CHUNK");

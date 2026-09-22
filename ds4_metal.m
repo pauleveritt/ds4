@@ -635,6 +635,12 @@ int ds4_gpu_mellum_attn_group_enabled(void) {
  * DS4_MELLUM_ATTN_MIN_KEYS, below which the serial kernel still runs and the
  * old arithmetic is preserved exactly.
  */
+/* P25 Task 10 cosmetic item 4: this value is duplicated, not shared, in
+ * metal/laguna.metal's two split_threshold constants (lines ~741, ~1229) --
+ * Metal shaders in this codebase are standalone (no shared header between
+ * .m and .metal), so a #define cannot mechanically unify the three. Keep
+ * this one as the source of truth; if it ever changes, grep
+ * "split_threshold = 256u" in metal/laguna.metal too. */
 #define DS4_MELLUM_ATTN_MIN_KEYS 256u
 
 int ds4_gpu_mellum_attn_split_enabled(void) {
@@ -12405,6 +12411,23 @@ void ds4_gpu_cleanup(void) {
         g_mellum_gqa_decode_pipeline = nil;
         g_mellum_gqa_decode_split_pipeline = nil;
         g_mellum_gqa_prefill_pipeline = nil;
+        /* P25 Task 10 cosmetic item 4: the spec's review cited "three
+         * pipeline statics never reset" here -- confirmed by re-grepping
+         * every g_mellum_*_pipeline declaration against this function.
+         * Six more (g_mellum_down_rowtile2/4, down_grouped4/8,
+         * slot_reduce, pair_swiglu_gemm, declared much later in this file
+         * around line 40952-40982) are ALSO never reset here, but are
+         * declared after this function and so are not reachable from it
+         * without moving their declarations or adding forward
+         * declarations -- confirmed by trying it and getting six "use of
+         * undeclared identifier" errors, reverted. Left as their own,
+         * separate PRODUCT_BACKLOG.md entry rather than folded into this
+         * one-line-per-static fix. None of the three fixed here is
+         * reachable from today's default shape (hygiene, not a behaviour
+         * change). */
+        g_mellum_q8_0_pair_swiglu_grouped_f32_pipeline = nil;
+        g_mellum_moe_bucket_reset_pipeline = nil;
+        g_mellum_moe_bucket_build_pipeline = nil;
         g_glm_q2_k_addr_down_f32_pipeline = nil;
         g_glm_q4_k_addr_down_f32_pipeline = nil;
         g_glm_q5_k_pair_swiglu_f32_pipeline = nil;
