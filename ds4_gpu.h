@@ -81,6 +81,12 @@ int ds4_gpu_pack_slot_rows_f32_tensor(
 int ds4_gpu_test_glm_q3_down_one_bound_equivalence(void);
 int ds4_gpu_test_glm_q3_down_slots8_bound_equivalence(void);
 
+/* P24b-S Task 2: dispatch ds4_mellum_stage_q4_k_rows (the Metal Q4_K
+ * prefill stager) on a synthetic, model-free block_q4_K buffer. */
+int ds4_gpu_test_stage_q4_k_rows(
+        ds4_gpu_tensor *rows_in, uint64_t row_bytes, uint32_t rows,
+        uint32_t dim, ds4_gpu_tensor *out);
+
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);

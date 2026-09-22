@@ -3217,6 +3217,70 @@ static inline void ds4_mellum_stage_q8_rows(device const char *base,
     }
 }
 
+/*
+ * Dequantize R consecutive Q4_K rows into threadgroup floats, cooperatively.
+ * P24b-S Task 2: one contiguous 8-element span per thread (`nspans = rows *
+ * dim / 8`), not one thread per element (K1's `ds4_glm_q4_K_value` pattern,
+ * which re-derives the scale/min unpack every element) and not one thread
+ * per 32-element sub-block (idles all but 9 of 256 threads at dim=2304). 8
+ * divides the 32-element sub-block, so a span never straddles a scale/min
+ * pair: the unpack happens once per span and is reused for all 8 elements.
+ * Traversal mirrors `tools/mellum/q4k_gemm_stager.py`'s
+ * `dequant_row_span_contiguous` exactly -- see that module's docstring for
+ * the byte layout this reads.
+ */
+static inline void ds4_mellum_stage_q4_k_rows(device const char *base,
+                                              uint64_t row_bytes,
+                                              uint rows, uint dim,
+                                              uint tid, uint ntg,
+                                              threadgroup float *dst) {
+    const uint span = 8u;
+    const uint nspans = rows * dim / span;
+    for (uint s = tid; s < nspans; s += ntg) {
+        const uint span_start = s * span;
+        const uint r = span_start / dim;
+        const uint k0 = span_start - r * dim;
+        const uint block = k0 / QK_K;
+        const uint idx = k0 - block * QK_K;
+        const uint group = idx / 32u;
+        const uint lane0 = idx - group * 32u;
+        device const block_q4_K *xb =
+            (device const block_q4_K *)(base + (uint64_t)r * row_bytes) + block;
+        const uchar2 sm = get_scale_min_k4_just2((int)group, 0, xb->scales);
+        const float d = (float)xb->d;
+        const float dmin = (float)xb->dmin;
+        const float sc = (float)sm.x;
+        const float mn = (float)sm.y;
+        const uint byte_base = (group >> 1u) * 32u + lane0;
+        const uint shift = (group & 1u) * 4u;
+        for (uint off = 0u; off < span; off++) {
+            const uint q = (xb->qs[byte_base + off] >> shift) & 0x0Fu;
+            dst[span_start + off] = d * sc * (float)q - dmin * mn;
+        }
+    }
+}
+
+/*
+ * P24b-S Task 2: diagnostic-only wrapper exposing ds4_mellum_stage_q4_k_rows
+ * to a test harness -- one threadgroup, dequantizes `rows * dim` Q4_K values
+ * into threadgroup memory then copies them out to `dst`.  Model-free: `base`
+ * is any synthetic block_q4_K buffer the caller uploads.
+ */
+kernel void kernel_test_mellum_stage_q4_k_rows(
+        device const char *base [[buffer(0)]],
+        constant uint64_t &row_bytes [[buffer(1)]],
+        constant uint &rows [[buffer(2)]],
+        constant uint &dim [[buffer(3)]],
+        device float *dst [[buffer(4)]],
+        threadgroup float *stage [[threadgroup(0)]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    const uint ntg = 256u;
+    ds4_mellum_stage_q4_k_rows(base, row_bytes, rows, dim, tid, ntg, stage);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint total = rows * dim;
+    for (uint i = tid; i < total; i += ntg) dst[i] = stage[i];
+}
+
 template <uint R>
 static inline void mellum_down_grouped_impl(
         constant ds4_metal_glm_routed_moe_args &args,

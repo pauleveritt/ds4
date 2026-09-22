@@ -2942,6 +2942,94 @@ static double test_mellum_q4_dot_d(const uint8_t *row, uint32_t width,
     return sum;
 }
 
+/*
+ * P24b-S Task 2: per-element float32 dequant of a (possibly multi-row,
+ * multi-block) Q4_K row buffer, span-contiguous traversal, matching
+ * ds4_mellum_stage_q4_k_rows / tools/mellum/q4k_gemm_stager.py's
+ * dequant_row_span_contiguous exactly -- all arithmetic in float32 (not
+ * double) so this is a bitwise oracle for the Metal stager, not a tolerance
+ * comparand.  `dst` receives `rows * dim` floats.
+ */
+static void test_mellum_q4_k_dequant_row_f32(const uint8_t *row_base,
+                                             uint64_t row_bytes,
+                                             uint32_t rows, uint32_t dim,
+                                             float *dst) {
+    const uint32_t blocks_per_row = dim / 256u;
+    for (uint32_t r = 0; r < rows; r++) {
+        const test_mellum_block_q4_k *blocks =
+            (const test_mellum_block_q4_k *)(row_base + (uint64_t)r * row_bytes);
+        for (uint32_t block = 0; block < blocks_per_row; block++) {
+            const test_mellum_block_q4_k *b = blocks + block;
+            const float d = test_f16_to_f32(b->d);
+            const float dmin = test_f16_to_f32(b->dmin);
+            for (uint32_t group = 0; group < 8u; group++) {
+                uint32_t scale, min;
+                if (group < 4u) {
+                    scale = b->scales[group] & 63u;
+                    min = b->scales[4u + group] & 63u;
+                } else {
+                    scale = (b->scales[4u + group] & 15u) |
+                        ((b->scales[group - 4u] & 0xc0u) >> 2u);
+                    min = (b->scales[4u + group] >> 4u) |
+                        ((b->scales[group] & 0xc0u) >> 2u);
+                }
+                for (uint32_t lane = 0; lane < 32u; lane++) {
+                    const uint32_t byte = (group >> 1u) * 32u + lane;
+                    const uint32_t q = (b->qs[byte] >> ((group & 1u) * 4u)) & 15u;
+                    const uint32_t k = block * 256u + group * 32u + lane;
+                    dst[(uint64_t)r * dim + k] =
+                        d * (float)scale * (float)q - dmin * (float)min;
+                }
+            }
+        }
+    }
+}
+
+/*
+ * P24b-S Task 2 red-first: the Metal stager ds4_mellum_stage_q4_k_rows
+ * (one contiguous 8-element span per thread) against the CPU float32
+ * per-element oracle above, on synthetic block_q4_K bytes -- no model, no
+ * GEMM dispatch.  Small fixed shape per the plan: in_dim=512 (2 blocks).
+ * Exact equality is expected: both traversals do the identical float32
+ * ops (unpack scale/min once per group of 32, cast, multiply-subtract) in
+ * the same order, so there is no reduction-order divergence to tolerate.
+ */
+static void test_metal_mellum_q4_k_stager(void) {
+    const uint32_t dim = 512u; /* 2 blocks, exercises a span crossing a block */
+    const uint32_t rows = 1u;
+    const uint32_t blocks = dim / 256u;
+    const uint64_t row_bytes = (uint64_t)blocks * sizeof(test_mellum_block_q4_k);
+    uint8_t *row_host = malloc((size_t)(rows * row_bytes));
+    float *ref = malloc((size_t)rows * dim * sizeof(float));
+    float *got = malloc((size_t)rows * dim * sizeof(float));
+    TEST_ASSERT(row_host && ref && got);
+    if (row_host && ref && got) {
+        test_fill_mellum_q4_k_random(row_host, dim, rows, 4242u);
+        test_mellum_q4_k_dequant_row_f32(row_host, row_bytes, rows, dim, ref);
+        ds4_gpu_tensor *rows_in = ds4_gpu_tensor_alloc((uint64_t)rows * row_bytes);
+        ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)rows * dim * sizeof(float));
+        TEST_ASSERT(rows_in && out);
+        if (rows_in && out) {
+            TEST_ASSERT(ds4_gpu_tensor_write(rows_in, 0, row_host, (uint64_t)rows * row_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_test_stage_q4_k_rows(rows_in, row_bytes, rows, dim, out) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(out, 0, got, (uint64_t)rows * dim * sizeof(float)) != 0);
+            uint32_t mismatches = 0;
+            float max_abs = 0.0f;
+            for (uint32_t i = 0; i < rows * dim; i++) {
+                const float diff = fabsf(got[i] - ref[i]);
+                max_abs = fmaxf(max_abs, diff);
+                if (got[i] != ref[i]) mismatches++;
+            }
+            fprintf(stderr, "ds4-test: Mellum q4_k_gemm_stager span-contiguous vs float32 "
+                    "reference: %u/%u elements mismatched, max_abs=%g\n",
+                    mismatches, rows * dim, (double)max_abs);
+            TEST_ASSERT(mismatches == 0u);
+        }
+        ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(rows_in);
+    }
+    free(got); free(ref); free(row_host);
+}
+
 static double test_mellum_q8_dot_d(const uint8_t *row, uint32_t width,
                                    const double *v) {
     double sum = 0.0;
@@ -8028,6 +8116,7 @@ static void test_metal_kernel_group(void) {
     test_metal_mellum_attention_prelude();
     test_metal_mellum_q8_layer();
     test_metal_mellum_q4_layer();
+    test_metal_mellum_q4_k_stager();
     test_metal_mellum_q4_q8_routed_moe();
     test_metal_mellum_q4_real_shape_decode();
     test_metal_mellum_q4_real_shape_batch();

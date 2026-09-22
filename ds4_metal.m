@@ -9667,6 +9667,46 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
     return 1;
 }
 
+/*
+ * P24b-S Task 2: diagnostic-only dispatch of ds4_mellum_stage_q4_k_rows via
+ * kernel_test_mellum_stage_q4_k_rows.  `rows_in` is any synthetic
+ * block_q4_K-packed buffer the caller uploads (model-free); `out` receives
+ * `rows * dim` dequantized floats.  One threadgroup, 256 threads.
+ */
+int ds4_gpu_test_stage_q4_k_rows(
+        ds4_gpu_tensor *rows_in, uint64_t row_bytes, uint32_t rows,
+        uint32_t dim, ds4_gpu_tensor *out) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!rows_in || !out || rows == 0u || dim == 0u || (dim % 8u) != 0u) return 0;
+    const uint64_t total = (uint64_t)rows * dim;
+    if (total > UINT64_MAX / sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) < total * sizeof(float) ||
+        !ds4_gpu_tensor_buffer(rows_in) || !ds4_gpu_tensor_buffer(out)) return 0;
+    static id<MTLComputePipelineState> pipeline;
+    if (!pipeline) pipeline = ds4_gpu_get_pipeline("kernel_test_mellum_stage_q4_k_rows");
+    if (!pipeline) return 0;
+    @autoreleasepool {
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:ds4_gpu_tensor_buffer(rows_in)
+                offset:ds4_gpu_tensor_offset(rows_in) atIndex:0];
+        [enc setBytes:&row_bytes length:sizeof(row_bytes) atIndex:1];
+        [enc setBytes:&rows length:sizeof(rows) atIndex:2];
+        [enc setBytes:&dim length:sizeof(dim) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        [enc setThreadgroupMemoryLength:(NSUInteger)(total * sizeof(float)) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "test stage q4_k rows")) return 0;
+    }
+    return 1;
+}
+
 typedef struct {
     uint8_t hmask[32];
     uint8_t qs[64];
