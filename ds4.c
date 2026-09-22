@@ -43342,6 +43342,41 @@ static uint64_t ds4_mellum_prefill_scratch_bytes(uint32_t cap) {
     return total;
 }
 
+/* P25.1: the sixth plan term.  ds4_gpu_mellum_moe_group_begin (ds4_metal.m)
+ * allocates six process-global static tensors on the expert-major MoE GEMM
+ * path -- s_partial (cap*n_expert_used*n_embd floats), s_pairs
+ * (n_expert*cap uint32s), s_counts (n_expert uint32s) and three offset
+ * tables (n_expert uint64s each) -- sized on the same first-sync cap Fix 1
+ * already threads through, and never counted by the plan. P25's own
+ * independent review root-caused exactly this as the -72.25 MiB residual
+ * its fail branch reported (docs/superpowers/research/
+ * 2026-09-22-p25-finding.md, "Review (Opus, 2026-09-22)", Blocker 1):
+ * 1024*8*2304*4 + 64*1024*4 + 64*4 + 3*64*8 = 75,761,408 B = 72.2517 MiB,
+ * matching the measured residual to the hundredth. Gated on
+ * ds4_gpu_mellum_moe_gemm_enabled() -- the GPU-only runtime switch that
+ * decides whether s_partial (the dominant term) is ever allocated; under
+ * DS4_NO_GPU there is no GPU session to allocate any of this, so the term
+ * is always 0 there. */
+#ifndef DS4_NO_GPU
+static uint64_t ds4_mellum_moe_group_workspace_bytes(uint32_t cap) {
+    if (!ds4_gpu_mellum_moe_gemm_enabled()) return 0;
+    const uint64_t c = cap;
+    uint64_t total = c * (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD *
+                     sizeof(float);                          /* s_partial */
+    total = ds4_add_sat_u64(total,
+                            (uint64_t)DS4_N_EXPERT * c * sizeof(uint32_t));
+                                                               /* s_pairs */
+    total = ds4_add_sat_u64(total, (uint64_t)DS4_N_EXPERT * 28u);
+                     /* s_counts (4B/expert) + 3 offset tables (8B/expert) */
+    return total;
+}
+#else
+static uint64_t ds4_mellum_moe_group_workspace_bytes(uint32_t cap) {
+    (void)cap;
+    return 0;
+}
+#endif
+
 static uint64_t ds4_mellum_planned_bytes(uint64_t weights_bytes,
                                          uint32_t ctx_size,
                                          uint32_t prefill_cap) {
@@ -43349,6 +43384,8 @@ static uint64_t ds4_mellum_planned_bytes(uint64_t weights_bytes,
     total = ds4_add_sat_u64(total, ds4_mellum_decode_state_bytes(ctx_size));
     total = ds4_add_sat_u64(total,
                             ds4_mellum_prefill_scratch_bytes(prefill_cap));
+    total = ds4_add_sat_u64(total,
+                            ds4_mellum_moe_group_workspace_bytes(prefill_cap));
     return total;
 }
 
@@ -43405,6 +43442,8 @@ static ds4_mellum_plan_parts ds4_mellum_plan_parts_for(uint64_t weights_bytes,
                                 ds4_mellum_decode_output_bytes(DS4_N_VOCAB));
     p.scratch = ds4_add_sat_u64(p.scratch,
                                 ds4_mellum_prefill_scratch_bytes(prefill_cap));
+    p.scratch = ds4_add_sat_u64(p.scratch,
+                                ds4_mellum_moe_group_workspace_bytes(prefill_cap));
     p.planned = ds4_mellum_planned_bytes(weights_bytes, ctx_size, prefill_cap);
     return p;
 }
