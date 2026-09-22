@@ -376,6 +376,7 @@ static id<MTLBlitCommandEncoder> ds4_gpu_blit_encoder(id<MTLCommandBuffer> cb, c
 }
 
 static void ds4_gpu_parallel_ffn_reset_state(BOOL close_encoder);
+static void ds4_gpu_mellum_moe_group_reset(void);
 static NSMutableArray<id<MTLCommandBuffer>> *g_pending_cbs;
 static id<MTLSharedEvent> g_selected_readback_event;
 static uint64_t g_selected_readback_event_value;
@@ -12165,6 +12166,7 @@ void ds4_gpu_cleanup(void) {
     @autoreleasepool {
         ds4_gpu_decode_pipeline_fast_cache_reset();
         ds4_gpu_parallel_ffn_reset_state(YES);
+        ds4_gpu_mellum_moe_group_reset();
         if (g_batch_cb) {
             ds4_gpu_close_batch_encoder();
             [g_batch_cb commit];
@@ -40998,6 +41000,55 @@ static id<MTLComputePipelineState> g_mellum_down_grouped8_pipeline;
 static id<MTLComputePipelineState> g_mellum_slot_reduce_pipeline;
 static id<MTLComputePipelineState> g_mellum_pair_swiglu_gemm_pipeline;
 
+/*
+ * P25.1: file-scope so ds4_gpu_mellum_moe_group_reset (below) can free them
+ * from ds4_gpu_cleanup. Previously function-local statics inside
+ * ds4_gpu_mellum_moe_group_begin, unreachable from outside it and never
+ * reset across cleanup -- the six-tensor, 72.25 MiB leak P25's independent
+ * review root-caused (docs/superpowers/research/2026-09-22-p25-finding.md,
+ * "Review (Opus, 2026-09-22)", Blocker 1). Same convention as
+ * ds4_gpu_parallel_ffn_reset_state's g_parallel_* statics: a file-scope
+ * cache plus a dedicated _reset function called from ds4_gpu_cleanup. */
+static ds4_gpu_tensor *g_mellum_moe_group_counts, *g_mellum_moe_group_pairs;
+static ds4_gpu_tensor *g_mellum_moe_group_gate_off, *g_mellum_moe_group_up_off;
+static ds4_gpu_tensor *g_mellum_moe_group_down_off, *g_mellum_moe_group_partial;
+static uint32_t g_mellum_moe_group_experts, g_mellum_moe_group_cap;
+static uint32_t g_mellum_moe_group_pairs_experts;
+static uint64_t g_mellum_moe_group_expert_bytes;
+static uint64_t g_mellum_moe_group_down_expert_bytes;
+static uint64_t g_mellum_moe_group_partial_bytes;
+
+/*
+ * Frees the six MoE-grouping statics above and zeros their size-tracking
+ * fields, so the next ds4_gpu_mellum_moe_group_begin call reallocates from
+ * scratch. Called from ds4_gpu_cleanup, alongside the other subsystem
+ * resets (ds4_gpu_decode_pipeline_fast_cache_reset,
+ * ds4_gpu_parallel_ffn_reset_state). ds4_gpu_cleanup only runs at true
+ * process/session teardown (its callers tear the whole GPU context down),
+ * so a plain free-and-null is sufficient here -- no in-flight command
+ * buffer can still reference these buffers by the time this runs.
+ */
+static void ds4_gpu_mellum_moe_group_reset(void) {
+    ds4_gpu_tensor_free(g_mellum_moe_group_counts);
+    ds4_gpu_tensor_free(g_mellum_moe_group_pairs);
+    ds4_gpu_tensor_free(g_mellum_moe_group_gate_off);
+    ds4_gpu_tensor_free(g_mellum_moe_group_up_off);
+    ds4_gpu_tensor_free(g_mellum_moe_group_down_off);
+    ds4_gpu_tensor_free(g_mellum_moe_group_partial);
+    g_mellum_moe_group_counts = NULL;
+    g_mellum_moe_group_pairs = NULL;
+    g_mellum_moe_group_gate_off = NULL;
+    g_mellum_moe_group_up_off = NULL;
+    g_mellum_moe_group_down_off = NULL;
+    g_mellum_moe_group_partial = NULL;
+    g_mellum_moe_group_experts = 0;
+    g_mellum_moe_group_cap = 0;
+    g_mellum_moe_group_pairs_experts = 0;
+    g_mellum_moe_group_expert_bytes = 0;
+    g_mellum_moe_group_down_expert_bytes = 0;
+    g_mellum_moe_group_partial_bytes = 0;
+}
+
 static int ds4_gpu_mellum_grouped_moe_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -41023,10 +41074,6 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
                                            uint32_t out_dim,
                                            id<MTLBuffer> selectedbuf,
                                            uint64_t selected_offset) {
-    static ds4_gpu_tensor *s_counts, *s_pairs, *s_gate_off, *s_up_off;
-    static ds4_gpu_tensor *s_down_off, *s_partial;
-    static uint32_t s_experts, s_cap, s_pairs_experts;
-    static uint64_t s_expert_bytes, s_down_expert_bytes, s_partial_bytes;
 
     if (!g || !cb || !selectedbuf || n_total_expert == 0 || n_tokens == 0 ||
         n_expert_used == 0 || n_expert_used > n_total_expert) return false;
@@ -41034,47 +41081,47 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
     const uint32_t cap = n_tokens;
     if (cap > UINT32_MAX / n_total_expert) return false;
 
-    if (!s_counts || s_experts != n_total_expert) {
-        if (s_counts && ds4_gpu_commands_active()) return false;
-        ds4_gpu_tensor_free(s_counts);
-        ds4_gpu_tensor_free(s_gate_off);
-        ds4_gpu_tensor_free(s_up_off);
-        s_counts = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * sizeof(uint32_t));
-        ds4_gpu_tensor_free(s_down_off);
-        s_gate_off = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * sizeof(uint64_t));
-        s_up_off = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * sizeof(uint64_t));
-        s_down_off = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * sizeof(uint64_t));
-        s_experts = n_total_expert;
-        s_expert_bytes = 0;
-        s_down_expert_bytes = 0;
+    if (!g_mellum_moe_group_counts || g_mellum_moe_group_experts != n_total_expert) {
+        if (g_mellum_moe_group_counts && ds4_gpu_commands_active()) return false;
+        ds4_gpu_tensor_free(g_mellum_moe_group_counts);
+        ds4_gpu_tensor_free(g_mellum_moe_group_gate_off);
+        ds4_gpu_tensor_free(g_mellum_moe_group_up_off);
+        g_mellum_moe_group_counts = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * sizeof(uint32_t));
+        ds4_gpu_tensor_free(g_mellum_moe_group_down_off);
+        g_mellum_moe_group_gate_off = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * sizeof(uint64_t));
+        g_mellum_moe_group_up_off = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * sizeof(uint64_t));
+        g_mellum_moe_group_down_off = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * sizeof(uint64_t));
+        g_mellum_moe_group_experts = n_total_expert;
+        g_mellum_moe_group_expert_bytes = 0;
+        g_mellum_moe_group_down_expert_bytes = 0;
     }
-    if (!s_pairs || s_cap < cap || s_pairs_experts != n_total_expert) {
+    if (!g_mellum_moe_group_pairs || g_mellum_moe_group_cap < cap || g_mellum_moe_group_pairs_experts != n_total_expert) {
         /*
          * Freeing here while a caller-owned batch is open could release a
          * buffer the queued command buffer still references.  Callers keep the
          * shape fixed for a whole chunk, so this only guards a future one that
          * does not.
          */
-        if (s_pairs && ds4_gpu_commands_active()) return false;
-        ds4_gpu_tensor_free(s_pairs);
-        s_pairs = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * cap *
+        if (g_mellum_moe_group_pairs && ds4_gpu_commands_active()) return false;
+        ds4_gpu_tensor_free(g_mellum_moe_group_pairs);
+        g_mellum_moe_group_pairs = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * cap *
                                        sizeof(uint32_t));
-        s_cap = cap;
-        s_pairs_experts = n_total_expert;
+        g_mellum_moe_group_cap = cap;
+        g_mellum_moe_group_pairs_experts = n_total_expert;
     }
-    if (!s_counts || !s_pairs || !s_gate_off || !s_up_off || !s_down_off) return false;
+    if (!g_mellum_moe_group_counts || !g_mellum_moe_group_pairs || !g_mellum_moe_group_gate_off || !g_mellum_moe_group_up_off || !g_mellum_moe_group_down_off) return false;
 
-    if (s_down_expert_bytes != down_expert_bytes) {
+    if (g_mellum_moe_group_down_expert_bytes != down_expert_bytes) {
         uint64_t *off = malloc((size_t)n_total_expert * sizeof(*off));
         if (!off) return false;
         for (uint32_t e = 0; e < n_total_expert; e++) {
             off[e] = (uint64_t)e * down_expert_bytes;
         }
         const uint64_t bytes = (uint64_t)n_total_expert * sizeof(*off);
-        const bool ok = ds4_gpu_tensor_write(s_down_off, 0, off, bytes) != 0;
+        const bool ok = ds4_gpu_tensor_write(g_mellum_moe_group_down_off, 0, off, bytes) != 0;
         free(off);
         if (!ok) return false;
-        s_down_expert_bytes = down_expert_bytes;
+        g_mellum_moe_group_down_expert_bytes = down_expert_bytes;
     }
 
     /*
@@ -41085,27 +41132,27 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
     if (ds4_gpu_mellum_moe_gemm_enabled() && out_dim > 0) {
         const uint64_t want = (uint64_t)n_tokens * n_expert_used * out_dim *
                               sizeof(float);
-        if (!s_partial || s_partial_bytes < want) {
-            if (s_partial && ds4_gpu_commands_active()) return false;
-            ds4_gpu_tensor_free(s_partial);
-            s_partial = ds4_gpu_tensor_alloc(want);
-            s_partial_bytes = s_partial ? want : 0;
+        if (!g_mellum_moe_group_partial || g_mellum_moe_group_partial_bytes < want) {
+            if (g_mellum_moe_group_partial && ds4_gpu_commands_active()) return false;
+            ds4_gpu_tensor_free(g_mellum_moe_group_partial);
+            g_mellum_moe_group_partial = ds4_gpu_tensor_alloc(want);
+            g_mellum_moe_group_partial_bytes = g_mellum_moe_group_partial ? want : 0;
         }
-        if (!s_partial) return false;
+        if (!g_mellum_moe_group_partial) return false;
     }
 
-    if (s_expert_bytes != gate_expert_bytes) {
+    if (g_mellum_moe_group_expert_bytes != gate_expert_bytes) {
         uint64_t *off = malloc((size_t)n_total_expert * sizeof(*off));
         if (!off) return false;
         for (uint32_t e = 0; e < n_total_expert; e++) {
             off[e] = (uint64_t)e * gate_expert_bytes;
         }
         const uint64_t bytes = (uint64_t)n_total_expert * sizeof(*off);
-        const bool ok = ds4_gpu_tensor_write(s_gate_off, 0, off, bytes) != 0 &&
-                        ds4_gpu_tensor_write(s_up_off, 0, off, bytes) != 0;
+        const bool ok = ds4_gpu_tensor_write(g_mellum_moe_group_gate_off, 0, off, bytes) != 0 &&
+                        ds4_gpu_tensor_write(g_mellum_moe_group_up_off, 0, off, bytes) != 0;
         free(off);
         if (!ok) return false;
-        s_expert_bytes = gate_expert_bytes;
+        g_mellum_moe_group_expert_bytes = gate_expert_bytes;
     }
 
     if (!g_mellum_moe_bucket_reset_pipeline) {
@@ -41123,21 +41170,21 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
         .n_tokens = n_tokens,
         .n_expert_used = n_expert_used,
         .n_total_expert = n_total_expert,
-        .bucket_cap = s_cap,
+        .bucket_cap = g_mellum_moe_group_cap,
     };
-    g->counts = s_counts;
-    g->pairs = s_pairs;
-    g->gate_offsets = s_gate_off;
-    g->up_offsets = s_up_off;
-    g->down_offsets = s_down_off;
-    g->partial = s_partial;
+    g->counts = g_mellum_moe_group_counts;
+    g->pairs = g_mellum_moe_group_pairs;
+    g->gate_offsets = g_mellum_moe_group_gate_off;
+    g->up_offsets = g_mellum_moe_group_up_off;
+    g->down_offsets = g_mellum_moe_group_down_off;
+    g->partial = g_mellum_moe_group_partial;
 
     /* Reset and build are separate encoders: the build must observe the reset. */
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
     [enc setComputePipelineState:g_mellum_moe_bucket_reset_pipeline];
     [enc setBytes:&g->args length:sizeof(g->args) atIndex:0];
-    [enc setBuffer:ds4_gpu_tensor_buffer(s_counts)
-            offset:ds4_gpu_tensor_offset(s_counts) atIndex:1];
+    [enc setBuffer:ds4_gpu_tensor_buffer(g_mellum_moe_group_counts)
+            offset:ds4_gpu_tensor_offset(g_mellum_moe_group_counts) atIndex:1];
     [enc dispatchThreadgroups:MTLSizeMake((n_total_expert + 63u) / 64u, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -41147,10 +41194,10 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
     [enc setComputePipelineState:g_mellum_moe_bucket_build_pipeline];
     [enc setBytes:&g->args length:sizeof(g->args) atIndex:0];
     [enc setBuffer:selectedbuf offset:(NSUInteger)selected_offset atIndex:1];
-    [enc setBuffer:ds4_gpu_tensor_buffer(s_counts)
-            offset:ds4_gpu_tensor_offset(s_counts) atIndex:2];
-    [enc setBuffer:ds4_gpu_tensor_buffer(s_pairs)
-            offset:ds4_gpu_tensor_offset(s_pairs) atIndex:3];
+    [enc setBuffer:ds4_gpu_tensor_buffer(g_mellum_moe_group_counts)
+            offset:ds4_gpu_tensor_offset(g_mellum_moe_group_counts) atIndex:2];
+    [enc setBuffer:ds4_gpu_tensor_buffer(g_mellum_moe_group_pairs)
+            offset:ds4_gpu_tensor_offset(g_mellum_moe_group_pairs) atIndex:3];
     [enc dispatchThreadgroups:MTLSizeMake((pair_total + 255u) / 256u, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
