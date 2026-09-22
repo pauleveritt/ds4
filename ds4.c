@@ -43359,6 +43359,17 @@ static bool ds4_mellum_admit(uint64_t planned, uint64_t budget) {
     return budget == 0 || planned <= budget;
 }
 
+/* P25 Task 9. Kept as a sibling, not a replacement: ds4_mellum_admit stays
+ * bool-returning for its existing callers (ds4.c:44782 -- this function's
+ * own call below -- and the DS4_NO_GPU test hook at ds4.c:74929,
+ * ds4_test_mellum_admit; both were grepped before adding this, per spec
+ * Risk 4). Returns 0 when admitted (a print-only unknown budget counts as
+ * admitted, matching ds4_mellum_admit), else planned - budget. */
+static uint64_t ds4_mellum_admit_residual(uint64_t planned, uint64_t budget) {
+    if (budget == 0 || planned <= budget) return 0;
+    return planned - budget;
+}
+
 /* P25 Fix 1.  The plan and the admission gate cannot know the real session's
  * first-sync pending-token count in advance (it is a property of the prompt,
  * not the engine), so this is the conservative upper bound: whatever the
@@ -44775,15 +44786,34 @@ static bool ds4_mellum_memory_admit_at_open(const ds4_engine *e,
      * sessions in that a real open would then overrun). This does shift the
      * admission boundary: a --ctx that admitted under the old, undercounted
      * plan can now be refused (P25 spec Risk 6). */
+    const uint32_t prefill_cap = ds4_mellum_effective_prefill_cap((uint32_t)ctx_size);
     const uint64_t planned =
         ds4_mellum_planned_bytes(e->startup_model_span_bytes,
-                                 (uint32_t)ctx_size,
-                                 ds4_mellum_effective_prefill_cap((uint32_t)ctx_size));
+                                 (uint32_t)ctx_size, prefill_cap);
     if (ds4_mellum_admit(planned, budget)) return true;
+    /* P25 Task 9: name the dominant term and print the residual in GiB, so
+     * the refusal is actionable instead of just a "no". Reuses the plan
+     * line's own parts struct (ds4_mellum_plan_parts_for) so this can never
+     * describe a different sum than the plan line does. TODO(owner): the
+     * exact human-readable phrasing below ("use a smaller --ctx" etc.) is
+     * not a product decision this phase makes -- see the spec's "not decide
+     * the exact wording". */
+    const ds4_mellum_plan_parts p =
+        ds4_mellum_plan_parts_for(e->startup_model_span_bytes, (uint32_t)ctx_size);
+    const uint64_t residual = ds4_mellum_admit_residual(planned, budget);
+    const char *dominant = "weights";
+    uint64_t dominant_bytes = p.weights;
+    if (p.kv > dominant_bytes) { dominant = "KV"; dominant_bytes = p.kv; }
+    if (p.scratch > dominant_bytes) { dominant = "scratch"; dominant_bytes = p.scratch; }
     fprintf(stderr,
-            "ds4: Mellum 2 needs %.2f GiB (weights + KV + scratch) but this "
-            "device recommends at most %.2f GiB; use a smaller --ctx\n",
-            ds4_bytes_to_gib(planned), ds4_bytes_to_gib(budget));
+            "ds4: Mellum 2 needs %.2f GiB (weights %.2f GiB + KV %.2f GiB + "
+            "scratch %.2f MiB) but this device recommends at most %.2f GiB "
+            "-- over by %.2f GiB, dominated by %s (%.2f GiB); use a smaller "
+            "--ctx\n",
+            ds4_bytes_to_gib(planned), ds4_bytes_to_gib(p.weights),
+            ds4_bytes_to_gib(p.kv), (double)p.scratch / 1048576.0,
+            ds4_bytes_to_gib(budget), ds4_bytes_to_gib(residual), dominant,
+            ds4_bytes_to_gib(dominant_bytes));
     return false;
 }
 
@@ -74929,6 +74959,14 @@ int ds4_test_mellum_memory_plan(uint32_t ctx_size, uint32_t prefill_cap,
 
 int ds4_test_mellum_admit(uint64_t planned, uint64_t budget) {
     return ds4_mellum_admit(planned, budget) ? 1 : 0;
+}
+
+/* P25 Task 9. Not declared in ds4.h -- kept out of the frozen header,
+ * per the corrected pattern this phase follows (a local extern prototype
+ * in the test file instead of a new ds4.h declaration; see tests/
+ * test_sampling.c). */
+uint64_t ds4_test_mellum_admit_residual(uint64_t planned, uint64_t budget) {
+    return ds4_mellum_admit_residual(planned, budget);
 }
 
 /* P25 Task 5/6: the generic, family-agnostic context-memory estimator

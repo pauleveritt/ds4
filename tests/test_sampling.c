@@ -548,12 +548,23 @@ static void check_mellum_memory_plan(void) {
     CHECK(p_kv == (unsigned long long)MELLUM_KV_BYTES_CTX4096,
           "mellum plan-bytes kv %llu != %llu",
           p_kv, (unsigned long long)MELLUM_KV_BYTES_CTX4096);
+    /* P25 Fix 1: ds4_mellum_plan_parts_for (which this suffix hook calls)
+     * now folds in the prefill scratch at
+     * ds4_mellum_effective_prefill_cap(ctx) = min(ctx, DS4_N_SWA); at
+     * ctx=4096 that is DS4_N_SWA=1024, so the expected suffix scratch grows
+     * by 1024 * MELLUM_PREFILL_BYTES_PER_TOKEN over the pre-fix figure this
+     * assertion used to check (533,056 bytes -> 136,393,280 bytes). This
+     * was RED before ds4.c's Fix 1 commit landed (asserted the old,
+     * undercounting figure); updated here in the same phase, per the red-
+     * first requirement, not retuned to paper over a real behaviour change. */
     CHECK(p_scratch == (unsigned long long)(MELLUM_DECODE_SCRATCH_BYTES +
-                                            MELLUM_DECODE_OUTPUT_BYTES),
+                                            MELLUM_DECODE_OUTPUT_BYTES +
+                                            1024ull * MELLUM_PREFILL_BYTES_PER_TOKEN),
           "mellum plan-bytes scratch %llu != %llu",
           p_scratch,
           (unsigned long long)(MELLUM_DECODE_SCRATCH_BYTES +
-                               MELLUM_DECODE_OUTPUT_BYTES));
+                               MELLUM_DECODE_OUTPUT_BYTES +
+                               1024ull * MELLUM_PREFILL_BYTES_PER_TOKEN));
 
     /* Admission truth table: a zero budget means the device did not answer,
      * so the plan is print-only and admits. */
@@ -564,6 +575,44 @@ static void check_mellum_memory_plan(void) {
     CHECK(ds4_test_mellum_admit(UINT64_MAX, 0) == 1,
           "admit: unknown budget admits any plan");
     printf("mellum admit truth table: ok\n");
+}
+
+/* P25 Task 9: ds4_test_mellum_admit_residual is deliberately NOT declared
+ * in ds4.h (frozen this phase) -- a local extern prototype here instead,
+ * per the corrected pattern (see docs/superpowers/research/
+ * 2026-09-22-p25-preregistration.md's citation of the prior session's
+ * header mistake). */
+extern uint64_t ds4_test_mellum_admit_residual(uint64_t planned,
+                                               uint64_t budget);
+
+static void check_mellum_admit_residual(void) {
+    /* Admitted: residual is 0 either way, matching ds4_test_mellum_admit's
+     * own truth table above. */
+    CHECK(ds4_test_mellum_admit_residual(100, 100) == 0,
+          "residual: equal must be 0");
+    CHECK(ds4_test_mellum_admit_residual(99, 100) == 0,
+          "residual: under must be 0");
+    CHECK(ds4_test_mellum_admit_residual(0, 0) == 0,
+          "residual: unknown budget must be 0");
+    CHECK(ds4_test_mellum_admit_residual(UINT64_MAX, 0) == 0,
+          "residual: unknown budget admits any plan, residual 0");
+    /* Two synthetic pairs where a DIFFERENT term dominates, per the plan --
+     * the residual function itself only sees (planned, budget), so
+     * "dominant term" is exercised at the ds4_mellum_memory_admit_at_open
+     * call site, not here; what this hook must get right is the byte
+     * arithmetic the refusal message's GiB figure is built from. */
+    CHECK(ds4_test_mellum_admit_residual(101, 100) == 1,
+          "residual: over by 1 must be 1");
+    const uint64_t big_planned = UINT64_C(14000000000);   /* ~13.04 GiB */
+    const uint64_t big_budget = UINT64_C(10000000000);    /* ~9.31 GiB */
+    CHECK(ds4_test_mellum_admit_residual(big_planned, big_budget) ==
+          big_planned - big_budget,
+          "residual: large over-budget arithmetic wrong");
+    printf("mellum admit residual: ok (equal=0 under=0 unknown=0 over1=%llu "
+           "over-large=%llu)\n",
+           (unsigned long long)ds4_test_mellum_admit_residual(101, 100),
+           (unsigned long long)ds4_test_mellum_admit_residual(big_planned,
+                                                               big_budget));
 }
 
 /*
@@ -610,6 +659,7 @@ static void check_mellum_generic_estimator_family_branch(void) {
 
 int main(void) {
     check_mellum_memory_plan();
+    check_mellum_admit_residual();
     check_mellum_generic_estimator_family_branch();
     check_sampling_defaults();
     check_speculative_distribution();
