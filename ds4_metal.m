@@ -40532,8 +40532,14 @@ int ds4_gpu_mellum_q8_0_layer_prefill_tensor(
            ds4_gpu_mellum_router_select_batch_tensor(
                router_selected, router_weights, router_probs, router_logits,
                desc->n_expert, desc->n_expert_used, n_tokens) != 0 &&
+           /*
+            * P24b-S Task 5: the prefill/batch route now takes the
+            * expert-major Q4_K GEMM kernel (Task 3), not the token-major
+            * fallback (P24a) -- the wiring this phase exists for. The
+            * decode twin above (:40459) is untouched, per the spec.
+            */
            (desc->gate_up_type == DS4_GPU_MELLUM_GATE_UP_Q4_K ?
-                ds4_gpu_mellum_routed_moe_batch_tensor(
+                ds4_gpu_mellum_q4_k_routed_moe_batch_tensor(
                moe_out, moe_mid, model_map, model_size, desc->gate_offset,
                desc->up_offset, desc->down_offset, desc->gate_expert_bytes,
                desc->gate_row_bytes, desc->down_expert_bytes,
@@ -40706,6 +40712,30 @@ static bool ds4_gpu_mellum_q4k_pair_select(
         *threads = 64u;
         *tg_bytes = 0u;
     }
+    return *pipeline != nil;
+}
+
+/*
+ * P24b-S Task 3: the expert-major Q4_K GEMM pipeline, mirroring how the
+ * Q8_0 wrapper picks kernel_mellum_q8_0_pair_swiglu_gemm_f32 (ds4_metal.m
+ * ~41378-41393): same pattern as ds4_gpu_mellum_q4k_pair_select above, but
+ * for the grouped/GEMM prefill route rather than the decode/token-major
+ * pair. Threadgroup memory: 2 * expert_in_dim floats, the same sizing the
+ * Q8_0 GEMM path's wstage uses.
+ */
+static id<MTLComputePipelineState> g_mellum_q4_K_pair_swiglu_gemm_f32_pipeline;
+
+static bool ds4_gpu_mellum_q4k_gemm_select(
+        uint32_t expert_in_dim, id<MTLComputePipelineState> __autoreleasing *pipeline,
+        NSUInteger *tg_bytes) {
+    if (!g_mellum_q4_K_pair_swiglu_gemm_f32_pipeline) {
+        g_mellum_q4_K_pair_swiglu_gemm_f32_pipeline = ds4_gpu_get_pipeline(
+            "kernel_mellum_q4_K_pair_swiglu_gemm_f32");
+    }
+    *pipeline = ds4_gpu_hot_pipeline(
+        g_mellum_q4_K_pair_swiglu_gemm_f32_pipeline,
+        "kernel_mellum_q4_K_pair_swiglu_gemm_f32");
+    *tg_bytes = 2u * (NSUInteger)expert_in_dim * sizeof(float);
     return *pipeline != nil;
 }
 
@@ -41161,7 +41191,8 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
                                            uint64_t down_expert_bytes,
                                            uint32_t out_dim,
                                            id<MTLBuffer> selectedbuf,
-                                           uint64_t selected_offset) {
+                                           uint64_t selected_offset,
+                                           bool need_partial) {
     static ds4_gpu_tensor *s_counts, *s_pairs, *s_partial;
     static uint32_t s_experts, s_cap, s_pairs_experts;
     static uint64_t s_partial_bytes;
@@ -41216,10 +41247,15 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
 
     /*
      * Per-(token, slot) staging for the expert-major down projection.  Only
-     * allocated when that path is on: it is n_tokens * n_expert_used * out_dim
-     * floats, about 75 MiB at a 1,024-token chunk.
+     * allocated when a caller needs it: it is n_tokens * n_expert_used *
+     * out_dim floats, about 75 MiB at a 1,024-token chunk.  The Q8_0 caller
+     * passes DS4_MELLUM_MOE_GEMM's own opt-out here (it has a non-GEMM
+     * fallback within the same wrapper); the Q4_K GEMM wrapper (P24b-S)
+     * has no non-GEMM path and always passes true -- it must not be
+     * silently starved of this buffer by a Q8_0-only env var (P24b-S
+     * Task 4/6's DS4_MELLUM_MOE_GEMM=0 guard-matrix leg caught this).
      */
-    if (ds4_gpu_mellum_moe_gemm_enabled() && out_dim > 0) {
+    if (need_partial && out_dim > 0) {
         const uint64_t want = (uint64_t)n_tokens * n_expert_used * out_dim *
                               sizeof(float);
         if (!s_partial || s_partial_bytes < want) {
@@ -41445,7 +41481,8 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
                                             n_tokens, gate_expert_bytes,
                                             down_expert_bytes, out_dim,
                                             selectedbuf,
-                                            ds4_gpu_tensor_offset(selected));
+                                            ds4_gpu_tensor_offset(selected),
+                                            want_gemm);
         const bool gemm = grouped && want_gemm && ggroup.partial;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         if (gemm) {
@@ -41555,6 +41592,195 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Mellum Q8_0 batch routed MoE"))
+            return 0;
+    }
+    return 1;
+}
+
+/*
+ * P24b-S Task 5: expert-major Q4_K gate/up + Q8_0 down Mellum MoE for a
+ * batch of tokens -- the Q4_K sibling of ds4_gpu_mellum_q8_0_routed_moe_
+ * batch_tensor's GEMM path above, always taking that route (Task 3's
+ * kernel_mellum_q4_K_pair_swiglu_gemm_f32 via ds4_gpu_mellum_q4k_gemm_
+ * select), reusing ds4_gpu_mellum_moe_group_begin's bucket-build/transient
+ * offset-table infrastructure exactly as the Q8_0 wrapper does -- no new
+ * dispatch pattern, per the spec's "free for any wrapper that calls it".
+ * The down projection is unchanged from the Q8_0 wrapper: Q8_0 down GEMM +
+ * slot-reduce. DS4_MELLUM_MOE_GEMM / _GROUPED_MOE are Q8_0-only opt-outs
+ * and are not consulted here -- this wrapper has exactly one route.
+ * Loud refusal on a stride mismatch (ds4_gpu_mellum_moe_stride_mismatch),
+ * not a silent 0, mirroring every other Mellum wrapper.
+ */
+int ds4_gpu_mellum_q4_k_routed_moe_batch_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *mid, const void *model_map,
+        uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t down_offset, uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes, uint64_t down_expert_bytes,
+        uint64_t down_row_bytes, uint32_t expert_in_dim,
+        uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, const ds4_gpu_tensor *x,
+        uint32_t n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (ds4_gpu_mellum_moe_stride_mismatch(
+            "batch", "Q4_K", 256u, 144u, expert_in_dim, expert_mid_dim,
+            gate_row_bytes, gate_expert_bytes, down_row_bytes)) return 0;
+    if (!out || !mid || !model_map || !selected || !weights || !x ||
+        n_total_expert == 0 || n_expert == 0 || n_expert > n_total_expert ||
+        n_expert > 32u ||
+        expert_in_dim == 0 || expert_mid_dim == 0 || out_dim == 0 || n_tokens == 0 ||
+        n_expert > UINT32_MAX / expert_mid_dim ||
+        (expert_in_dim % 256u) != 0 || (expert_mid_dim % 32u) != 0 ||
+        gate_row_bytes != (uint64_t)(expert_in_dim / 256u) * 144u ||
+        down_row_bytes != (uint64_t)(expert_mid_dim / 32u) * 34u ||
+        gate_expert_bytes != (uint64_t)expert_mid_dim * gate_row_bytes ||
+        down_expert_bytes != (uint64_t)out_dim * down_row_bytes) return 0;
+    if ((uint64_t)n_total_expert > UINT64_MAX / gate_expert_bytes ||
+        (uint64_t)n_total_expert > UINT64_MAX / down_expert_bytes) return 0;
+    const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
+    const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
+    if (gate_offset > model_size || gate_bytes > model_size - gate_offset ||
+        up_offset > model_size || gate_bytes > model_size - up_offset ||
+        down_offset > model_size || down_bytes > model_size - down_offset) return 0;
+    const uint64_t x_values = (uint64_t)n_tokens * expert_in_dim;
+    const uint64_t route_values = (uint64_t)n_tokens * n_expert;
+    const uint64_t out_values = (uint64_t)n_tokens * out_dim;
+    if (x_values > UINT64_MAX / sizeof(float) ||
+        route_values > UINT64_MAX / expert_mid_dim ||
+        route_values > UINT64_MAX / sizeof(float) ||
+        out_values > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t mid_values = route_values * expert_mid_dim;
+    if (mid_values > UINT64_MAX / sizeof(float) ||
+        route_values > UINT64_MAX / sizeof(int32_t) ||
+        !ds4_gpu_tensor_buffer(x) || !ds4_gpu_tensor_buffer(mid) ||
+        !ds4_gpu_tensor_buffer(out) || !ds4_gpu_tensor_buffer(selected) ||
+        !ds4_gpu_tensor_buffer(weights) ||
+        ds4_gpu_tensor_bytes(x) < x_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(mid) < mid_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) < out_values * sizeof(float) ||
+        ds4_gpu_tensor_bytes(selected) < route_values * sizeof(int32_t) ||
+        ds4_gpu_tensor_bytes(weights) < route_values * sizeof(float)) return 0;
+    @autoreleasepool {
+        uint64_t gate_inner = 0, up_inner = 0, down_inner = 0;
+        id<MTLBuffer> gatebuf = ds4_gpu_wrap_model_exact_range(
+            model_map, model_size, gate_offset, gate_bytes, &gate_inner);
+        id<MTLBuffer> upbuf = ds4_gpu_wrap_model_exact_range(
+            model_map, model_size, up_offset, gate_bytes, &up_inner);
+        id<MTLBuffer> downbuf = ds4_gpu_wrap_model_exact_range(
+            model_map, model_size, down_offset, down_bytes, &down_inner);
+        if (!gatebuf || !upbuf || !downbuf) return 0;
+
+        id<MTLComputePipelineState> gemm_pair_pipeline = nil;
+        NSUInteger gemm_pair_tg_bytes = 0;
+        if (!ds4_gpu_mellum_q4k_gemm_select(expert_in_dim, &gemm_pair_pipeline,
+                                            &gemm_pair_tg_bytes)) return 0;
+        id<MTLComputePipelineState> gemm_reduce_pipeline = nil;
+        if (!g_mellum_slot_reduce_pipeline)
+            g_mellum_slot_reduce_pipeline = ds4_gpu_get_pipeline(
+                "kernel_mellum_moe_slot_reduce_f32");
+        gemm_reduce_pipeline = ds4_gpu_hot_pipeline(
+            g_mellum_slot_reduce_pipeline, "kernel_mellum_moe_slot_reduce_f32");
+        const uint64_t stage8 = 8ull * expert_mid_dim * sizeof(float);
+        id<MTLComputePipelineState> gemm_down_pipeline = nil;
+        unsigned gemm_rows = 0;
+        if (stage8 <= 32768ull) {
+            if (!g_mellum_down_grouped8_pipeline)
+                g_mellum_down_grouped8_pipeline = ds4_gpu_get_pipeline(
+                    "kernel_mellum_q8_0_down_grouped8_f32");
+            gemm_down_pipeline = ds4_gpu_hot_pipeline(
+                g_mellum_down_grouped8_pipeline, "kernel_mellum_q8_0_down_grouped8_f32");
+            gemm_rows = 8;
+        }
+        if (!gemm_down_pipeline) {
+            if (!g_mellum_down_grouped4_pipeline)
+                g_mellum_down_grouped4_pipeline = ds4_gpu_get_pipeline(
+                    "kernel_mellum_q8_0_down_grouped4_f32");
+            gemm_down_pipeline = ds4_gpu_hot_pipeline(
+                g_mellum_down_grouped4_pipeline, "kernel_mellum_q8_0_down_grouped4_f32");
+            gemm_rows = gemm_down_pipeline ? 4 : 0;
+        }
+        if (!gemm_pair_pipeline || !gemm_down_pipeline || !gemm_reduce_pipeline ||
+            !gemm_rows) return 0;
+
+        const ds4_gpu_glm_routed_moe_args args = {
+            .in_dim = expert_in_dim, .mid_dim = expert_mid_dim, .out_dim = out_dim,
+            .n_total_expert = n_total_expert, .n_expert_used = n_expert,
+            .n_tokens = n_tokens, .mid_token_stride = n_expert * expert_mid_dim,
+            .down_type = DS4_METAL_TENSOR_Q8_0, .tp_world = 1,
+            .gate_expert_bytes = gate_expert_bytes, .gate_row_bytes = gate_row_bytes,
+            .up_expert_bytes = gate_expert_bytes, .up_row_bytes = gate_row_bytes,
+            .down_expert_bytes = down_expert_bytes, .down_row_bytes = down_row_bytes,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> midbuf = ds4_gpu_tensor_buffer(mid);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
+        id<MTLBuffer> weightsbuf = ds4_gpu_tensor_buffer(weights);
+        ds4_gpu_mellum_moe_group ggroup = {0};
+        const bool grouped = ds4_gpu_mellum_moe_group_begin(
+            &ggroup, cb, n_total_expert, n_expert, n_tokens, gate_expert_bytes,
+            down_expert_bytes, out_dim, selectedbuf, ds4_gpu_tensor_offset(selected),
+            /*need_partial=*/true);
+        if (!grouped || !ggroup.partial) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:gemm_pair_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBytes:&ggroup.args length:sizeof(ggroup.args) atIndex:1];
+        [enc setBuffer:gatebuf offset:(NSUInteger)gate_inner atIndex:2];
+        [enc setBuffer:upbuf offset:(NSUInteger)up_inner atIndex:3];
+        [enc setBuffer:ggroup.offsets offset:ggroup.gate_offsets_at atIndex:4];
+        [enc setBuffer:ggroup.offsets offset:ggroup.up_offsets_at atIndex:5];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:6];
+        [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:7];
+        [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.counts)
+                offset:ds4_gpu_tensor_offset(ggroup.counts) atIndex:8];
+        [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.pairs)
+                offset:ds4_gpu_tensor_offset(ggroup.pairs) atIndex:9];
+        [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:10];
+        [enc useResource:gatebuf usage:MTLResourceUsageRead];
+        [enc useResource:upbuf usage:MTLResourceUsageRead];
+        [enc setThreadgroupMemoryLength:gemm_pair_tg_bytes atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(expert_mid_dim, n_total_expert, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:gemm_down_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBytes:&ggroup.args length:sizeof(ggroup.args) atIndex:1];
+        [enc setBuffer:downbuf offset:(NSUInteger)down_inner atIndex:2];
+        [enc setBuffer:ggroup.offsets offset:ggroup.down_offsets_at atIndex:3];
+        [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.counts)
+                offset:ds4_gpu_tensor_offset(ggroup.counts) atIndex:5];
+        [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.pairs)
+                offset:ds4_gpu_tensor_offset(ggroup.pairs) atIndex:6];
+        [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.partial)
+                offset:ds4_gpu_tensor_offset(ggroup.partial) atIndex:7];
+        [enc useResource:downbuf usage:MTLResourceUsageRead];
+        [enc setThreadgroupMemoryLength:(NSUInteger)gemm_rows *
+             (NSUInteger)expert_mid_dim * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((out_dim + gemm_rows - 1u) / gemm_rows,
+                                              n_total_expert, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:gemm_reduce_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(ggroup.partial)
+                offset:ds4_gpu_tensor_offset(ggroup.partial) atIndex:1];
+        [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        const NSUInteger n_out = (NSUInteger)n_tokens * out_dim;
+        [enc dispatchThreadgroups:MTLSizeMake((n_out + 255u) / 256u, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Mellum Q4_K expert-major MoE"))
             return 0;
     }
     return 1;

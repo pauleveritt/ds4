@@ -3480,6 +3480,72 @@ kernel void kernel_mellum_q8_0_pair_swiglu_gemm_f32(
 }
 
 /*
+ * P24b-S Task 3: expert-major Q4_K gate/up GEMM, structurally identical to
+ * kernel_mellum_q8_0_pair_swiglu_gemm_f32 above -- same buffer indices 0-10,
+ * same threadgroup float *wstage, same (ntg=256, nsg=8, lanes=32), same
+ * grid (row, expert), same per-token simd_sum reduction (it runs on
+ * already-dequantized floats in wstage regardless of source type). The only
+ * differences: gate_row_bytes/up_row_bytes are Q4_K's (144 B/block, 9-block
+ * row at in_dim=2,304 vs Q8_0's 34 B/32-wide block), and staging calls
+ * Task 2's ds4_mellum_stage_q4_k_rows. The epilogue is deliberately the
+ * unclamped Q8_0-GEMM form (g / (1+exp(-g)) * u * weight), not K2's
+ * ds4_glm_swiglu clamp -- the spec review's explicit trap to avoid.
+ */
+kernel void kernel_mellum_q4_K_pair_swiglu_gemm_f32(
+        constant ds4_metal_glm_routed_moe_args &args [[buffer(0)]],
+        constant ds4_metal_mellum_moe_group_args &gargs [[buffer(1)]],
+        device const char *gate [[buffer(2)]],
+        device const char *up [[buffer(3)]],
+        device const uint64_t *gate_offsets [[buffer(4)]],
+        device const uint64_t *up_offsets [[buffer(5)]],
+        device const float *x [[buffer(6)]],
+        device const float *weights [[buffer(7)]],
+        device const uint32_t *counts [[buffer(8)]],
+        device const uint32_t *pairs [[buffer(9)]],
+        device float *mid [[buffer(10)]],
+        threadgroup float *wstage [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint simd_lane [[thread_index_in_simdgroup]],
+        uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint ntg = 256u, nsg = 8u, lanes = 32u;
+    const uint row = tgpig.x;
+    const uint expert = tgpig.y;
+    if (row >= args.mid_dim || expert >= gargs.n_total_expert) return;
+    const uint count = min(counts[expert], gargs.bucket_cap);
+    if (count == 0u) return;
+
+    const uint K = args.in_dim;
+    ds4_mellum_stage_q4_k_rows(gate + gate_offsets[expert] +
+                                   (uint64_t)row * args.gate_row_bytes,
+                               args.gate_row_bytes, 1u, K, tid, ntg, wstage);
+    ds4_mellum_stage_q4_k_rows(up + up_offsets[expert] +
+                                   (uint64_t)row * args.up_row_bytes,
+                               args.up_row_bytes, 1u, K, tid, ntg, wstage + K);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint p = simd_group; p < count; p += nsg) {
+        const uint pair = pairs[expert * gargs.bucket_cap + p];
+        const uint token = pair / args.n_expert_used;
+        const uint slot = pair - token * args.n_expert_used;
+        device const float *token_x = x + (uint64_t)token * K;
+        float ag = 0.0f, au = 0.0f;
+        for (uint k = simd_lane * 4u; k < K; k += lanes * 4u) {
+            const float4 xv = *(device const float4 *)(token_x + k);
+            ag += dot(*(threadgroup const float4 *)(wstage + k), xv);
+            au += dot(*(threadgroup const float4 *)(wstage + K + k), xv);
+        }
+        const float g = simd_sum(ag);
+        const float u = simd_sum(au);
+        if (simd_lane == 0u) {
+            mid[(uint64_t)token * args.mid_token_stride +
+                (uint64_t)slot * args.mid_dim + row] =
+                g / (1.0f + exp(-g)) * u * weights[pair];
+        }
+    }
+}
+
+/*
  * Row-tiled Mellum Q8_0 down projection.
  *
  * The batch kernel above spends one 256-lane tree reduction -- eight

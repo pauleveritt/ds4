@@ -3419,6 +3419,141 @@ static void test_metal_mellum_q4_real_shape_batch(void) {
     free(f.model);
 }
 
+/*
+ * P24b-S Task 4 + Task 6, combined (same fixture, same n_tokens set): the
+ * expert-major Q4_K GEMM wrapper (ds4_gpu_mellum_q4_k_routed_moe_batch_
+ * tensor, Task 5) at the real shape, n_tokens in {1, 33, 257, 1024}
+ * (the preregistered D7 batch-row set), against BOTH:
+ *   (a) the double-precision reference (test_q4k_real_reference) -- D7
+ *       item 1, mid <= 4e-5, out <= 1e-4;
+ *   (b) the existing token-major fallback (ds4_gpu_mellum_routed_moe_
+ *       batch_tensor) on the IDENTICAL weights/activations -- Task 6's
+ *       fallback-vs-shader agreement check, D7's own frozen bound, not
+ *       loosened. This gates all later speed work.
+ * Out-of-range experts (id -1 or 64 injected into every 7th slot, per
+ * P24a's convention): the bucket build drops them, so the GEMM route
+ * leaves that (token, slot) row of `mid` UNWRITTEN -- the fixture
+ * zero-initialises `mid` before the GEMM call and expects 0 there,
+ * matching the fallback's zero-fill (Task 4's pre-stated fixture
+ * convention, B2's OOR fix).
+ */
+static void test_metal_mellum_q4_gemm_real_shape_batch(void) {
+    test_q4k_real f;
+    const bool built = test_q4k_real_build(&f);
+    TEST_ASSERT(built);
+    const uint32_t counts[4] = {1u, 33u, 257u, 1024u};
+    const uint32_t n_sel = 8u;
+    for (uint32_t ci = 0; built && ci < 4u; ci++) {
+        const uint32_t nt = counts[ci];
+        const uint64_t x_bytes = (uint64_t)nt * f.in_dim * sizeof(float);
+        const uint64_t mid_tok = (uint64_t)n_sel * f.mid_dim * sizeof(float);
+        const uint64_t out_tok = (uint64_t)f.out_dim * sizeof(float);
+        const uint64_t sel_tok = (uint64_t)n_sel * sizeof(int32_t);
+        const uint64_t w_tok = (uint64_t)n_sel * sizeof(float);
+        ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_bytes);
+        ds4_gpu_tensor *mid_gemm = ds4_gpu_tensor_alloc(nt * mid_tok);
+        ds4_gpu_tensor *out_gemm = ds4_gpu_tensor_alloc(nt * out_tok);
+        ds4_gpu_tensor *mid_fb = ds4_gpu_tensor_alloc(nt * mid_tok);
+        ds4_gpu_tensor *out_fb = ds4_gpu_tensor_alloc(nt * out_tok);
+        ds4_gpu_tensor *sel = ds4_gpu_tensor_alloc(nt * sel_tok);
+        ds4_gpu_tensor *wts = ds4_gpu_tensor_alloc(nt * w_tok);
+        float *x_h = malloc((size_t)x_bytes);
+        float *mid_gemm_h = malloc(nt * mid_tok), *out_gemm_h = malloc(nt * out_tok);
+        float *mid_fb_h = malloc(nt * mid_tok), *out_fb_h = malloc(nt * out_tok);
+        float *mid_r = malloc(nt * mid_tok), *out_r = malloc(nt * out_tok);
+        int32_t *sel_h = malloc(nt * sel_tok);
+        float *w_h = malloc(nt * w_tok);
+        const bool ok = x && mid_gemm && out_gemm && mid_fb && out_fb && sel && wts &&
+                        x_h && mid_gemm_h && out_gemm_h && mid_fb_h && out_fb_h &&
+                        mid_r && out_r && sel_h && w_h;
+        TEST_ASSERT(ok);
+        if (ok) {
+            for (uint32_t t = 0; t < nt; t++) {
+                for (uint32_t i = 0; i < f.in_dim; i++)
+                    x_h[(uint64_t)t * f.in_dim + i] =
+                        (float)((int)((i * 19u + (i >> 2u) * 7u) % 41u) - 20) / 32.0f +
+                        (float)(t % 11u) / 97.0f;
+                for (uint32_t sl = 0; sl < n_sel; sl++) {
+                    const uint32_t linear = t * n_sel + sl;
+                    if (linear % 7u == 6u) {
+                        /* out-of-range id, alternating -1 and 64 */
+                        sel_h[linear] = (linear % 14u == 6u) ? -1 : 64;
+                    } else {
+                        sel_h[linear] = (int32_t)test_q4k_filled[(t + sl) % 12u];
+                    }
+                    w_h[linear] = 0.05f + 0.03f * (float)((t * 7u + sl * 3u) % 9u);
+                }
+            }
+            /* mid must be zero-initialised: the GEMM route leaves OOR (token,
+             * slot) rows unwritten, so a stale/garbage pattern would leak
+             * through and hide a missing zero-fill. */
+            memset(mid_gemm_h, 0, (size_t)(nt * mid_tok));
+            TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_h, x_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(sel, 0, sel_h, nt * sel_tok) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(wts, 0, w_h, nt * w_tok) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(mid_gemm, 0, mid_gemm_h, nt * mid_tok) != 0);
+            TEST_ASSERT(ds4_gpu_mellum_q4_k_routed_moe_batch_tensor(
+                out_gemm, mid_gemm, f.model, f.model_bytes, f.gate_off, f.up_off, f.down_off,
+                f.gate_expert, f.gate_row, f.down_expert, f.down_row, f.in_dim,
+                f.mid_dim, f.out_dim, sel, wts, f.n_total, n_sel, x, nt) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(mid_gemm, 0, mid_gemm_h, nt * mid_tok) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(out_gemm, 0, out_gemm_h, nt * out_tok) != 0);
+
+            /* Task 6: fallback-vs-shader agreement, identical weights/activations. */
+            TEST_ASSERT(ds4_gpu_mellum_routed_moe_batch_tensor(
+                out_fb, mid_fb, f.model, f.model_bytes, f.gate_off, f.up_off, f.down_off,
+                f.gate_expert, f.gate_row, f.down_expert, f.down_row, f.in_dim,
+                f.mid_dim, f.out_dim, sel, wts, f.n_total, n_sel, x, nt) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(mid_fb, 0, mid_fb_h, nt * mid_tok) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(out_fb, 0, out_fb_h, nt * out_tok) != 0);
+            const float agree_mid = test_mellum_max_abs(mid_gemm_h, mid_fb_h, (uint32_t)(nt * n_sel * f.mid_dim));
+            const float agree_out = test_mellum_max_abs(out_gemm_h, out_fb_h, nt * f.out_dim);
+            fprintf(stderr, "ds4-test: Mellum Q4_K GEMM vs fallback (Task 6 agreement) "
+                    "n_tokens=%u mid_max_abs=%g out_max_abs=%g\n", nt,
+                    (double)agree_mid, (double)agree_out);
+            TEST_ASSERT(agree_mid <= 4.0e-5f);
+            TEST_ASSERT(agree_out <= 1.0e-4f);
+
+            /* Task 4: D7 vs the double-precision reference. */
+            for (uint32_t t = 0; t < nt; t++) {
+                test_q4k_real_reference(&f, sel_h + t * n_sel, w_h + t * n_sel, n_sel,
+                    x_h + (uint64_t)t * f.in_dim, mid_r + (uint64_t)t * n_sel * f.mid_dim,
+                    out_r + (uint64_t)t * f.out_dim);
+            }
+            const float worst_mid = test_mellum_max_abs(mid_gemm_h, mid_r, nt * n_sel * f.mid_dim);
+            const float worst_out = test_mellum_max_abs(out_gemm_h, out_r, nt * f.out_dim);
+            fprintf(stderr, "ds4-test: Mellum Q4_K GEMM D7 real-shape batch n_tokens=%u vs "
+                    "double reference mid_max_abs=%g out_max_abs=%g\n", nt,
+                    (double)worst_mid, (double)worst_out);
+            TEST_ASSERT(worst_mid <= 4.0e-5f);
+            TEST_ASSERT(worst_out <= 1.0e-4f);
+
+            /* OOR slots: exactly zero in the GEMM route's mid, matching the
+             * fallback's zero-fill. */
+            uint32_t bad_oor = 0;
+            for (uint32_t t = 0; t < nt; t++) {
+                for (uint32_t sl = 0; sl < n_sel; sl++) {
+                    const int32_t id = sel_h[t * n_sel + sl];
+                    if (id >= 0 && (uint32_t)id < f.n_total) continue;
+                    for (uint32_t row = 0; row < f.mid_dim; row++) {
+                        if (mid_gemm_h[((uint64_t)t * n_sel + sl) * f.mid_dim + row] != 0.0f)
+                            bad_oor++;
+                    }
+                }
+            }
+            fprintf(stderr, "ds4-test: Mellum Q4_K GEMM OOR-expert slots n_tokens=%u: "
+                    "%u nonzero mid values (want 0)\n", nt, bad_oor);
+            TEST_ASSERT(bad_oor == 0u);
+        }
+        free(w_h); free(sel_h); free(out_r); free(mid_r);
+        free(out_fb_h); free(mid_fb_h); free(out_gemm_h); free(mid_gemm_h); free(x_h);
+        ds4_gpu_tensor_free(wts); ds4_gpu_tensor_free(sel);
+        ds4_gpu_tensor_free(out_fb); ds4_gpu_tensor_free(mid_fb);
+        ds4_gpu_tensor_free(out_gemm); ds4_gpu_tensor_free(mid_gemm); ds4_gpu_tensor_free(x);
+    }
+    free(f.model);
+}
+
 /* Capture what a call writes to stderr, to prove a rejected shape is LOUD. */
 typedef struct { int saved; FILE *tf; } test_stderr_capture;
 static bool test_stderr_capture_begin(test_stderr_capture *c) {
@@ -3494,6 +3629,16 @@ static void test_metal_mellum_moe_wrong_type_is_loud(void) {
         TEST_ASSERT(r3 == 0);
         TEST_ASSERT(strstr(msg, "gate_row_bytes") != NULL);
         fprintf(stderr, "ds4-test: Q4_K decode wrapper fed Q8_0 strides -> %d, stderr: %s", r3, msg);
+        /* P24b-S Task 5: Q4_K GEMM batch wrapper, Q8_0 strides. */
+        TEST_ASSERT(test_stderr_capture_begin(&cap));
+        const int r4 = ds4_gpu_mellum_q4_k_routed_moe_batch_tensor(
+            out, mid, model, model_bytes, 0, 0, 0, (uint64_t)mid_dim * q8_gate_row,
+            q8_gate_row, down_expert, down_row, in_dim, mid_dim, out_dim, sel, wts,
+            n_total, n_sel, x, n_tokens);
+        test_stderr_capture_end(&cap, msg, sizeof(msg));
+        TEST_ASSERT(r4 == 0);
+        TEST_ASSERT(strstr(msg, "gate_row_bytes") != NULL);
+        fprintf(stderr, "ds4-test: Q4_K GEMM batch wrapper fed Q8_0 strides -> %d, stderr: %s", r4, msg);
     }
     ds4_gpu_tensor_free(wts); ds4_gpu_tensor_free(sel); ds4_gpu_tensor_free(out);
     ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(x);
@@ -8120,6 +8265,7 @@ static void test_metal_kernel_group(void) {
     test_metal_mellum_q4_q8_routed_moe();
     test_metal_mellum_q4_real_shape_decode();
     test_metal_mellum_q4_real_shape_batch();
+    test_metal_mellum_q4_gemm_real_shape_batch();
     test_metal_mellum_q4_k2_vs_k1();
     test_metal_mellum_moe_wrong_type_is_loud();
     test_metal_mellum_q8_q8_routed_moe();

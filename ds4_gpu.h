@@ -2741,6 +2741,32 @@ int ds4_gpu_mellum_q8_0_routed_moe_batch_tensor(
  * DS4_MELLUM_Q4K_PAIR=scalar).  Read on every call. */
 int ds4_gpu_mellum_q4k_pair_rung(void);
 
+/* P24b-S Task 5: expert-major Q4_K gate/up + Q8_0 down Mellum MoE for a
+ * batch of tokens -- the Q4_K sibling of ds4_gpu_mellum_q8_0_routed_moe_
+ * batch_tensor's GEMM path.  Same contract/signature as the token-major
+ * fallback below. */
+int ds4_gpu_mellum_q4_k_routed_moe_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_tokens);
+
 /* Token-major Q4_K gate/up + Q8_0 down Mellum MoE (P24a): the correct-but-
  * not-fast route a Q4_K layer's prefill takes until the expert-major Q4_K
  * kernel exists.  Same contract as the Q8_0 wrapper above. */
