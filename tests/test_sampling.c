@@ -13,6 +13,15 @@ typedef struct {
     float prob;
 } reference_candidate;
 
+/* P25 Task 5/6: local prototype for a non-static ds4.c test hook that is
+ * deliberately NOT added to ds4.h -- ds4.h/ds4_ssd.h stay byte-identical to
+ * the frozen 7939d93 header (sha256 821c289e...e73ba) through P25, per
+ * CLAUDE.md. The function itself (ds4.c) has external linkage regardless of
+ * whether a header declares it; this prototype is only so this translation
+ * unit's compiler sees the signature. */
+int ds4_test_mellum_generic_estimate(int ctx_size, uint32_t prefill_chunk,
+                                     ds4_context_memory *out);
+
 static int failures;
 
 #define CHECK(cond, ...) do {                                                 \
@@ -557,8 +566,51 @@ static void check_mellum_memory_plan(void) {
     printf("mellum admit truth table: ok\n");
 }
 
+/*
+ * P25 Task 5/6: the generic (family-agnostic) context-memory estimator,
+ * ds4_context_memory_estimate_with_prefill_mode, is what
+ * ds4_streaming_manual_cache_safe_bytes and the four log_context_memory call
+ * sites (ds4_cli.c, ds4_server.c, ds4_bench.c, ds4_eval.c) all read — none of
+ * them is family-gated (spec facts 15-19). Before a Mellum branch is added,
+ * a Mellum session falls through to the DeepSeek-V4-shaped compressive
+ * branch, whose raw_bytes is n_layer * raw_cap * n_head_dim * 4 with no
+ * n_head_kv factor and no x2 for K and V, and whose raw_cap is capped at
+ * ds4_default_raw_cap(ctx) = min(DS4_N_SWA, ctx) in the DS4_NO_GPU overload
+ * this model-free binary exercises. That disagrees with the Mellum-aware KV
+ * total (ds4_mellum_kv_bytes, already correct and already tested above) by a
+ * large, predictable factor. This asserts the two must be equal — the
+ * invariant Task 6 makes true by adding a Mellum branch to the estimator —
+ * so it is RED against the unfixed 7939d93 tip and GREEN after Task 6.
+ */
+static void check_mellum_generic_estimator_family_branch(void) {
+    const uint32_t ctx = 4096;
+    ds4_test_mellum_memory m;
+    memset(&m, 0, sizeof(m));
+    CHECK(ds4_test_mellum_memory_plan(ctx, 0, 0, &m) == 0,
+          "mellum memory-plan hook refused ctx %u", ctx);
+
+    ds4_context_memory generic;
+    memset(&generic, 0, sizeof(generic));
+    CHECK(ds4_test_mellum_generic_estimate((int)ctx, 0, &generic) == 0,
+          "mellum generic-estimate hook refused ctx %u", ctx);
+
+    printf("mellum generic estimator @ ctx=%u: mellum_kv=%llu "
+           "generic.raw_bytes=%llu generic.total_bytes=%llu\n",
+           ctx,
+           (unsigned long long)m.kv_bytes,
+           (unsigned long long)generic.raw_bytes,
+           (unsigned long long)generic.total_bytes);
+    CHECK(generic.raw_bytes == m.kv_bytes,
+          "generic estimator not Mellum-branched: raw_bytes %llu != "
+          "ds4_mellum_kv_bytes %llu (ctx %u) -- P25 Task 6 not landed, or "
+          "regressed",
+          (unsigned long long)generic.raw_bytes,
+          (unsigned long long)m.kv_bytes, ctx);
+}
+
 int main(void) {
     check_mellum_memory_plan();
+    check_mellum_generic_estimator_family_branch();
     check_sampling_defaults();
     check_speculative_distribution();
     const uint32_t semantic_n = 4096;

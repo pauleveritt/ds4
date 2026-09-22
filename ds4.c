@@ -40399,6 +40399,15 @@ static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
     return chunk > ctx ? ctx : chunk;
 }
 
+/* P25 fix 3 (spec fact 21): forward declarations so the Mellum branch below
+ * (and its DS4_NO_GPU twin) can call the real, Mellum-shape-aware arithmetic
+ * instead of the generic DeepSeek-V4-shaped fallback every other family here
+ * uses. Defined later (ds4_mellum_kv_bytes at :43239-ish); not moved, to
+ * avoid disturbing the surrounding P20-era ordering. */
+static uint64_t ds4_mellum_kv_bytes(uint32_t ctx_size);
+static uint64_t ds4_mellum_decode_scratch_bytes(void);
+static uint64_t ds4_mellum_prefill_scratch_bytes(uint32_t cap);
+
 ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         ds4_backend backend,
         int         ctx_size,
@@ -40460,6 +40469,23 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
 
             m.prefill_cap = laguna_graph_prefill_cap(ctx, prefill_chunk);
             m.scratch_bytes = laguna_graph_scratch_bytes(m.prefill_cap);
+            m.total_bytes = m.raw_bytes + m.scratch_bytes;
+            return m;
+        }
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+            /* P25 fix 3 (spec fact 21): route through the Mellum-aware
+             * arithmetic instead of falling through to the generic
+             * DeepSeek-V4-shaped branch below (no n_head_kv factor, no x2
+             * for K and V, raw_cap capped at a hard 8192 -- see
+             * metal_graph_raw_cap_for_context). prefill_cap mirrors fix 1's
+             * conservative min(ctx, DS4_N_SWA) upper bound. */
+            const uint32_t mellum_prefill_cap = ctx < DS4_N_SWA ? ctx : DS4_N_SWA;
+            m.raw_cap = ctx;
+            m.prefill_cap = mellum_prefill_cap;
+            m.raw_bytes = ds4_mellum_kv_bytes(ctx);
+            m.scratch_bytes = ds4_add_sat_u64(
+                ds4_mellum_decode_scratch_bytes(),
+                ds4_mellum_prefill_scratch_bytes(mellum_prefill_cap));
             m.total_bytes = m.raw_bytes + m.scratch_bytes;
             return m;
         }
@@ -63371,6 +63397,22 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        /* P25 fix 3 (spec fact 21): the DS4_NO_GPU twin of the graph-branch
+         * Mellum arithmetic above, so a model-free (DS4_TEST_HOOKS) build
+         * agrees with the real Metal path instead of exercising the generic
+         * DeepSeek-V4-shaped fallback below. */
+        const uint32_t mellum_prefill_cap = ctx < DS4_N_SWA ? ctx : DS4_N_SWA;
+        m.raw_cap = ctx;
+        m.prefill_cap = mellum_prefill_cap;
+        m.raw_bytes = ds4_mellum_kv_bytes(ctx);
+        m.scratch_bytes = ds4_add_sat_u64(
+            ds4_mellum_decode_scratch_bytes(),
+            ds4_mellum_prefill_scratch_bytes(mellum_prefill_cap));
+        m.total_bytes = m.raw_bytes + m.scratch_bytes;
+        return m;
+    }
+
     m.raw_cap = ds4_default_raw_cap(ctx);
     m.raw_bytes = (uint64_t)DS4_N_LAYER *
                   m.raw_cap *
@@ -74859,6 +74901,24 @@ int ds4_test_mellum_memory_plan(uint32_t ctx_size, uint32_t prefill_cap,
 
 int ds4_test_mellum_admit(uint64_t planned, uint64_t budget) {
     return ds4_mellum_admit(planned, budget) ? 1 : 0;
+}
+
+/* P25 Task 5/6: the generic, family-agnostic context-memory estimator
+ * (ds4_context_memory_estimate_with_prefill_mode) that
+ * ds4_streaming_manual_cache_safe_bytes and the four log_context_memory call
+ * sites consume — reached with the Mellum shape installed, same
+ * select/call/restore pattern as ds4_test_mellum_memory_plan above. Backend
+ * DS4_BACKEND_CPU selects the DS4_NO_GPU-safe arithmetic path in a
+ * DS4_TEST_HOOKS (model-free) build. */
+int ds4_test_mellum_generic_estimate(int ctx_size, uint32_t prefill_chunk,
+                                     ds4_context_memory *out) {
+    if (!out) return -1;
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_MELLUM2;
+    *out = ds4_context_memory_estimate_with_prefill_mode(
+        DS4_BACKEND_CPU, ctx_size, prefill_chunk, false);
+    g_ds4_shape = saved;
+    return 0;
 }
 
 /* Render the exact-bytes suffix of the startup plan line exactly as
