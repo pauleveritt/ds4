@@ -43374,20 +43374,32 @@ static uint64_t ds4_mellum_prefill_scratch_bytes(uint32_t cap) {
 }
 
 /* P25.1: the sixth plan term.  ds4_gpu_mellum_moe_group_begin (ds4_metal.m)
- * allocates six process-global static tensors on the expert-major MoE GEMM
- * path -- s_partial (cap*n_expert_used*n_embd floats), s_pairs
- * (n_expert*cap uint32s), s_counts (n_expert uint32s) and three offset
- * tables (n_expert uint64s each) -- sized on the same first-sync cap Fix 1
- * already threads through, and never counted by the plan. P25's own
- * independent review root-caused exactly this as the -72.25 MiB residual
- * its fail branch reported (docs/superpowers/research/
- * 2026-09-22-p25-finding.md, "Review (Opus, 2026-09-22)", Blocker 1):
- * 1024*8*2304*4 + 64*1024*4 + 64*4 + 3*64*8 = 75,761,408 B = 72.2517 MiB,
- * matching the measured residual to the hundredth. Gated on
- * ds4_gpu_mellum_moe_gemm_enabled() -- the GPU-only runtime switch that
- * decides whether s_partial (the dominant term) is ever allocated; under
- * DS4_NO_GPU there is no GPU session to allocate any of this, so the term
- * is always 0 there. */
+ * allocates three process-global static tensors on the expert-major MoE
+ * GEMM path -- s_partial (cap*n_expert_used*n_embd floats), s_pairs
+ * (n_expert*cap uint32s) and s_counts (n_expert uint32s) -- sized on the
+ * same first-sync cap Fix 1 already threads through, and never counted by
+ * the plan. P25's own independent review root-caused exactly this as the
+ * -72.25 MiB residual its fail branch reported (docs/superpowers/research/
+ * 2026-09-22-p25-finding.md, "Review (Opus, 2026-09-22)", Blocker 1).
+ * Gated on ds4_gpu_mellum_moe_gemm_enabled() -- the GPU-only runtime
+ * switch that decides whether s_partial (the dominant term) is ever
+ * allocated; under DS4_NO_GPU there is no GPU session to allocate any of
+ * this, so the term is always 0 there.
+ *
+ * P35: the expert gate/up/down offset tables that P25.1's original review
+ * also charged here (3 * n_expert uint64s, 8 B/expert each) are gone from
+ * this term. P24's c4a71f1 (merged in P35) replaced them with one per-call
+ * Metal transient buffer (the "tables" buffer in
+ * ds4_gpu_mellum_moe_group_begin), which is not a ds4_gpu_tensor, is not
+ * owned across calls, and is never counted here or freed by
+ * ds4_gpu_cleanup. So the formula below is s_partial + s_pairs +
+ * s_counts only:
+ * 1024*8*2304*4 + 64*1024*4 + 64*4 = 75,759,872 B = 72.2502 MiB, 1,536 B
+ * (3*64*8) less than P25.1's original 75,761,408 B = 72.2517 MiB -- below
+ * the measurement instrument's 0.01 MiB resolution, so no printed figure
+ * can show the difference (established by derivation and review, not
+ * measurement; see docs/superpowers/research/
+ * 2026-09-23-p35-preregistration.md, PB3). */
 #ifndef DS4_NO_GPU
 static uint64_t ds4_mellum_moe_group_workspace_bytes(uint32_t cap) {
     if (!ds4_gpu_mellum_moe_gemm_enabled()) return 0;
@@ -43397,8 +43409,10 @@ static uint64_t ds4_mellum_moe_group_workspace_bytes(uint32_t cap) {
     total = ds4_add_sat_u64(total,
                             (uint64_t)DS4_N_EXPERT * c * sizeof(uint32_t));
                                                                /* s_pairs */
-    total = ds4_add_sat_u64(total, (uint64_t)DS4_N_EXPERT * 28u);
-                     /* s_counts (4B/expert) + 3 offset tables (8B/expert) */
+    total = ds4_add_sat_u64(total, (uint64_t)DS4_N_EXPERT * 4u);
+                     /* s_counts (4B/expert); the offset tables are a
+                      * per-call Metal transient buffer since c4a71f1, not
+                      * a tracked tensor -- see the comment above. */
     return total;
 }
 #else
