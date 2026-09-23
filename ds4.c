@@ -43374,17 +43374,16 @@ static uint64_t ds4_mellum_prefill_scratch_bytes(uint32_t cap) {
 }
 
 /* P25.1: the sixth plan term.  ds4_gpu_mellum_moe_group_begin (ds4_metal.m)
- * allocates three process-global static tensors on the expert-major MoE
- * GEMM path -- s_partial (cap*n_expert_used*n_embd floats), s_pairs
- * (n_expert*cap uint32s) and s_counts (n_expert uint32s) -- sized on the
- * same first-sync cap Fix 1 already threads through, and never counted by
- * the plan. P25's own independent review root-caused exactly this as the
+ * allocates three file-scope global tensors on the expert-major MoE GEMM
+ * path -- g_mellum_moe_group_partial (cap*n_expert_used*n_embd floats),
+ * g_mellum_moe_group_pairs (n_expert*cap uint32s) and
+ * g_mellum_moe_group_counts (n_expert uint32s) -- sized on the same
+ * first-sync cap Fix 1 already threads through, and never counted by the
+ * plan. P25's own independent review root-caused exactly this as the
  * -72.25 MiB residual its fail branch reported (docs/superpowers/research/
  * 2026-09-22-p25-finding.md, "Review (Opus, 2026-09-22)", Blocker 1).
- * Gated on ds4_gpu_mellum_moe_gemm_enabled() -- the GPU-only runtime
- * switch that decides whether s_partial (the dominant term) is ever
- * allocated; under DS4_NO_GPU there is no GPU session to allocate any of
- * this, so the term is always 0 there.
+ * Under DS4_NO_GPU there is no GPU session to allocate any of this, so the
+ * term is always 0 there.
  *
  * P35: the expert gate/up/down offset tables that P25.1's original review
  * also charged here (3 * n_expert uint64s, 8 B/expert each) are gone from
@@ -43392,45 +43391,68 @@ static uint64_t ds4_mellum_prefill_scratch_bytes(uint32_t cap) {
  * Metal transient buffer (the "tables" buffer in
  * ds4_gpu_mellum_moe_group_begin), which is not a ds4_gpu_tensor, is not
  * owned across calls, and is never counted here or freed by
- * ds4_gpu_cleanup. So the formula below is s_partial + s_pairs +
- * s_counts only:
+ * ds4_gpu_cleanup. So the formula below is g_mellum_moe_group_partial +
+ * g_mellum_moe_group_pairs + g_mellum_moe_group_counts only:
  * 1024*8*2304*4 + 64*1024*4 + 64*4 = 75,759,872 B = 72.2502 MiB, 1,536 B
  * (3*64*8) less than P25.1's original 75,761,408 B = 72.2517 MiB -- below
  * the measurement instrument's 0.01 MiB resolution, so no printed figure
  * can show the difference (established by derivation and review, not
  * measurement; see docs/superpowers/research/
- * 2026-09-23-p35-preregistration.md, PB3). */
+ * 2026-09-23-p35-preregistration.md, PB3).
+ *
+ * P35 M4b: this term is charged -- g_mellum_moe_group_partial included --
+ * whenever EITHER of the two callers of ds4_gpu_mellum_moe_group_begin
+ * that can set need_partial=true actually would. The Opus merge review
+ * found the gap: ds4_gpu_mellum_q4_k_routed_moe_batch_tensor (ds4_metal.m,
+ * the Q4_K GEMM wrapper P24b-S added) has no non-GEMM fallback and passes
+ * need_partial=true unconditionally, so a Q4_K gate/up artifact allocates
+ * g_mellum_moe_group_partial even with DS4_MELLUM_MOE_GEMM=0 -- a
+ * supported arm (E2's third env arm, P24b-S's guard matrix) the original
+ * ds4_gpu_mellum_moe_gemm_enabled()-only gate missed, undercounting the
+ * plan by ~72.25 MiB. The q4k_gate_up parameter below (threaded from
+ * ds4_mellum_routed_gate_up_is_q4_k, static/ds4.c-internal, not declared
+ * in ds4.h) is that second condition; the two model-free callers that have
+ * no real weights (ds4_test_mellum_memory_plan, ds4_test_mellum_plan_bytes_
+ * suffix, both frozen in ds4.h) always pass false, which is exact for them
+ * since ds4_mellum_moe_group_workspace_bytes's DS4_NO_GPU stub ignores the
+ * parameter and returns 0 regardless. */
 #ifndef DS4_NO_GPU
-static uint64_t ds4_mellum_moe_group_workspace_bytes(uint32_t cap) {
-    if (!ds4_gpu_mellum_moe_gemm_enabled()) return 0;
+static uint64_t ds4_mellum_moe_group_workspace_bytes(uint32_t cap,
+                                                      bool q4k_gate_up) {
+    if (!ds4_gpu_mellum_moe_gemm_enabled() && !q4k_gate_up) return 0;
     const uint64_t c = cap;
     uint64_t total = c * (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD *
-                     sizeof(float);                          /* s_partial */
+                     sizeof(float);              /* g_mellum_moe_group_partial */
     total = ds4_add_sat_u64(total,
                             (uint64_t)DS4_N_EXPERT * c * sizeof(uint32_t));
-                                                               /* s_pairs */
+                                                  /* g_mellum_moe_group_pairs */
     total = ds4_add_sat_u64(total, (uint64_t)DS4_N_EXPERT * 4u);
-                     /* s_counts (4B/expert); the offset tables are a
-                      * per-call Metal transient buffer since c4a71f1, not
-                      * a tracked tensor -- see the comment above. */
+                     /* g_mellum_moe_group_counts (4B/expert); the offset
+                      * tables are a per-call Metal transient buffer since
+                      * c4a71f1, not a tracked tensor -- see the comment
+                      * above. */
     return total;
 }
 #else
-static uint64_t ds4_mellum_moe_group_workspace_bytes(uint32_t cap) {
+static uint64_t ds4_mellum_moe_group_workspace_bytes(uint32_t cap,
+                                                      bool q4k_gate_up) {
     (void)cap;
+    (void)q4k_gate_up;
     return 0;
 }
 #endif
 
 static uint64_t ds4_mellum_planned_bytes(uint64_t weights_bytes,
                                          uint32_t ctx_size,
-                                         uint32_t prefill_cap) {
+                                         uint32_t prefill_cap,
+                                         bool q4k_gate_up) {
     uint64_t total = weights_bytes;
     total = ds4_add_sat_u64(total, ds4_mellum_decode_state_bytes(ctx_size));
     total = ds4_add_sat_u64(total,
                             ds4_mellum_prefill_scratch_bytes(prefill_cap));
     total = ds4_add_sat_u64(total,
-                            ds4_mellum_moe_group_workspace_bytes(prefill_cap));
+                            ds4_mellum_moe_group_workspace_bytes(prefill_cap,
+                                                                 q4k_gate_up));
     return total;
 }
 
@@ -43478,7 +43500,8 @@ typedef struct {
 } ds4_mellum_plan_parts;
 
 static ds4_mellum_plan_parts ds4_mellum_plan_parts_for(uint64_t weights_bytes,
-                                                       uint32_t ctx_size) {
+                                                       uint32_t ctx_size,
+                                                       bool q4k_gate_up) {
     ds4_mellum_plan_parts p;
     const uint32_t prefill_cap = ds4_mellum_effective_prefill_cap(ctx_size);
     p.weights = weights_bytes;
@@ -43488,8 +43511,10 @@ static ds4_mellum_plan_parts ds4_mellum_plan_parts_for(uint64_t weights_bytes,
     p.scratch = ds4_add_sat_u64(p.scratch,
                                 ds4_mellum_prefill_scratch_bytes(prefill_cap));
     p.scratch = ds4_add_sat_u64(p.scratch,
-                                ds4_mellum_moe_group_workspace_bytes(prefill_cap));
-    p.planned = ds4_mellum_planned_bytes(weights_bytes, ctx_size, prefill_cap);
+                                ds4_mellum_moe_group_workspace_bytes(prefill_cap,
+                                                                     q4k_gate_up));
+    p.planned = ds4_mellum_planned_bytes(weights_bytes, ctx_size, prefill_cap,
+                                         q4k_gate_up);
     return p;
 }
 
@@ -44813,6 +44838,31 @@ static uint64_t ds4_mellum_memory_budget_bytes(void) {
 }
 
 /*
+ * P35 M4b.  True when the loaded model's routed gate/up is Q4_K -- the
+ * other case (besides ds4_gpu_mellum_moe_gemm_enabled()) where
+ * ds4_gpu_mellum_moe_group_begin's need_partial=true, because
+ * ds4_gpu_mellum_q4_k_routed_moe_batch_tensor (ds4_metal.m, P24b-S's Q4_K
+ * GEMM wrapper) has no non-GEMM fallback and always passes true. Scans for
+ * the first routed layer rather than trusting a fixed index: gate and up
+ * always share a type by the time weights_validate_mellum_layout has
+ * accepted the file (ds4_mellum_expert_types_supported's contract; down
+ * stays Q8_0), so the first routed layer settles it for every layer. e's
+ * weights.layer[] is already populated by the time this is called (open,
+ * after the model map has fixed the weights span -- ds4_engine_bind_
+ * mellum_decode_contract, called later for the decode descriptors, reads
+ * the same e->weights.layer[] this does).  Static, ds4.c-internal only --
+ * not declared in ds4.h, so the header hash cannot move (same pattern as
+ * ds4_mellum_expert_types_supported's own comment). */
+static bool ds4_mellum_routed_gate_up_is_q4_k(const ds4_engine *e) {
+    if (!e) return false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
+        if (gate) return gate->type == DS4_TENSOR_Q4_K;
+    }
+    return false;
+}
+
+/*
  * Mellum's own startup plan (P20, spec Scope 4).  The GLM/DSA context
  * estimator this function otherwise calls describes a model Mellum is not:
  * it is never consulted for this family.  Every part is printed so the sum
@@ -44822,9 +44872,13 @@ static void ds4_mellum_print_memory_plan(const ds4_engine *e, int ctx_size) {
     const uint32_t ctx = (uint32_t)ctx_size;
     /* P25 Fix 1: ds4_mellum_plan_parts_for now passes
      * ds4_mellum_effective_prefill_cap(ctx), not a literal 0 -- see that
-     * function's comment. */
+     * function's comment. P35 M4b: also passes whether the routed gate/up
+     * is Q4_K, so the sixth plan term (ds4_mellum_moe_group_workspace_
+     * bytes) is charged in that case too, not just when the GEMM switch is
+     * on. */
     const ds4_mellum_plan_parts p =
-        ds4_mellum_plan_parts_for(e->startup_model_span_bytes, ctx);
+        ds4_mellum_plan_parts_for(e->startup_model_span_bytes, ctx,
+                                  ds4_mellum_routed_gate_up_is_q4_k(e));
     const uint64_t weights = p.weights;
     const uint64_t kv = p.kv;
     const uint64_t scratch = p.scratch;
@@ -44873,9 +44927,12 @@ static bool ds4_mellum_memory_admit_at_open(const ds4_engine *e,
      * admission boundary: a --ctx that admitted under the old, undercounted
      * plan can now be refused (P25 spec Risk 6). */
     const uint32_t prefill_cap = ds4_mellum_effective_prefill_cap((uint32_t)ctx_size);
+    /* P35 M4b: also passes whether the routed gate/up is Q4_K -- see
+     * ds4_mellum_print_memory_plan's comment on the same call shape. */
+    const bool q4k_gate_up = ds4_mellum_routed_gate_up_is_q4_k(e);
     const uint64_t planned =
         ds4_mellum_planned_bytes(e->startup_model_span_bytes,
-                                 (uint32_t)ctx_size, prefill_cap);
+                                 (uint32_t)ctx_size, prefill_cap, q4k_gate_up);
     if (ds4_mellum_admit(planned, budget)) return true;
     /* P25 Task 9: name the dominant term and print the residual in GiB, so
      * the refusal is actionable instead of just a "no". Reuses the plan
@@ -44885,7 +44942,8 @@ static bool ds4_mellum_memory_admit_at_open(const ds4_engine *e,
      * not a product decision this phase makes -- see the spec's "not decide
      * the exact wording". */
     const ds4_mellum_plan_parts p =
-        ds4_mellum_plan_parts_for(e->startup_model_span_bytes, (uint32_t)ctx_size);
+        ds4_mellum_plan_parts_for(e->startup_model_span_bytes, (uint32_t)ctx_size,
+                                  q4k_gate_up);
     const uint64_t residual = ds4_mellum_admit_residual(planned, budget);
     const char *dominant = "weights";
     uint64_t dominant_bytes = p.weights;
@@ -75037,8 +75095,14 @@ int ds4_test_mellum_memory_plan(uint32_t ctx_size, uint32_t prefill_cap,
     out->decode_output_bytes = ds4_mellum_decode_output_bytes(DS4_N_VOCAB);
     out->decode_state_bytes = ds4_mellum_decode_state_bytes(ctx_size);
     out->prefill_scratch_bytes = ds4_mellum_prefill_scratch_bytes(prefill_cap);
+    /* P35 M4b: no engine or real weights here, so no routed-type signal
+     * exists to pass -- false is exact, not just conservative, because
+     * ds4_mellum_moe_group_workspace_bytes's DS4_NO_GPU stub (the only one
+     * this model-free hook can link) ignores the parameter and returns 0
+     * either way. */
     out->planned_bytes =
-        ds4_mellum_planned_bytes(weights_bytes, ctx_size, prefill_cap);
+        ds4_mellum_planned_bytes(weights_bytes, ctx_size, prefill_cap,
+                                 /*q4k_gate_up=*/false);
     g_ds4_shape = saved;
     return 0;
 }
@@ -75165,8 +75229,11 @@ int ds4_test_mellum_plan_bytes_suffix(uint32_t ctx_size, uint64_t weights_bytes,
     if (!buf || cap == 0) return -1;
     const ds4_shape saved = g_ds4_shape;
     g_ds4_shape = DS4_SHAPE_MELLUM2;
+    /* P35 M4b: false is exact here too -- see
+     * ds4_test_mellum_memory_plan's comment on the same call shape. */
     const ds4_mellum_plan_parts p =
-        ds4_mellum_plan_parts_for(weights_bytes, ctx_size);
+        ds4_mellum_plan_parts_for(weights_bytes, ctx_size,
+                                  /*q4k_gate_up=*/false);
     const int n = ds4_mellum_format_plan_bytes(buf, cap, p);
     g_ds4_shape = saved;
     return (n < 0 || (size_t)n >= cap) ? -1 : n;
