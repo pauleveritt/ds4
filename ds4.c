@@ -44838,15 +44838,21 @@ static uint64_t ds4_mellum_memory_budget_bytes(void) {
 }
 
 /*
- * P35 M4b.  True when the loaded model's routed gate/up is Q4_K -- the
- * other case (besides ds4_gpu_mellum_moe_gemm_enabled()) where
+ * P35 M4b.  True when ANY routed layer's gate/up is Q4_K -- the other
+ * case (besides ds4_gpu_mellum_moe_gemm_enabled()) where
  * ds4_gpu_mellum_moe_group_begin's need_partial=true, because
  * ds4_gpu_mellum_q4_k_routed_moe_batch_tensor (ds4_metal.m, P24b-S's Q4_K
- * GEMM wrapper) has no non-GEMM fallback and always passes true. Scans for
- * the first routed layer rather than trusting a fixed index: gate and up
- * always share a type by the time weights_validate_mellum_layout has
- * accepted the file (ds4_mellum_expert_types_supported's contract; down
- * stays Q8_0), so the first routed layer settles it for every layer. e's
+ * GEMM wrapper) has no non-GEMM fallback and always passes true. Must
+ * scan every routed layer, not stop at the first: gate and up share a
+ * type WITHIN a layer (ds4_mellum_expert_types_supported's contract; down
+ * stays Q8_0), but nothing enforces that type is uniform ACROSS layers --
+ * weights_validate_mellum_layout checks each layer independently, so a
+ * file with Q8_0 gate/up in layer 0 and Q4_K in a later layer passes
+ * validation, still runs the Q4_K wrapper (unconditionally, for whichever
+ * layers it routes) with need_partial=true, and the first-layer-only
+ * version of this check would have missed it (re-review finding,
+ * 2026-09-23). Any hit settles it, which can only over-count relative to
+ * a hypothetical exact per-call check -- the amendment allows that. e's
  * weights.layer[] is already populated by the time this is called (open,
  * after the model map has fixed the weights span -- ds4_engine_bind_
  * mellum_decode_contract, called later for the decode descriptors, reads
@@ -44857,7 +44863,7 @@ static bool ds4_mellum_routed_gate_up_is_q4_k(const ds4_engine *e) {
     if (!e) return false;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
-        if (gate) return gate->type == DS4_TENSOR_Q4_K;
+        if (gate && gate->type == DS4_TENSOR_Q4_K) return true;
     }
     return false;
 }
@@ -75096,10 +75102,13 @@ int ds4_test_mellum_memory_plan(uint32_t ctx_size, uint32_t prefill_cap,
     out->decode_state_bytes = ds4_mellum_decode_state_bytes(ctx_size);
     out->prefill_scratch_bytes = ds4_mellum_prefill_scratch_bytes(prefill_cap);
     /* P35 M4b: no engine or real weights here, so no routed-type signal
-     * exists to pass -- false is exact, not just conservative, because
-     * ds4_mellum_moe_group_workspace_bytes's DS4_NO_GPU stub (the only one
-     * this model-free hook can link) ignores the parameter and returns 0
-     * either way. */
+     * exists to pass -- false is exact, not just conservative, for the
+     * DS4_NO_GPU build that tests/test_sampling links: there,
+     * ds4_mellum_moe_group_workspace_bytes's DS4_NO_GPU stub ignores the
+     * parameter and returns 0 either way. (A DS4_TEST_HOOKS build without
+     * DS4_NO_GPU, e.g. ds4_cuda_test_hooks.o at Makefile:1162, would link
+     * the real variant instead, where the parameter is not a no-op --
+     * but no such build calls this hook today.) */
     out->planned_bytes =
         ds4_mellum_planned_bytes(weights_bytes, ctx_size, prefill_cap,
                                  /*q4k_gate_up=*/false);
