@@ -83170,8 +83170,17 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
 }
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
-    if (!s || ds4_session_is_mellum(s) || !s->logits ||
-        !logits || n != (int)DS4_N_VOCAB) return 1;
+    /* P29: was a blanket Mellum refusal, asymmetric with every sibling that
+     * reads s->logits -- ds4_session_sample, ds4_session_token_logprob and
+     * ds4_session_top_logprobs all already admit an interactive Mellum
+     * session (ds4_session_is_mellum_interactive), refusing only a
+     * non-interactive one. set_logits exists to prepare s->logits for a
+     * following sample() call, and sample() itself already requires
+     * interactive, so gating set_logits any wider would accept writes no
+     * downstream call could ever read back. This mirrors
+     * ds4_session_token_logprob's guard shape exactly. */
+    if (!s || (ds4_session_is_mellum(s) && !ds4_session_is_mellum_interactive(s)) ||
+        !s->logits || !logits || n != (int)DS4_N_VOCAB) return 1;
     memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     return 0;
 }
