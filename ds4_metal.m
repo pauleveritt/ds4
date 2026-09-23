@@ -376,6 +376,7 @@ static id<MTLBlitCommandEncoder> ds4_gpu_blit_encoder(id<MTLCommandBuffer> cb, c
 }
 
 static void ds4_gpu_parallel_ffn_reset_state(BOOL close_encoder);
+static void ds4_gpu_mellum_moe_group_reset(void);
 static NSMutableArray<id<MTLCommandBuffer>> *g_pending_cbs;
 static id<MTLSharedEvent> g_selected_readback_event;
 static uint64_t g_selected_readback_event_value;
@@ -636,6 +637,12 @@ int ds4_gpu_mellum_attn_group_enabled(void) {
  * DS4_MELLUM_ATTN_MIN_KEYS, below which the serial kernel still runs and the
  * old arithmetic is preserved exactly.
  */
+/* P25 Task 10 cosmetic item 4: this value is duplicated, not shared, in
+ * metal/laguna.metal's two split_threshold constants (lines ~741, ~1229) --
+ * Metal shaders in this codebase are standalone (no shared header between
+ * .m and .metal), so a #define cannot mechanically unify the three. Keep
+ * this one as the source of truth; if it ever changes, grep
+ * "split_threshold = 256u" in metal/laguna.metal too. */
 #define DS4_MELLUM_ATTN_MIN_KEYS 256u
 
 int ds4_gpu_mellum_attn_split_enabled(void) {
@@ -12200,6 +12207,7 @@ void ds4_gpu_cleanup(void) {
     @autoreleasepool {
         ds4_gpu_decode_pipeline_fast_cache_reset();
         ds4_gpu_parallel_ffn_reset_state(YES);
+        ds4_gpu_mellum_moe_group_reset();
         if (g_batch_cb) {
             ds4_gpu_close_batch_encoder();
             [g_batch_cb commit];
@@ -12447,6 +12455,23 @@ void ds4_gpu_cleanup(void) {
         g_mellum_gqa_decode_pipeline = nil;
         g_mellum_gqa_decode_split_pipeline = nil;
         g_mellum_gqa_prefill_pipeline = nil;
+        /* P25 Task 10 cosmetic item 4: the spec's review cited "three
+         * pipeline statics never reset" here -- confirmed by re-grepping
+         * every g_mellum_*_pipeline declaration against this function.
+         * Six more (g_mellum_down_rowtile2/4, down_grouped4/8,
+         * slot_reduce, pair_swiglu_gemm, declared much later in this file
+         * around line 40952-40982) are ALSO never reset here, but are
+         * declared after this function and so are not reachable from it
+         * without moving their declarations or adding forward
+         * declarations -- confirmed by trying it and getting six "use of
+         * undeclared identifier" errors, reverted. Left as their own,
+         * separate PRODUCT_BACKLOG.md entry rather than folded into this
+         * one-line-per-static fix. None of the three fixed here is
+         * reachable from today's default shape (hygiene, not a behaviour
+         * change). */
+        g_mellum_q8_0_pair_swiglu_grouped_f32_pipeline = nil;
+        g_mellum_moe_bucket_reset_pipeline = nil;
+        g_mellum_moe_bucket_build_pipeline = nil;
         g_glm_q2_k_addr_down_f32_pipeline = nil;
         g_glm_q4_k_addr_down_f32_pipeline = nil;
         g_glm_q5_k_pair_swiglu_f32_pipeline = nil;
@@ -41167,6 +41192,57 @@ static id<MTLComputePipelineState> g_mellum_down_grouped8_pipeline;
 static id<MTLComputePipelineState> g_mellum_slot_reduce_pipeline;
 static id<MTLComputePipelineState> g_mellum_pair_swiglu_gemm_pipeline;
 
+/*
+ * P25.1: file-scope so ds4_gpu_mellum_moe_group_reset (below) can free them
+ * from ds4_gpu_cleanup. Previously function-local statics inside
+ * ds4_gpu_mellum_moe_group_begin, unreachable from outside it and never
+ * reset across cleanup -- the six-tensor, 72.25 MiB leak P25's independent
+ * review root-caused (docs/superpowers/research/2026-09-22-p25-finding.md,
+ * "Review (Opus, 2026-09-22)", Blocker 1). Same convention as
+ * ds4_gpu_parallel_ffn_reset_state's g_parallel_* statics: a file-scope
+ * cache plus a dedicated _reset function called from ds4_gpu_cleanup.
+ *
+ * P35: only three of the original six survive here. P24's c4a71f1 (merged
+ * in P35) replaced the other three -- the gate/up/down expert offset
+ * tables -- with one per-call Metal transient buffer, to fix a
+ * deterministic last-writer-wins aliasing defect (P24 review B1). A
+ * transient buffer is not a tracked ds4_gpu_tensor and is not owned across
+ * calls, so it has nothing for this reset to free; see
+ * ds4_gpu_mellum_moe_group_begin's "one transient buffer per call" comment.
+ */
+static ds4_gpu_tensor *g_mellum_moe_group_counts, *g_mellum_moe_group_pairs;
+static ds4_gpu_tensor *g_mellum_moe_group_partial;
+static uint32_t g_mellum_moe_group_experts, g_mellum_moe_group_cap;
+static uint32_t g_mellum_moe_group_pairs_experts;
+static uint64_t g_mellum_moe_group_partial_bytes;
+
+/*
+ * Frees the three MoE-grouping tensors above (counts, pairs, partial) and
+ * zeros their size-tracking fields, so the next
+ * ds4_gpu_mellum_moe_group_begin call reallocates from scratch. Called
+ * from ds4_gpu_cleanup, alongside the other subsystem resets
+ * (ds4_gpu_decode_pipeline_fast_cache_reset,
+ * ds4_gpu_parallel_ffn_reset_state). ds4_gpu_cleanup only runs at true
+ * process/session teardown (its callers tear the whole GPU context down),
+ * so a plain free-and-null is sufficient here -- no in-flight command
+ * buffer can still reference these buffers by the time this runs.
+ * The expert offset tables are not here: since P24's c4a71f1 they are a
+ * per-call Metal transient buffer (see ds4_gpu_mellum_moe_group_begin),
+ * not a tracked tensor, so there is nothing for cleanup to free.
+ */
+static void ds4_gpu_mellum_moe_group_reset(void) {
+    ds4_gpu_tensor_free(g_mellum_moe_group_counts);
+    ds4_gpu_tensor_free(g_mellum_moe_group_pairs);
+    ds4_gpu_tensor_free(g_mellum_moe_group_partial);
+    g_mellum_moe_group_counts = NULL;
+    g_mellum_moe_group_pairs = NULL;
+    g_mellum_moe_group_partial = NULL;
+    g_mellum_moe_group_experts = 0;
+    g_mellum_moe_group_cap = 0;
+    g_mellum_moe_group_pairs_experts = 0;
+    g_mellum_moe_group_partial_bytes = 0;
+}
+
 static int ds4_gpu_mellum_grouped_moe_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -41193,9 +41269,6 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
                                            id<MTLBuffer> selectedbuf,
                                            uint64_t selected_offset,
                                            bool need_partial) {
-    static ds4_gpu_tensor *s_counts, *s_pairs, *s_partial;
-    static uint32_t s_experts, s_cap, s_pairs_experts;
-    static uint64_t s_partial_bytes;
 
     if (!g || !cb || !selectedbuf || n_total_expert == 0 || n_tokens == 0 ||
         n_expert_used == 0 || n_expert_used > n_total_expert) return false;
@@ -41203,27 +41276,27 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
     const uint32_t cap = n_tokens;
     if (cap > UINT32_MAX / n_total_expert) return false;
 
-    if (!s_counts || s_experts != n_total_expert) {
-        if (s_counts && ds4_gpu_commands_active()) return false;
-        ds4_gpu_tensor_free(s_counts);
-        s_counts = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * sizeof(uint32_t));
-        s_experts = n_total_expert;
+    if (!g_mellum_moe_group_counts || g_mellum_moe_group_experts != n_total_expert) {
+        if (g_mellum_moe_group_counts && ds4_gpu_commands_active()) return false;
+        ds4_gpu_tensor_free(g_mellum_moe_group_counts);
+        g_mellum_moe_group_counts = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * sizeof(uint32_t));
+        g_mellum_moe_group_experts = n_total_expert;
     }
-    if (!s_pairs || s_cap < cap || s_pairs_experts != n_total_expert) {
+    if (!g_mellum_moe_group_pairs || g_mellum_moe_group_cap < cap || g_mellum_moe_group_pairs_experts != n_total_expert) {
         /*
          * Freeing here while a caller-owned batch is open could release a
          * buffer the queued command buffer still references.  Callers keep the
          * shape fixed for a whole chunk, so this only guards a future one that
          * does not.
          */
-        if (s_pairs && ds4_gpu_commands_active()) return false;
-        ds4_gpu_tensor_free(s_pairs);
-        s_pairs = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * cap *
+        if (g_mellum_moe_group_pairs && ds4_gpu_commands_active()) return false;
+        ds4_gpu_tensor_free(g_mellum_moe_group_pairs);
+        g_mellum_moe_group_pairs = ds4_gpu_tensor_alloc((uint64_t)n_total_expert * cap *
                                        sizeof(uint32_t));
-        s_cap = cap;
-        s_pairs_experts = n_total_expert;
+        g_mellum_moe_group_cap = cap;
+        g_mellum_moe_group_pairs_experts = n_total_expert;
     }
-    if (!s_counts || !s_pairs) return false;
+    if (!g_mellum_moe_group_counts || !g_mellum_moe_group_pairs) return false;
 
     /*
      * One transient buffer per call: gate/up table at 0, down table at the next
@@ -41258,13 +41331,13 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
     if (need_partial && out_dim > 0) {
         const uint64_t want = (uint64_t)n_tokens * n_expert_used * out_dim *
                               sizeof(float);
-        if (!s_partial || s_partial_bytes < want) {
-            if (s_partial && ds4_gpu_commands_active()) return false;
-            ds4_gpu_tensor_free(s_partial);
-            s_partial = ds4_gpu_tensor_alloc(want);
-            s_partial_bytes = s_partial ? want : 0;
+        if (!g_mellum_moe_group_partial || g_mellum_moe_group_partial_bytes < want) {
+            if (g_mellum_moe_group_partial && ds4_gpu_commands_active()) return false;
+            ds4_gpu_tensor_free(g_mellum_moe_group_partial);
+            g_mellum_moe_group_partial = ds4_gpu_tensor_alloc(want);
+            g_mellum_moe_group_partial_bytes = g_mellum_moe_group_partial ? want : 0;
         }
-        if (!s_partial) return false;
+        if (!g_mellum_moe_group_partial) return false;
     }
 
     if (!g_mellum_moe_bucket_reset_pipeline) {
@@ -41282,22 +41355,22 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
         .n_tokens = n_tokens,
         .n_expert_used = n_expert_used,
         .n_total_expert = n_total_expert,
-        .bucket_cap = s_cap,
+        .bucket_cap = g_mellum_moe_group_cap,
     };
-    g->counts = s_counts;
-    g->pairs = s_pairs;
+    g->counts = g_mellum_moe_group_counts;
+    g->pairs = g_mellum_moe_group_pairs;
     g->offsets = tables;
     g->gate_offsets_at = 0;
     g->up_offsets_at = 0;
     g->down_offsets_at = (NSUInteger)table_stride;
-    g->partial = s_partial;
+    g->partial = g_mellum_moe_group_partial;
 
     /* Reset and build are separate encoders: the build must observe the reset. */
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
     [enc setComputePipelineState:g_mellum_moe_bucket_reset_pipeline];
     [enc setBytes:&g->args length:sizeof(g->args) atIndex:0];
-    [enc setBuffer:ds4_gpu_tensor_buffer(s_counts)
-            offset:ds4_gpu_tensor_offset(s_counts) atIndex:1];
+    [enc setBuffer:ds4_gpu_tensor_buffer(g_mellum_moe_group_counts)
+            offset:ds4_gpu_tensor_offset(g_mellum_moe_group_counts) atIndex:1];
     [enc dispatchThreadgroups:MTLSizeMake((n_total_expert + 63u) / 64u, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -41307,10 +41380,10 @@ static bool ds4_gpu_mellum_moe_group_begin(ds4_gpu_mellum_moe_group *g,
     [enc setComputePipelineState:g_mellum_moe_bucket_build_pipeline];
     [enc setBytes:&g->args length:sizeof(g->args) atIndex:0];
     [enc setBuffer:selectedbuf offset:(NSUInteger)selected_offset atIndex:1];
-    [enc setBuffer:ds4_gpu_tensor_buffer(s_counts)
-            offset:ds4_gpu_tensor_offset(s_counts) atIndex:2];
-    [enc setBuffer:ds4_gpu_tensor_buffer(s_pairs)
-            offset:ds4_gpu_tensor_offset(s_pairs) atIndex:3];
+    [enc setBuffer:ds4_gpu_tensor_buffer(g_mellum_moe_group_counts)
+            offset:ds4_gpu_tensor_offset(g_mellum_moe_group_counts) atIndex:2];
+    [enc setBuffer:ds4_gpu_tensor_buffer(g_mellum_moe_group_pairs)
+            offset:ds4_gpu_tensor_offset(g_mellum_moe_group_pairs) atIndex:3];
     [enc dispatchThreadgroups:MTLSizeMake((pair_total + 255u) / 256u, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);

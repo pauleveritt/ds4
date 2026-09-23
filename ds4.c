@@ -40430,6 +40430,15 @@ static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
     return chunk > ctx ? ctx : chunk;
 }
 
+/* P25 fix 3 (spec fact 21): forward declarations so the Mellum branch below
+ * (and its DS4_NO_GPU twin) can call the real, Mellum-shape-aware arithmetic
+ * instead of the generic DeepSeek-V4-shaped fallback every other family here
+ * uses. Defined later (ds4_mellum_kv_bytes at :43239-ish); not moved, to
+ * avoid disturbing the surrounding P20-era ordering. */
+static uint64_t ds4_mellum_kv_bytes(uint32_t ctx_size);
+static uint64_t ds4_mellum_decode_scratch_bytes(void);
+static uint64_t ds4_mellum_prefill_scratch_bytes(uint32_t cap);
+
 ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         ds4_backend backend,
         int         ctx_size,
@@ -40491,6 +40500,23 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
 
             m.prefill_cap = laguna_graph_prefill_cap(ctx, prefill_chunk);
             m.scratch_bytes = laguna_graph_scratch_bytes(m.prefill_cap);
+            m.total_bytes = m.raw_bytes + m.scratch_bytes;
+            return m;
+        }
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+            /* P25 fix 3 (spec fact 21): route through the Mellum-aware
+             * arithmetic instead of falling through to the generic
+             * DeepSeek-V4-shaped branch below (no n_head_kv factor, no x2
+             * for K and V, raw_cap capped at a hard 8192 -- see
+             * metal_graph_raw_cap_for_context). prefill_cap mirrors fix 1's
+             * conservative min(ctx, DS4_N_SWA) upper bound. */
+            const uint32_t mellum_prefill_cap = ctx < DS4_N_SWA ? ctx : DS4_N_SWA;
+            m.raw_cap = ctx;
+            m.prefill_cap = mellum_prefill_cap;
+            m.raw_bytes = ds4_mellum_kv_bytes(ctx);
+            m.scratch_bytes = ds4_add_sat_u64(
+                ds4_mellum_decode_scratch_bytes(),
+                ds4_mellum_prefill_scratch_bytes(mellum_prefill_cap));
             m.total_bytes = m.raw_bytes + m.scratch_bytes;
             return m;
         }
@@ -43316,11 +43342,14 @@ static uint64_t ds4_mellum_decode_state_bytes(uint32_t cap) {
     return total;
 }
 
-/* ds4_mellum_prefill_scratch_create's nineteen tensors.  No product path
- * allocates one: the only callers are the resident-profile and prefill
- * probes, which size it from DS4_MELLUM_PREFILL_CHUNK (ds4_mellum_probe_chunk)
- * rather than from e->prefill_chunk.  It is accounted here so a probe's plan
- * can include it. */
+/* ds4_mellum_prefill_scratch_create's nineteen tensors.  P25 Fix 1: the
+ * product session path *does* allocate one -- ds4_session_sync's Mellum
+ * branch (ds4.c, "layer-major prefill, for spans long enough to pay for the
+ * workspace") creates it the first time a sync sees >= 64 pending tokens,
+ * frozen at cap = min(pending, DS4_N_SWA) for the life of the session. The
+ * plan and the admission gate below pass ds4_mellum_effective_prefill_cap's
+ * conservative upper bound, min(ctx_size, DS4_N_SWA), so this is accounted
+ * for every session whose --ctx could reach that path, not only probes. */
 static uint64_t ds4_mellum_prefill_scratch_bytes(uint32_t cap) {
     if (cap == 0) return 0;
     const uint64_t c = cap;
@@ -43344,6 +43373,41 @@ static uint64_t ds4_mellum_prefill_scratch_bytes(uint32_t cap) {
     return total;
 }
 
+/* P25.1: the sixth plan term.  ds4_gpu_mellum_moe_group_begin (ds4_metal.m)
+ * allocates six process-global static tensors on the expert-major MoE GEMM
+ * path -- s_partial (cap*n_expert_used*n_embd floats), s_pairs
+ * (n_expert*cap uint32s), s_counts (n_expert uint32s) and three offset
+ * tables (n_expert uint64s each) -- sized on the same first-sync cap Fix 1
+ * already threads through, and never counted by the plan. P25's own
+ * independent review root-caused exactly this as the -72.25 MiB residual
+ * its fail branch reported (docs/superpowers/research/
+ * 2026-09-22-p25-finding.md, "Review (Opus, 2026-09-22)", Blocker 1):
+ * 1024*8*2304*4 + 64*1024*4 + 64*4 + 3*64*8 = 75,761,408 B = 72.2517 MiB,
+ * matching the measured residual to the hundredth. Gated on
+ * ds4_gpu_mellum_moe_gemm_enabled() -- the GPU-only runtime switch that
+ * decides whether s_partial (the dominant term) is ever allocated; under
+ * DS4_NO_GPU there is no GPU session to allocate any of this, so the term
+ * is always 0 there. */
+#ifndef DS4_NO_GPU
+static uint64_t ds4_mellum_moe_group_workspace_bytes(uint32_t cap) {
+    if (!ds4_gpu_mellum_moe_gemm_enabled()) return 0;
+    const uint64_t c = cap;
+    uint64_t total = c * (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD *
+                     sizeof(float);                          /* s_partial */
+    total = ds4_add_sat_u64(total,
+                            (uint64_t)DS4_N_EXPERT * c * sizeof(uint32_t));
+                                                               /* s_pairs */
+    total = ds4_add_sat_u64(total, (uint64_t)DS4_N_EXPERT * 28u);
+                     /* s_counts (4B/expert) + 3 offset tables (8B/expert) */
+    return total;
+}
+#else
+static uint64_t ds4_mellum_moe_group_workspace_bytes(uint32_t cap) {
+    (void)cap;
+    return 0;
+}
+#endif
+
 static uint64_t ds4_mellum_planned_bytes(uint64_t weights_bytes,
                                          uint32_t ctx_size,
                                          uint32_t prefill_cap) {
@@ -43351,6 +43415,8 @@ static uint64_t ds4_mellum_planned_bytes(uint64_t weights_bytes,
     total = ds4_add_sat_u64(total, ds4_mellum_decode_state_bytes(ctx_size));
     total = ds4_add_sat_u64(total,
                             ds4_mellum_prefill_scratch_bytes(prefill_cap));
+    total = ds4_add_sat_u64(total,
+                            ds4_mellum_moe_group_workspace_bytes(prefill_cap));
     return total;
 }
 
@@ -43361,10 +43427,35 @@ static bool ds4_mellum_admit(uint64_t planned, uint64_t budget) {
     return budget == 0 || planned <= budget;
 }
 
+/* P25 Task 9. Kept as a sibling, not a replacement: ds4_mellum_admit stays
+ * bool-returning for its existing callers (ds4.c:44782 -- this function's
+ * own call below -- and the DS4_NO_GPU test hook at ds4.c:74929,
+ * ds4_test_mellum_admit; both were grepped before adding this, per spec
+ * Risk 4). Returns 0 when admitted (a print-only unknown budget counts as
+ * admitted, matching ds4_mellum_admit), else planned - budget. */
+static uint64_t ds4_mellum_admit_residual(uint64_t planned, uint64_t budget) {
+    if (budget == 0 || planned <= budget) return 0;
+    return planned - budget;
+}
+
+/* P25 Fix 1.  The plan and the admission gate cannot know the real session's
+ * first-sync pending-token count in advance (it is a property of the prompt,
+ * not the engine), so this is the conservative upper bound: whatever the
+ * product path would freeze its cap at is never more than
+ * min(ctx_size, DS4_N_SWA) (ds4_session_sync's Mellum branch,
+ * "cap = pending < DS4_N_SWA ? pending : DS4_N_SWA"; pending is bounded by
+ * ctx_size). Strictly tighter than a bare DS4_N_SWA at small --ctx. */
+static uint32_t ds4_mellum_effective_prefill_cap(uint32_t ctx_size) {
+    return ctx_size < DS4_N_SWA ? ctx_size : DS4_N_SWA;
+}
+
 /* The four figures the startup plan line reports, computed once so the human
  * text and the exact byte counts beside it cannot describe different sums
- * (P20 review, F5).  prefill_cap is 0: no product Mellum session allocates a
- * prefill scratch. */
+ * (P20 review, F5).  P25 Fix 1: prefill_cap is
+ * ds4_mellum_effective_prefill_cap(ctx_size), not 0 -- a real product Mellum
+ * session's first long-enough sync does allocate a prefill scratch
+ * (ds4_session_sync's Mellum branch), so the plan and the admission gate
+ * below both account for it. */
 typedef struct {
     uint64_t weights;
     uint64_t kv;
@@ -43375,11 +43466,16 @@ typedef struct {
 static ds4_mellum_plan_parts ds4_mellum_plan_parts_for(uint64_t weights_bytes,
                                                        uint32_t ctx_size) {
     ds4_mellum_plan_parts p;
+    const uint32_t prefill_cap = ds4_mellum_effective_prefill_cap(ctx_size);
     p.weights = weights_bytes;
     p.kv = ds4_mellum_kv_bytes(ctx_size);
     p.scratch = ds4_add_sat_u64(ds4_mellum_decode_scratch_bytes(),
                                 ds4_mellum_decode_output_bytes(DS4_N_VOCAB));
-    p.planned = ds4_mellum_planned_bytes(weights_bytes, ctx_size, 0);
+    p.scratch = ds4_add_sat_u64(p.scratch,
+                                ds4_mellum_prefill_scratch_bytes(prefill_cap));
+    p.scratch = ds4_add_sat_u64(p.scratch,
+                                ds4_mellum_moe_group_workspace_bytes(prefill_cap));
+    p.planned = ds4_mellum_planned_bytes(weights_bytes, ctx_size, prefill_cap);
     return p;
 }
 
@@ -44710,8 +44806,9 @@ static uint64_t ds4_mellum_memory_budget_bytes(void) {
  */
 static void ds4_mellum_print_memory_plan(const ds4_engine *e, int ctx_size) {
     const uint32_t ctx = (uint32_t)ctx_size;
-    /* prefill_cap 0: no product Mellum session allocates a prefill scratch
-     * (its only callers are the probes). */
+    /* P25 Fix 1: ds4_mellum_plan_parts_for now passes
+     * ds4_mellum_effective_prefill_cap(ctx), not a literal 0 -- see that
+     * function's comment. */
     const ds4_mellum_plan_parts p =
         ds4_mellum_plan_parts_for(e->startup_model_span_bytes, ctx);
     const uint64_t weights = p.weights;
@@ -44755,14 +44852,40 @@ static bool ds4_mellum_memory_admit_at_open(const ds4_engine *e,
                                             int ctx_size) {
     if (!e || ctx_size <= 0) return true;
     const uint64_t budget = ds4_mellum_memory_budget_bytes();
+    /* P25 Fix 1: was a literal 0 (see ds4_mellum_effective_prefill_cap's
+     * comment -- the product path does allocate a prefill scratch, and this
+     * gate feeds the admission decision, so undercounting it here let
+     * sessions in that a real open would then overrun). This does shift the
+     * admission boundary: a --ctx that admitted under the old, undercounted
+     * plan can now be refused (P25 spec Risk 6). */
+    const uint32_t prefill_cap = ds4_mellum_effective_prefill_cap((uint32_t)ctx_size);
     const uint64_t planned =
         ds4_mellum_planned_bytes(e->startup_model_span_bytes,
-                                 (uint32_t)ctx_size, 0);
+                                 (uint32_t)ctx_size, prefill_cap);
     if (ds4_mellum_admit(planned, budget)) return true;
+    /* P25 Task 9: name the dominant term and print the residual in GiB, so
+     * the refusal is actionable instead of just a "no". Reuses the plan
+     * line's own parts struct (ds4_mellum_plan_parts_for) so this can never
+     * describe a different sum than the plan line does. TODO(owner): the
+     * exact human-readable phrasing below ("use a smaller --ctx" etc.) is
+     * not a product decision this phase makes -- see the spec's "not decide
+     * the exact wording". */
+    const ds4_mellum_plan_parts p =
+        ds4_mellum_plan_parts_for(e->startup_model_span_bytes, (uint32_t)ctx_size);
+    const uint64_t residual = ds4_mellum_admit_residual(planned, budget);
+    const char *dominant = "weights";
+    uint64_t dominant_bytes = p.weights;
+    if (p.kv > dominant_bytes) { dominant = "KV"; dominant_bytes = p.kv; }
+    if (p.scratch > dominant_bytes) { dominant = "scratch"; dominant_bytes = p.scratch; }
     fprintf(stderr,
-            "ds4: Mellum 2 needs %.2f GiB (weights + KV + scratch) but this "
-            "device recommends at most %.2f GiB; use a smaller --ctx\n",
-            ds4_bytes_to_gib(planned), ds4_bytes_to_gib(budget));
+            "ds4: Mellum 2 needs %.2f GiB (weights %.2f GiB + KV %.2f GiB + "
+            "scratch %.2f MiB) but this device recommends at most %.2f GiB "
+            "-- over by %.2f GiB, dominated by %s (%.2f GiB); use a smaller "
+            "--ctx\n",
+            ds4_bytes_to_gib(planned), ds4_bytes_to_gib(p.weights),
+            ds4_bytes_to_gib(p.kv), (double)p.scratch / 1048576.0,
+            ds4_bytes_to_gib(budget), ds4_bytes_to_gib(residual), dominant,
+            ds4_bytes_to_gib(dominant_bytes));
     return false;
 }
 
@@ -63404,6 +63527,22 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
+        /* P25 fix 3 (spec fact 21): the DS4_NO_GPU twin of the graph-branch
+         * Mellum arithmetic above, so a model-free (DS4_TEST_HOOKS) build
+         * agrees with the real Metal path instead of exercising the generic
+         * DeepSeek-V4-shaped fallback below. */
+        const uint32_t mellum_prefill_cap = ctx < DS4_N_SWA ? ctx : DS4_N_SWA;
+        m.raw_cap = ctx;
+        m.prefill_cap = mellum_prefill_cap;
+        m.raw_bytes = ds4_mellum_kv_bytes(ctx);
+        m.scratch_bytes = ds4_add_sat_u64(
+            ds4_mellum_decode_scratch_bytes(),
+            ds4_mellum_prefill_scratch_bytes(mellum_prefill_cap));
+        m.total_bytes = m.raw_bytes + m.scratch_bytes;
+        return m;
+    }
+
     m.raw_cap = ds4_default_raw_cap(ctx);
     m.raw_bytes = (uint64_t)DS4_N_LAYER *
                   m.raw_cap *
@@ -74977,6 +75116,32 @@ int ds4_test_mellum_admit(uint64_t planned, uint64_t budget) {
     return ds4_mellum_admit(planned, budget) ? 1 : 0;
 }
 
+/* P25 Task 9. Not declared in ds4.h -- kept out of the frozen header,
+ * per the corrected pattern this phase follows (a local extern prototype
+ * in the test file instead of a new ds4.h declaration; see tests/
+ * test_sampling.c). */
+uint64_t ds4_test_mellum_admit_residual(uint64_t planned, uint64_t budget) {
+    return ds4_mellum_admit_residual(planned, budget);
+}
+
+/* P25 Task 5/6: the generic, family-agnostic context-memory estimator
+ * (ds4_context_memory_estimate_with_prefill_mode) that
+ * ds4_streaming_manual_cache_safe_bytes and the four log_context_memory call
+ * sites consume — reached with the Mellum shape installed, same
+ * select/call/restore pattern as ds4_test_mellum_memory_plan above. Backend
+ * DS4_BACKEND_CPU selects the DS4_NO_GPU-safe arithmetic path in a
+ * DS4_TEST_HOOKS (model-free) build. */
+int ds4_test_mellum_generic_estimate(int ctx_size, uint32_t prefill_chunk,
+                                     ds4_context_memory *out) {
+    if (!out) return -1;
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_MELLUM2;
+    *out = ds4_context_memory_estimate_with_prefill_mode(
+        DS4_BACKEND_CPU, ctx_size, prefill_chunk, false);
+    g_ds4_shape = saved;
+    return 0;
+}
+
 /* Render the exact-bytes suffix of the startup plan line exactly as
  * ds4_mellum_print_memory_plan renders it — same parts, same formatter — so
  * a model-free test can check the printed integers satisfy
@@ -78773,7 +78938,12 @@ int ds4_engine_mellum_swa_boundary_probe(ds4_engine *e,
      * magnitude either way and only demand exactness of the serial path, so
      * this stays a real gate for both rather than a false green for one.
      */
-    const int split = ds4_gpu_mellum_attn_split_enabled();
+    /* P25 Task 10 cosmetic item 2: either the split-K OR the grouped decode
+     * kernel reassociates the softmax above the 256-key boundary -- this
+     * used to key on split alone, which silently fell back to a bitwise
+     * memcmp (and would have failed it) whenever grouped-only ran. */
+    const int split = ds4_gpu_mellum_attn_split_enabled() ||
+        ds4_gpu_mellum_attn_group_enabled();
     double max_abs = 0.0, sum_sq = 0.0;
     if (ok) {
         for (uint64_t i = 0; i < vocab_dim; i++) {
@@ -78937,8 +79107,12 @@ int ds4_engine_mellum_resident_profile(ds4_engine *e, FILE *out,
             ok = false;
         } else {
             depth_n = (uint32_t)decode_depth;
-            depth_chunk = ds4_mellum_probe_chunk(depth_n < 1024u ? depth_n : 1024u,
-                                                 depth_n);
+            /* P25 Task 10 cosmetic item 3: confirmed correct (1024 ==
+             * DS4_N_SWA for the Mellum 2 shape), named instead of a magic
+             * literal so it reads as the same bound the product path's
+             * frozen cap uses, not a coincidence. */
+            depth_chunk = ds4_mellum_probe_chunk(
+                depth_n < DS4_N_SWA ? depth_n : DS4_N_SWA, depth_n);
             depth_toks = xmalloc((size_t)depth_n * sizeof(*depth_toks));
             for (uint32_t i = 0; i < depth_n; i++) {
                 depth_toks[i] = (int)((i * 7919u + 27u) % DS4_N_VOCAB);
@@ -79057,9 +79231,15 @@ static bool ds4_mellum_prefill_chunks(const ds4_engine           *e,
 }
 
 /*
- * Diagnostic chunk size for the prefill probes.  Unset keeps the historical
- * single-batch behaviour; 1 makes every projection use the decode matvec, which
- * separates layer-major graph semantics from batched-kernel precision.
+ * P25 Task 10 cosmetic item 3 (corrected comment): this is NOT probe-only.
+ * The product session path calls it too -- ds4_session_sync's Mellum
+ * branch, "cap = ds4_mellum_probe_chunk(cap, DS4_N_SWA)" (ds4.c:81768) --
+ * to let DS4_MELLUM_PREFILL_CHUNK override the real first-sync scratch cap
+ * for diagnosis, same as it overrides the probes' chunk size below. Unset
+ * keeps the caller's own fallback (the probe's single-batch size, or the
+ * product path's min(pending, DS4_N_SWA)); 1 makes every projection use the
+ * decode matvec, which separates layer-major graph semantics from
+ * batched-kernel precision.
  */
 static uint32_t ds4_mellum_probe_chunk(uint32_t fallback, uint32_t max_chunk) {
     const char *env = getenv("DS4_MELLUM_PREFILL_CHUNK");

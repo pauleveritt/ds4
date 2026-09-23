@@ -738,6 +738,10 @@ kernel void kernel_mellum_attention_decode_gqa_split_f16(
         ushort simd_group_u [[simdgroup_index_in_threadgroup]],
         uint head [[threadgroup_position_in_grid]]) {
     constexpr uint split_simd_groups = DS4_MELLUM_SPLIT_SIMD_GROUPS;
+    /* P25 Task 10 cosmetic item 4: mirrors DS4_MELLUM_ATTN_MIN_KEYS
+     * (ds4_metal.m, ~line 638) by value, not by a shared #define -- Metal
+     * shaders here are standalone. Keep this in sync by hand if that
+     * constant ever changes. */
     constexpr uint split_threshold = 256u;
     /*
      * Every early return here must be uniform across the threadgroup, because
@@ -1226,6 +1230,10 @@ kernel void kernel_laguna_attention_decode_gqa_f16(
         ushort simd_group_u [[simdgroup_index_in_threadgroup]],
         uint head [[threadgroup_position_in_grid]]) {
     constexpr uint split_simd_groups = 8u;
+    /* P25 Task 10 cosmetic item 4: mirrors DS4_MELLUM_ATTN_MIN_KEYS
+     * (ds4_metal.m, ~line 638) by value, not by a shared #define -- Metal
+     * shaders here are standalone. Keep this in sync by hand if that
+     * constant ever changes. */
     constexpr uint split_threshold = 256u;
     if (head >= args.n_head || args.n_head_kv == 0u ||
         args.head_dim != 128u || args.key_count == 0u) {
