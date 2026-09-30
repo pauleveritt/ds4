@@ -956,6 +956,119 @@ kernel void kernel_qwen4_gdn_out(
     }
 }
 
+/* Dense qwen35's gated norm: the same per-head RMSNorm, gated by silu(z)
+ * (llama.cpp qwen35 build_norm_gated) instead of sigmoid(z). */
+kernel void kernel_qwen35_gdn_out(
+        constant ds4_metal_args_qwen4_gdn_out & args,
+        device float       *o,        /* [T][H*D], in place */
+        device const float *z,        /* [T][H*D] */
+        device const float *weight,   /* [D] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint h = tgpig.x;
+    const uint tok = tgpig.y;
+    if (h >= args.n_head || tok >= args.n_tokens) return;
+    const uint D = args.head_dim;
+    const uint npt = D / 32;
+    const uint64_t base = ((uint64_t)tok * args.n_head + h) * D + tiisg * npt;
+    float ss = 0.0f;
+    for (uint i = 0; i < npt; i++) ss += o[base + i] * o[base + i];
+    ss = simd_sum(ss);
+    const float r = rsqrt(ss / (float)D + args.eps);
+    for (uint i = 0; i < npt; i++) {
+        o[base + i] = o[base + i] * r * weight[tiisg * npt + i] * qwen4_silu(z[base + i]);
+    }
+}
+
+struct ds4_metal_args_qwen35_q6_matmul {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_tokens;
+    uint32_t pad0;
+    uint64_t row_bytes;
+};
+
+/* Dense qwen35 Q6_K matvec (down projections and output head of the Q4_K_M
+ * recipes): two simdgroups of two rows per threadgroup, one token per grid
+ * row, the Q6_K dot of moe.metal's routed-down kernel on a single dense
+ * matrix. */
+kernel void kernel_qwen35_q6_K_matmul_f32(
+        constant ds4_metal_args_qwen35_q6_matmul &args,
+        device const char  *weight,
+        device const float *x,
+        device float       *out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simd_group [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint rows_per_simd = 2u;
+    constexpr uint simd_groups = 2u;
+    constexpr uint kmask1 = 0x03u;
+    constexpr uint kmask2 = 0x0Cu;
+    constexpr uint kmask3 = 0x30u;
+    constexpr uint kmask4 = 0xC0u;
+    constexpr uint qk_k = 256u;
+
+    const uint row0 = (tgpig.x * simd_groups + simd_group) * rows_per_simd;
+    const uint token = tgpig.y;
+    if (row0 >= args.out_dim || token >= args.n_tokens) return;
+
+    const int n_blocks = (int)(args.in_dim / qk_k);
+    const short tid = (short)(lane / 2u);
+    const short ix = (short)(lane & 1u);
+    const short ip = (short)(tid / 8);
+    const short il = (short)(tid % 8);
+    const short l0 = (short)(4 * il);
+    const short is = (short)(8 * ip + l0 / 16);
+    const short y_offset = (short)(128 * ip + l0);
+    const short q_offset_l = (short)(64 * ip + l0);
+    const short q_offset_h = (short)(32 * ip + l0);
+    device const float *input = x + (uint64_t)token * args.in_dim;
+    float sums[rows_per_simd] = {0.0f, 0.0f};
+    float yl[16];
+
+    for (int ib = ix; ib < n_blocks; ib += 2) {
+        device const float *y = input + (uint64_t)ib * qk_k + y_offset;
+        for (short l = 0; l < 4; l++) {
+            yl[4 * l + 0] = y[l + 0];
+            yl[4 * l + 1] = y[l + 32];
+            yl[4 * l + 2] = y[l + 64];
+            yl[4 * l + 3] = y[l + 96];
+        }
+
+        for (uint r = 0u; r < rows_per_simd && row0 + r < args.out_dim; r++) {
+            device const block_q6_K *block =
+                (device const block_q6_K *)(weight +
+                    (uint64_t)(row0 + r) * args.row_bytes) + ib;
+            device const uchar *q1 = block->ql + q_offset_l;
+            device const uchar *q2 = q1 + 32;
+            device const uchar *qh = block->qh + q_offset_h;
+            device const char *sc = block->scales + is;
+            float4 part = float4(0.0f);
+            for (short l = 0; l < 4; l++) {
+                const uint h = (uint)qh[l];
+                part[0] += yl[4 * l + 0] *
+                    (float)((int)((q1[l] & 0x0Fu) | ((h & kmask1) << 4u)) - 32);
+                part[1] += yl[4 * l + 1] *
+                    (float)((int)((q2[l] & 0x0Fu) | ((h & kmask2) << 2u)) - 32);
+                part[2] += yl[4 * l + 2] *
+                    (float)((int)((q1[l] >> 4u) | (h & kmask3)) - 32);
+                part[3] += yl[4 * l + 3] *
+                    (float)((int)((q2[l] >> 4u) | ((h & kmask4) >> 2u)) - 32);
+            }
+            sums[r] += (float)block->d *
+                (part[0] * (float)sc[0] + part[1] * (float)sc[2] +
+                 part[2] * (float)sc[4] + part[3] * (float)sc[6]);
+        }
+    }
+
+    for (uint r = 0u; r < rows_per_simd && row0 + r < args.out_dim; r++) {
+        const float sum = simd_sum(sums[r]);
+        if (lane == 0u) {
+            out[(uint64_t)token * args.out_dim + row0 + r] = sum;
+        }
+    }
+}
+
 /* --- PLE ---------------------------------------------------------------- */
 
 struct ds4_metal_args_qwen4_ple_gate {

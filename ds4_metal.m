@@ -20055,6 +20055,87 @@ int ds4_gpu_matmul_quant_decode_mpp_model_view_tensor(
                                             false);
 }
 
+/* Dense Q6_K projection: the matvec of the Q4_K_M recipes' Q6_K tensors
+ * (down projections, output head) for dense qwen35. */
+typedef struct {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_tokens;
+    uint32_t pad0;
+    uint64_t row_bytes;
+} ds4_gpu_qwen35_q6_matmul_args;
+
+int ds4_gpu_matmul_q6_K_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !model_map || !x || n_tok == 0 ||
+        in_dim == 0 || (in_dim % 256u) != 0 ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
+        return 0;
+    }
+
+    const uint64_t row_bytes = (in_dim / 256u) * 210u;
+    if (out_dim > UINT64_MAX / row_bytes ||
+        n_tok > UINT64_MAX / in_dim ||
+        n_tok > UINT64_MAX / out_dim) {
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+    const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+    if (weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset ||
+        ds4_gpu_tensor_bytes(x) < x_bytes ||
+        ds4_gpu_tensor_bytes(out) < out_bytes) {
+        fprintf(stderr, "ds4: Metal Q6_K matmul received an invalid model range or activation buffer\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map,
+                                                       model_size,
+                                                       weight_offset,
+                                                       weight_bytes,
+                                                       &inner_offset);
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_qwen35_q6_K_matmul_f32");
+        if (!xbuf || !outbuf || !wbuf || !pipeline) return 0;
+
+        ds4_gpu_qwen35_q6_matmul_args args = {
+            .in_dim = (uint32_t)in_dim,
+            .out_dim = (uint32_t)out_dim,
+            .n_tokens = (uint32_t)n_tok,
+            .row_bytes = row_bytes,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + 3u) / 4u,
+                                              (NSUInteger)n_tok,
+                                              1)
+             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen35 Q6_K matmul")) return 0;
+    }
+    return 1;
+}
+
 int ds4_gpu_matmul_quant_rows_scalar_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -48185,6 +48266,7 @@ enum {
     QWEN4_K_VIS_ATTENTION,
     QWEN4_K_VIS_BIAS_RESIDUAL,
     QWEN4_K_VIS_BIAS_ACT,
+    QWEN4_K_QWEN35_GDN_OUT,
     QWEN4_K_COUNT,
 };
 
@@ -48290,6 +48372,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_vis_attention",
     "kernel_qwen4_vis_bias_residual",
     "kernel_qwen4_vis_bias_act",
+    "kernel_qwen35_gdn_out",
 };
 
 typedef struct {
@@ -48937,6 +49020,24 @@ int ds4_gpu_qwen4_gdn_out_tensor(
                           MTLSizeMake(n_head, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
 }
 
+int ds4_gpu_qwen35_gdn_out_tensor(
+        ds4_gpu_tensor *o, const ds4_gpu_tensor *z,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_tokens, uint32_t n_head, uint32_t head_dim, float eps) {
+    struct { uint32_t n_tokens, n_head, head_dim; float eps; } args = { n_tokens, n_head, head_dim, eps };
+    qwen4_bind b[3];
+    const uint64_t bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+    if (n_tokens == 0 || head_dim < 32 || (head_dim % 32) != 0 ||
+        !qwen4_bind_tensor(&b[0], o, bytes, "gdn out") ||
+        !qwen4_bind_tensor(&b[1], z, bytes, "gdn gate") ||
+        !qwen4_bind_weight(&b[2], model_map, model_size, weight_offset, (uint64_t)head_dim * sizeof(float),
+                           "ssm_norm")) {
+        return 0;
+    }
+    return qwen4_dispatch(QWEN4_K_QWEN35_GDN_OUT, &args, sizeof(args), b, 3,
+                          MTLSizeMake(n_head, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
+}
+
 int ds4_gpu_qwen4_ple_gate_tensor(
         ds4_gpu_tensor *gated, ds4_gpu_tensor *normed, const ds4_gpu_tensor *R,
         const ds4_gpu_tensor *key, const ds4_gpu_tensor *value,
@@ -49100,6 +49201,48 @@ int ds4_gpu_qwen4_attn_prep_tensor(
     }
     return qwen4_dispatch(QWEN4_K_ATTN_PREP, &args, sizeof(args), b, 15,
                           MTLSizeMake(n_head + n_head_kv + n_idx_head + 1u, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
+}
+
+/* kernel_qwen4_attn_prep without the indexer: the grid stops after the kv
+ * heads, so the indexer bindings (aliased to q_out) are never touched. */
+int ds4_gpu_qwen35_attn_prep_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *gate_out, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kproj, const ds4_gpu_tensor *vproj,
+        const ds4_gpu_tensor *pos3, const void *model_map, uint64_t model_size,
+        uint64_t g_q_offset, uint64_t g_k_offset,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
+        uint32_t pos0, uint32_t cache_cap, float rope_base, float eps) {
+    struct {
+        uint32_t n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap;
+        float rope_base, eps; uint32_t pad0; float rope_mscale; float rope_freq[32];
+    } args = { n_tokens, n_head, n_head_kv, head_dim, n_rot, 0, 32, pos0, cache_cap,
+               rope_base, eps, 0, 1.0f, { 0 } };
+    qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
+    const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)n_tokens * n_head_kv * head_dim * sizeof(float);
+    const uint64_t cache_bytes = (uint64_t)cache_cap * n_head_kv * head_dim * 2u;
+    qwen4_bind b[15];
+    if (n_tokens == 0 || head_dim < 32 || head_dim > 256 || (head_dim % 32) != 0 ||
+        n_rot > 64 || (n_rot % 2) != 0 || n_rot > head_dim ||
+        (uint64_t)pos0 + n_tokens > cache_cap || n_head_kv == 0 || (n_head % n_head_kv) != 0 ||
+        !qwen4_bind_tensor(&b[0], qg, 2u * q_bytes, "attn q/gate projection") ||
+        !qwen4_bind_tensor(&b[1], kproj, kv_bytes, "attn k projection") ||
+        !qwen4_bind_tensor(&b[2], vproj, kv_bytes, "attn v projection") ||
+        !qwen4_bind_weight(&b[5], model_map, model_size, g_q_offset, (uint64_t)head_dim * sizeof(float),
+                           "attn q_norm") ||
+        !qwen4_bind_weight(&b[6], model_map, model_size, g_k_offset, (uint64_t)head_dim * sizeof(float),
+                           "attn k_norm") ||
+        !qwen4_bind_tensor(&b[8], q_out, q_bytes, "attn q") ||
+        !qwen4_bind_tensor(&b[9], gate_out, q_bytes, "attn gate") ||
+        !qwen4_bind_tensor(&b[10], k_cache, cache_bytes, "k cache") ||
+        !qwen4_bind_tensor(&b[11], v_cache, cache_bytes, "v cache") ||
+        !qwen4_bind_tensor(&b[14], pos3, (uint64_t)cache_cap * 16u, "rope positions")) {
+        return 0;
+    }
+    b[3] = b[4] = b[12] = b[13] = b[8];
+    b[7] = b[5];
+    return qwen4_dispatch(QWEN4_K_ATTN_PREP, &args, sizeof(args), b, 15,
+                          MTLSizeMake(n_head + n_head_kv, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_idx_block_key_tensor(
