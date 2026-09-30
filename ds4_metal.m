@@ -52900,6 +52900,7 @@ enum {
     QWEN4_K_VIS_ATTENTION,
     QWEN4_K_VIS_BIAS_RESIDUAL,
     QWEN4_K_VIS_BIAS_ACT,
+    QWEN4_K_QWEN35_GDN_OUT,
     QWEN4_K_COUNT,
 };
 
@@ -52987,6 +52988,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_vis_attention",
     "kernel_qwen4_vis_bias_residual",
     "kernel_qwen4_vis_bias_act",
+    "kernel_qwen35_gdn_out",
 };
 
 typedef struct {
@@ -53443,6 +53445,24 @@ int ds4_gpu_qwen4_gdn_out_tensor(
                           MTLSizeMake(n_head, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
 }
 
+int ds4_gpu_qwen35_gdn_out_tensor(
+        ds4_gpu_tensor *o, const ds4_gpu_tensor *z,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_tokens, uint32_t n_head, uint32_t head_dim, float eps) {
+    struct { uint32_t n_tokens, n_head, head_dim; float eps; } args = { n_tokens, n_head, head_dim, eps };
+    qwen4_bind b[3];
+    const uint64_t bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+    if (n_tokens == 0 || head_dim < 32 || (head_dim % 32) != 0 ||
+        !qwen4_bind_tensor(&b[0], o, bytes, "gdn out") ||
+        !qwen4_bind_tensor(&b[1], z, bytes, "gdn gate") ||
+        !qwen4_bind_weight(&b[2], model_map, model_size, weight_offset, (uint64_t)head_dim * sizeof(float),
+                           "ssm_norm")) {
+        return 0;
+    }
+    return qwen4_dispatch(QWEN4_K_QWEN35_GDN_OUT, &args, sizeof(args), b, 3,
+                          MTLSizeMake(n_head, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
+}
+
 int ds4_gpu_qwen4_ple_gate_tensor(
         ds4_gpu_tensor *gated, ds4_gpu_tensor *normed, const ds4_gpu_tensor *R,
         const ds4_gpu_tensor *key, const ds4_gpu_tensor *value,
@@ -53606,6 +53626,48 @@ int ds4_gpu_qwen4_attn_prep_tensor(
     }
     return qwen4_dispatch(QWEN4_K_ATTN_PREP, &args, sizeof(args), b, 15,
                           MTLSizeMake(n_head + n_head_kv + n_idx_head + 1u, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
+}
+
+/* kernel_qwen4_attn_prep without the indexer: the grid stops after the kv
+ * heads, so the indexer bindings (aliased to q_out) are never touched. */
+int ds4_gpu_qwen35_attn_prep_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *gate_out, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kproj, const ds4_gpu_tensor *vproj,
+        const ds4_gpu_tensor *pos3, const void *model_map, uint64_t model_size,
+        uint64_t g_q_offset, uint64_t g_k_offset,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
+        uint32_t pos0, uint32_t cache_cap, float rope_base, float eps) {
+    struct {
+        uint32_t n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap;
+        float rope_base, eps; uint32_t pad0; float rope_mscale; float rope_freq[32];
+    } args = { n_tokens, n_head, n_head_kv, head_dim, n_rot, 0, 32, pos0, cache_cap,
+               rope_base, eps, 0, 1.0f, { 0 } };
+    qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
+    const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)n_tokens * n_head_kv * head_dim * sizeof(float);
+    const uint64_t cache_bytes = (uint64_t)cache_cap * n_head_kv * head_dim * 2u;
+    qwen4_bind b[15];
+    if (n_tokens == 0 || head_dim < 32 || head_dim > 256 || (head_dim % 32) != 0 ||
+        n_rot > 64 || (n_rot % 2) != 0 || n_rot > head_dim ||
+        (uint64_t)pos0 + n_tokens > cache_cap || n_head_kv == 0 || (n_head % n_head_kv) != 0 ||
+        !qwen4_bind_tensor(&b[0], qg, 2u * q_bytes, "attn q/gate projection") ||
+        !qwen4_bind_tensor(&b[1], kproj, kv_bytes, "attn k projection") ||
+        !qwen4_bind_tensor(&b[2], vproj, kv_bytes, "attn v projection") ||
+        !qwen4_bind_weight(&b[5], model_map, model_size, g_q_offset, (uint64_t)head_dim * sizeof(float),
+                           "attn q_norm") ||
+        !qwen4_bind_weight(&b[6], model_map, model_size, g_k_offset, (uint64_t)head_dim * sizeof(float),
+                           "attn k_norm") ||
+        !qwen4_bind_tensor(&b[8], q_out, q_bytes, "attn q") ||
+        !qwen4_bind_tensor(&b[9], gate_out, q_bytes, "attn gate") ||
+        !qwen4_bind_tensor(&b[10], k_cache, cache_bytes, "k cache") ||
+        !qwen4_bind_tensor(&b[11], v_cache, cache_bytes, "v cache") ||
+        !qwen4_bind_tensor(&b[14], pos3, (uint64_t)cache_cap * 16u, "rope positions")) {
+        return 0;
+    }
+    b[3] = b[4] = b[12] = b[13] = b[8];
+    b[7] = b[5];
+    return qwen4_dispatch(QWEN4_K_ATTN_PREP, &args, sizeof(args), b, 15,
+                          MTLSizeMake(n_head + n_head_kv, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_idx_block_key_tensor(

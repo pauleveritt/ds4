@@ -46,6 +46,9 @@ typedef enum {
     /* P19 merge: the Mellum branch numbered MELLUM2 5, already taken here
      * (LAGUNA_XS21).  Mellum takes the next free value. */
     DS4_VARIANT_MELLUM2 = 9,
+    /* Dense `qwen35` GGUFs (GDN + gated attention with a SwiGLU FFN).  They
+     * stay in the QWEN4_EXP family so the Qwen session path drives them. */
+    DS4_VARIANT_QWEN35 = 10,
 } ds4_variant;
 
 /* Per-model-shape constants. Most of ds4.c's shape table stays private
