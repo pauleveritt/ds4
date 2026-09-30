@@ -83,6 +83,39 @@ output) agreed to within about 1e-3, and the projections differed at the
 1e-3 level expected from llama.cpp's f16 activations in its prefill
 matmuls.
 
+## Milestone 2: 64 greedy tokens
+
+ds4 against three llama.cpp configurations on the same token ids: Metal
+with its default batched prompt processing, Metal with `-ub 1` (every prompt
+token through the one-row kernels decode uses), and the CPU backend
+(`-ngl 0`).  "Max diff" is the largest absolute logprob difference of the
+chosen token over the steps where both agree.
+
+| Prompt | Metal default | Metal `-ub 1` | CPU |
+|---|---|---|---|
+| en-capital | 64 of 64, max diff 0.013 | 64 of 64, max diff 0.0012 | 64 of 64, max diff 0.148 |
+| en-hashmap | 64 of 64, max diff 0.024 | 64 of 64, max diff 0.0010 | 64 of 64, max diff 0.158 |
+| ja-seasons | diverges at step 15, max diff 0.016 before it | 64 of 64, max diff 0.0019 | diverges at step 16 |
+| code-fib | 64 of 64, max diff 0.029 | 64 of 64, max diff 0.0010 | 64 of 64, max diff 0.128 |
+| code-cbug | 64 of 64, max diff 0.010 | 64 of 64, max diff 0.0010 | 64 of 64, max diff 0.136 |
+
+Against `-ub 1` every prompt matches for all 64 tokens, and the top-5 at the
+last prompt position differs by at most 0.004 (against 0.038 to 0.100 with
+the default batching, milestone 1).
+
+The one divergence is a near-tie that llama.cpp's own configurations split.
+At ja-seasons step 15 ds4 ranks ` with` (440, -0.718) over ` by` (539,
+-0.723); default llama.cpp ranks ` by` (-0.720) over ` with` (-0.721), a gap
+of 0.001.  llama.cpp with `-ub 1` gives ` with` with ds4's numbers
+(-0.718 and -0.723), and so does its CPU backend; so the flip comes from
+llama.cpp's batched prompt arithmetic, not from a difference in the model.
+The CPU run then parts at step 16 (` spring` over ` a` by 0.026 there, 0.28
+the other way in ds4 and in Metal `-ub 1`), within the CPU backend's
+spread: its chosen-token differences reach 0.16 even where the tokens agree.
+
+    LLAMA_ARGS="-ngl 99 -ub 1" uv run --no-project python tests/qwen35_parity/llama_side.py MODEL OUT/ds4 OUT/llama-ub1
+    LLAMA_ARGS="-ngl 0" uv run --no-project python tests/qwen35_parity/llama_side.py MODEL OUT/ds4 OUT/llama-cpu
+
 ## Open problems
 
 - Prefill uses the Laguna Q6_K matvec per token for Q6_K tensors
