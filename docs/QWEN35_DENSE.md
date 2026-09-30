@@ -3,15 +3,20 @@
 Branch `qwen35-dense`, from `c97c0da`.  An experiment: nothing here is on
 ds4-engine's main or its submodule pin.
 
-**What is measured.** On one M4 Max (36 GB): the dense `qwen35` GGUF
-Ornith-1.5-9B (Q4_K_M, 5,780,090,208 bytes, sha256 prefix
-`5533e1a703c072fa`) loads, and its logits and greedy tokens are compared
-with llama.cpp `19e28a2` (Metal, and its CPU backend as a second reference)
-on five fixed prompts fed as the same token ids.
+**What is measured.** On one M4 Max (36 GB), two dense `qwen35` GGUFs
+from `satyrn-ai` on Hugging Face: Ornith-1.5-9B (Q4_K_M, 5,780,090,208
+bytes, sha256 prefix `5533e1a703c072fa`, repository
+`satyrn-ai/Ornith-1.5-9B-py3.15` at `b66b600`) and Qwen3.8-27B (Q4_K_M,
+16,810,715,584 bytes, sha256 prefix `990750f543aa83b2`, repository
+`satyrn-ai/Qwen3.8-27B-py3.15` at `f3dbc8b`).  Both load; their logits and
+greedy tokens are compared with llama.cpp `19e28a2` (Metal, and for the 9B
+its CPU backend as a second reference) on five fixed prompts fed as the
+same token ids; and their prompt and generation speed is timed beside
+`llama-bench`.
 
 **What is not measured.** Long contexts beyond these prompts, sampling,
-tool calls, the MTP block, vision, and any quality claim beyond agreement
-with llama.cpp.
+tool calls, the MTP block, vision, speed on any other machine, and any
+quality claim beyond agreement with llama.cpp.
 
 ## What runs
 
@@ -37,7 +42,11 @@ forward pass (`qwen35_graph_forward_tokens`), and `kernel_qwen35_gdn_out`:
 the one numerical difference inside the GDN block is the output gate,
 `silu(z)` here against `sigmoid(z)` in Qwen3.8.  The chat template decides
 whether a reasoning-effort instruction is rendered (the 9B's does not have
-one; Qwen3.8's does).
+one; the 27B's, a Qwen3.8 template, does).  Prompt batches of more than 8
+tokens multiply Q6_K weights through `kernel_mul_mm_q6_K_f32`, the tiled
+kernel of `metal/dense.metal` with the Q6_K dequantizer of
+`metal/moe.metal`, the same instantiation llama.cpp uses; decode keeps the
+Laguna Q6_K matvec (milestone 3).
 
 Not implemented, and refused at load: `--mtp`, `--vision`, KV checkpoint
 save/load, and non-Metal backends.  The CPU first-token reference is Qwen3.8
@@ -116,8 +125,56 @@ spread: its chosen-token differences reach 0.16 even where the tokens agree.
     LLAMA_ARGS="-ngl 99 -ub 1" uv run --no-project python tests/qwen35_parity/llama_side.py MODEL OUT/ds4 OUT/llama-ub1
     LLAMA_ARGS="-ngl 0" uv run --no-project python tests/qwen35_parity/llama_side.py MODEL OUT/ds4 OUT/llama-cpu
 
+**The 27B.** Its template renders the reasoning-effort instruction ahead of
+the system prompt, and llama.cpp's template and tokenizer give the same ids
+on all five prompts.  All five match in every token against both Metal
+configurations; en-capital ends at `<|im_end|>` after 52 tokens in all
+three runs, the others run to 64.
+
+| Prompt | Metal default | Metal `-ub 1` |
+|---|---|---|
+| en-capital | 52 of 52, max diff 0.0050 | 52 of 52, max diff 0.0004 |
+| en-hashmap | 64 of 64, max diff 0.0073 | 64 of 64, max diff 0.0006 |
+| ja-seasons | 64 of 64, max diff 0.0204 | 64 of 64, max diff 0.0013 |
+| code-fib | 64 of 64, max diff 0.0048 | 64 of 64, max diff 0.0005 |
+| code-cbug | 64 of 64, max diff 0.0135 | 64 of 64, max diff 0.0007 |
+
+This table is the build with milestone 3's tiled Q6_K prefill; the 9B's
+tables above are the build before it.  Between the two builds every run has
+the same tokens (max chosen-token difference 0.0012 on the 9B, 0.0005 on
+the 27B), and the 9B's comparison with llama.cpp is unchanged: all five
+against `-ub 1`, and ja-seasons' step-15 near-tie against the default.
+
+## Milestone 3: speed
+
+`tests/qwen35_parity/bench.sh MODEL` runs 128 greedy tokens after each of
+two fixed prompts (502 and 2006 rendered tokens on the 9B, 540 and 2044 on
+the 27B), one warm-up then three runs; below are the medians of ds4's own
+prefill and generation rates.  llama.cpp's are `llama-bench` at its
+defaults (`-b 2048 -ub 512`, flash attention auto), three repetitions:
+`pp512`/`pp2048` from an empty context and `tg128` at depth 512/2048.  The
+counts differ slightly (502 against 512 tokens and so on), so the columns
+compare rates, not identical work.
+
+| Model | ds4 prefill, Q6_K matvec | ds4 prefill, tiled Q6_K | llama.cpp prefill | ds4 generation | llama.cpp generation |
+|---|---|---|---|---|---|
+| 9B, short | 286.65 t/s | 560.97 t/s | 646.35 t/s | 58.40 t/s | 55.01 t/s |
+| 9B, long | 285.69 t/s | 558.98 t/s | 646.38 t/s | 56.36 t/s | 54.00 t/s |
+| 27B, short | 85.92 t/s | 167.19 t/s | 188.29 t/s | 19.85 t/s | 18.66 t/s |
+| 27B, long | 85.66 t/s | 169.13 t/s | 187.21 t/s | 19.45 t/s | 18.59 t/s |
+
+Generation is within the same few percent before and after (58.43 and
+19.74 t/s short before); the tiled kernel changes prefill only.
+
+- **Prefill doubled** with the tiled Q6_K kernel and is now 86 to 87 %
+  (9B) and 89 to 90 % (27B) of llama.cpp's.  In these Q4_K_M files
+  `ffn_down`, the GDN `attn_qkv` and `attn_v` are largely Q6_K (all of them
+  in the 27B's first eight blocks), and the matvec read those weights once
+  per prompt token.
+- **Generation is 4 to 6 % faster than llama.cpp's** on both models.
+
 ## Open problems
 
-- Prefill uses the Laguna Q6_K matvec per token for Q6_K tensors
-  (`attn_qkv` on GDN layers, `attn_v`, `ffn_down`, the output head); it has
-  no tiled prefill kernel.
+- The remaining 10 to 14 % of prefill against llama.cpp is not located.
+- Nothing longer than 2044 prompt tokens is timed; GDN's scan and the
+  attention kernel both grow with the prompt.
