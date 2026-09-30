@@ -58620,7 +58620,10 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
     case DS4_TENSOR_Q4_0:
     case DS4_TENSOR_Q4_K: rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
 #if defined(__APPLE__)
-    case DS4_TENSOR_Q6_K: rc = ds4_gpu_matmul_q6_K_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok); break;
+    case DS4_TENSOR_Q6_K:
+        rc = n_tok > 8u ? ds4_gpu_matmul_q6_K_mm_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok)
+                        : ds4_gpu_matmul_q6_K_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok);
+        break;
 #endif
     case DS4_TENSOR_BF16: {
         ds4_gpu_tensor *outs[1] = { out };

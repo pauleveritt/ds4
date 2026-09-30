@@ -1069,6 +1069,11 @@ kernel void kernel_qwen35_q6_K_matmul_f32(
     }
 }
 
+/* Dense qwen35 prompt batches of Q6_K weights: dense.metal's tiled matrix
+ * kernel with moe.metal's Q6_K dequantizer, the instantiation llama.cpp's
+ * kernel_mul_mm_q6_K_f32 uses. */
+template [[host_name("kernel_mul_mm_q6_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, 16, dequantize_q6_K, float, float4x4, float, float2x4>;
+
 /* --- PLE ---------------------------------------------------------------- */
 
 struct ds4_metal_args_qwen4_ple_gate {
