@@ -529,11 +529,22 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
 static void cli_apply_model_sampling_defaults(
         ds4_engine             *engine,
         cli_generation_options *gen) {
-    if (!engine || !gen || !ds4_engine_is_glm_dsa(engine)) return;
+    if (!engine || !gen) return;
 
-    if (!gen->temperature_set) gen->temperature = 1.0f;
-    if (!gen->top_p_set) gen->top_p = 0.95f;
-    if (!gen->min_p_set) gen->min_p = 0.0f;
+    if (ds4_engine_is_glm_dsa(engine)) {
+        if (!gen->temperature_set) gen->temperature = 1.0f;
+        if (!gen->top_p_set) gen->top_p = 0.95f;
+        if (!gen->min_p_set) gen->min_p = 0.0f;
+    } else if (ds4_engine_is_qwen4(engine)) {
+        /* Qwen's documented thinking-mode sampling (the Qwen3 model cards'
+         * "Best Practices": temperature 0.6, top_p 0.95, top_k 20, min_p 0).
+         * Before this the family fell through to the generic defaults
+         * (temperature 1.0, top_p 1.0, min_p 0.05).  This front end has no
+         * top_k option, so top_k stays unset. */
+        if (!gen->temperature_set) gen->temperature = 0.6f;
+        if (!gen->top_p_set) gen->top_p = 0.95f;
+        if (!gen->min_p_set) gen->min_p = 0.0f;
+    }
 }
 
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
