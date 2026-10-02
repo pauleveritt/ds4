@@ -44045,15 +44045,23 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 
     if (ds4_model_is_qwen4()) {
         if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+            /* The template's <tool_response> and </tool_response> are the
+             * vocabulary's own special tokens, as the model saw them in
+             * training; rendering them as plain BPE pieces showed the model
+             * text it never learned as a tool result. The result itself stays
+             * untrusted text that cannot spell a control token. */
             qwen4_chat_open(vocab, "user", tokens);
-            bpe_tokenize_text(vocab, "<tool_response>\n", tokens);
+            tokenize_rendered_chat_vocab(vocab, "<tool_response>\n", tokens);
             bpe_tokenize_tool_response_text(vocab, content, tokens);
-            bpe_tokenize_text(vocab, "\n</tool_response>", tokens);
+            tokenize_rendered_chat_vocab(vocab, "\n</tool_response>", tokens);
         } else {
             const char *name = (!strcmp(role, "system") || !strcmp(role, "developer")) ? "system" :
                                !strcmp(role, "assistant") ? "assistant" : "user";
             qwen4_chat_open(vocab, name, tokens);
-            if (!strcmp(name, "assistant")) {
+            /* The system message is the host's own trusted text: its
+             * <tool_call> and the like are the special tokens the model
+             * emits, as the template renders them. */
+            if (!strcmp(name, "assistant") || !strcmp(name, "system")) {
                 tokenize_rendered_chat_vocab(vocab, content, tokens);
             } else {
                 bpe_tokenize_text(vocab, content, tokens);
