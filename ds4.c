@@ -78327,6 +78327,15 @@ void ds4_engine_sampling_defaults(ds4_engine *e, float *temperature,
     } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
         *top_k = 20;
         *min_p = 0.0f;
+    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4_EXP) {
+        /* Qwen's documented thinking-mode sampling (the Qwen3 model cards'
+         * "Best Practices": temperature 0.6, top_p 0.95, top_k 20, min_p 0).
+         * Before this the family fell through to the generic defaults above
+         * (temperature 1.0, top_p 1.0, min_p 0.05). */
+        *temperature = 0.6f;
+        *top_k = 20;
+        *top_p = 0.95f;
+        *min_p = 0.0f;
     } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MELLUM) {
         /* The Quickstart sampling example on the model card of the PUBLIC
          * release JetBrains/Mellum2-12B-A2.5B-Thinking (revision
