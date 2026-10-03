@@ -20633,8 +20633,10 @@ static int ds4_gpu_matmul_quant_impl_tensor(
          * DenseQ4 decode shapes while this impl streams 530-650 GB/s
          * (misc/q4mv_bench.m). Falls through to ext when unavailable.
          */
+        const char *classic_max_env = getenv("DS4_Q4K_CLASSIC_MAX");
+        const uint64_t classic_max = classic_max_env ? (uint64_t)strtoul(classic_max_env, NULL, 10) : 8u;
         if (weight_type == DS4_METAL_TENSOR_Q4_K &&
-            n_tok <= 8u &&
+            n_tok <= classic_max &&
             (in_dim % 256u) == 0 &&
             getenv("DS4_METAL_DISABLE_Q4_MV_CLASSIC") == NULL) {
             const int16_t nsg = 2;

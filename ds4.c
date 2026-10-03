@@ -61906,7 +61906,7 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
     QWEN35_ALLOC(q, T * q_dim);
     QWEN35_ALLOC(gate, T * q_dim);
     QWEN35_ALLOC(attn_o, T * q_dim);
-    QWEN35_ALLOC(attn_part, ds4_gpu_qwen4_attn_part_floats(3u, DS4_N_HEAD, DS4_N_HEAD_DIM));
+    QWEN35_ALLOC(attn_part, ds4_gpu_qwen4_attn_part_floats(16u, DS4_N_HEAD, DS4_N_HEAD_DIM));
     QWEN35_ALLOC(ffn_gate, T * F);
     QWEN35_ALLOC(ffn_up, T * F);
     QWEN35_ALLOC(ffn_mid, T * F);
@@ -62161,6 +62161,14 @@ static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
     g->snap_after_second = false;
 }
 
+static uint32_t qwen35_env_u32(const char *name, uint32_t fallback) {
+    const char *v = getenv(name);
+    if (!v || !*v) return fallback;
+    const long n = strtol(v, NULL, 10);
+    if (n < 0) return fallback;
+    return n > 16 ? 16u : (uint32_t)n;
+}
+
 /* rows > 0 limits the product to the leading rows of w (a contiguous prefix
  * of the weight buffer); the per-row arithmetic is unchanged. */
 static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
@@ -62189,7 +62197,7 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
     case DS4_TENSOR_Q4_0:
     case DS4_TENSOR_Q4_K: rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_Q6_K:
-        rc = n_tok > 8u ? ds4_gpu_matmul_q6_K_mm_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok)
+        rc = n_tok > qwen35_env_u32("DS4_Q6K_MM_ABOVE", 8u) ? ds4_gpu_matmul_q6_K_mm_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok)
                         : ds4_gpu_matmul_q6_K_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok);
         break;
     case DS4_TENSOR_BF16: {
@@ -63262,7 +63270,7 @@ static bool qwen35_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, c
                                            T, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
                                            pos0, g->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) &&
            ds4_gpu_qwen4_attn_decode_tensor(g->attn_o, g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il],
-                                            NULL, NULL, T <= 2u ? g->attn_part : NULL, T,
+                                            NULL, NULL, T <= qwen35_env_u32("DS4_QWEN35_SPLIT_MAX_T", 2u) ? g->attn_part : NULL, T,
                                             DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, false, 0u, scale) &&
            qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
 }
