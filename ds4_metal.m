@@ -20633,6 +20633,54 @@ static int ds4_gpu_matmul_quant_impl_tensor(
          * DenseQ4 decode shapes while this impl streams 530-650 GB/s
          * (misc/q4mv_bench.m). Falls through to ext when unavailable.
          */
+        const char *rows_env = getenv("DS4_Q4K_ROWS");
+        const uint64_t rows_r = rows_env ? (uint64_t)strtoul(rows_env, NULL, 10) : 0u;
+        if (weight_type == DS4_METAL_TENSOR_Q4_K && rows_r >= 2u && rows_r <= 4u &&
+            n_tok >= 2u && n_tok <= 16u && (in_dim % 256u) == 0) {
+            const int16_t nsg = 2;
+            const char *fn = rows_r == 2u ? "kernel_mul_mv_q4_K_rows2_f32" :
+                             rows_r == 3u ? "kernel_mul_mv_q4_K_rows3_f32" :
+                                            "kernel_mul_mv_q4_K_rows4_f32";
+            id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_ext_pipeline(fn, nsg, 8);
+            if (pipeline) {
+                ds4_gpu_q8_0_matvec_args args = {
+                    .ne00 = (int32_t)in_dim,
+                    .ne01 = (int32_t)out_dim,
+                    .ne02 = 1,
+                    .nb00 = 1,
+                    .nb01 = row_bytes,
+                    .nb02 = row_bytes * out_dim,
+                    .nb03 = row_bytes * out_dim,
+                    .ne10 = (int32_t)in_dim,
+                    .ne11 = (int32_t)n_tok,
+                    .ne12 = 1,
+                    .nb10 = sizeof(float),
+                    .nb11 = in_dim * sizeof(float),
+                    .nb12 = in_dim * n_tok * sizeof(float),
+                    .nb13 = in_dim * n_tok * sizeof(float),
+                    .ne0 = (int32_t)out_dim,
+                    .ne1 = (int32_t)n_tok,
+                    .nr0 = 2,
+                    .r2 = 1,
+                    .r3 = 1,
+                };
+                const uint64_t rows_ptg = (uint64_t)nsg * 2u;
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:pipeline];
+                [enc setBytes:&args length:sizeof(args) atIndex:0];
+                [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+                [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+                [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+                [enc setThreadgroupMemoryLength:32 atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + rows_ptg - 1u) / rows_ptg,
+                                                      ((NSUInteger)n_tok + rows_r - 1u) / rows_r,
+                                                      1)
+                     threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+                if (!ds4_gpu_finish_command_buffer(cb, owned, "Q4_K rows mul_mv")) return 0;
+                return 1;
+            }
+        }
         const char *classic_max_env = getenv("DS4_Q4K_CLASSIC_MAX");
         const uint64_t classic_max = classic_max_env ? (uint64_t)strtoul(classic_max_env, NULL, 10) : 8u;
         if (weight_type == DS4_METAL_TENSOR_Q4_K &&

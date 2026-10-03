@@ -5779,6 +5779,125 @@ kernel void kernel_mul_mv_q4_K_dense_f32(
     kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// Q4_K matvec over R activation rows at once: the classic impl's lanes and
+// unpacking, with each weight block read once and applied to R rows, so a
+// short verify batch does not re-stream the weights per row.
+template<int nr0, int R, typename args_t>
+void kernel_mul_mv_q4_K_rows_f32_impl(
+        args_t args,
+        device const char *src0,
+        device const char *src1,
+        device       char *dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short ix = tiisg / 8;
+    const short it = tiisg % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+
+    const int nb = args.ne00 / QK_K;
+    const int first_row = (tgpig.x * NSG + sgitg) * nr0;
+    const int r1 = tgpig.y * R;
+    const int nrows = min(R, (int)args.ne11 - r1);
+
+    device const block_q4_K *x = (device const block_q4_K *)(src0 + (uint64_t)first_row * args.nb01);
+    device const float *ybase = (device const float *)(src1 + (uint64_t)r1 * args.nb11) + ix * QK_K + 64 * iq + 8 * ir;
+    const uint64_t ystride = args.nb11 / sizeof(float);
+
+    float sumf[nr0 * R];
+    FOR_UNROLL (short i = 0; i < nr0 * R; ++i) sumf[i] = 0.f;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        uint16_t qa[nr0][4];
+        uint16_t qb[nr0][4];
+        uint16_t sc16[nr0][4];
+        float d0[nr0];
+        float d1[nr0];
+        FOR_UNROLL (short row = 0; row < nr0; ++row) {
+            device const block_q4_K *blk = (device const block_q4_K *)((device const char *)(x + ib) + (uint64_t)row * args.nb01);
+            device const uint16_t *sc = (device const uint16_t *)blk->scales + iq;
+            device const uint16_t *q1 = (device const uint16_t *)blk->qs + 16 * iq + 4 * ir;
+            device const uint16_t *q2 = q1 + 32;
+            sc16[row][0] = sc[0] & kmask1;
+            sc16[row][1] = sc[2] & kmask1;
+            sc16[row][2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[row][3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+            FOR_UNROLL (short i = 0; i < 4; ++i) { qa[row][i] = q1[i]; qb[row][i] = q2[i]; }
+            d0[row] = blk->d;
+            d1[row] = blk->dmin;
+        }
+
+        FOR_UNROLL (short k = 0; k < R; ++k) {
+            if (k >= nrows) break;
+            device const float *y4 = ybase + (uint64_t)k * ystride + (uint64_t)ib * QK_K;
+            float yl[16];
+            float yh[16];
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            FOR_UNROLL (short i = 0; i < 8; ++i) {
+                yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
+                yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
+                yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+                yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+            }
+            FOR_UNROLL (short row = 0; row < nr0; ++row) {
+                thread const uint8_t *sc8 = (thread const uint8_t *)sc16[row];
+                float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+                FOR_UNROLL (short i = 0; i < 4; ++i) {
+                    acc1[0] += yl[2 * i + 0] * (qa[row][i] & 0x000F);
+                    acc1[1] += yl[2 * i + 1] * (qa[row][i] & 0x0F00);
+                    acc1[2] += yl[2 * i + 8] * (qa[row][i] & 0x00F0);
+                    acc1[3] += yl[2 * i + 9] * (qa[row][i] & 0xF000);
+                    acc2[0] += yh[2 * i + 0] * (qb[row][i] & 0x000F);
+                    acc2[1] += yh[2 * i + 1] * (qb[row][i] & 0x0F00);
+                    acc2[2] += yh[2 * i + 8] * (qb[row][i] & 0x00F0);
+                    acc2[3] += yh[2 * i + 9] * (qb[row][i] & 0xF000);
+                }
+                sumf[row * R + k] += d0[row] * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
+                                                (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
+                                                (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
+                                                (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
+                                     d1[row] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+            }
+        }
+    }
+
+    FOR_UNROLL (short k = 0; k < R; ++k) {
+        if (k >= nrows) break;
+        device float *dst_f32 = (device float *)dst + (uint64_t)(r1 + k) * args.ne0;
+        FOR_UNROLL (short row = 0; row < nr0; ++row) {
+            const float sum_all = simd_sum(sumf[row * R + k]);
+            if (tiisg == 0 && first_row + row < args.ne0) {
+                dst_f32[first_row + row] = sum_all;
+            }
+        }
+    }
+}
+
+#define DS4_Q4K_ROWS_KERNEL(R)                                                     \
+kernel void kernel_mul_mv_q4_K_rows##R##_f32(                                      \
+        constant ds4_metal_args_mul_mv & args,                                     \
+        device const char * src0,                                                  \
+        device const char * src1,                                                  \
+        device       char * dst,                                                   \
+        threadgroup  char * shmem [[threadgroup(0)]],                              \
+        uint3  tgpig[[threadgroup_position_in_grid]],                              \
+        ushort tiisg[[thread_index_in_simdgroup]],                                 \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {                          \
+    (void)shmem;                                                                   \
+    kernel_mul_mv_q4_K_rows_f32_impl<N_R0_Q4_K, R>(args, src0, src1, dst, tgpig, tiisg, sgitg); \
+}
+DS4_Q4K_ROWS_KERNEL(2)
+DS4_Q4K_ROWS_KERNEL(3)
+DS4_Q4K_ROWS_KERNEL(4)
+
 // DS4 attention output low projection, specialized for the fixed block
 // diagonal mapping used by the model:
 //
