@@ -67332,8 +67332,7 @@ static uint64_t qwen35_payload_tensor_bytes(uint32_t rows);
 #endif
 
 bool ds4_session_supports_payload(ds4_session *s) {
-    return s && !ds4_session_is_mellum(s) &&
-           !(s->engine && ds4_model_is_qwen35() && !getenv("DS4_QWEN35_PAYLOAD"));
+    return s && !ds4_session_is_mellum(s);
 }
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
@@ -67341,7 +67340,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
 #ifndef DS4_HAS_QWEN4_GPU
         return 0;
 #else
-        if ((ds4_model_is_qwen35() && !getenv("DS4_QWEN35_PAYLOAD")) || !s->qwen4_graph_ready || !s->checkpoint_valid) return 0;
+        if (!s->qwen4_graph_ready || !s->checkpoint_valid) return 0;
         if (s->qwen4_rewound || s->qwen4_graph.pos != (uint32_t)s->checkpoint.len) return 0;
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
         bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
@@ -67684,11 +67683,7 @@ static int qwen35_session_load_payload(ds4_session *s, FILE *fp, const uint32_t 
 }
 
 static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
-    if (ds4_model_is_qwen35()) {
-        if (getenv("DS4_QWEN35_PAYLOAD")) return qwen35_session_save_payload(s, fp, err, errlen);
-        payload_set_err(err, errlen, "KV checkpoints are not implemented for dense qwen35");
-        return 1;
-    }
+    if (ds4_model_is_qwen35()) return qwen35_session_save_payload(s, fp, err, errlen);
     if (!s->qwen4_graph_ready || s->qwen4_rewound ||
         s->qwen4_graph.pos != (uint32_t)s->checkpoint.len) {
         payload_set_err(err, errlen, "Qwen3.8 snapshot requires sync or eval after rewind");
@@ -67768,11 +67763,7 @@ static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_
 
 static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *h, uint64_t *remaining,
                                       char *err, size_t errlen) {
-    if (ds4_model_is_qwen35()) {
-        if (getenv("DS4_QWEN35_PAYLOAD")) return qwen35_session_load_payload(s, fp, h, remaining, err, errlen);
-        payload_set_err(err, errlen, "KV checkpoints are not implemented for dense qwen35");
-        return 1;
-    }
+    if (ds4_model_is_qwen35()) return qwen35_session_load_payload(s, fp, h, remaining, err, errlen);
     if (!s->qwen4_graph_ready) {
         payload_set_err(err, errlen, "Qwen3.8 graph is not ready for restore");
         return 1;
