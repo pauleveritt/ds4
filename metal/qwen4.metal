@@ -1084,7 +1084,7 @@ kernel void kernel_qwen35_q6_K_rows_f32(
         ushort lane [[thread_index_in_simdgroup]],
         ushort simd_group [[simdgroup_index_in_threadgroup]]) {
     constexpr uint rows_per_simd = 2u;
-    constexpr uint simd_groups = 1u;
+    constexpr uint simd_groups = 2u;
     constexpr uint max_tok = 8u;
     constexpr uint kmask1 = 0x03u;
     constexpr uint kmask2 = 0x0Cu;
@@ -1135,7 +1135,6 @@ kernel void kernel_qwen35_q6_K_rows_f32(
             dw[r] = block->d;
         }
 
-#pragma clang loop unroll(disable)
         for (uint t = 0u; t < n_tok; t++) {
             device const float *y = x + (uint64_t)t * args.in_dim + (uint64_t)ib * qk_k + y_offset;
             for (short l = 0; l < 4; l++) {
@@ -1146,10 +1145,13 @@ kernel void kernel_qwen35_q6_K_rows_f32(
             }
 
             for (uint r = 0u; r < rows_per_simd && row0 + r < args.out_dim; r++) {
-                thread const uchar *q1 = q1w[r];
-                thread const uchar *q2 = q2w[r];
-                thread const uchar *qh = qhw[r];
-                thread const char *sc = scw[r];
+                device const block_q6_K *block =
+                    (device const block_q6_K *)(weight +
+                        (uint64_t)(row0 + r) * args.row_bytes) + ib;
+                device const uchar *q1 = block->ql + q_offset_l;
+                device const uchar *q2 = q1 + 32;
+                device const uchar *qh = block->qh + q_offset_h;
+                device const char *sc = block->scales + is;
                 float4 part = float4(0.0f);
                 for (short l = 0; l < 4; l++) {
                     const uint h = (uint)qh[l];
@@ -1162,9 +1164,9 @@ kernel void kernel_qwen35_q6_K_rows_f32(
                     part[3] += yl[4 * l + 3] *
                         (float)((int)((q2[l] >> 4u) | ((h & kmask4) >> 2u)) - 32);
                 }
-                sums[t][r] += (float)dw[r] *
-                    (part[0] * (float)sc[0] + part[1] * (float)sc[1] +
-                     part[2] * (float)sc[2] + part[3] * (float)sc[3]);
+                sums[t][r] += (float)block->d *
+                    (part[0] * (float)sc[0] + part[1] * (float)sc[2] +
+                     part[2] * (float)sc[4] + part[3] * (float)sc[6]);
             }
         }
     }

@@ -3602,6 +3602,25 @@ static int qwen35_q4_K_one_row(ds4_gpu_tensor *out, const void *map, uint64_t si
 /* A multi-row matvec against its one-row twin, byte for byte: for T = 1..8,
  * row t of one rows dispatch over x's first T rows equals a one-row dispatch
  * on row t alone. */
+static void qwen35_diag_rows(const char *what, const ds4_gpu_tensor *ta, const ds4_gpu_tensor *tb, uint32_t T, uint32_t out_dim) {
+    const uint64_t n = (uint64_t)T * out_dim;
+    float *a = download(ta, n), *b = download(tb, n);
+    uint64_t ndiff = 0; int32_t maxulp = 0; uint32_t first_t = 99;
+    uint64_t per_t[8] = {0};
+    for (uint64_t i = 0; i < n; i++) {
+        int32_t ua, ub; memcpy(&ua, &a[i], 4); memcpy(&ub, &b[i], 4);
+        if (ua != ub) {
+            ndiff++; per_t[i / out_dim]++;
+            if (first_t == 99) first_t = (uint32_t)(i / out_dim);
+            int32_t d = ua - ub; if (d < 0) d = -d;
+            if (d > maxulp) maxulp = d;
+        }
+    }
+    printf("  DIAG %s T=%u: %llu of %llu differ, max %d ulp; per row:", what, T, (unsigned long long)ndiff, (unsigned long long)n, maxulp);
+    for (uint32_t t = 0; t < T; t++) printf(" %llu", (unsigned long long)per_t[t]);
+    printf("\n");
+    free(a); free(b);
+}
 static void test_qwen35_rows_exact(arena_t *a, const char *type, qwen35_mv_fn rows, qwen35_mv_fn one,
                                    uint32_t in_dim, uint32_t out_dim) {
     double *sh;
@@ -3625,9 +3644,11 @@ static void test_qwen35_rows_exact(arena_t *a, const char *type, qwen35_mv_fn ro
         require_ok(rows(gout, a->base, a->size, off, in_dim, out_dim, gx, T), "qwen35 rows matvec");
         char name[96];
         snprintf(name, sizeof(name), "qwen35 %s rows %u->%u T=%u", type, in_dim, out_dim, T);
+        if (getenv("QWEN35_DIAG")) qwen35_diag_rows(name, gout, gone, T, out_dim); else
         for (uint32_t t = 0; t < T; t++) same_bytes(name, t, gout, t * out_bytes, gone, t * out_bytes, out_bytes);
         require_ok(one(gout, a->base, a->size, off, in_dim, out_dim, gx, T), "qwen35 one-row matvec at n_tok T");
         snprintf(name, sizeof(name), "qwen35 %s n_tok=T %u->%u T=%u", type, in_dim, out_dim, T);
+        if (getenv("QWEN35_DIAG")) qwen35_diag_rows(name, gout, gone, T, out_dim); else
         for (uint32_t t = 0; t < T; t++) same_bytes(name, t, gout, t * out_bytes, gone, t * out_bytes, out_bytes);
         ds4_gpu_tensor_free(gout);
     }
@@ -3706,6 +3727,7 @@ static double qwen35_median20(const double *samples) {
 static void bench_qwen35_verify(arena_t *a) {
     const qwen35_bench_type types[] = {
         {"Q4_K", qwen35_q4_K_one_row, {"rows", NULL}, {ds4_gpu_matmul_q4_K_rows_tensor, NULL}},
+        {"Q6_K", ds4_gpu_matmul_q6_K_tensor, {"rows", NULL}, {ds4_gpu_matmul_q6_K_rows_tensor, NULL}},
     };
     const uint32_t shapes[][2] = {{5120, 17408}, {17408, 5120}, {5120, 12288}};
     printf("qwen35 verify bench: us/call, median of 20 batches of 10 calls\n");
