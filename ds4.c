@@ -58586,34 +58586,23 @@ static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
 }
 
 #if defined(__APPLE__)
-/* The Q4_K and Q6_K matvecs of a qwen35 verify (2..8 rows), each row's bytes
- * a one-row decode's.  EXACT takes today's dispatch over n_tok grid rows: one
- * token per grid row, the one-row arithmetic (test_qwen35_rows_exact and
- * qwen35_graph_q6_K_rows pin it), at about 0.76x the time of n_tok one-row
- * dispatches; the multi-row Q4_K kernel was exact but slower.  MMA runs the
- * one-row kernel per row until the few-row kernel
- * (ds4_gpu_matmul_mma_rows_tensor) is wired in here. */
+/* The Q4_K and Q6_K matvecs of a qwen35 verify.  EXACT (2..8 rows) takes
+ * today's dispatch over n_tok grid rows: one token per grid row, the one-row
+ * arithmetic (test_qwen35_rows_exact and qwen35_graph_q6_K_rows pin it), at
+ * about 0.76x the time of n_tok one-row dispatches; the multi-row Q4_K
+ * kernel was exact but slower.  MMA (1..8 rows) takes the few-row kernel on
+ * simdgroup matrices, whose row t is the same bits for every row count, so
+ * a pass of any width matches one-row MMA passes, not today's decode. */
 static int qwen35_verify_gemv(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
                               const ds4_gpu_tensor *x, uint32_t n_tok, uint64_t in_dim, uint64_t out_dim,
                               uint32_t verify) {
-    if (verify == DS4_QWEN35_VERIFY_EXACT) {
-        return w->type == DS4_TENSOR_Q6_K
-            ? ds4_gpu_matmul_q6_K_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok)
-            : ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok);
+    if (verify == DS4_QWEN35_VERIFY_MMA) {
+        return ds4_gpu_matmul_mma_rows_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim,
+                                              x, n_tok);
     }
-    int rc = 1;
-    for (uint32_t t = 0; t < n_tok && rc; t++) {
-        ds4_gpu_tensor *xt = ds4_gpu_tensor_view(x, (uint64_t)t * in_dim * sizeof(float), in_dim * sizeof(float));
-        ds4_gpu_tensor *ot = ds4_gpu_tensor_view(out, (uint64_t)t * out_dim * sizeof(float), out_dim * sizeof(float));
-        rc = xt && ot &&
-             (w->type == DS4_TENSOR_Q6_K
-                  ? ds4_gpu_matmul_q6_K_tensor(ot, m->map, m->size, w->abs_offset, in_dim, out_dim, xt, 1u)
-                  : ds4_gpu_matmul_quant_tensor(ot, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim,
-                                                xt, 1u));
-        ds4_gpu_tensor_free(ot);
-        ds4_gpu_tensor_free(xt);
-    }
-    return rc;
+    return w->type == DS4_TENSOR_Q6_K
+        ? ds4_gpu_matmul_q6_K_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok)
+        : ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok);
 }
 #endif
 
@@ -58633,7 +58622,7 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
                                            w->type, n_tok, (uint32_t)in_dim, (uint32_t)out_dim);
 #else
 
-    if (verify != DS4_QWEN35_VERIFY_OFF && n_tok >= 2u && n_tok <= 8u &&
+    if (verify != DS4_QWEN35_VERIFY_OFF && n_tok >= 1u && n_tok <= 8u &&
         (w->type == DS4_TENSOR_Q4_K || w->type == DS4_TENSOR_Q6_K)) {
         rc = qwen35_verify_gemv(out, m, w, x, n_tok, in_dim, out_dim, verify);
         if (!rc) {
@@ -59259,10 +59248,15 @@ static bool qwen35_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, c
 
 /* The verify mode of one qwen35 forward: the graph's, else the diagnostic
  * DS4_QWEN35_VERIFY=exact|mma (read per call, as the attention split keys
- * are, so a tool can switch it per step); 2..8 rows only, one row being
- * decode. */
+ * are, so a tool can switch it per step); 2..8 rows only.  One row is
+ * decode, unless DS4_QWEN35_VERIFY_T1=mma (also per call) puts it on the
+ * MMA matvecs too, so serial passes match MMA verify rows bit for bit. */
 static uint32_t qwen35_graph_verify_mode(const ds4_qwen4_gpu_graph *g, uint32_t T) {
-    if (T < 2u || T > 8u) return DS4_QWEN35_VERIFY_OFF;
+    if (T == 1u) {
+        const char *t1 = getenv("DS4_QWEN35_VERIFY_T1");
+        return t1 && strcmp(t1, "mma") == 0 ? DS4_QWEN35_VERIFY_MMA : DS4_QWEN35_VERIFY_OFF;
+    }
+    if (T > 8u) return DS4_QWEN35_VERIFY_OFF;
     if (g->qwen35_verify != DS4_QWEN35_VERIFY_OFF) return g->qwen35_verify;
     const char *env = getenv("DS4_QWEN35_VERIFY");
     if (!env || !env[0]) return DS4_QWEN35_VERIFY_OFF;
