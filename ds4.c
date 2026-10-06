@@ -59929,6 +59929,20 @@ static bool qwen35_dflash_capture(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t 
     return true;
 }
 
+/* A drafter matvec over `rows` rows of x: Q4_0 at up to 8 rows through the
+ * few-row MMA kernel, which reads each weight once for all rows (the
+ * generic path's mul_mv_ext once per group of 2 to 5 rows), anything else
+ * through the generic path. */
+static bool qwen35_dflash_matvec(ds4_gpu_tensor *out, const ds4_model *dm, const ds4_tensor *t,
+                                 uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t rows) {
+    if (t->type == DS4_TENSOR_Q4_0 && rows <= 8u) {
+        return ds4_gpu_matmul_mma_rows_tensor(out, dm->map, dm->size, t->abs_offset, t->type, in_dim, out_dim,
+                                              x, rows) != 0;
+    }
+    return ds4_gpu_matmul_quant_tensor(out, dm->map, dm->size, t->abs_offset, t->type, in_dim, out_dim, x,
+                                       rows) != 0;
+}
+
 /* Inject the pending committed features [inject_pos, feat_end) into every
  * block's ring, in sub-batches of DS4_DFLASH_INJECT_ROWS that never cross
  * the capture ring's wrap: g = rmsnorm(fc . f) * enc.output_norm, then per
@@ -59953,17 +59967,14 @@ static bool qwen35_dflash_inject(ds4_qwen35_dflash *d) {
         ds4_gpu_tensor *f = ds4_gpu_tensor_view(d->features, (uint64_t)slot * in * sizeof(float),
                                                 (uint64_t)n * in * sizeof(float));
         ok = f != NULL &&
-             ds4_gpu_matmul_quant_tensor(d->inj_g, dm->map, dm->size, dw->fc->abs_offset, dw->fc->type,
-                                         in, E, f, n) != 0 &&
+             qwen35_dflash_matvec(d->inj_g, dm, dw->fc, in, E, f, n) &&
              ds4_gpu_rms_norm_weight_rows_tensor(d->inj_gn, d->inj_g, dm->map, dm->size,
                                                  dw->enc_output_norm->abs_offset, (uint32_t)E, n, dw->rms_eps) != 0;
         ds4_gpu_tensor_free(f);
         for (uint32_t b = 0; ok && b < dw->n_block; b++) {
             const ds4_dflash_block_weights *bw = &dw->block[b];
-            ok = ds4_gpu_matmul_quant_tensor(d->inj_k, dm->map, dm->size, bw->attn_k->abs_offset, bw->attn_k->type,
-                                             E, kv, d->inj_gn, n) != 0 &&
-                 ds4_gpu_matmul_quant_tensor(d->inj_v, dm->map, dm->size, bw->attn_v->abs_offset, bw->attn_v->type,
-                                             E, kv, d->inj_gn, n) != 0 &&
+            ok = qwen35_dflash_matvec(d->inj_k, dm, bw->attn_k, E, kv, d->inj_gn, n) &&
+                 qwen35_dflash_matvec(d->inj_v, dm, bw->attn_v, E, kv, d->inj_gn, n) &&
                  ds4_gpu_dflash_head_norm_rope_tensor(d->inj_k, d->inj_k, dm->map, dm->size,
                                                       bw->attn_k_norm->abs_offset, n, dw->n_head_kv, dw->head_dim,
                                                       pos, dw->rope_dims, dw->rope_base, dw->rms_eps) != 0 &&
@@ -60153,8 +60164,7 @@ static bool qwen35_dflash_draft(ds4_qwen4_gpu_graph *g, const ds4_model *m, cons
     if (!glm_graph_begin_commands_if_needed()) return false;
     const void *dmap = dm->map;
     const uint64_t dsize = dm->size;
-#define DFLASH_MM(out, t, in_dim, out_dim, x) \
-    (ds4_gpu_matmul_quant_tensor((out), dmap, dsize, (t)->abs_offset, (t)->type, (in_dim), (out_dim), (x), R) != 0)
+#define DFLASH_MM(out, t, in_dim, out_dim, x) qwen35_dflash_matvec((out), dm, (t), (in_dim), (out_dim), (x), R)
     bool ok = true;
     for (uint32_t b = 0; ok && b < dw->n_block; b++) {
         const ds4_dflash_block_weights *bw = &dw->block[b];

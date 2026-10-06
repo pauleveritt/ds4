@@ -753,9 +753,10 @@ int ds4_gpu_matmul_q6_K_tensor(
         const ds4_gpu_tensor *x,
         uint64_t              n_tok);
 
-/* Few-row Q4_K or Q6_K matvec (weight_type 12 or 14) over 1..8 rows of x on
- * 8x8 simdgroup matrices (Metal only; llama.cpp's mul_mv_mma kernels), for
- * qwen35's verify.  Its sums are not in the one-row kernels' order, but its
+/* Few-row Q4_K, Q6_K or Q4_0 matvec (weight_type 12, 14 or 2) over 1..8 rows
+ * of x on 8x8 simdgroup matrices (Metal only; llama.cpp's mul_mv_mma
+ * kernels), for qwen35's verify (Q4_K, Q6_K) and the DFlash drafter (Q4_0,
+ * in_dim a multiple of 32).  Its sums are not in the one-row kernels' order, but its
  * tiling depends only on the weight shape, so row t of the output is bitwise
  * the same for every n_tok and whatever the other rows hold. */
 int ds4_gpu_matmul_mma_rows_tensor(

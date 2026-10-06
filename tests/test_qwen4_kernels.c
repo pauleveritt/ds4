@@ -155,12 +155,12 @@ static uint64_t arena_bf16(arena_t *a, uint64_t n, double **shadow, float scale)
     return off;
 }
 
-/* q4_0 rows: 18-byte blocks of 32 (f16 scale, 16 nibble bytes; low nibbles first) */
+/* q4_0 rows: 18-byte blocks of 32 (f16 scale, 16 nibble bytes; low nibbles first); no shadow when shadow is NULL */
 static uint64_t arena_q4_0(arena_t *a, uint64_t rows, uint64_t cols, double **shadow, float scale) {
     const uint64_t blocks = cols / 32;
     const uint64_t off = arena_alloc(a, rows * blocks * 18u);
     uint8_t *w = a->base + off;
-    *shadow = malloc(rows * cols * sizeof(double));
+    if (shadow) *shadow = malloc(rows * cols * sizeof(double));
     for (uint64_t r = 0; r < rows; r++) {
         for (uint64_t b = 0; b < blocks; b++) {
             float vals[32];
@@ -182,6 +182,7 @@ static uint64_t arena_q4_0(arena_t *a, uint64_t rows, uint64_t cols, double **sh
                 if (q1 < 0) q1 = 0;
                 if (q1 > 15) q1 = 15;
                 blk[2 + j] = (uint8_t)(q0 | (q1 << 4));
+                if (!shadow) continue;
                 (*shadow)[r * cols + b * 32 + j] = dq * (q0 - 8);
                 (*shadow)[r * cols + b * 32 + 16 + j] = dq * (q1 - 8);
             }
@@ -4057,6 +4058,23 @@ static int qwen35_mma_q6_K(ds4_gpu_tensor *out, const void *map, uint64_t size, 
     return ds4_gpu_matmul_mma_rows_tensor(out, map, size, off, 14u, in_dim, out_dim, x, n_tok);
 }
 
+static int qwen35_mma_q4_0(ds4_gpu_tensor *out, const void *map, uint64_t size, uint64_t off,
+                           uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    return ds4_gpu_matmul_mma_rows_tensor(out, map, size, off, 2u, in_dim, out_dim, x, n_tok);
+}
+
+static int qwen35_q4_0_one_row(ds4_gpu_tensor *out, const void *map, uint64_t size, uint64_t off,
+                               uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    return ds4_gpu_matmul_quant_tensor(out, map, size, off, 2u, in_dim, out_dim, x, n_tok);
+}
+
+/* random weights of the named type ("Q4_0", "Q4_K" or "Q6_K") with their double shadow */
+static uint64_t qwen35_arena_weights(arena_t *a, const char *type, uint32_t rows, uint32_t cols, double **sh) {
+    if (!strcmp(type, "Q6_K")) return arena_q6_K(a, rows, cols, sh, 0.5f);
+    if (!strcmp(type, "Q4_0")) return arena_q4_0(a, rows, cols, sh, 0.05f);
+    return arena_q4_K(a, rows, cols, sh, 0.05f);
+}
+
 /* The few-row MMA matvec.  Within 1e-3 (relative to the largest output) of
  * the double shadow, and row t independent of the row count and of the
  * other rows, byte for byte: for T = 1..8, row t of a T-row dispatch equals
@@ -4066,8 +4084,7 @@ static int qwen35_mma_q6_K(ds4_gpu_tensor *out, const void *map, uint64_t size, 
 static void test_qwen35_mma(arena_t *a, const char *type, qwen35_mv_fn mma, qwen35_mv_fn one,
                             uint32_t in_dim, uint32_t out_dim) {
     double *sh;
-    const uint64_t off = type[1] == '6' ? arena_q6_K(a, out_dim, in_dim, &sh, 0.5f)
-                                        : arena_q4_K(a, out_dim, in_dim, &sh, 0.05f);
+    const uint64_t off = qwen35_arena_weights(a, type, out_dim, in_dim, &sh);
     const uint64_t in_bytes = (uint64_t)in_dim * 4u, out_bytes = (uint64_t)out_dim * 4u;
     float *x = rand_vec(8ull * in_dim, 1.0f), *other = rand_vec(8ull * in_dim, 1.0f);
     double *ref = qwen35_mv_ref(sh, x, in_dim, out_dim, 8);
@@ -4148,15 +4165,28 @@ static void test_qwen35_verify(arena_t *a) {
         test_qwen35_mma(a, "Q6_K", qwen35_mma_q6_K, ds4_gpu_matmul_q6_K_tensor, mv_shapes[i][0], mv_shapes[i][1]);
     }
     test_qwen35_mma(a, "Q6_K", qwen35_mma_q6_K, ds4_gpu_matmul_q6_K_tensor, 5120, 4099);
+    /* Q4_0, the DFlash drafter's matvecs: the shapes above, an in-dim of
+     * three blocks, the drafter's (conv_proj 5120 -> 1280, wo 4096 -> 5120,
+     * the FFN's 17408 in, fc's 25600 in) and every NSG/NT regime */
+    for (uint32_t i = 0; i < sizeof(mv_shapes) / sizeof(mv_shapes[0]); i++) {
+        test_qwen35_mma(a, "Q4_0", qwen35_mma_q4_0, qwen35_q4_0_one_row, mv_shapes[i][0], mv_shapes[i][1]);
+    }
+    const uint32_t q4_0_shapes[][2] = {{96, 13}, {5120, 1280}, {5120, 2053}, {4096, 5120}, {25600, 517}, {256, 6151}};
+    for (uint32_t i = 0; i < sizeof(q4_0_shapes) / sizeof(q4_0_shapes[0]); i++) {
+        test_qwen35_mma(a, "Q4_0", qwen35_mma_q4_0, qwen35_q4_0_one_row, q4_0_shapes[i][0], q4_0_shapes[i][1]);
+    }
 }
 
 /* One weight type in the verify bench: its one-row matvec (also today's one
- * dispatch over T grid rows at n_tok T) and its multi-row variants. */
+ * dispatch over T grid rows at n_tok T), its multi-row variants, and the
+ * first n_shapes of its shapes. */
 typedef struct {
     const char *type;
     qwen35_mv_fn one;
     const char *rows_name[2];
     qwen35_mv_fn rows[2];
+    const uint32_t (*shapes)[2];
+    uint32_t n_shapes;
 } qwen35_bench_type;
 
 static double qwen35_bench_batch(arena_t *a, const qwen35_bench_type *bt, uint32_t variant, uint64_t off,
@@ -4195,24 +4225,34 @@ static double qwen35_median20(const double *samples) {
  * including its final GPU wait; median of 20 batches, variants alternating)
  * of T one-row dispatches, today's one dispatch over T grid rows, and each
  * multi-row variant, at the 27B's projection shapes and, for Q6_K, the
- * output head (5120 -> 248320, about 1 GiB of the arena). No pass/fail. */
-static void bench_qwen35_verify(arena_t *a) {
-    const qwen35_bench_type types[] = {
-        {"Q4_K", qwen35_q4_K_one_row, {"rows", "mma"}, {ds4_gpu_matmul_q4_K_rows_tensor, qwen35_mma_q4_K}},
-        {"Q6_K", ds4_gpu_matmul_q6_K_tensor, {"mma", NULL}, {qwen35_mma_q6_K, NULL}},
+ * output head (5120 -> 248320, about 1 GiB of the arena).
+ * DS4_TEST_QWEN35_VERIFY_BENCH=Q4_0: the DFlash drafter's Q4_0 shapes
+ * instead (FFN, q, k/v, wo, conv_proj, fc). No pass/fail. */
+static void bench_qwen35_verify(arena_t *a, bool drafter) {
+    static const uint32_t shapes[][2] = {{5120, 17408}, {17408, 5120}, {5120, 12288}, {5120, 248320}};
+    static const uint32_t drafter_shapes[][2] = {{5120, 17408}, {17408, 5120}, {5120, 4096}, {5120, 1024},
+                                                 {4096, 5120}, {5120, 1280}, {25600, 5120}};
+    const qwen35_bench_type target_types[] = {
+        {"Q4_K", qwen35_q4_K_one_row, {"rows", "mma"}, {ds4_gpu_matmul_q4_K_rows_tensor, qwen35_mma_q4_K}, shapes, 3},
+        {"Q6_K", ds4_gpu_matmul_q6_K_tensor, {"mma", NULL}, {qwen35_mma_q6_K, NULL}, shapes, 4},
     };
-    const uint32_t shapes[][2] = {{5120, 17408}, {17408, 5120}, {5120, 12288}, {5120, 248320}};
+    const qwen35_bench_type drafter_types[] = {
+        {"Q4_0", qwen35_q4_0_one_row, {"mma", NULL}, {qwen35_mma_q4_0, NULL}, drafter_shapes, 7},
+    };
+    const qwen35_bench_type *types = drafter ? drafter_types : target_types;
+    const uint32_t n_types = drafter ? 1u : 2u;
     printf("qwen35 verify bench: us/call, median of 20 batches of 10 calls\n");
-    for (uint32_t ti = 0; ti < sizeof(types) / sizeof(types[0]); ti++) {
+    for (uint32_t ti = 0; ti < n_types; ti++) {
         const qwen35_bench_type *bt = &types[ti];
         const bool q6 = bt->type[1] == '6';
         const uint32_t n_var = 2u + (bt->rows[0] != NULL) + (bt->rows[1] != NULL);
-        for (uint32_t si = 0; si < (q6 ? 4u : 3u); si++) {
-            const uint32_t in_dim = shapes[si][0], out_dim = shapes[si][1];
+        for (uint32_t si = 0; si < bt->n_shapes; si++) {
+            const uint32_t in_dim = bt->shapes[si][0], out_dim = bt->shapes[si][1];
             const uint64_t in_bytes = (uint64_t)in_dim * 4u, out_bytes = (uint64_t)out_dim * 4u;
             double *sh = NULL;
             const uint64_t off = q6 ? arena_q6_K(a, out_dim, in_dim, si == 3 ? NULL : &sh, 0.5f)
-                                    : arena_q4_K(a, out_dim, in_dim, &sh, 0.05f);
+                                    : drafter ? arena_q4_0(a, out_dim, in_dim, NULL, 0.05f)
+                                              : arena_q4_K(a, out_dim, in_dim, &sh, 0.05f);
             free(sh);
             float *x = rand_vec(8ull * in_dim, 1.0f);
             ds4_gpu_tensor *gx = upload(x, 8ull * in_dim);
@@ -4770,7 +4810,10 @@ int main(void) {
         printf("all qwen35 verify tests passed\n");
         return 0;
     }
-    if (getenv("DS4_TEST_QWEN35_VERIFY_BENCH")) { bench_qwen35_verify(&arena); return 0; }
+    if (getenv("DS4_TEST_QWEN35_VERIFY_BENCH")) {
+        bench_qwen35_verify(&arena, !strcmp(getenv("DS4_TEST_QWEN35_VERIFY_BENCH"), "Q4_0"));
+        return 0;
+    }
     if (getenv("DS4_TEST_DFLASH_ONLY") && !strcmp(getenv("DS4_TEST_DFLASH_ONLY"), "ring")) {
         test_dflash_ring();
         printf("all dflash ring tests passed\n");

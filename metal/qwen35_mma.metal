@@ -1,11 +1,15 @@
-// qwen35 verify: few-row Q4_K and Q6_K matvecs on 8x8 simdgroup matrices.
+// qwen35 verify and the DFlash drafter: few-row Q4_K, Q6_K and Q4_0
+// matvecs on 8x8 simdgroup matrices.
 //
 // Ported from llama.cpp's ggml/src/ggml-metal/kernels/mul_mv_mma.metal
 // (ggml-org/llama.cpp #29869, at a46709b; MIT, the ggml authors):
 // mul_mv_mma_tile_init, mul_mv_mma_src0_row, mul_mv_mma_src1_row,
 // mul_mv_mma_store and kernel_mul_mv_mma_gen at one 8-row src1 tile (RT 1),
 // with NT 1, 2 or 4 weight tiles, on moe.metal's dequantize_q4_K and a
-// port of llama.cpp's dequantize_q6_K (below).
+// port of llama.cpp's dequantize_q6_K (below); and for Q4_0,
+// mul_mv_mma_1024_plus, mul_mv_mma_q4_0, load_mma_blk_a, load_mma_blk_b and
+// kernel_mul_mv_mma_blk at RT 1 (the row length a kernel argument, not a
+// function constant).
 //
 // Changes from llama.cpp: no batch dimensions and no fused residual add;
 // src1 rows past ne11 are zero instead of copies of the last row. The tile
@@ -223,3 +227,165 @@ template [[host_name("kernel_qwen35_mma_q4_K_f32_nt4")]] kernel qwen35_mma_t ker
 template [[host_name("kernel_qwen35_mma_q6_K_f32_nt1")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<1, block_q6_K, 16, qwen35_mma_dequantize_q6_K>;
 template [[host_name("kernel_qwen35_mma_q6_K_f32_nt2")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<2, block_q6_K, 16, qwen35_mma_dequantize_q6_K>;
 template [[host_name("kernel_qwen35_mma_q6_K_f32_nt4")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<4, block_q6_K, 16, qwen35_mma_dequantize_q6_K>;
+
+constexpr constant static ushort qwen35_mma_f16_1024_bits = 0x6400;
+constexpr constant static half   qwen35_mma_f16_1024      = 1024.0h;
+
+// the halves 1024 + q for integers q < 1024: exact normal values, unlike the subnormal q*2^-24 that Metal may flush to zero
+inline half2 qwen35_mma_1024_plus(ushort2 q) {
+    return as_type<half2>(q | qwen35_mma_f16_1024_bits);
+}
+
+// llama.cpp's mul_mv_mma_q4_0: a K step is one 32-weight block, its src1 values split into halves b0 and b1;
+// MMA step s uses half b1 when s is odd and the .y value of a pair when s >= 2.
+// A lane (m, j) holds qs ushorts j and j + 1 (j even); a high nibble stays in place as 16*q, so b1 is divided by 16.
+// B lane k = fm holds src1 values 2*k, 2*k + 1 (b0, low nibbles) and 2*k + 16, 2*k + 17 (b1, high nibbles) of a block
+struct qwen35_mma_q4_0 {
+    typedef ds4_dense_block_q4_0 block;
+    typedef ushort2              quants;
+
+    // weights per block, and the float2 offset of b1 in a src1 block
+    enum { qk = 32, b1 = 32/4 };
+
+    static short a_off(short fn) { return 1 + fn; }
+    static short b_off(short fm) { return 2*fm; }
+
+    static quants load(device const ushort * qs) { return ushort2(qs[0], qs[1]); }
+    static float2 prep_b1(float2 v) {
+        constexpr float hi_scale = 1.0f/16;
+        return v*hi_scale;
+    }
+
+    static bool b1_step(short s) { return s % 2 != 0; }
+    static bool y_step (short s) { return s >= 2; }
+
+    static half2 frag(quants q, short s) {
+        constexpr ushort lo_mask = 0x000F;
+        constexpr ushort hi_mask = 0x00F0;
+        constexpr half   lo_zero = 8.0h;
+        constexpr half   hi_zero = 16*lo_zero;
+
+        const ushort2 qq = s < 2 ? q : q >> 8;
+        return s % 2 == 0 ? qwen35_mma_1024_plus(qq & lo_mask) - (qwen35_mma_f16_1024 + lo_zero)
+                          : qwen35_mma_1024_plus(qq & hi_mask) - (qwen35_mma_f16_1024 + hi_zero);
+    }
+};
+
+template<typename Q, short NT>
+inline void qwen35_mma_load_blk_a(device const ushort * const x[NT], int off, short fn, thread typename Q::quants * q, thread float * d) {
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        device const ushort * qs = x[t] + off;
+        q[t] = Q::load(qs);
+        d[t] = as_type<half>(*(qs - Q::a_off(fn)));
+    }
+}
+
+// src1 columns past ne11 read as zero
+template<typename Q>
+inline void qwen35_mma_load_blk_b(device const float2 * const y[2], const bool live[2], int ib, thread float2 * b0, thread float2 * b1) {
+    FOR_UNROLL (short e = 0; e < 2; ++e) {
+        b0[e] = live[e] ? y[e][ib*(Q::qk/2)]         : float2(0.0f);
+        b1[e] = live[e] ? y[e][ib*(Q::qk/2) + Q::b1] : float2(0.0f);
+    }
+}
+
+// few-row mat-mat for 32-weight block types: a threadgroup reads each weight once for 8*NT src0 rows x 8 src1 rows,
+// and its NSG simdgroups split K by blocks, the next block's loads issued before the current block's MMAs
+template<short NT, typename Q>
+kernel void kernel_qwen35_mma_blk_f32(
+        constant ds4_metal_args_qwen35_mma & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const qwen35_mma_tile tile = qwen35_mma_tile_init<NT>(tgpig, tiisg);
+
+    device const ushort * x[NT];
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        x[t] = (device const ushort *) qwen35_mma_src0_row(tile, args, src0, t) + Q::a_off(tile.fn);
+    }
+
+    device const float2 * y[2];
+    bool live[2];
+    FOR_UNROLL (short e = 0; e < 2; ++e) {
+        live[e] = tile.fn + e < args.ne11;
+        y[e] = (device const float2 *) (qwen35_mma_src1_row(tile, args, src1, e) + Q::b_off(tile.fm));
+    }
+
+    float acc[NT][2] = {};
+
+    const int nb = args.ne00/Q::qk;
+
+    // a block is d, then the quants
+    constexpr short us_blk = sizeof(typename Q::block)/2;
+
+    typename Q::quants q[NT];
+    float  d[NT];
+    float2 b0[2];
+    float2 b1[2];
+
+    const int ib0 = min((int) sgitg, nb - 1);
+    qwen35_mma_load_blk_a<Q, NT>(x, ib0*us_blk, tile.fn, q, d);
+    qwen35_mma_load_blk_b<Q>(y, live, ib0, b0, b1);
+
+    for (int ib = sgitg; ib < nb; ib += NSG) {
+        typename Q::quants qc[NT];
+        float  dc[NT];
+        float2 b0c[2];
+        float2 b1c[2];
+
+        FOR_UNROLL (short t = 0; t < NT; ++t) {
+            qc[t] = q[t];
+            dc[t] = d[t];
+        }
+        FOR_UNROLL (short e = 0; e < 2; ++e) {
+            b0c[e] = b0[e];
+            b1c[e] = Q::prep_b1(b1[e]);
+        }
+
+        const int ibn = min(ib + NSG, nb - 1);
+        qwen35_mma_load_blk_a<Q, NT>(x, ibn*us_blk, tile.fn, q, d);
+        qwen35_mma_load_blk_b<Q>(y, live, ibn, b0, b1);
+
+        simdgroup_float8x8 mp[NT];
+        FOR_UNROLL (short t = 0; t < NT; ++t) {
+            mp[t] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        }
+
+        FOR_UNROLL (short s = 0; s < 4; ++s) {
+            simdgroup_float8x8 mb;
+            {
+                const float2 v0 = Q::b1_step(s) ? b1c[0] : b0c[0];
+                const float2 v1 = Q::b1_step(s) ? b1c[1] : b0c[1];
+                mb.thread_elements()[0] = Q::y_step(s) ? v0.y : v0.x;
+                mb.thread_elements()[1] = Q::y_step(s) ? v1.y : v1.x;
+            }
+
+            FOR_UNROLL (short t = 0; t < NT; ++t) {
+                const half2 h = Q::frag(qc[t], s);
+
+                simdgroup_half8x8 ma;
+                ma.thread_elements()[0] = h.x;
+                ma.thread_elements()[1] = h.y;
+
+                simdgroup_multiply_accumulate(mp[t], ma, mb, mp[t]);
+            }
+        }
+
+        FOR_UNROLL (short t = 0; t < NT; ++t) {
+            acc[t][0] = fma(dc[t], mp[t].thread_elements()[0], acc[t][0]);
+            acc[t][1] = fma(dc[t], mp[t].thread_elements()[1], acc[t][1]);
+        }
+    }
+
+    qwen35_mma_store<NT>(acc, args, dst, shmem, tile, tiisg, sgitg);
+}
+
+template [[host_name("kernel_qwen35_mma_q4_0_f32_nt1")]] kernel qwen35_mma_t kernel_qwen35_mma_blk_f32<1, qwen35_mma_q4_0>;
+template [[host_name("kernel_qwen35_mma_q4_0_f32_nt2")]] kernel qwen35_mma_t kernel_qwen35_mma_blk_f32<2, qwen35_mma_q4_0>;
+template [[host_name("kernel_qwen35_mma_q4_0_f32_nt4")]] kernel qwen35_mma_t kernel_qwen35_mma_blk_f32<4, qwen35_mma_q4_0>;

@@ -20245,15 +20245,18 @@ int ds4_gpu_matmul_mma_rows_tensor(
         const ds4_gpu_tensor *x,
         uint64_t              n_tok) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    const bool q4_0 = weight_type == DS4_METAL_TENSOR_Q4_0;
+    const bool q6 = weight_type == DS4_METAL_TENSOR_Q6_K;
+    /* a K step: a 64-weight chunk of a 256-weight super-block, or a Q4_0 block */
+    const uint64_t k_step = q4_0 ? 32u : 64u;
     if (!out || !model_map || !x || n_tok == 0 || n_tok > 8u ||
-        (weight_type != DS4_METAL_TENSOR_Q4_K && weight_type != DS4_METAL_TENSOR_Q6_K) ||
-        in_dim == 0 || (in_dim % 256u) != 0 ||
+        (weight_type != DS4_METAL_TENSOR_Q4_K && !q6 && !q4_0) ||
+        in_dim == 0 || (in_dim % (q4_0 ? 32u : 256u)) != 0 ||
         in_dim > INT32_MAX || out_dim == 0 || out_dim > INT32_MAX) {
         return 0;
     }
 
-    const bool q6 = weight_type == DS4_METAL_TENSOR_Q6_K;
-    const uint64_t row_bytes = (in_dim / 256u) * (q6 ? 210u : 144u);
+    const uint64_t row_bytes = q4_0 ? (in_dim / 32u) * 18u : (in_dim / 256u) * (q6 ? 210u : 144u);
     if (out_dim > UINT64_MAX / row_bytes) return 0;
     const uint64_t weight_bytes = out_dim * row_bytes;
     const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
@@ -20270,14 +20273,14 @@ int ds4_gpu_matmul_mma_rows_tensor(
      * llama.cpp's few-row tiling at one 8-row src1 tile
      * (ggml_metal_op_mul_mat_mma_tiling, ggml-metal-device.cpp, a46709b):
      * NSG simdgroups split K, from 32 for at most 64 weight rows down to 8
-     * above 6144, never more than the 64-weight chunks; NT 8-row weight tiles
+     * above 6144, never more than the K steps; NT 8-row weight tiles
      * per threadgroup, at most 4, fewer when the reduction buffer would pass
      * 16 KiB or fewer than 128 threadgroups would fill the GPU.  Both depend
      * on the weight shape only, never on n_tok, which keeps each output row
      * independent of the row count.
      */
     int16_t nsg = out_dim <= 64u ? 32 : out_dim <= 6144u ? 16 : 8;
-    while (nsg > 1 && (uint64_t)nsg > in_dim / 64u) nsg /= 2;
+    while (nsg > 1 && (uint64_t)nsg > in_dim / k_step) nsg /= 2;
     const uint64_t nt_smem = 16384u / ((uint64_t)nsg * 256u);
     const uint64_t nt_rows = out_dim / (128u * 8u);
     const uint64_t nt_limit = nt_smem < nt_rows ? nt_smem : nt_rows;
@@ -20285,7 +20288,7 @@ int ds4_gpu_matmul_mma_rows_tensor(
     while (nt > 1 && (uint64_t)nt > nt_limit) nt /= 2;
 
     char fn_name[64];
-    snprintf(fn_name, sizeof(fn_name), "kernel_qwen35_mma_%s_f32_nt%d", q6 ? "q6_K" : "q4_K", nt);
+    snprintf(fn_name, sizeof(fn_name), "kernel_qwen35_mma_%s_f32_nt%d", q4_0 ? "q4_0" : q6 ? "q6_K" : "q4_K", nt);
 
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
