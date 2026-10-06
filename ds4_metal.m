@@ -51057,6 +51057,25 @@ static int dflash_dispatch(const char *name, const void *args, size_t args_len,
     }
 }
 
+int ds4_gpu_dflash_capture_tensor(
+        ds4_gpu_tensor *features, const ds4_gpu_tensor *src,
+        uint32_t n_rows, uint32_t n_embd, uint32_t n_taps, uint32_t tap,
+        uint32_t src_row0, uint32_t dst_row0, uint32_t n_slots) {
+    struct { uint32_t n_rows, n_embd, n_aux, aux_index, src_row0, dst_row0, n_slots, pad0; } args =
+        { n_rows, n_embd, n_taps, tap, src_row0, dst_row0, n_slots, 0 };
+    if (n_rows == 0 || n_embd == 0 || tap >= n_taps || n_slots == 0 || n_rows > n_slots) return 0;
+    const uint64_t n = (uint64_t)n_rows * n_embd;
+    qwen4_bind b[2];
+    if (!qwen4_bind_tensor(&b[0], src, ((uint64_t)src_row0 + n_rows) * n_embd * sizeof(float),
+                           "dflash capture source") ||
+        !qwen4_bind_tensor(&b[1], features, (uint64_t)n_slots * n_taps * n_embd * sizeof(float),
+                           "dflash features")) {
+        return 0;
+    }
+    return dflash_dispatch("kernel_dflash_capture_rows", &args, sizeof(args), b, 2,
+                           MTLSizeMake((n + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1));
+}
+
 int ds4_gpu_dflash_head_norm_rope_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,

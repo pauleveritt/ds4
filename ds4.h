@@ -631,6 +631,14 @@ int  ds4_session_verify(ds4_session *s, int anchor, const int *draft, int n_draf
 int  ds4_session_verify_select(ds4_session *s, int row);
 int  ds4_session_verify_commit(ds4_session *s, int n_rows, char *err, size_t errlen);
 void ds4_session_spec_stats(ds4_session *s, ds4_spec_stats *out);
+/* DFlash test hooks, for the live checks of the drafter's state (the DFlash
+ * plan's S4 and G7), not for inference.  ds4_engine_dflash_feature_floats
+ * is one position's feature row (the target's residual stream after each
+ * tapped block, n_target_layers x width floats), 0 without a drafter.
+ * ds4_session_dflash_features copies position pos's captured row, verify
+ * rows included, while it is still in the capture ring; nonzero otherwise. */
+int ds4_engine_dflash_feature_floats(ds4_engine *e);
+int ds4_session_dflash_features(ds4_session *s, int pos, float *out);
 /* TP worker side of a mirrored speculative-verify block: run its half of the
  * batch verify for KV side effects, then obey the leader's commit frame
  * (keep, or roll back and replay). Only called from ds4_tp_worker_run. */

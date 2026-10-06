@@ -4,6 +4,48 @@
  * over the K/V ring and the block's own rows, and the selector's lattice
  * scores.  Transients are f32; the ring holds f16 K and V. */
 
+/* --- target feature capture ----------------------------------------------- */
+
+struct ds4_metal_args_dflash_capture {
+    uint32_t n_rows;
+    uint32_t n_embd;
+    uint32_t n_aux;        /* taps per feature row */
+    uint32_t aux_index;    /* this tap's slot in the row */
+    uint32_t src_row0;
+    uint32_t dst_row0;
+    uint32_t n_slots;      /* feature rows in the buffer; row dst_row0 + r goes to (dst_row0 + r) % n_slots */
+    uint32_t pad0;
+};
+
+/* antirez's kernel_dflash_capture_rows (laguna-s2.1, 8f620f3,
+ * metal/dflash.metal:13-34) with the destination row taken modulo the
+ * buffer: copies rows of the residual stream into one tap of the feature
+ * rows, a NaN as 0 and an infinity as +-65504, so no non-finite value
+ * reaches the drafter. */
+kernel void kernel_dflash_capture_rows(
+        constant ds4_metal_args_dflash_capture &args,
+        device const float *src,
+        device       float *features,
+        uint gid [[thread_position_in_grid]]) {
+    const uint64_t count = (uint64_t)args.n_rows * args.n_embd;
+    if ((uint64_t)gid >= count || args.aux_index >= args.n_aux || args.n_slots == 0u) return;
+
+    const uint row = gid / args.n_embd;
+    const uint col = gid - row * args.n_embd;
+    float value =
+        src[(uint64_t)(args.src_row0 + row) * args.n_embd + col];
+    const uint value_bits = as_type<uint>(value);
+    if ((value_bits & 0x7f800000u) == 0x7f800000u) {
+        value = (value_bits & 0x007fffffu) != 0u ? 0.0f :
+            ((value_bits & 0x80000000u) != 0u ? -65504.0f : 65504.0f);
+    }
+    const uint slot = (args.dst_row0 + row) % args.n_slots;
+    const uint64_t dst =
+        (uint64_t)slot * args.n_aux * args.n_embd +
+        (uint64_t)args.aux_index * args.n_embd + col;
+    features[dst] = value;
+}
+
 /* --- q/k head norm with rope ---------------------------------------------- */
 
 struct ds4_metal_args_dflash_head_norm_rope {

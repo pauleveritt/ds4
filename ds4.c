@@ -58327,6 +58327,24 @@ static const ds4_vision_span *qwen4_fake_spans(size_t *count) {
  * in the multi-row matvecs. */
 enum { DS4_QWEN35_VERIFY_OFF = 0, DS4_QWEN35_VERIFY_EXACT = 1, DS4_QWEN35_VERIFY_MMA = 2 };
 
+/* A session's DFlash drafter state (dense qwen35 with a drafter, spec
+ * sections 3.2 and 3.3).  The capture ring keeps the target's features, the
+ * residual stream after each tapped block (n_target_layers x E floats per
+ * position), at slot pos % DS4_DFLASH_RING: every row a forward evaluates is
+ * captured, except sync rows older than the window of the prompt's end.
+ * Features of committed positions [inject_pos, feat_end) wait for injection;
+ * a verify's rows are captured but become committed only at its commit, so
+ * a rejected row is never injected. */
+typedef struct ds4_qwen35_dflash {
+    const ds4_dflash_weights *dw;
+    const ds4_model *dm;          /* the drafter's map */
+    ds4_gpu_tensor *features;     /* [DS4_DFLASH_RING][n_target_layers][E] f32 */
+    uint32_t inject_pos;          /* positions below are injected, or skipped as out of every window */
+    uint32_t feat_end;            /* committed features end here */
+    uint32_t cap_from;            /* a forward captures only rows at positions >= cap_from (set by sync) */
+    uint32_t cap_hi;              /* one past the highest position captured */
+} ds4_qwen35_dflash;
+
 typedef struct ds4_qwen4_gpu_graph {
     uint32_t ctx_cap;
     uint32_t pos;
@@ -58412,6 +58430,8 @@ typedef struct ds4_qwen4_gpu_graph {
     ds4_gpu_tensor *qwen35_verify_part, *qwen35_verify_table;
     ds4_gpu_tensor *qwen35_gdn_pre, *qwen35_gdn_qkv, *qwen35_gdn_ga, *qwen35_gdn_gb;
     float *qwen35_verify_host;
+    /* the DFlash drafter's state when the engine has a drafter, else NULL */
+    ds4_qwen35_dflash *dflash;
     bool snap_valid;
     /* multimodal: per-position (t, h, w) rope positions, the text counter
      * offset, and the image spans of the prompt being prefilled */
@@ -58556,8 +58576,42 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
     return true;
 }
 
+/* Forget every drafter position: nothing is pending, nothing captured.  A
+ * reset, a payload load or a fresh test sequence starts here. */
+static void qwen35_dflash_forget(ds4_qwen35_dflash *d, uint32_t pos) {
+    if (!d) return;
+    d->inject_pos = pos;
+    d->feat_end = pos;
+    d->cap_hi = pos;
+    d->cap_from = 0;
+}
+
+static void qwen35_dflash_free(ds4_qwen35_dflash *d) {
+    if (!d) return;
+    ds4_gpu_tensor_free(d->features);
+    free(d);
+}
+
+/* The drafter state of a session whose engine holds a drafter: the capture
+ * ring (200 MiB at the 27B's width and five taps). */
+static ds4_qwen35_dflash *qwen35_dflash_alloc(const ds4_dflash_weights *dw, const ds4_model *dm) {
+    ds4_qwen35_dflash *d = xcalloc(1, sizeof(*d));
+    d->dw = dw;
+    d->dm = dm;
+    const uint64_t row = (uint64_t)dw->n_target_layers * dw->n_embd;
+    d->features = ds4_gpu_tensor_alloc((uint64_t)DS4_DFLASH_RING * row * sizeof(float));
+    if (!d->features) {
+        fprintf(stderr, "ds4: DFlash drafter state allocation failed\n");
+        qwen35_dflash_free(d);
+        return NULL;
+    }
+    return d;
+}
+
 static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
     if (!g) return;
+    qwen35_dflash_free(g->dflash);
+    g->dflash = NULL;
     ds4_gpu_tensor **all[] = {
         &g->ple_hist, &g->logits,
         &g->mtp_e, &g->mtp_cat, &g->mtp_proj, &g->mtp_R, &g->mtp_argmax, &g->mtp_argmax_tmp,
@@ -59005,6 +59059,7 @@ static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
     g->snap0_valid = false;
     g->snap_after_first = false;
     g->snap_after_second = false;
+    qwen35_dflash_forget(g->dflash, 0);
 }
 
 #if defined(__APPLE__)
@@ -59794,6 +59849,42 @@ static bool qwen35_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m
            ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u);
 }
 
+/* After layer il's FFN residual add, R holds the input of layer il + 1 for
+ * every row: llama.cpp's t_layer_inp[il + 1], the drafter's tap when il + 1
+ * is one of its target layers.  Rows at positions below cap_from are not
+ * captured, nor any but the last DS4_DFLASH_RING rows of a longer forward. */
+static bool qwen35_dflash_capture(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t pos0, uint32_t T) {
+    ds4_qwen35_dflash *d = g->dflash;
+    const ds4_dflash_weights *dw = d->dw;
+    uint32_t first = d->cap_from > pos0 ? d->cap_from - pos0 : 0u;
+    if (T > DS4_DFLASH_RING && first < T - DS4_DFLASH_RING) first = T - DS4_DFLASH_RING;
+    if (first >= T) return true;
+    for (uint32_t k = 0; k < dw->n_target_layers; k++) {
+        if (dw->target_layers[k] != il + 1u) continue;
+        if (!ds4_gpu_dflash_capture_tensor(d->features, g->R, T - first, DS4_N_EMBD, dw->n_target_layers, k,
+                                           first, pos0 + first, DS4_DFLASH_RING)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The capture's bookkeeping around one forward of T rows at pos0.  Before:
+ * pending features the capture would overwrite are dropped (they are older
+ * than every window the next draft can open).  After: the rows of a forward
+ * that advances the session are committed; a verify's wait for its commit. */
+static void qwen35_dflash_capture_begin(ds4_qwen35_dflash *d, uint32_t pos0, uint32_t T) {
+    if (!d) return;
+    const uint32_t hi = pos0 + T;
+    if (hi > DS4_DFLASH_RING && d->inject_pos < hi - DS4_DFLASH_RING) d->inject_pos = hi - DS4_DFLASH_RING;
+}
+
+static void qwen35_dflash_capture_end(ds4_qwen35_dflash *d, uint32_t pos0, uint32_t T, bool committed) {
+    if (!d) return;
+    if (pos0 + T > d->cap_hi) d->cap_hi = pos0 + T;
+    if (committed) d->feat_end = pos0 + T;
+}
+
 /* Dense qwen35 forward, the layer order of llama.cpp's qwen35 graph:
  *   R += mixer(rmsnorm(R) * attn_norm)
  *   R += down(silu(gate(x)) * up(x)),  x = rmsnorm(R) * post_attention_norm
@@ -59809,6 +59900,7 @@ static bool qwen35_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model 
     if (all_rows && T > g->n_logit_rows) return false;
     if (!qwen35_graph_stage_inputs(g, m, w, tokens, T)) return false;
     if (!glm_graph_begin_commands_if_needed()) return false;
+    qwen35_dflash_capture_begin(g->dflash, pos0, T);
     /* Under a verify every kernel below runs in the mode; both switches are
      * cleared before anything can return. */
     g->qwen35_verify_now = verify;
@@ -59835,6 +59927,7 @@ static bool qwen35_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model 
         }
         if (ok) ok = qwen4_graph_apply_steering_ffn(g, il, T);
         if (ok) ok = ds4_gpu_add_tensor(g->R, g->R, g->blk, T * E) != 0;
+        if (ok && g->dflash) ok = qwen35_dflash_capture(g, il, pos0, T);
         if (ok && il == 1u && n_trunk > 2u) ok = ds4_gpu_flush_commands() != 0;
     }
     /* A verify computes every row's logits; off computes the last row's, or
@@ -59864,6 +59957,7 @@ static bool qwen35_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model 
         ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, (uint64_t)rows * DS4_N_VOCAB * sizeof(float)) != 0;
     }
     if (ok && !g->qwen35_no_write_back) g->pos += T;
+    if (ok) qwen35_dflash_capture_end(g->dflash, pos0, T, !g->qwen35_no_write_back);
     return ok;
 }
 
@@ -59919,6 +60013,7 @@ static bool qwen35_graph_commit(ds4_qwen4_gpu_graph *g, uint32_t n) {
     ds4_gpu_qwen35_set_verify_rows(0u);
     if (!ds4_gpu_end_commands()) ok = false;
     if (ok) g->pos += n;
+    if (ok && g->dflash) g->dflash->feat_end = g->pos;
     return ok;
 }
 #endif
@@ -64040,6 +64135,7 @@ static int qwen35_session_load_payload(ds4_session *s, FILE *fp, const uint32_t 
     }
     g->pos = rows;
     g->mtp_pos = 0;
+    qwen35_dflash_forget(g->dflash, rows);
     token_vec_free(&s->checkpoint);
     s->checkpoint = new_checkpoint;
     s->checkpoint_valid = true;
@@ -74410,6 +74506,15 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                     "each further session costs its caches only\n",
                     cap_tokens, (double)arena / (1024.0 * 1024.0 * 1024.0));
         }
+#ifdef DS4_HAS_QWEN4_METAL
+        if (e->dflash_ready && ds4_model_is_qwen35() &&
+            !(s->qwen4_graph.dflash = qwen35_dflash_alloc(&e->dflash_weights, &e->mtp_model))) {
+            if (s->qwen4_slot >= 0) e->qwen4_pool_used &= ~(UINT64_C(1) << s->qwen4_slot);
+            qwen4_graph_free(&s->qwen4_graph);
+            free(s);
+            return 1;
+        }
+#endif
         qwen4_graph_reset(&s->qwen4_graph);
         if (!qwen4_graph_load_steering(&s->qwen4_graph,
                                        e->directional_steering_file,
@@ -76786,6 +76891,14 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         /* A one-token prefill tail is still a prompt row. Speculative verify
          * batches, despite having multiple rows, must never overwrite dumps. */
         s->qwen4_graph.dump_prompt_rows = true;
+        /* The drafter's windows after this sync open at the prompt's end or
+         * later, so rows older than DS4_DFLASH_RING - 1 positions before it
+         * are neither captured nor injected. */
+        ds4_qwen35_dflash *dflash = s->qwen4_graph.dflash;
+        if (dflash && (uint32_t)prompt->len >= DS4_DFLASH_RING) {
+            dflash->cap_from = (uint32_t)prompt->len - (DS4_DFLASH_RING - 1u);
+            if (dflash->inject_pos < dflash->cap_from) dflash->inject_pos = dflash->cap_from;
+        }
         int prefill_rc = 0;
         for (int i = start; i < prompt->len;) {
             if (ds4_session_cancelled(s)) {
@@ -76817,6 +76930,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         s->qwen4_graph.vis_spans = NULL;
         s->qwen4_graph.vis_span_count = 0;
         s->qwen4_graph.dump_prompt_rows = false;
+        if (dflash) dflash->cap_from = 0;
         if (prefill_rc != 0) return prefill_rc;
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
@@ -86779,6 +86893,25 @@ int ds4_session_verify_commit(ds4_session *s, int n_rows, char *err, size_t errl
 #else
     (void)s; (void)n_rows;
     payload_set_err(err, errlen, "verify is not supported in this build");
+    return 1;
+#endif
+}
+
+int ds4_engine_dflash_feature_floats(ds4_engine *e) {
+    if (!e || !e->dflash_ready) return 0;
+    return (int)(e->dflash_weights.n_target_layers * e->dflash_weights.n_embd);
+}
+
+int ds4_session_dflash_features(ds4_session *s, int pos, float *out) {
+#ifdef DS4_HAS_QWEN4_METAL
+    const ds4_qwen35_dflash *d = s && s->qwen4_graph_ready ? s->qwen4_graph.dflash : NULL;
+    if (!d || !out || pos < 0 || (uint32_t)pos >= d->cap_hi || (uint32_t)pos + DS4_DFLASH_RING <= d->cap_hi) {
+        return 1;
+    }
+    const uint64_t row = (uint64_t)d->dw->n_target_layers * d->dw->n_embd * sizeof(float);
+    return ds4_gpu_tensor_read(d->features, (uint64_t)((uint32_t)pos % DS4_DFLASH_RING) * row, out, row) ? 0 : 1;
+#else
+    (void)s; (void)pos; (void)out;
     return 1;
 #endif
 }

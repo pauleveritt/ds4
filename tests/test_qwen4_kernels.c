@@ -4511,6 +4511,55 @@ static void test_dflash_selector(arena_t *a, uint32_t n_rows, uint32_t K, uint32
     free(cand); free(logits); free(gate); free(sentinel); free(ref); free(pr); free(sr);
 }
 
+/* S4.1's capture: n_rows rows of a residual stream from src_row0 into tap
+ * `tap` of a feature buffer of n_slots rows, starting at slot dst_row0 and
+ * wrapping; every other float keeps its sentinel.  Copies are exact, a NaN
+ * becomes 0 and +-Inf +-65504; a few rows carry NaNs, infinities, -0 and a
+ * subnormal. */
+static void test_dflash_capture(uint32_t n_rows, uint32_t E, uint32_t n_taps, uint32_t tap,
+                                uint32_t src_row0, uint32_t dst_row0, uint32_t n_slots) {
+    const uint64_t src_n = ((uint64_t)src_row0 + n_rows + 2u) * E, feat_n = (uint64_t)n_slots * n_taps * E;
+    float *src = rand_vec(src_n, 4.0f);
+    const uint32_t specials[5] = { 0x7fc00000u, 0x7f800000u, 0xff800000u, 0x80000000u, 0x00000123u };
+    for (uint32_t i = 0; i < 5 && i < n_rows; i++) {
+        const uint64_t at = ((uint64_t)src_row0 + i * (n_rows / 5u > 0 ? n_rows / 5u : 1u)) * E + (i * 977u) % E;
+        memcpy(&src[at], &specials[i], 4);
+    }
+    float *feat = malloc(feat_n * sizeof(float)), *want = malloc(feat_n * sizeof(float));
+    for (uint64_t i = 0; i < feat_n; i++) feat[i] = -777.0f;
+    memcpy(want, feat, feat_n * sizeof(float));
+    for (uint32_t r = 0; r < n_rows; r++) {
+        const uint64_t slot = ((uint64_t)dst_row0 + r) % n_slots;
+        for (uint32_t c = 0; c < E; c++) {
+            float v = src[((uint64_t)src_row0 + r) * E + c];
+            uint32_t bits;
+            memcpy(&bits, &v, 4);
+            if ((bits & 0x7f800000u) == 0x7f800000u) {
+                v = (bits & 0x007fffffu) ? 0.0f : ((bits & 0x80000000u) ? -65504.0f : 65504.0f);
+            }
+            want[(slot * n_taps + tap) * E + c] = v;
+        }
+    }
+    ds4_gpu_tensor *ts = upload(src, src_n), *tf = upload(feat, feat_n);
+    require_ok(ds4_gpu_dflash_capture_tensor(tf, ts, n_rows, E, n_taps, tap, src_row0, dst_row0, n_slots),
+               "dflash capture");
+    float *got = download(tf, feat_n);
+    char name[128];
+    snprintf(name, sizeof(name), "dflash capture %u rows x %u from row %u into tap %u/%u at slot %u of %u",
+             n_rows, E, src_row0, tap, n_taps, dst_row0, n_slots);
+    for (uint64_t i = 0; i < feat_n; i++) {
+        if (memcmp(&got[i], &want[i], 4) != 0) {
+            fprintf(stderr, "%s: slot %llu tap %llu col %llu: got %.9g want %.9g\n", name,
+                    (unsigned long long)(i / ((uint64_t)n_taps * E)), (unsigned long long)(i / E % n_taps),
+                    (unsigned long long)(i % E), got[i], want[i]);
+            exit(1);
+        }
+    }
+    printf("  %s: exact\n", name);
+    ds4_gpu_tensor_free(ts); ds4_gpu_tensor_free(tf);
+    free(src); free(feat); free(want); free(got);
+}
+
 static void test_dflash_drafter(arena_t *a) {
     printf("dflash drafter\n");
     test_dflash_head_norm_rope(a, 8, 32, 128, 128, 5000);
@@ -4526,6 +4575,10 @@ static void test_dflash_drafter(arena_t *a) {
     test_dflash_attn(3, 6, 2, 96, 37, 23, 50);
     test_dflash_selector(a, 8, 16, 256, 248320);
     test_dflash_selector(a, 3, 5, 64, 1000);
+    test_dflash_capture(8, 5120, 5, 2, 3, 60, 64);
+    test_dflash_capture(1, 5120, 5, 4, 0, 63, 64);
+    test_dflash_capture(300, 256, 5, 0, 0, 400, 512);
+    test_dflash_capture(37, 96, 3, 1, 11, 0, 37);
 }
 #endif
 
