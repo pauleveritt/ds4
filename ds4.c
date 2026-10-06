@@ -63013,6 +63013,10 @@ static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows);
 static uint64_t qwen35_payload_tensor_bytes(uint32_t rows);
 #endif
 
+bool ds4_session_supports_payload(ds4_session *s) {
+    return s != NULL;
+}
+
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (s && !s->distributed && ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
@@ -72537,6 +72541,24 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
 bool ds4_engine_is_qwen4(ds4_engine *e) {
     (void)e;
     return ds4_model_is_qwen4();
+}
+
+void ds4_engine_sampling_defaults(ds4_engine *e, float *temperature,
+                                  int *top_k, float *top_p, float *min_p) {
+    if (!temperature || !top_k || !top_p || !min_p) return;
+    *temperature = DS4_DEFAULT_TEMPERATURE;
+    *top_k = 0;
+    *top_p = DS4_DEFAULT_TOP_P;
+    *min_p = DS4_DEFAULT_MIN_P;
+    if (ds4_engine_is_glm_dsa(e)) {
+        *top_p = 0.95f;
+        *min_p = 0.0f;
+    } else if (ds4_engine_is_qwen4(e)) {
+        *temperature = 0.6f;
+        *top_k = 20;
+        *top_p = 0.95f;
+        *min_p = 0.0f;
+    }
 }
 
 /* The official template's default effort is xhigh; medium adds no text.

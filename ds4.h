@@ -308,6 +308,11 @@ int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
 bool ds4_engine_is_qwen4(ds4_engine *e);
+/* The sampler defaults for the loaded model: the generic DS4_DEFAULT_*
+ * values, overridden per family as the CLI does (Qwen: 0.6, top_k 20,
+ * 0.95, 0). For hosts that sample themselves. */
+void ds4_engine_sampling_defaults(ds4_engine *e, float *temperature,
+                                  int *top_k, float *top_p, float *min_p);
 /* Qwen3.8 reasoning-effort system instruction for a think mode (NULL when none) */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode);
 const char *ds4_backend_name(ds4_backend backend);
@@ -631,6 +636,8 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 #define DS4_SESSION_LAYER_PAYLOAD_VERSION UINT32_C(1)
 #define DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS 14u
 
+/* Whether this session's state can be saved and loaded as a payload. */
+bool ds4_session_supports_payload(ds4_session *s);
 uint64_t ds4_session_payload_bytes(ds4_session *s);
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen);
