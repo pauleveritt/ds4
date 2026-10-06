@@ -20055,6 +20055,93 @@ int ds4_gpu_matmul_quant_decode_mpp_model_view_tensor(
                                             false);
 }
 
+int ds4_gpu_matmul_q4_K_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !x || !model_map ||
+        in_dim == 0 || (in_dim % 256u) != 0 || out_dim == 0 ||
+        n_tok == 0 || n_tok > 8u ||
+        in_dim > INT32_MAX || out_dim > INT32_MAX) {
+        return 0;
+    }
+
+    const uint64_t row_bytes = (in_dim / 256u) * 144u;
+    if (out_dim > UINT64_MAX / row_bytes) return 0;
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+    const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+    if (weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset ||
+        ds4_gpu_tensor_bytes(x) < x_bytes ||
+        ds4_gpu_tensor_bytes(out) < out_bytes) {
+        fprintf(stderr, "ds4: Metal Q4_K rows matmul received an invalid model range or activation buffer\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map,
+                                                      model_size,
+                                                      weight_offset,
+                                                      weight_bytes,
+                                                      &inner_offset);
+        const int16_t nsg = 2;
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_mul_mv_ext_pipeline("kernel_mul_mv_q4_K_rows_f32", nsg, 8);
+        if (!xbuf || !outbuf || !wbuf || !pipeline) return 0;
+
+        /* The classic path's arguments (ds4_gpu_matmul_quant_impl_tensor),
+         * with ne11 the row count the kernel loops over. */
+        ds4_gpu_q8_0_matvec_args args = {
+            .ne00 = (int32_t)in_dim,
+            .ne01 = (int32_t)out_dim,
+            .ne02 = 1,
+            .nb00 = 1,
+            .nb01 = row_bytes,
+            .nb02 = row_bytes * out_dim,
+            .nb03 = row_bytes * out_dim,
+            .ne10 = (int32_t)in_dim,
+            .ne11 = (int32_t)n_tok,
+            .ne12 = 1,
+            .nb10 = sizeof(float),
+            .nb11 = in_dim * sizeof(float),
+            .nb12 = in_dim * n_tok * sizeof(float),
+            .nb13 = in_dim * n_tok * sizeof(float),
+            .ne0 = (int32_t)out_dim,
+            .ne1 = (int32_t)n_tok,
+            .nr0 = 2,
+            .r2 = 1,
+            .r3 = 1,
+        };
+        const uint64_t rows_ptg = (uint64_t)nsg * 2u;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:32 atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + rows_ptg - 1u) / rows_ptg, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Q4_K rows mul_mv")) return 0;
+    }
+    return 1;
+}
+
 /* Dense Q6_K projection: the matvec of the Q4_K_M recipes' Q6_K tensors
  * (down projections, output head) for dense qwen35. */
 typedef struct {

@@ -230,6 +230,37 @@ static uint64_t arena_q4_K(arena_t *a, uint64_t rows, uint64_t cols, double **sh
     return off;
 }
 
+#ifdef __APPLE__
+/* q6_K rows: 210-byte super-blocks of 256 (ql nibbles, qh bit pairs, 16 int8
+ * scales, f16 d); element e of a block is d * scales[e/16] * (q - 32) */
+static uint64_t arena_q6_K(arena_t *a, uint64_t rows, uint64_t cols, double **shadow, float scale) {
+    const uint64_t blocks = cols / 256;
+    const uint64_t off = arena_alloc(a, rows * blocks * 210u);
+    uint8_t *w = a->base + off;
+    *shadow = malloc(rows * cols * sizeof(double));
+    for (uint64_t r = 0; r < rows; r++) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            uint8_t *blk = w + (r * blocks + b) * 210u;
+            uint8_t *ql = blk, *qh = blk + 128;
+            int8_t *sc = (int8_t *)(blk + 192);
+            const uint16_t dh = f32_to_f16(scale / 63.0f / 32.0f);
+            const float dq = f16_to_f32(dh);
+            memset(blk, 0, 192);
+            memcpy(blk + 208, &dh, 2);
+            for (int g = 0; g < 16; g++) sc[g] = (int8_t)(int)(63.0f * frand());
+            for (int e = 0; e < 256; e++) {
+                const int q = (int)(63.0f * (0.5f * frand() + 0.5f));
+                const int n = e / 128, k = (e % 128) / 32, l = e % 32;
+                ql[n * 64 + (k & 1) * 32 + l] |= (uint8_t)((q & 0xF) << ((k >> 1) * 4));
+                qh[n * 32 + l] |= (uint8_t)((q >> 4) << (2 * k));
+                (*shadow)[r * cols + b * 256 + e] = (double)dq * sc[e / 16] * (q - 32);
+            }
+        }
+    }
+    return off;
+}
+#endif
+
 /* q4_K rows with dyadic dequantized values (d a power of two, mins 0), so
  * d*sc*q is exactly representable in half and the weight-rounding share of
  * the error vanishes; the residual is activation rounding plus accumulation */
@@ -3793,6 +3824,193 @@ static void test_dense_mm_large(arena_t *a, uint32_t wtype) {
 }
 #endif
 
+#ifdef __APPLE__
+/* ---- qwen35 verify mode ---- */
+
+/* T rows of x (in_dim each) through a double weight shadow (out_dim rows) */
+static double *qwen35_mv_ref(const double *w, const float *x, uint32_t in_dim, uint32_t out_dim, uint32_t T) {
+    double *ref = malloc((uint64_t)T * out_dim * sizeof(double));
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t r = 0; r < out_dim; r++) {
+            double acc = 0.0;
+            for (uint32_t k = 0; k < in_dim; k++) acc += w[(uint64_t)r * in_dim + k] * x[(uint64_t)t * in_dim + k];
+            ref[(uint64_t)t * out_dim + r] = acc;
+        }
+    return ref;
+}
+
+/* the one-row Q6_K matvec against its double shadow: the reference the
+ * multi-row kernels are pinned to */
+static void test_qwen35_q6_K_one_row(arena_t *a, uint32_t in_dim, uint32_t out_dim) {
+    double *sh;
+    const uint64_t off = arena_q6_K(a, out_dim, in_dim, &sh, 0.5f);
+    float *x = rand_vec(in_dim, 1.0f);
+    double *ref = qwen35_mv_ref(sh, x, in_dim, out_dim, 1);
+    ds4_gpu_tensor *gx = upload(x, in_dim);
+    ds4_gpu_tensor *gout = upload(NULL, out_dim);
+    require_ok(ds4_gpu_matmul_q6_K_tensor(gout, a->base, a->size, off, in_dim, out_dim, gx, 1), "qwen35 Q6_K matvec");
+    char name[96];
+    snprintf(name, sizeof(name), "Q6_K matvec %u->%u", in_dim, out_dim);
+    check_tensor(name, gout, ref, out_dim, 1e-4);
+    free(ref); free(x); free(sh);
+    ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
+}
+
+typedef int (*qwen35_mv_fn)(ds4_gpu_tensor *out, const void *map, uint64_t size, uint64_t off,
+                            uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok);
+
+static int qwen35_q4_K_one_row(ds4_gpu_tensor *out, const void *map, uint64_t size, uint64_t off,
+                               uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    return ds4_gpu_matmul_quant_tensor(out, map, size, off, 12u, in_dim, out_dim, x, n_tok);
+}
+
+/* A multi-row matvec against its one-row twin, byte for byte: for T = 1..8,
+ * row t of one rows dispatch over x's first T rows equals a one-row dispatch
+ * on row t alone. */
+static void test_qwen35_rows_exact(arena_t *a, const char *type, qwen35_mv_fn rows, qwen35_mv_fn one,
+                                   uint32_t in_dim, uint32_t out_dim) {
+    double *sh;
+    const uint64_t off = type[1] == '6' ? arena_q6_K(a, out_dim, in_dim, &sh, 0.5f)
+                                        : arena_q4_K(a, out_dim, in_dim, &sh, 0.05f);
+    free(sh);
+    const uint64_t in_bytes = (uint64_t)in_dim * 4u, out_bytes = (uint64_t)out_dim * 4u;
+    float *x = rand_vec(8ull * in_dim, 1.0f);
+    ds4_gpu_tensor *gx = upload(x, 8ull * in_dim);
+    ds4_gpu_tensor *gone = upload(NULL, 8ull * out_dim);
+    for (uint32_t t = 0; t < 8; t++) {
+        ds4_gpu_tensor *xt = ds4_gpu_tensor_view(gx, t * in_bytes, in_bytes);
+        ds4_gpu_tensor *ot = ds4_gpu_tensor_view(gone, t * out_bytes, out_bytes);
+        require_ok(xt && ot, "qwen35 row views");
+        require_ok(one(ot, a->base, a->size, off, in_dim, out_dim, xt, 1), "qwen35 one-row matvec");
+        ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(ot);
+    }
+    for (uint32_t T = 1; T <= 8; T++) {
+        ds4_gpu_tensor *gout = upload(NULL, (uint64_t)T * out_dim);
+        require_ok(ds4_gpu_tensor_fill_f32(gout, 17.25f, (uint64_t)T * out_dim), "qwen35 rows guard fill");
+        require_ok(rows(gout, a->base, a->size, off, in_dim, out_dim, gx, T), "qwen35 rows matvec");
+        char name[96];
+        snprintf(name, sizeof(name), "qwen35 %s rows %u->%u T=%u", type, in_dim, out_dim, T);
+        for (uint32_t t = 0; t < T; t++) same_bytes(name, t, gout, t * out_bytes, gone, t * out_bytes, out_bytes);
+        require_ok(one(gout, a->base, a->size, off, in_dim, out_dim, gx, T), "qwen35 one-row matvec at n_tok T");
+        snprintf(name, sizeof(name), "qwen35 %s n_tok=T %u->%u T=%u", type, in_dim, out_dim, T);
+        for (uint32_t t = 0; t < T; t++) same_bytes(name, t, gout, t * out_bytes, gone, t * out_bytes, out_bytes);
+        ds4_gpu_tensor_free(gout);
+    }
+    printf("  %s rows %u->%u T=1..8: byte-exact against one-row dispatches (so is today's n_tok=T)\n",
+           type, in_dim, out_dim);
+    free(x);
+    ds4_gpu_tensor_free(gone); ds4_gpu_tensor_free(gx);
+}
+
+/* DFlash verify mode, G1: the kernels a verify of up to 8 rows runs.
+ * Matvec shapes: A the 27B's in-dims (5120, 17408), B small and odd
+ * (256 -> 7, 13), C Qwen3.8 Flash's hidden width (2560). */
+static void test_qwen35_verify(arena_t *a) {
+    printf("qwen35 verify\n");
+    test_qwen35_q6_K_one_row(a, 256, 7);
+    test_qwen35_q6_K_one_row(a, 256, 13);
+    test_qwen35_q6_K_one_row(a, 5120, 1031);
+    test_qwen35_q6_K_one_row(a, 17408, 517);
+    const uint32_t mv_shapes[][2] = {{256, 7}, {256, 13}, {5120, 1031}, {17408, 517}, {2560, 517}};
+    for (uint32_t i = 0; i < sizeof(mv_shapes) / sizeof(mv_shapes[0]); i++) {
+        test_qwen35_rows_exact(a, "Q4_K", ds4_gpu_matmul_q4_K_rows_tensor, qwen35_q4_K_one_row,
+                               mv_shapes[i][0], mv_shapes[i][1]);
+    }
+}
+
+/* One weight type in the verify bench: its one-row matvec (also today's one
+ * dispatch over T grid rows at n_tok T) and its multi-row variants. */
+typedef struct {
+    const char *type;
+    qwen35_mv_fn one;
+    const char *rows_name[2];
+    qwen35_mv_fn rows[2];
+} qwen35_bench_type;
+
+static double qwen35_bench_batch(arena_t *a, const qwen35_bench_type *bt, uint32_t variant, uint64_t off,
+                                 uint32_t in_dim, uint32_t out_dim, uint32_t T, ds4_gpu_tensor *gx,
+                                 ds4_gpu_tensor *gout, ds4_gpu_tensor **xs, ds4_gpu_tensor **os) {
+    const uint32_t calls = 10;
+    const double t0 = bench_now();
+    require_ok(ds4_gpu_begin_commands(), "qwen35 bench batch begin");
+    for (uint32_t c = 0; c < calls; c++) {
+        if (variant == 0) {
+            for (uint32_t t = 0; t < T; t++)
+                require_ok(bt->one(os[t], a->base, a->size, off, in_dim, out_dim, xs[t], 1), "qwen35 bench one-row");
+        } else if (variant == 1) {
+            require_ok(bt->one(gout, a->base, a->size, off, in_dim, out_dim, gx, T), "qwen35 bench n_tok T");
+        } else {
+            require_ok(bt->rows[variant - 2](gout, a->base, a->size, off, in_dim, out_dim, gx, T), "qwen35 bench rows");
+        }
+    }
+    require_ok(ds4_gpu_end_commands(), "qwen35 bench batch end and wait");
+    return 1e6 * (bench_now() - t0) / calls;
+}
+
+static double qwen35_median20(const double *samples) {
+    double s[20];
+    memcpy(s, samples, sizeof(s));
+    for (uint32_t i = 1; i < 20; i++) {
+        const double v = s[i];
+        uint32_t j = i;
+        while (j && s[j - 1u] > v) { s[j] = s[j - 1u]; j--; }
+        s[j] = v;
+    }
+    return 0.5 * (s[9] + s[10]);
+}
+
+/* DS4_TEST_QWEN35_VERIFY_BENCH=1: microseconds per call (a batch of 10 calls
+ * including its final GPU wait; median of 20 batches, variants alternating)
+ * of T one-row dispatches, today's one dispatch over T grid rows, and each
+ * multi-row variant, at the 27B's projection shapes. No pass/fail. */
+static void bench_qwen35_verify(arena_t *a) {
+    const qwen35_bench_type types[] = {
+        {"Q4_K", qwen35_q4_K_one_row, {"rows", NULL}, {ds4_gpu_matmul_q4_K_rows_tensor, NULL}},
+    };
+    const uint32_t shapes[][2] = {{5120, 17408}, {17408, 5120}, {5120, 12288}};
+    printf("qwen35 verify bench: us/call, median of 20 batches of 10 calls\n");
+    for (uint32_t ti = 0; ti < sizeof(types) / sizeof(types[0]); ti++) {
+        const qwen35_bench_type *bt = &types[ti];
+        const uint32_t n_var = 2u + (bt->rows[0] != NULL) + (bt->rows[1] != NULL);
+        for (uint32_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
+            const uint32_t in_dim = shapes[si][0], out_dim = shapes[si][1];
+            const uint64_t in_bytes = (uint64_t)in_dim * 4u, out_bytes = (uint64_t)out_dim * 4u;
+            double *sh;
+            const uint64_t off = bt->type[1] == '6' ? arena_q6_K(a, out_dim, in_dim, &sh, 0.5f)
+                                                    : arena_q4_K(a, out_dim, in_dim, &sh, 0.05f);
+            free(sh);
+            float *x = rand_vec(8ull * in_dim, 1.0f);
+            ds4_gpu_tensor *gx = upload(x, 8ull * in_dim);
+            ds4_gpu_tensor *gout = upload(NULL, 8ull * out_dim);
+            ds4_gpu_tensor *xs[8], *os[8];
+            for (uint32_t t = 0; t < 8; t++) {
+                xs[t] = ds4_gpu_tensor_view(gx, t * in_bytes, in_bytes);
+                os[t] = ds4_gpu_tensor_view(gout, t * out_bytes, out_bytes);
+                require_ok(xs[t] && os[t], "qwen35 bench views");
+            }
+            for (uint32_t T = 1; T <= 8; T++) {
+                double samples[4][20], med[4];
+                for (uint32_t v = 0; v < n_var; v++)
+                    (void)qwen35_bench_batch(a, bt, v, off, in_dim, out_dim, T, gx, gout, xs, os);
+                for (uint32_t rep = 0; rep < 20; rep++)
+                    for (uint32_t k = 0; k < n_var; k++) {
+                        const uint32_t v = (rep + k) % n_var;
+                        samples[v][rep] = qwen35_bench_batch(a, bt, v, off, in_dim, out_dim, T, gx, gout, xs, os);
+                    }
+                for (uint32_t v = 0; v < n_var; v++) med[v] = qwen35_median20(samples[v]);
+                printf("  %s %u->%u T=%u: one-row x%u %.1f  n_tok=%u %.1f", bt->type, in_dim, out_dim, T, T, med[0], T, med[1]);
+                for (uint32_t v = 2; v < n_var; v++)
+                    printf("  %s %.1f (%.3f of one-row x%u)", bt->rows_name[v - 2], med[v], med[v] / med[0], T);
+                printf("\n");
+            }
+            for (uint32_t t = 0; t < 8; t++) { ds4_gpu_tensor_free(xs[t]); ds4_gpu_tensor_free(os[t]); }
+            ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
+            free(x);
+        }
+    }
+}
+#endif
+
 int main(void) {
     arena_t arena;
     arena.size = (uint64_t)1536 << 20;
@@ -3843,6 +4061,14 @@ int main(void) {
         printf("all Qwen MoE decode specialization tests passed\n");
         return 0;
     }
+#ifdef __APPLE__
+    if (getenv("DS4_TEST_QWEN35_VERIFY_ONLY")) {
+        test_qwen35_verify(&arena);
+        printf("all qwen35 verify tests passed\n");
+        return 0;
+    }
+    if (getenv("DS4_TEST_QWEN35_VERIFY_BENCH")) { bench_qwen35_verify(&arena); return 0; }
+#endif
     if (getenv("DS4_TEST_QWEN4_IDX_PREFILTER_ONLY")) { test_idx_prefilter(); printf("all qwen4 indexer prefilter tests passed\n"); return 0; }
     const char *q4k_ordered_only = getenv("DS4_TEST_QWEN4_Q4K_ORDERED_ONLY");
     if (q4k_ordered_only && q4k_ordered_only[0] && strcmp(q4k_ordered_only, "0") != 0) {
@@ -3987,6 +4213,9 @@ int main(void) {
     test_mtp(&arena, 64, 4);
     test_hc_norm_reuse(&arena);
     test_gdn_prefill_dispatch();
+#ifdef __APPLE__
+    test_qwen35_verify(&arena);
+#endif
     printf("all qwen4 kernel tests passed\n");
     return 0;
 }

@@ -727,6 +727,20 @@ int ds4_gpu_matmul_quant_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Dense Q4_K matvec over 1..8 rows of x in one dispatch (Metal only), for
+ * qwen35's verify: each weight block is read once for all rows, and row t
+ * is bitwise the classic one-row kernel's (ds4_gpu_matmul_quant_tensor at
+ * n_tok 1) on row t. */
+int ds4_gpu_matmul_q4_K_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
+
 /* Dense Q6_K matvec (Metal only), for the Q6_K tensors of dense qwen35's
  * Q4_K_M recipes: selected down projections and the output head. */
 int ds4_gpu_matmul_q6_K_tensor(
