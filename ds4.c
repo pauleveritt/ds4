@@ -58586,15 +58586,21 @@ static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
 }
 
 #if defined(__APPLE__)
-/* The Q4_K and Q6_K matvecs of a qwen35 verify (2..8 rows): each row runs
- * the one-row kernel decode runs, so its bytes are a decode's.  EXACT and
- * MMA both take that path until the multi-row kernels are merged here
- * (ds4_gpu_matmul_q4_K_rows_tensor and ds4_gpu_matmul_q6_K_rows_tensor for
- * EXACT, ds4_gpu_matmul_mma_rows_tensor for MMA). */
+/* The Q4_K and Q6_K matvecs of a qwen35 verify (2..8 rows), each row's bytes
+ * a one-row decode's.  EXACT takes today's dispatch over n_tok grid rows: one
+ * token per grid row, the one-row arithmetic (test_qwen35_rows_exact and
+ * qwen35_graph_q6_K_rows pin it), at about 0.76x the time of n_tok one-row
+ * dispatches; the multi-row Q4_K kernel was exact but slower.  MMA runs the
+ * one-row kernel per row until the few-row kernel
+ * (ds4_gpu_matmul_mma_rows_tensor) is wired in here. */
 static int qwen35_verify_gemv(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
                               const ds4_gpu_tensor *x, uint32_t n_tok, uint64_t in_dim, uint64_t out_dim,
                               uint32_t verify) {
-    (void)verify;
+    if (verify == DS4_QWEN35_VERIFY_EXACT) {
+        return w->type == DS4_TENSOR_Q6_K
+            ? ds4_gpu_matmul_q6_K_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok)
+            : ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok);
+    }
     int rc = 1;
     for (uint32_t t = 0; t < n_tok && rc; t++) {
         ds4_gpu_tensor *xt = ds4_gpu_tensor_view(x, (uint64_t)t * in_dim * sizeof(float), in_dim * sizeof(float));

@@ -1808,6 +1808,37 @@ static void qwen35_graph_attention(const char *shape, uint32_t H, uint32_t Hkv, 
     free(gate); free(q); free(vh); free(kh);
 }
 
+/* The Q6_K matvec as a verify runs it, one dispatch at n_tok T, against T
+ * one-row dispatches: row t of the T-row dispatch equals a one-row dispatch
+ * on row t alone, T = 1..8. */
+static void qwen35_graph_q6_K_rows(arena_t *a, uint32_t in_dim, uint32_t out_dim) {
+    double *sh;
+    const uint64_t off = arena_q6_K(a, out_dim, in_dim, &sh, 0.5f);
+    free(sh);
+    const uint32_t R = 8;
+    float *x = rand_vec((uint64_t)R * in_dim, 1.0f);
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)R * in_dim), *gone = upload(NULL, (uint64_t)R * out_dim);
+    for (uint32_t t = 0; t < R; t++) {
+        ds4_gpu_tensor *xt = graph_row(gx, t, in_dim), *ot = graph_row(gone, t, out_dim);
+        require_ok(ds4_gpu_matmul_q6_K_tensor(ot, a->base, a->size, off, in_dim, out_dim, xt, 1),
+                   "qwen35 Q6_K: one-row matvec");
+        ds4_gpu_tensor_free(ot); ds4_gpu_tensor_free(xt);
+    }
+    char name[128];
+    for (uint32_t T = 1; T <= R; T++) {
+        ds4_gpu_tensor *gout = upload(NULL, (uint64_t)T * out_dim);
+        require_ok(ds4_gpu_matmul_q6_K_tensor(gout, a->base, a->size, off, in_dim, out_dim, gx, T),
+                   "qwen35 Q6_K: n_tok T matvec");
+        ds4_gpu_tensor *first = graph_row(gone, 0, (uint64_t)T * out_dim);
+        snprintf(name, sizeof(name), "Q6_K n_tok=T %u->%u T=%u", in_dim, out_dim, T);
+        graph_same_bytes(name, first, gout, (uint64_t)T * out_dim * 4u, (uint64_t)out_dim * 4u);
+        ds4_gpu_tensor_free(first); ds4_gpu_tensor_free(gout);
+    }
+    printf("  qwen35 Q6_K %u->%u: n_tok=T T=1..8 byte-exact against one-row dispatches\n", in_dim, out_dim);
+    free(x);
+    ds4_gpu_tensor_free(gone); ds4_gpu_tensor_free(gx);
+}
+
 /* Shapes: A the 27B's, B small and odd, C Qwen3.8 Flash's for the kernels
  * the two share.  The random stream is restored afterwards, so the suite's
  * later tests see the inputs they saw before these were added. */
@@ -1821,6 +1852,9 @@ static void test_qwen35_graph(arena_t *a) {
     qwen35_graph_row_ops(a, "B", 256, 260, 4, 2, 128, 64, 6, 128);
     qwen35_graph_attention("A", 24, 4, 256);
     qwen35_graph_attention("C", 24, 2, 256);
+    const uint32_t q6_shapes[][2] = {{256, 7}, {256, 13}, {5120, 1031}, {17408, 517}, {2560, 517}, {5120, 4099}};
+    for (uint32_t i = 0; i < sizeof(q6_shapes) / sizeof(q6_shapes[0]); i++)
+        qwen35_graph_q6_K_rows(a, q6_shapes[i][0], q6_shapes[i][1]);
     g_rng = rng;
 }
 
