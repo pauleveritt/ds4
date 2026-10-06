@@ -18,7 +18,7 @@
  * Exit status 0 when every tap of every generated position is >= 0.999.
  *
  * inject: see run_inject; the recompute is the host's s4 data dir's
- * inject_check.py.
+ * inject_check.py.  g7 and spec: see run_g7 and run_spec.
  *
  * Usage: test_dflash_live capture MODEL DRAFTER PROMPTS FILLER [--prompts N]
  *                                 [--depths D,D,...] [--ctx N]
@@ -26,6 +26,10 @@
  *                                 [--first I] [--ctx N]
  *        test_dflash_live inject MODEL DRAFTER PROMPTS FILLER OUT [--first I]
  *                                 [--depths D] [--ctx N]
+ *        test_dflash_live g7 MODEL DRAFTER INDEX FEATURES LATTICE [--prompts N]
+ *                                 [--first I] [--ctx N]
+ *        test_dflash_live spec MODEL DRAFTER PROMPTS FILLER [--prompts N] [--first I]
+ *                                 [--depths D] [--ctx N] [--tokens M]
  * PROMPTS holds JSON lines with "name" and "prompt", as for
  * test_qwen35_verify_live. */
 #define _POSIX_C_SOURCE 200809L
@@ -135,20 +139,21 @@ static void features_or_die(ds4_session *s, int pos, float *out) {
 
 typedef struct {
     const char *model, *drafter;
-    int ctx, first, count, n_depths, depths[8];
+    int ctx, first, count, n_depths, depths[8], tokens;
     char **rest;
     int n_rest;
 } live_args;
 
 static live_args parse_args(int argc, char **argv, int n_fixed) {
     live_args a = { .model = argv[2], .drafter = argv[3], .ctx = 10240, .count = 1 << 30,
-                    .n_depths = 3, .depths = {100, 2600, 9700} };
+                    .n_depths = 3, .depths = {100, 2600, 9700}, .tokens = 128 };
     a.rest = argv + 4;
     a.n_rest = n_fixed;
     for (int i = 4 + n_fixed; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--prompts")) a.count = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "--first")) a.first = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "--ctx")) a.ctx = atoi(argv[i + 1]);
+        else if (!strcmp(argv[i], "--tokens")) a.tokens = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "--depths")) {
             a.n_depths = 0;
             for (char *p = argv[i + 1]; *p && a.n_depths < 8;) {
@@ -452,6 +457,169 @@ static int run_inject(int argc, char **argv) {
     return rejected_absent == ROWS - 5 ? 0 : 1;
 }
 
+static double now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1e3 + t.tv_nsec * 1e-6;
+}
+
+/* G7: llama.cpp's features into our drafter.  Per prompt of the dump the
+ * session's ring is filled with llama.cpp's feature rows of the prompt
+ * (positions 0..N-1); then for each generated position p, our drafter
+ * drafts after the dump's token at p from the features of 0..p-1, and
+ * llama.cpp's row p is appended, as llama.cpp's dump did.  The target model
+ * is loaded for its embeddings and head only; nothing is evaluated.  One
+ * JSON line per draft (drafts and draft_ms); the lattice of rows 1..n goes
+ * to LATTICE in the dump's layout (per row 16 candidate ids as f32, then
+ * scores[j][k]).  The comparison is the s5 data dir's g7_compare.py. */
+static int run_g7(int argc, char **argv) {
+    if (argc < 7) die("g7 needs MODEL DRAFTER INDEX FEATURES LATTICE", NULL);
+    live_args a = parse_args(argc, argv, 3);
+    dump_prompt dp[16];
+    const int n_dp = read_dump(a.rest[0], dp, 16);
+    FILE *ff = fopen(a.rest[1], "rb"), *fl = fopen(a.rest[2], "wb");
+    if (!ff || !fl) die("cannot open the features or the lattice", NULL);
+    ds4_engine *engine = open_or_die(&a);
+    const int width = ds4_engine_dflash_feature_floats(engine), K = ds4_engine_dflash_top_k(engine);
+    ds4_session *s = NULL;
+    if (ds4_session_create(&s, engine, a.ctx) != 0) die("session create failed", NULL);
+    float *rows = malloc((size_t)2048 * width * sizeof(float));
+    int *cand = malloc((size_t)ROWS * K * sizeof(int));
+    float *scores = malloc((size_t)ROWS * K * K * sizeof(float)), *out = malloc((size_t)(K + K * K) * sizeof(float));
+    int drafts_done = 0;
+    for (int i = a.first; i < n_dp && i < a.first + a.count; i++) {
+        const dump_prompt *d = &dp[i];
+        for (int p = 0; p < d->n_prompt; p++) read_feature_row(ff, d->feature_row[p], width, rows + (size_t)p * width);
+        if (ds4_session_dflash_set_features(s, 0, d->n_prompt, rows) != 0) die("set features failed", d->name);
+        for (int p = d->n_prompt; p < d->n; p++) {
+            int draft[ROWS];
+            char err[256] = {0};
+            const double t0 = now_ms();
+            const int n = ds4_session_dflash_draft_at(s, p, d->token[p], ROWS - 1, draft, cand, scores, err, sizeof(err));
+            const double ms = now_ms() - t0;
+            if (n != ROWS - 1) die("draft failed", err);
+            printf("{\"prompt\":%d,\"name\":\"%s\",\"pos\":%d,\"anchor\":%d,\"drafts\":[", d->prompt, d->name, p,
+                   d->token[p]);
+            for (int j = 0; j < n; j++) printf("%s%d", j ? "," : "", draft[j]);
+            printf("],\"draft_ms\":%.3f}\n", ms);
+            for (int r = 1; r <= n; r++) {
+                for (int k = 0; k < K; k++) out[k] = (float)cand[r * K + k];
+                memcpy(out + K, scores + (size_t)r * K * K, (size_t)K * K * sizeof(float));
+                fwrite(out, sizeof(float), (size_t)(K + K * K), fl);
+            }
+            drafts_done++;
+            read_feature_row(ff, d->feature_row[p], width, rows);
+            if (ds4_session_dflash_set_features(s, p, 1, rows) != 0) die("set features failed", d->name);
+        }
+        fflush(stdout);
+    }
+    ds4_spec_stats st;
+    ds4_session_spec_stats(s, &st);
+    fprintf(stderr, "G7: %d drafts, draft_ms total %.1f (mean %.2f)\n", drafts_done, st.draft_ms,
+            drafts_done ? st.draft_ms / drafts_done : 0.0);
+    fclose(fl); fclose(ff);
+    free(rows); free(cand); free(scores); free(out);
+    ds4_session_free(s);
+    ds4_engine_close(engine);
+    return drafts_done > 0 ? 0 : 1;
+}
+
+/* The product path once, greedy: per prompt at one depth, a DFlash-mode
+ * session decodes --tokens tokens serially (the reference), then, from the
+ * same snapshot, speculatively: draft after the anchor, verify, select rows
+ * while each row's argmax equals its draft, commit, and the last selected
+ * row's argmax is the next anchor.  The two streams must be equal.  One
+ * JSON line per step (drafted, accepted, draft/verify/commit ms) and one
+ * per prompt. */
+static int run_spec(int argc, char **argv) {
+    if (argc < 6) die("spec needs MODEL DRAFTER PROMPTS FILLER", NULL);
+    live_args a = parse_args(argc, argv, 2);
+    const int tokens = a.tokens;
+    ds4_engine *engine = open_or_die(&a);
+    ds4_session *s = NULL;
+    if (ds4_session_create(&s, engine, a.ctx) != 0) die("session create failed", NULL);
+    if (ds4_session_set_verify_mode(s, DS4_VERIFY_MODE_MMA) != 0) die("DFlash mode refused", NULL);
+    char *filler_text = read_file(a.rest[1]);
+    ds4_tokens filler = {0};
+    ds4_tokenize_text(engine, filler_text, &filler);
+    free(filler_text);
+    char *prompts = read_file(a.rest[0]);
+    int index = 0, cases = 0, passed = 0;
+    int *ref = malloc((size_t)(tokens + ROWS) * sizeof(int)), *got = malloc((size_t)(tokens + ROWS) * sizeof(int));
+    ds4_session_snapshot base = {0};
+    for (char *line = strtok(prompts, "\n"); line; line = strtok(NULL, "\n"), index++) {
+        if (index < a.first || index >= a.first + a.count) continue;
+        char *name = json_field(line, "name"), *prompt = json_field(line, "prompt");
+        ds4_tokens chat = {0}, prefix = {0};
+        ds4_encode_chat_prompt(engine, NULL, prompt, DS4_THINK_HIGH, &chat);
+        for (int i = 0; i + chat.len < a.depths[0]; i++) ds4_tokens_push(&prefix, filler.v[i % filler.len]);
+        for (int i = 0; i < chat.len; i++) ds4_tokens_push(&prefix, chat.v[i]);
+        if (prefix.len + tokens + ROWS > a.ctx) die("prefix does not fit the context", name);
+        sync_or_die(s, &prefix);
+        char err[256] = {0};
+        if (ds4_session_save_snapshot(s, &base, err, sizeof(err)) != 0) die("snapshot save failed", err);
+        double serial_ms = now_ms();
+        for (int i = 0; i < tokens; i++) {
+            ref[i] = ds4_session_argmax(s);
+            if (i + 1 < tokens) eval_or_die(s, ref[i]);
+        }
+        serial_ms = now_ms() - serial_ms;
+        if (ds4_session_load_snapshot(s, &base, err, sizeof(err)) != 0) die("snapshot load failed", err);
+        ds4_spec_stats st0, st1;
+        ds4_session_spec_stats(s, &st0);
+        int n_got = 0, steps = 0, drafted = 0, accepted = 0;
+        int anchor = ds4_session_argmax(s);
+        double spec_ms = now_ms();
+        while (n_got < tokens) {
+            int draft[ROWS];
+            ds4_spec_stats a0, a1;
+            ds4_session_spec_stats(s, &a0);
+            int n = ds4_session_dflash_draft(s, anchor, ROWS - 1, draft, err, sizeof(err));
+            if (n < 0) die("draft failed", err);
+            if (n > tokens - n_got - 1) n = tokens - n_got - 1;
+            if (ds4_session_verify(s, anchor, draft, n, err, sizeof(err)) != 0) die("verify failed", err);
+            int k = 0, next = -1;
+            for (int r = 0; r <= n; r++) {
+                if (ds4_session_verify_select(s, r) != 0) die("select refused", NULL);
+                next = ds4_session_argmax(s);
+                if (r == n || next != draft[r]) { k = r; break; }
+            }
+            if (ds4_session_verify_commit(s, k + 1, err, sizeof(err)) != 0) die("commit failed", err);
+            ds4_session_spec_stats(s, &a1);
+            got[n_got++] = anchor;
+            for (int r = 0; r < k; r++) got[n_got++] = draft[r];
+            printf("{\"prompt\":\"%s\",\"step\":%d,\"pos\":%d,\"drafted\":%d,\"accepted\":%d,\"draft_ms\":%.3f,"
+                   "\"verify_ms\":%.3f,\"commit_ms\":%.3f}\n", name, steps, ds4_session_pos(s) - k - 1, n, k,
+                   a1.draft_ms - a0.draft_ms, a1.verify_ms - a0.verify_ms, a1.commit_ms - a0.commit_ms);
+            steps++; drafted += n; accepted += k;
+            anchor = next;
+        }
+        spec_ms = now_ms() - spec_ms;
+        ds4_session_spec_stats(s, &st1);
+        int equal = 0;
+        while (equal < tokens && got[equal] == ref[equal]) equal++;
+        const bool pass = equal == tokens;
+        cases++;
+        passed += pass;
+        printf("{\"prompt\":\"%s\",\"depth\":%d,\"pos0\":%d,\"tokens\":%d,\"stream_equal_prefix\":%d,\"steps\":%d,"
+               "\"drafted\":%d,\"accepted\":%d,\"serial_ms\":%.1f,\"spec_ms\":%.1f,\"draft_ms\":%.1f,"
+               "\"verify_ms\":%.1f,\"commit_ms\":%.1f,\"pass\":%s}\n",
+               name, a.depths[0], prefix.len, tokens, equal, steps, drafted, accepted, serial_ms, spec_ms,
+               st1.draft_ms - st0.draft_ms, st1.verify_ms - st0.verify_ms, st1.commit_ms - st0.commit_ms,
+               pass ? "true" : "false");
+        fflush(stdout);
+        ds4_tokens_free(&prefix); ds4_tokens_free(&chat);
+        free(name); free(prompt);
+    }
+    fprintf(stderr, "spec: %d/%d streams equal\n", passed, cases);
+    ds4_session_snapshot_free(&base);
+    free(ref); free(got); free(prompts);
+    ds4_tokens_free(&filler);
+    ds4_session_free(s);
+    ds4_engine_close(engine);
+    return cases > 0 && passed == cases ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s capture MODEL DRAFTER PROMPTS FILLER [options]\n"
@@ -462,6 +630,8 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "capture")) return run_capture(argc, argv);
     if (!strcmp(argv[1], "features")) return run_features(argc, argv);
     if (!strcmp(argv[1], "inject")) return run_inject(argc, argv);
+    if (!strcmp(argv[1], "g7")) return run_g7(argc, argv);
+    if (!strcmp(argv[1], "spec")) return run_spec(argc, argv);
     die("unknown command", argv[1]);
     return 2;
 }

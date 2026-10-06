@@ -631,6 +631,14 @@ int  ds4_session_verify(ds4_session *s, int anchor, const int *draft, int n_draf
 int  ds4_session_verify_select(ds4_session *s, int row);
 int  ds4_session_verify_commit(ds4_session *s, int n_rows, char *err, size_t errlen);
 void ds4_session_spec_stats(ds4_session *s, ds4_spec_stats *out);
+/* ds4_session_dflash_draft (an engine with a DFlash drafter): injects the
+ * committed features still pending, then drafts after `anchor`, the host's
+ * chosen and not yet evaluated token at the session position, by the
+ * drafter's greedy walk through its selector lattice.  Returns the number of
+ * drafts written, 0..n_max (clamped to the drafter's n_max and to the
+ * context left for a verify), or -1 with err set; refused while a verify is
+ * open.  Its time joins ds4_spec_stats.draft_ms. */
+int  ds4_session_dflash_draft(ds4_session *s, int anchor, int n_max, int *draft, char *err, size_t errlen);
 /* DFlash test hooks, for the live checks of the drafter's state (the DFlash
  * plan's S4 and G7), not for inference.  ds4_engine_dflash_feature_floats
  * is one position's feature row (the target's residual stream after each
@@ -643,6 +651,18 @@ int ds4_session_dflash_features(ds4_session *s, int pos, float *out);
  * rows of position pos (n_head_kv x head_dim floats each, from f16) while
  * the ring's slot holds pos; nonzero otherwise. */
 int ds4_session_dflash_ring(ds4_session *s, int block, int pos, float *k, float *v);
+/* ds4_session_dflash_set_features writes n_rows (<= 2048) feature rows for
+ * positions pos0.. as if captured and committed, and injects them; pos0 is
+ * 0, which forgets every earlier position, or where the last call ended.
+ * ds4_session_dflash_draft_at drafts as ds4_session_dflash_draft with the
+ * anchor at position pos, ignoring the session's, and copies the lattice
+ * when cand and scores are given: cand[(n + 1) x top_k] candidate ids and
+ * scores[(n + 1) x top_k x top_k], row i's [j][k] the score of candidate k
+ * after row i - 1's candidate j (row 1's after the anchor; row 0 unused). */
+int ds4_engine_dflash_top_k(ds4_engine *e);
+int ds4_session_dflash_set_features(ds4_session *s, int pos0, int n_rows, const float *features);
+int ds4_session_dflash_draft_at(ds4_session *s, int pos, int anchor, int n_max, int *draft,
+                                int *cand, float *scores, char *err, size_t errlen);
 /* TP worker side of a mirrored speculative-verify block: run its half of the
  * batch verify for KV side effects, then obey the leader's commit frame
  * (keep, or roll back and replay). Only called from ds4_tp_worker_run. */

@@ -58349,6 +58349,14 @@ typedef struct ds4_qwen35_dflash {
     ds4_gpu_tensor *ring_v[DS4_DFLASH_MAX_BLOCKS];
     ds4_gpu_tensor *ring_pos;     /* [DS4_DFLASH_RING] int32 position tags, -1 empty; one for every block */
     ds4_gpu_tensor *inj_g, *inj_gn, *inj_k, *inj_v;  /* one injection sub-batch */
+    /* one draft block of up to block_size rows: the residual stream, norm
+     * and conv outputs, conv coefficients, q/k/v and attention, projections,
+     * the FFN, then logits, the selector's gate, top-k candidates and the
+     * lattice, with host copies of the last two */
+    ds4_gpu_tensor *dx, *dn, *dc, *ddyn, *dq, *dk, *dv, *da, *dout, *dout2, *dffin;
+    ds4_gpu_tensor *dgate, *dup, *dact, *dlogits, *dsel, *dcand, *dscores;
+    int32_t *host_cand;
+    float *host_scores;
     uint32_t inject_pos;          /* positions below are injected, or skipped as out of every window */
     uint32_t feat_end;            /* committed features end here */
     uint32_t cap_from;            /* a forward captures only rows at positions >= cap_from (set by sync) */
@@ -58606,14 +58614,20 @@ static void qwen35_dflash_free(ds4_qwen35_dflash *d) {
         ds4_gpu_tensor_free(d->ring_k[b]);
         ds4_gpu_tensor_free(d->ring_v[b]);
     }
-    ds4_gpu_tensor *rest[] = { d->ring_pos, d->inj_g, d->inj_gn, d->inj_k, d->inj_v };
+    ds4_gpu_tensor *rest[] = {
+        d->ring_pos, d->inj_g, d->inj_gn, d->inj_k, d->inj_v,
+        d->dx, d->dn, d->dc, d->ddyn, d->dq, d->dk, d->dv, d->da, d->dout, d->dout2, d->dffin,
+        d->dgate, d->dup, d->dact, d->dlogits, d->dsel, d->dcand, d->dscores,
+    };
     for (size_t i = 0; i < sizeof(rest) / sizeof(rest[0]); i++) ds4_gpu_tensor_free(rest[i]);
+    free(d->host_cand);
+    free(d->host_scores);
     free(d);
 }
 
 /* The drafter state of a session whose engine holds a drafter: the capture
- * ring (200 MiB at the 27B's width and five taps), the K/V rings (40 MiB)
- * and the injection's sub-batch buffers. */
+ * ring (200 MiB at the 27B's width and five taps), the K/V rings (40 MiB),
+ * the injection's sub-batch buffers and one draft block's activations. */
 static ds4_qwen35_dflash *qwen35_dflash_alloc(const ds4_dflash_weights *dw, const ds4_model *dm) {
     ds4_qwen35_dflash *d = xcalloc(1, sizeof(*d));
     d->dw = dw;
@@ -58630,6 +58644,22 @@ static ds4_qwen35_dflash *qwen35_dflash_alloc(const ds4_dflash_weights *dw, cons
         ok = (d->ring_k[b] = ds4_gpu_tensor_alloc((uint64_t)DS4_DFLASH_RING * kv * sizeof(uint16_t))) &&
              (d->ring_v[b] = ds4_gpu_tensor_alloc((uint64_t)DS4_DFLASH_RING * kv * sizeof(uint16_t)));
     }
+    const uint64_t R = dw->block_size, E = dw->n_embd, K = dw->selector_top_k;
+    const uint64_t q_dim = (uint64_t)dw->n_head * dw->head_dim;
+    const uint64_t conv_rows = 2ull * dw->conv_kernel * (E / dw->conv_group);
+    struct { ds4_gpu_tensor **t; uint64_t floats; } act[] = {
+        { &d->dx, R * E }, { &d->dn, R * E }, { &d->dc, R * E }, { &d->ddyn, R * conv_rows },
+        { &d->dq, R * q_dim }, { &d->dk, R * kv }, { &d->dv, R * kv }, { &d->da, R * q_dim },
+        { &d->dout, R * E }, { &d->dout2, R * E }, { &d->dffin, R * E },
+        { &d->dgate, R * dw->n_ff }, { &d->dup, R * dw->n_ff }, { &d->dact, R * dw->n_ff },
+        { &d->dlogits, R * DS4_N_VOCAB }, { &d->dsel, R * dw->selector_rank },
+        { &d->dcand, R * K }, { &d->dscores, R * K * K },
+    };
+    for (size_t i = 0; ok && i < sizeof(act) / sizeof(act[0]); i++) {
+        ok = (*act[i].t = ds4_gpu_tensor_alloc(act[i].floats * sizeof(float))) != NULL;
+    }
+    d->host_cand = xmalloc((size_t)(R * K) * sizeof(int32_t));
+    d->host_scores = xmalloc((size_t)(R * K * K) * sizeof(float));
     if (!ok || !qwen35_dflash_forget(d, 0)) {
         fprintf(stderr, "ds4: DFlash drafter state allocation failed\n");
         qwen35_dflash_free(d);
@@ -60094,6 +60124,109 @@ static bool qwen35_graph_commit(ds4_qwen4_gpu_graph *g, uint32_t n) {
     if (ok) g->pos += n;
     if (ok && g->dflash) g->dflash->feat_end = g->pos;
     return ok;
+}
+
+static ds4_gpu_tensor *qwen35_dflash_rows(ds4_gpu_tensor *t, uint64_t row, uint64_t rows, uint64_t floats) {
+    return ds4_gpu_tensor_view(t, row * floats * sizeof(float), rows * floats * sizeof(float));
+}
+
+/* One DFlash2 draft (spec section 3.3, llama.cpp src/models/dflash.cpp:
+ * 678-812 and common/speculative.cpp:1264-1327): the block [anchor, MASK x n]
+ * at positions pos..pos+n runs the drafter's blocks over the ring (slots
+ * with tag t < pos inside each row's window) and its own rows, then
+ * output_norm, the target's head on rows 1..n through the few-row MMA
+ * kernel, the top-k candidates per row, the selector's lattice, and the
+ * greedy walk from the anchor.  Writes n drafts and leaves the lattice in
+ * host_cand and host_scores; false on a GPU failure. */
+static bool qwen35_dflash_draft(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                uint32_t pos, int anchor, uint32_t n, int *draft) {
+    ds4_qwen35_dflash *d = g->dflash;
+    const ds4_dflash_weights *dw = d->dw;
+    const ds4_model *dm = d->dm;
+    const uint32_t R = n + 1u, E = dw->n_embd, F = dw->n_ff, K = dw->selector_top_k, V = DS4_N_VOCAB;
+    const uint32_t D = dw->head_dim, kv = dw->n_head_kv * D, q_dim = dw->n_head * D;
+    const uint32_t conv_rows = 2u * dw->conv_kernel * (E / dw->conv_group);
+    for (uint32_t t = 0; t < R; t++) {
+        qwen4_ref_row(m, w->token_embd, t == 0 ? (uint64_t)anchor : dw->mask_token, g->host_row + (uint64_t)t * E);
+    }
+    if (!ds4_gpu_tensor_write(d->dx, 0, g->host_row, (uint64_t)R * E * sizeof(float))) return false;
+    if (!glm_graph_begin_commands_if_needed()) return false;
+    const void *dmap = dm->map;
+    const uint64_t dsize = dm->size;
+#define DFLASH_MM(out, t, in_dim, out_dim, x) \
+    (ds4_gpu_matmul_quant_tensor((out), dmap, dsize, (t)->abs_offset, (t)->type, (in_dim), (out_dim), (x), R) != 0)
+    bool ok = true;
+    for (uint32_t b = 0; ok && b < dw->n_block; b++) {
+        const ds4_dflash_block_weights *bw = &dw->block[b];
+        ok = ds4_gpu_rms_norm_weight_rows_tensor(d->dn, d->dx, dmap, dsize, bw->attn_norm->abs_offset, E, R,
+                                                 dw->rms_eps) != 0 &&
+             DFLASH_MM(d->ddyn, bw->attn_conv_proj, E, conv_rows, d->dn) &&
+             ds4_gpu_dflash_conv_tensor(d->dc, d->dn, d->ddyn, dmap, dsize, bw->attn_conv_base->abs_offset,
+                                        R, R, E, dw->conv_group, 0) != 0 &&
+             DFLASH_MM(d->dq, bw->attn_q, E, q_dim, d->dc) &&
+             DFLASH_MM(d->dk, bw->attn_k, E, kv, d->dc) &&
+             DFLASH_MM(d->dv, bw->attn_v, E, kv, d->dc) &&
+             ds4_gpu_dflash_head_norm_rope_tensor(d->dq, d->dq, dmap, dsize, bw->attn_q_norm->abs_offset, R,
+                                                  dw->n_head, D, pos, dw->rope_dims, dw->rope_base,
+                                                  dw->rms_eps) != 0 &&
+             ds4_gpu_dflash_head_norm_rope_tensor(d->dk, d->dk, dmap, dsize, bw->attn_k_norm->abs_offset, R,
+                                                  dw->n_head_kv, D, pos, dw->rope_dims, dw->rope_base,
+                                                  dw->rms_eps) != 0 &&
+             ds4_gpu_dflash_attn_tensor(d->da, d->dq, d->dk, d->dv, d->ring_k[b], d->ring_v[b], d->ring_pos,
+                                        R, dw->n_head, dw->n_head_kv, D, DS4_DFLASH_RING, dw->window, pos,
+                                        1.0f / sqrtf((float)D)) != 0 &&
+             DFLASH_MM(d->dout, bw->attn_output, q_dim, E, d->da) &&
+             ds4_gpu_dflash_conv_tensor(d->dout2, d->dout, d->ddyn, dmap, dsize, bw->attn_conv_base->abs_offset,
+                                        R, R, E, dw->conv_group, 1) != 0 &&
+             ds4_gpu_add_tensor(d->dffin, d->dout2, d->dx, R * E) != 0 &&
+             ds4_gpu_rms_norm_weight_rows_tensor(d->dn, d->dffin, dmap, dsize, bw->ffn_norm->abs_offset, E, R,
+                                                 dw->rms_eps) != 0 &&
+             DFLASH_MM(d->ddyn, bw->ffn_conv_proj, E, conv_rows, d->dn) &&
+             ds4_gpu_dflash_conv_tensor(d->dc, d->dn, d->ddyn, dmap, dsize, bw->ffn_conv_base->abs_offset,
+                                        R, R, E, dw->conv_group, 0) != 0 &&
+             DFLASH_MM(d->dgate, bw->ffn_gate, E, F, d->dc) &&
+             DFLASH_MM(d->dup, bw->ffn_up, E, F, d->dc) &&
+             ds4_gpu_swiglu_tensor(d->dact, d->dgate, d->dup, R * F, 0.0f, 1.0f) != 0 &&
+             DFLASH_MM(d->dout, bw->ffn_down, F, E, d->dact) &&
+             ds4_gpu_dflash_conv_tensor(d->dout2, d->dout, d->ddyn, dmap, dsize, bw->ffn_conv_base->abs_offset,
+                                        R, R, E, dw->conv_group, 1) != 0 &&
+             ds4_gpu_add_tensor(d->dx, d->dout2, d->dffin, R * E) != 0;
+    }
+    ds4_gpu_tensor *h1 = NULL, *logits1 = NULL, *cand1 = NULL;
+    if (ok) {
+        h1 = qwen35_dflash_rows(d->dn, 1, n, E);
+        logits1 = qwen35_dflash_rows(d->dlogits, 1, n, V);
+        cand1 = ds4_gpu_tensor_view(d->dcand, (uint64_t)K * sizeof(int32_t), (uint64_t)n * K * sizeof(int32_t));
+        ok = h1 && logits1 && cand1 &&
+             ds4_gpu_rms_norm_weight_rows_tensor(d->dn, d->dx, dmap, dsize, dw->output_norm->abs_offset, E, R,
+                                                 dw->rms_eps) != 0 &&
+             ds4_gpu_matmul_mma_rows_tensor(logits1, m->map, m->size, w->output->abs_offset, w->output->type,
+                                            E, V, h1, n) != 0 &&
+             DFLASH_MM(d->dsel, dw->selector_hidden, E, dw->selector_rank, d->dn) &&
+             ds4_gpu_indexer_topk_tensor(cand1, logits1, V, n, K) != 0 &&
+             ds4_gpu_dflash_selector_tensor(d->dscores, d->dcand, d->dlogits, d->dsel, dmap, dsize,
+                                            dw->selector_pred->abs_offset, dw->selector_succ->abs_offset,
+                                            R, K, dw->selector_rank, V, (uint32_t)anchor) != 0;
+    }
+#undef DFLASH_MM
+    ds4_gpu_tensor_free(cand1);
+    ds4_gpu_tensor_free(logits1);
+    ds4_gpu_tensor_free(h1);
+    if (!ds4_gpu_end_commands()) ok = false;
+    ok = ok && ds4_gpu_tensor_read(d->dcand, 0, d->host_cand, (uint64_t)R * K * sizeof(int32_t)) &&
+         ds4_gpu_tensor_read(d->dscores, 0, d->host_scores, (uint64_t)R * K * K * sizeof(float));
+    if (!ok) return false;
+    /* row 1's predecessor is the anchor (every j alike); row i > 1 takes the
+     * scores given the candidate row i - 1 chose; the first maximum wins */
+    uint32_t pred = 0;
+    for (uint32_t i = 1; i < R; i++) {
+        const float *sc = d->host_scores + ((uint64_t)i * K + pred) * K;
+        uint32_t best = 0;
+        for (uint32_t k = 1; k < K; k++) if (sc[k] > sc[best]) best = k;
+        draft[i - 1u] = d->host_cand[(uint64_t)i * K + best];
+        pred = best;
+    }
+    return true;
 }
 #endif
 
@@ -87003,6 +87136,86 @@ int ds4_session_dflash_features(ds4_session *s, int pos, float *out) {
     (void)s; (void)pos; (void)out;
     return 1;
 #endif
+}
+
+int ds4_engine_dflash_top_k(ds4_engine *e) {
+    return e && e->dflash_ready ? (int)e->dflash_weights.selector_top_k : 0;
+}
+
+int ds4_session_dflash_set_features(ds4_session *s, int pos0, int n_rows, const float *features) {
+#ifdef DS4_HAS_QWEN4_METAL
+    ds4_qwen35_dflash *d = s && s->qwen4_graph_ready ? s->qwen4_graph.dflash : NULL;
+    if (!d || !features || pos0 < 0 || n_rows < 1 || (uint32_t)n_rows > DS4_DFLASH_RING ||
+        s->qwen35_verify_open) {
+        return 1;
+    }
+    if (pos0 == 0 && !qwen35_dflash_forget(d, 0)) return 1;
+    if ((uint32_t)pos0 != d->feat_end) return 1;
+    const uint64_t row = (uint64_t)d->dw->n_target_layers * d->dw->n_embd * sizeof(float);
+    for (uint32_t r = 0; r < (uint32_t)n_rows; r++) {
+        const uint32_t slot = ((uint32_t)pos0 + r) % DS4_DFLASH_RING;
+        if (!ds4_gpu_tensor_write(d->features, (uint64_t)slot * row, (const char *)features + r * row, row)) {
+            return 1;
+        }
+    }
+    d->feat_end = (uint32_t)pos0 + (uint32_t)n_rows;
+    if (d->cap_hi < d->feat_end) d->cap_hi = d->feat_end;
+    return qwen35_dflash_inject(d) ? 0 : 1;
+#else
+    (void)s; (void)pos0; (void)n_rows; (void)features;
+    return 1;
+#endif
+}
+
+int ds4_session_dflash_draft_at(ds4_session *s, int pos, int anchor, int n_max, int *draft,
+                                int *cand, float *scores, char *err, size_t errlen) {
+    if (!s) return -1;
+    if (ds4_session_verify_refuses(s, "draft", err, errlen)) return -1;
+#ifdef DS4_HAS_QWEN4_METAL
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    ds4_qwen35_dflash *d = s->qwen4_graph_ready ? g->dflash : NULL;
+    if (!d) {
+        payload_set_err(err, errlen, "draft needs an engine with a DFlash drafter");
+        return -1;
+    }
+    if (anchor < 0 || anchor >= (int)DS4_N_VOCAB || pos < 0 || (n_max > 0 && !draft)) {
+        payload_set_err(err, errlen, "draft takes an anchor in the vocabulary at a position");
+        return -1;
+    }
+    const double t0 = now_sec();
+    int n = n_max < (int)d->dw->n_draft ? n_max : (int)d->dw->n_draft;
+    if ((int64_t)pos + 1 + n > (int64_t)g->ctx_cap) n = (int)g->ctx_cap - pos - 1;
+    if (n <= 0) return 0;
+    (void)qwen35_dflash_inject(d);
+    if (!qwen35_dflash_draft(g, &s->engine->model, &s->engine->weights, (uint32_t)pos, anchor, (uint32_t)n, draft)) {
+        payload_set_err(err, errlen, "qwen35 DFlash draft failed");
+        return -1;
+    }
+    const uint32_t K = d->dw->selector_top_k, R = (uint32_t)n + 1u;
+    if (cand) for (uint32_t i = 0; i < R * K; i++) cand[i] = d->host_cand[i];
+    if (scores) memcpy(scores, d->host_scores, (size_t)R * K * K * sizeof(float));
+    s->qwen35_spec_stats.draft_ms += (now_sec() - t0) * 1000.0;
+    return n;
+#else
+    (void)pos; (void)anchor; (void)n_max; (void)draft; (void)cand; (void)scores;
+    payload_set_err(err, errlen, "draft is not supported in this build");
+    return -1;
+#endif
+}
+
+int ds4_session_dflash_draft(ds4_session *s, int anchor, int n_max, int *draft, char *err, size_t errlen) {
+#ifdef DS4_HAS_QWEN4_METAL
+    if (s && s->qwen4_graph_ready && s->qwen4_graph.dflash && !s->qwen35_verify_open) {
+        if (qwen4_session_replay_if_stale(s, err, errlen) != 0) return -1;
+        if (!s->checkpoint_valid) {
+            payload_set_err(err, errlen, "draft requires a synchronized checkpoint");
+            return -1;
+        }
+        return ds4_session_dflash_draft_at(s, (int)s->qwen4_graph.pos, anchor, n_max, draft, NULL, NULL,
+                                           err, errlen);
+    }
+#endif
+    return ds4_session_dflash_draft_at(s, 0, anchor, n_max, draft, NULL, NULL, err, errlen);
 }
 
 int ds4_session_dflash_ring(ds4_session *s, int block, int pos, float *k, float *v) {
