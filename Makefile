@@ -92,6 +92,7 @@ help:
 	@echo "  make test-qwen35-verify  Check the qwen35 verify-mode kernels against their one-row twins"
 	@echo "  make test-qwen4-vision  Compare the Qwen3.8 vision tower with HF (set DS4_QWEN4_SNAPSHOT, DS4_QWEN4_MMPROJ, DS4_QWEN4_IMAGE)"
 	@echo "  make test-qwen35-graph  Check the qwen35 verify rows against one-row dispatches"
+	@echo "  make test-qwen35-verify-live  G3: qwen35 verify and commit against serial evals (set DS4_QWEN35_MODEL, DS4_QWEN35_PROMPTS, DS4_QWEN35_FILLER)"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth  Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean        Remove build outputs"
@@ -770,6 +771,21 @@ else
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
 
+tests/test_qwen35_verify_live.o: tests/test_qwen35_verify_live.c ds4.h
+	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
+
+tests/test_qwen35_verify_live: tests/test_qwen35_verify_live.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+# G3 of the DFlash spec on the dense qwen35 model (Metal):
+# DS4_QWEN35_MODEL=<gguf> DS4_QWEN35_PROMPTS=<jsonl> DS4_QWEN35_FILLER=<text>,
+# DS4_QWEN35_VERIFY_LIVE_ARGS for --first, --prompts, --depths, --ctx
+.PHONY: test-qwen35-verify-live
+test-qwen35-verify-live: tests/test_qwen35_verify_live
+	@test -n "$(DS4_QWEN35_MODEL)" -a -n "$(DS4_QWEN35_PROMPTS)" -a -n "$(DS4_QWEN35_FILLER)" || \
+	  { echo "set DS4_QWEN35_MODEL, DS4_QWEN35_PROMPTS and DS4_QWEN35_FILLER"; exit 1; }
+	./tests/test_qwen35_verify_live "$(DS4_QWEN35_MODEL)" "$(DS4_QWEN35_PROMPTS)" "$(DS4_QWEN35_FILLER)" $(DS4_QWEN35_VERIFY_LIVE_ARGS)
+
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o ds4_metal.o ds4_cuda.o ds4_rocm.o tests/test_qwen4_cuda.o tests/test_qwen4_kernels.o tests/test_qwen4_ngram_state.o: ds4_qwen4_vision.h
 
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_tp.h ds4_gpu_mgpu.h ds4_linux_memory.h ds4_deepseek41_gpu.h ds4_deepseek41_cuda.cuh ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_qwen4_cuda.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h
@@ -1106,7 +1122,7 @@ clean:
 	rm -f tests/test_metal_tp_cancel
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 	rm -f tests/test_image_decode
-	rm -f tests/test_qwen4_kernels tests/test_qwen4_cuda tests/test_qwen4_vision tests/test_qwen4_prefill
+	rm -f tests/test_qwen4_kernels tests/test_qwen4_cuda tests/test_qwen4_vision tests/test_qwen4_prefill tests/test_qwen35_verify_live
 	rm -f speed-bench/session_concurrency_bench
 
 # The active tokenizer includes generated Unicode classes.
