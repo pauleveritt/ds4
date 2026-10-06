@@ -697,7 +697,7 @@ struct ds4_metal_args_qwen4_gdn_scan {
     uint32_t head_dim;
     uint32_t snap_tok;     /* copy the state after this token into snap_state (UINT32_MAX: never) */
     uint32_t snap2_tok;    /* second snapshot point for 3-row MTP verifies (UINT32_MAX: never) */
-    uint32_t pad1;
+    uint32_t no_store;     /* qwen35 verify: leave the state as it was */
     uint32_t pad2;
 };
 
@@ -759,6 +759,7 @@ kernel void kernel_qwen4_gdn_scan(
             for (uint i = 0; i < npt; i++) snap2row[i] = s[i];
         }
     }
+    if (args.no_store) return;
     for (uint i = 0; i < npt; i++) srow[i] = s[i];
 }
 
@@ -922,6 +923,7 @@ kernel void kernel_qwen4_gdn_scan_r4(
             for (uint r = 0; r < 4; r++) *(device float4 *)(snap2row + r * D) = s[r];
         }
     }
+    if (args.no_store) return;
     for (uint r = 0; r < 4; r++) *(device float4 *)(srow + r * D) = s[r];
 }
 
@@ -977,6 +979,30 @@ kernel void kernel_qwen35_gdn_out(
     const float r = rsqrt(ss / (float)D + args.eps);
     for (uint i = 0; i < npt; i++) {
         o[base + i] = o[base + i] * r * weight[tiisg * npt + i] * qwen4_silu(z[base + i]);
+    }
+}
+
+struct ds4_metal_args_qwen35_gdn_hist_commit {
+    uint32_t n_rows;
+    uint32_t conv_dim;
+    uint32_t conv_kernel;
+    uint32_t pad0;
+};
+
+/* The conv history half of a qwen35 verify's commit: entry t becomes entry
+ * n_rows + t of [history; saved rows], what n_rows passes of the front's
+ * shift would leave.  t rises and n_rows >= 1, so each read is of an entry
+ * not yet overwritten. */
+kernel void kernel_qwen35_gdn_hist_commit(
+        constant ds4_metal_args_qwen35_gdn_hist_commit & args,
+        device float       *state,    /* [K-1][C] */
+        device const float *saved,    /* [n_rows][C] pre-conv rows of the verify */
+        uint gid [[thread_position_in_grid]]) {
+    const uint C = args.conv_dim, K = args.conv_kernel;
+    if (gid >= C) return;
+    for (uint t = 0; t + 1 < K; t++) {
+        const uint j = args.n_rows + t;
+        state[t * C + gid] = j + 1 < K ? state[j * C + gid] : saved[(uint64_t)(j + 1 - K) * C + gid];
     }
 }
 
@@ -4651,7 +4677,7 @@ struct ds4_metal_args_qwen4_gdn_front {
     uint32_t row_bytes;
     uint32_t snap_tok;     /* copy the conv history after this token into snap_state */
     uint32_t snap2_tok;    /* second snapshot point for 3-row MTP verifies */
-    uint32_t pad1;
+    uint32_t save_rows;    /* qwen35 verify: leave the history, save the pre-conv rows */
     uint32_t pad2;
 };
 
@@ -4659,7 +4685,11 @@ struct ds4_metal_args_qwen4_gdn_front {
  * threadgroup per k-head owns q_h, k_h and the value heads tiled onto it
  * (j % Hk == h): its threads run the conv over those channels, then
  * simdgroups 0/1 normalize q/k and the others take the alpha/beta rows.
- * Tokens are walked in order; the conv history is advanced in place. */
+ * Tokens are walked in order; the conv history is advanced in place.  With
+ * save_rows (a qwen35 verify) the history stays as it was: each row's raw
+ * input goes to saved instead, and token tok's history entry t is entry
+ * tok + t of [history; saved rows], the value the advancing history would
+ * hold.  A channel stays on one thread, so it reads only its own writes. */
 kernel void kernel_qwen4_gdn_front(
         constant ds4_metal_args_qwen4_gdn_front & args,
         device float       *qkv,      /* [T][C] raw in; conv'd, q/k normalized out */
@@ -4674,6 +4704,7 @@ kernel void kernel_qwen4_gdn_front(
         device float       *gb,       /* [T][Hv] beta out */
         device float       *snap_state,
         device float       *snap2_state,
+        device float       *saved,    /* [T][C] pre-conv rows out under save_rows */
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]],
         ushort3 ntg [[threads_per_threadgroup]],
@@ -4695,9 +4726,18 @@ kernel void kernel_qwen4_gdn_front(
             const uint c = (grp == 0 ? h * D : grp == 1 ? Hk * D + h * D : 2 * Hk * D + (h + (grp - 2) * Hk) * D) + i;
             const float raw = row[c];
             float acc = conv_w[c * K + K - 1] * raw;
-            for (uint t = 0; t + 1 < K; t++) acc += conv_w[c * K + t] * state[t * C + c];
-            for (uint t = 0; t + 2 < K; t++) state[t * C + c] = state[(t + 1) * C + c];
-            state[(K - 2) * C + c] = raw;
+            if (args.save_rows) {
+                for (uint t = 0; t + 1 < K; t++) {
+                    const uint j = tok + t;
+                    const float hv = j + 1 < K ? state[j * C + c] : saved[(uint64_t)(j + 1 - K) * C + c];
+                    acc += conv_w[c * K + t] * hv;
+                }
+                saved[(uint64_t)tok * C + c] = raw;
+            } else {
+                for (uint t = 0; t + 1 < K; t++) acc += conv_w[c * K + t] * state[t * C + c];
+                for (uint t = 0; t + 2 < K; t++) state[t * C + c] = state[(t + 1) * C + c];
+                state[(K - 2) * C + c] = raw;
+            }
             row[c] = qwen4_silu(acc);
             if (tok == args.snap_tok) {
                 for (uint t = 0; t + 1 < K; t++) snap_state[t * C + c] = state[t * C + c];

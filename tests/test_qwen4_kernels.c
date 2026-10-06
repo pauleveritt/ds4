@@ -1840,6 +1840,113 @@ static void qwen35_graph_q6_K_rows(arena_t *a, uint32_t in_dim, uint32_t out_dim
     ds4_gpu_tensor_free(gone); ds4_gpu_tensor_free(gx);
 }
 
+static void graph_same_host(const char *what, const ds4_gpu_tensor *t, const void *host, uint64_t bytes,
+                            uint64_t row_bytes) {
+    uint8_t *x = malloc(bytes);
+    const uint8_t *y = host;
+    require_ok(ds4_gpu_tensor_read(t, 0, x, bytes), "qwen35 graph read");
+    for (uint64_t i = 0; i < bytes; i++) {
+        if (x[i] != y[i]) {
+            fprintf(stderr, "qwen35 graph: %s differs in row %llu at byte %llu (%02x vs %02x)\n", what,
+                    (unsigned long long)(i / row_bytes), (unsigned long long)(i % row_bytes), x[i], y[i]);
+            exit(1);
+        }
+    }
+    free(x);
+}
+
+/* DFlash S2.1: the verify's GDN front and scan without write-back, and the
+ * commit by recompute.  From one history and state, for T = 1..8 and
+ * n = 1..T: the verify over T rows leaves the history and the state
+ * byte-identical, saves the T pre-conv rows, and gives the post-front rows,
+ * decay, beta and scan output of T one-row dispatches; the commit of its
+ * first n rows (the history from the saved rows, the decode scan rerun from
+ * the untouched state) leaves the history and state of n one-row
+ * dispatches. */
+static void qwen35_graph_gdn_commit(arena_t *a, const char *shape, uint32_t Hk, uint32_t Hv, uint32_t D,
+                                    uint32_t E, uint32_t wtype) {
+    const uint32_t K = 4, C = 2 * Hk * D + Hv * D, vd = Hv * D, R = 8;
+    const uint64_t S = (uint64_t)Hv * D * D, Hn = (uint64_t)(K - 1) * C;
+    double *conv_w, *ssm_a, *dt, *alpha_w, *beta_w;
+    const uint64_t conv_off = arena_f32(a, (uint64_t)C * K, &conv_w, -0.5f, 0.5f);
+    const uint64_t a_off = arena_f32(a, Hv, &ssm_a, -8.0f, -0.1f);
+    const uint64_t dt_off = arena_f32(a, Hv, &dt, 0.2f, 1.5f);
+    const uint64_t alpha_off = wtype == 12u ? arena_q4_K(a, Hv, E, &alpha_w, 0.05f) : arena_q8_0(a, Hv, E, &alpha_w, 0.05f);
+    const uint64_t beta_off = wtype == 12u ? arena_q4_K(a, Hv, E, &beta_w, 0.05f) : arena_q8_0(a, Hv, E, &beta_w, 0.05f);
+    float *qkv = rand_vec((uint64_t)R * C, 1.0f), *mixed = rand_vec((uint64_t)R * E, 1.0f);
+    float *state0 = rand_vec(S, 0.1f), *hist0 = rand_vec(Hn, 1.0f);
+
+    /* One-row dispatches over all R rows; row t's results do not depend on
+     * the rows after it, so their first T rows serve every T. */
+    float *ref_h = malloc((uint64_t)R * Hn * 4u), *ref_s = malloc((uint64_t)R * S * 4u);
+    ds4_gpu_tensor *rq = upload(qkv, (uint64_t)R * C), *rm = upload(mixed, (uint64_t)R * E);
+    ds4_gpu_tensor *ra = upload(NULL, (uint64_t)R * Hv), *rb = upload(NULL, (uint64_t)R * Hv);
+    ds4_gpu_tensor *rs = upload(state0, S), *rh = upload(hist0, Hn), *ro = upload(NULL, (uint64_t)R * vd);
+    for (uint32_t t = 0; t < R; t++) {
+        ds4_gpu_tensor *vq = graph_row(rq, t, C), *va = graph_row(ra, t, Hv), *vb = graph_row(rb, t, Hv);
+        ds4_gpu_tensor *vm = graph_row(rm, t, E), *vo = graph_row(ro, t, vd);
+        require_ok(ds4_gpu_qwen4_gdn_front_tensor(vq, rh, vm, va, vb, a->base, a->size, conv_off, alpha_off,
+                                                  beta_off, a_off, dt_off, wtype, 1, Hk, Hv, D, K, E,
+                                                  NULL, 0u, NULL, 0u), "qwen35 gdn commit: one-row front");
+        require_ok(ds4_gpu_qwen4_gdn_scan_tensor(vo, rs, vq, va, vb, 1, Hk, Hv, D, NULL, 0u, NULL, 0u),
+                   "qwen35 gdn commit: one-row scan");
+        require_ok(ds4_gpu_tensor_read(rh, 0, ref_h + (uint64_t)t * Hn, Hn * 4u) &&
+                   ds4_gpu_tensor_read(rs, 0, ref_s + (uint64_t)t * S, S * 4u), "qwen35 gdn commit: one-row read");
+        ds4_gpu_tensor_free(vo); ds4_gpu_tensor_free(vm); ds4_gpu_tensor_free(vb);
+        ds4_gpu_tensor_free(va); ds4_gpu_tensor_free(vq);
+    }
+    float *ref_q = download(rq, (uint64_t)R * C), *ref_a = download(ra, (uint64_t)R * Hv);
+    float *ref_b = download(rb, (uint64_t)R * Hv), *ref_o = download(ro, (uint64_t)R * vd);
+
+    char name[160];
+    for (uint32_t T = 1; T <= R; T++) {
+        for (uint32_t n = 1; n <= T; n++) {
+            ds4_gpu_tensor *gq = upload(qkv, (uint64_t)T * C), *gm = upload(mixed, (uint64_t)T * E);
+            ds4_gpu_tensor *ga = upload(NULL, (uint64_t)T * Hv), *gb = upload(NULL, (uint64_t)T * Hv);
+            ds4_gpu_tensor *gs = upload(state0, S), *gh = upload(hist0, Hn);
+            ds4_gpu_tensor *go = upload(NULL, (uint64_t)T * vd), *gp = upload(NULL, (uint64_t)T * C);
+            ds4_gpu_tensor *gc = upload(NULL, (uint64_t)n * vd);
+            ds4_gpu_qwen35_set_verify_rows(T);
+            require_ok(ds4_gpu_qwen35_gdn_front_verify_tensor(gq, gh, gm, ga, gb, gp, a->base, a->size, conv_off,
+                                                              alpha_off, beta_off, a_off, dt_off, wtype, T, Hk,
+                                                              Hv, D, K, E), "qwen35 gdn commit: verify front");
+            require_ok(ds4_gpu_qwen35_gdn_scan_verify_tensor(go, gs, gq, ga, gb, T, Hk, Hv, D),
+                       "qwen35 gdn commit: verify scan");
+            ds4_gpu_qwen35_set_verify_rows(0);
+            const char *what[7] = { "conv history after the verify", "state after the verify",
+                                    "saved pre-conv rows", "post-front qkv", "decay", "beta", "scan output" };
+            const ds4_gpu_tensor *got[7] = { gh, gs, gp, gq, ga, gb, go };
+            const float *want[7] = { hist0, state0, qkv, ref_q, ref_a, ref_b, ref_o };
+            const uint64_t row[7] = { C, (uint64_t)D * D, C, C, Hv, Hv, vd };
+            const uint64_t cnt[7] = { Hn, S, (uint64_t)T * C, (uint64_t)T * C, (uint64_t)T * Hv,
+                                      (uint64_t)T * Hv, (uint64_t)T * vd };
+            for (int i = 0; i < 7; i++) {
+                snprintf(name, sizeof(name), "gdn commit %s T=%u n=%u %s", shape, T, n, what[i]);
+                graph_same_host(name, got[i], want[i], cnt[i] * 4u, row[i] * 4u);
+            }
+            require_ok(ds4_gpu_qwen35_gdn_hist_commit_tensor(gh, gp, n, C, K), "qwen35 gdn commit: history");
+            ds4_gpu_qwen35_set_verify_rows(n);
+            require_ok(ds4_gpu_qwen4_gdn_scan_tensor(gc, gs, gq, ga, gb, n, Hk, Hv, D, NULL, 0u, NULL, 0u),
+                       "qwen35 gdn commit: scan rerun");
+            ds4_gpu_qwen35_set_verify_rows(0);
+            snprintf(name, sizeof(name), "gdn commit %s T=%u n=%u committed conv history", shape, T, n);
+            graph_same_host(name, gh, ref_h + (uint64_t)(n - 1) * Hn, Hn * 4u, (uint64_t)C * 4u);
+            snprintf(name, sizeof(name), "gdn commit %s T=%u n=%u committed state", shape, T, n);
+            graph_same_host(name, gs, ref_s + (uint64_t)(n - 1) * S, S * 4u, (uint64_t)D * D * 4u);
+            ds4_gpu_tensor_free(gc); ds4_gpu_tensor_free(gp); ds4_gpu_tensor_free(go); ds4_gpu_tensor_free(gh);
+            ds4_gpu_tensor_free(gs); ds4_gpu_tensor_free(gb); ds4_gpu_tensor_free(ga); ds4_gpu_tensor_free(gm);
+            ds4_gpu_tensor_free(gq);
+        }
+    }
+    printf("  qwen35 gdn commit %s (%u/%u heads of %u, in %u, type %u): verify T=1..8 leaves history and state, "
+           "commit n=1..T byte-exact against n one-row dispatches\n", shape, Hk, Hv, D, E, wtype);
+    ds4_gpu_tensor_free(ro); ds4_gpu_tensor_free(rh); ds4_gpu_tensor_free(rs); ds4_gpu_tensor_free(rb);
+    ds4_gpu_tensor_free(ra); ds4_gpu_tensor_free(rm); ds4_gpu_tensor_free(rq);
+    free(ref_o); free(ref_b); free(ref_a); free(ref_q); free(ref_s); free(ref_h);
+    free(hist0); free(state0); free(mixed); free(qkv);
+    free(conv_w); free(ssm_a); free(dt); free(alpha_w); free(beta_w);
+}
+
 /* Shapes: A the 27B's, B small and odd, C Qwen3.8 Flash's for the kernels
  * the two share.  The random stream is restored afterwards, so the suite's
  * later tests see the inputs they saw before these were added. */
@@ -1856,6 +1963,9 @@ static void test_qwen35_graph(arena_t *a) {
     const uint32_t q6_shapes[][2] = {{256, 7}, {256, 13}, {5120, 1031}, {17408, 517}, {2560, 517}, {5120, 4099}};
     for (uint32_t i = 0; i < sizeof(q6_shapes) / sizeof(q6_shapes[0]); i++)
         qwen35_graph_q6_K_rows(a, q6_shapes[i][0], q6_shapes[i][1]);
+    qwen35_graph_gdn_commit(a, "A", 16, 48, 128, 5120, 12u);
+    qwen35_graph_gdn_commit(a, "B", 2, 6, 128, 256, 12u);
+    qwen35_graph_gdn_commit(a, "C", 16, 48, 128, 2560, 8u);
     g_rng = rng;
 }
 

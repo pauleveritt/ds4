@@ -3599,6 +3599,30 @@ int ds4_gpu_qwen4_gdn_front_tensor(
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
         uint32_t conv_kernel, uint32_t in_dim, ds4_gpu_tensor *snap_state, uint32_t snap_tok,
         ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
+/* qwen35 verify without write-back (Metal only, DFlash).  The front is
+ * ds4_gpu_qwen4_gdn_front_tensor without snapshots, except that the conv
+ * history is left as it was and each row's pre-conv input goes to
+ * saved_rows ([n_tokens][conv_dim]); the scan is ds4_gpu_qwen4_gdn_scan_tensor
+ * without snapshots, except that the state is left as it was. */
+int ds4_gpu_qwen35_gdn_front_verify_tensor(
+        ds4_gpu_tensor *qkv, ds4_gpu_tensor *state, const ds4_gpu_tensor *mixed,
+        ds4_gpu_tensor *ga, ds4_gpu_tensor *gb, ds4_gpu_tensor *saved_rows,
+        const void *model_map, uint64_t model_size, uint64_t conv_offset,
+        uint64_t alpha_offset, uint64_t beta_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
+        uint32_t weight_type, uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t conv_kernel, uint32_t in_dim);
+int ds4_gpu_qwen35_gdn_scan_verify_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
+        uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim);
+/* The conv history half of a verify's commit (Metal only): the history
+ * becomes the last conv_kernel - 1 rows of [history; saved_rows 0..n_rows-1].
+ * The state half is ds4_gpu_qwen4_gdn_scan_tensor over the same n_rows
+ * post-front rows from the state the verify left alone, with the verify rows
+ * set, its outputs discarded. */
+int ds4_gpu_qwen35_gdn_hist_commit_tensor(
+        ds4_gpu_tensor *state, const ds4_gpu_tensor *saved_rows,
+        uint32_t n_rows, uint32_t conv_dim, uint32_t conv_kernel);
 /* Encode one image: patches [n_patches][3*P*P] in 2x2 window order plus the
  * resampled position embedding [n_patches][n_embd]; out receives
  * [n_patches/4][n_out].  Weights are read from the mapped mmproj GGUF. */

@@ -48521,6 +48521,7 @@ enum {
     QWEN4_K_VIS_BIAS_RESIDUAL,
     QWEN4_K_VIS_BIAS_ACT,
     QWEN4_K_QWEN35_GDN_OUT,
+    QWEN4_K_QWEN35_GDN_HIST_COMMIT,
     QWEN4_K_COUNT,
 };
 
@@ -48627,6 +48628,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_vis_bias_residual",
     "kernel_qwen4_vis_bias_act",
     "kernel_qwen35_gdn_out",
+    "kernel_qwen35_gdn_hist_commit",
 };
 
 typedef struct {
@@ -49041,16 +49043,17 @@ void ds4_gpu_qwen35_set_verify_rows(uint32_t n_rows) {
     g_qwen35_verify_rows = n_rows <= 8u ? n_rows : 8u;
 }
 
-int ds4_gpu_qwen4_gdn_scan_tensor(
+/* no_store (a qwen35 verify) leaves the state as it was. */
+static int qwen4_gdn_scan_impl(
         ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *qkv,
         const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
         uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
         ds4_gpu_tensor *snap_state, uint32_t snap_tok,
-        ds4_gpu_tensor *snap2_state, uint32_t snap2_tok) {
+        ds4_gpu_tensor *snap2_state, uint32_t snap2_tok, bool no_store) {
     const uint64_t conv_dim = (uint64_t)(2u * n_k_head + n_v_head) * head_dim;
-    struct { uint32_t n_tokens, n_k_head, n_v_head, head_dim, snap_tok, snap2_tok, pad1, pad2; } args =
+    struct { uint32_t n_tokens, n_k_head, n_v_head, head_dim, snap_tok, snap2_tok, no_store, pad2; } args =
         { n_tokens, n_k_head, n_v_head, head_dim,
-          snap_state ? snap_tok : UINT32_MAX, snap2_state ? snap2_tok : UINT32_MAX, 0, 0 };
+          snap_state ? snap_tok : UINT32_MAX, snap2_state ? snap2_tok : UINT32_MAX, no_store ? 1u : 0u, 0 };
     const uint64_t state_bytes = (uint64_t)n_v_head * head_dim * head_dim * sizeof(float);
     qwen4_bind bd[7];
     if (n_tokens == 0 || head_dim < 32 || head_dim > 128 || (head_dim % 32) != 0 || n_k_head == 0 ||
@@ -49091,6 +49094,40 @@ int ds4_gpu_qwen4_gdn_scan_tensor(
     }
     return qwen4_dispatch(QWEN4_K_GDN_SCAN, &args, sizeof(args), bd, 7,
                           MTLSizeMake(head_dim, n_v_head, 1), MTLSizeMake(32, 1, 1), 0);
+}
+
+int ds4_gpu_qwen4_gdn_scan_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
+        uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        ds4_gpu_tensor *snap_state, uint32_t snap_tok,
+        ds4_gpu_tensor *snap2_state, uint32_t snap2_tok) {
+    return qwen4_gdn_scan_impl(out, state, qkv, a, b, n_tokens, n_k_head, n_v_head, head_dim,
+                               snap_state, snap_tok, snap2_state, snap2_tok, false);
+}
+
+int ds4_gpu_qwen35_gdn_scan_verify_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
+        uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim) {
+    return qwen4_gdn_scan_impl(out, state, qkv, a, b, n_tokens, n_k_head, n_v_head, head_dim,
+                               NULL, 0u, NULL, 0u, true);
+}
+
+int ds4_gpu_qwen35_gdn_hist_commit_tensor(
+        ds4_gpu_tensor *state, const ds4_gpu_tensor *saved_rows,
+        uint32_t n_rows, uint32_t conv_dim, uint32_t conv_kernel) {
+    struct { uint32_t n_rows, conv_dim, conv_kernel, pad0; } args = { n_rows, conv_dim, conv_kernel, 0 };
+    qwen4_bind bd[2];
+    if (n_rows == 0 || conv_dim == 0 || conv_kernel < 2 || conv_kernel > 4 ||
+        !qwen4_bind_tensor(&bd[0], state, (uint64_t)(conv_kernel - 1u) * conv_dim * sizeof(float),
+                           "gdn commit conv history") ||
+        !qwen4_bind_tensor(&bd[1], saved_rows, (uint64_t)n_rows * conv_dim * sizeof(float),
+                           "gdn commit saved rows")) {
+        return 0;
+    }
+    return qwen4_dispatch(QWEN4_K_QWEN35_GDN_HIST_COMMIT, &args, sizeof(args), bd, 2,
+                          MTLSizeMake((conv_dim + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1), 0);
 }
 
 static ds4_gpu_tensor *g_qwen4_gdn_slots;
@@ -50552,24 +50589,26 @@ int ds4_gpu_qwen4_mtp_combine_tensor(
                           MTLSizeMake((n + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1), 0);
 }
 
-int ds4_gpu_qwen4_gdn_front_tensor(
+/* saved_rows (a qwen35 verify) leaves the conv history as it was and
+ * receives the pre-conv rows. */
+static int qwen4_gdn_front_impl(
         ds4_gpu_tensor *qkv, ds4_gpu_tensor *state, const ds4_gpu_tensor *mixed,
         ds4_gpu_tensor *ga, ds4_gpu_tensor *gb,
         const void *model_map, uint64_t model_size, uint64_t conv_offset,
         uint64_t alpha_offset, uint64_t beta_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
         uint32_t conv_kernel, uint32_t in_dim, ds4_gpu_tensor *snap_state, uint32_t snap_tok,
-        ds4_gpu_tensor *snap2_state, uint32_t snap2_tok) {
+        ds4_gpu_tensor *snap2_state, uint32_t snap2_tok, ds4_gpu_tensor *saved_rows) {
     const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, in_dim);
     struct { uint32_t n_tokens, n_k_head, n_v_head, head_dim, conv_kernel, weight_type, in_dim, row_bytes,
-                      snap_tok, snap2_tok, pad1, pad2; } args =
+                      snap_tok, snap2_tok, save_rows, pad2; } args =
         { n_tokens, n_k_head, n_v_head, head_dim, conv_kernel, weight_type, in_dim, row_bytes,
-          snap_state ? snap_tok : UINT32_MAX, snap2_state ? snap2_tok : UINT32_MAX, 0, 0 };
+          snap_state ? snap_tok : UINT32_MAX, snap2_state ? snap2_tok : UINT32_MAX, saved_rows ? 1u : 0u, 0 };
     const uint64_t conv_dim = 2ull * n_k_head * head_dim + (uint64_t)n_v_head * head_dim;
     const uint64_t state_bytes = (uint64_t)(conv_kernel - 1) * conv_dim * sizeof(float);
     const uint64_t proj_bytes = (uint64_t)n_v_head * row_bytes;
     const uint64_t vhead_bytes = (uint64_t)n_v_head * sizeof(float);
-    qwen4_bind b[12];
+    qwen4_bind b[13];
     if (n_tokens == 0 || n_k_head == 0 || head_dim % 32 != 0 || n_v_head % n_k_head != 0 ||
         conv_kernel < 2 || conv_kernel > 4 || row_bytes == 0 ||
         !qwen4_bind_tensor(&b[0], qkv, (uint64_t)n_tokens * conv_dim * sizeof(float), "gdn front qkv") ||
@@ -50595,13 +50634,46 @@ int ds4_gpu_qwen4_gdn_front_tensor(
     } else {
         b[11] = b[1];
     }
+    if (saved_rows) {
+        if (!qwen4_bind_tensor(&b[12], saved_rows, (uint64_t)n_tokens * conv_dim * sizeof(float),
+                               "gdn front saved rows")) return 0;
+    } else {
+        b[12] = b[1];
+    }
     /* One threadgroup per key head: simdgroups 0/1 normalize, the rest take
      * the alpha/beta rows, and every channel's conv stays on one thread, so
      * the thread count only spreads the conv wider.  M5 measured 1024. */
     const uint64_t nth = ds4_gpu_env_u64("DS4_QWEN4_GDN_FRONT_THREADS",
                                          ds4_gpu_device_is_m5_apple_silicon() ? 1024u : 256u, 96u, 1024u);
-    return qwen4_dispatch(QWEN4_K_GDN_FRONT, &args, sizeof(args), b, 12,
+    return qwen4_dispatch(QWEN4_K_GDN_FRONT, &args, sizeof(args), b, 13,
                           MTLSizeMake(n_k_head, 1, 1), MTLSizeMake((NSUInteger)(nth / 32u * 32u), 1, 1), 0);
+}
+
+int ds4_gpu_qwen4_gdn_front_tensor(
+        ds4_gpu_tensor *qkv, ds4_gpu_tensor *state, const ds4_gpu_tensor *mixed,
+        ds4_gpu_tensor *ga, ds4_gpu_tensor *gb,
+        const void *model_map, uint64_t model_size, uint64_t conv_offset,
+        uint64_t alpha_offset, uint64_t beta_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
+        uint32_t weight_type, uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t conv_kernel, uint32_t in_dim, ds4_gpu_tensor *snap_state, uint32_t snap_tok,
+        ds4_gpu_tensor *snap2_state, uint32_t snap2_tok) {
+    return qwen4_gdn_front_impl(qkv, state, mixed, ga, gb, model_map, model_size, conv_offset, alpha_offset,
+                                beta_offset, ssm_a_offset, dt_bias_offset, weight_type, n_tokens, n_k_head,
+                                n_v_head, head_dim, conv_kernel, in_dim, snap_state, snap_tok, snap2_state,
+                                snap2_tok, NULL);
+}
+
+int ds4_gpu_qwen35_gdn_front_verify_tensor(
+        ds4_gpu_tensor *qkv, ds4_gpu_tensor *state, const ds4_gpu_tensor *mixed,
+        ds4_gpu_tensor *ga, ds4_gpu_tensor *gb, ds4_gpu_tensor *saved_rows,
+        const void *model_map, uint64_t model_size, uint64_t conv_offset,
+        uint64_t alpha_offset, uint64_t beta_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
+        uint32_t weight_type, uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t conv_kernel, uint32_t in_dim) {
+    if (!saved_rows) return 0;
+    return qwen4_gdn_front_impl(qkv, state, mixed, ga, gb, model_map, model_size, conv_offset, alpha_offset,
+                                beta_offset, ssm_a_offset, dt_bias_offset, weight_type, n_tokens, n_k_head,
+                                n_v_head, head_dim, conv_kernel, in_dim, NULL, 0u, NULL, 0u, saved_rows);
 }
 
 int ds4_gpu_qwen4_multi_gemv_tensor(
