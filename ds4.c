@@ -497,7 +497,7 @@ enum {
     DS4_MAX_EMBD             = 7168,
     DS4_MAX_VOCAB            = 248320,
     DS4_MAX_HEAD             = 128,
-    DS4_MAX_HEAD_KV          = 2,
+    DS4_MAX_HEAD_KV          = 4,
     DS4_MAX_HEAD_DIM         = 576,
     DS4_MAX_VALUE_DIM        = 512,
     DS4_MAX_ROT              = 64,
