@@ -1703,6 +1703,80 @@ static void qwen35_graph_row_ops(arena_t *a, const char *shape, uint32_t E, uint
     free(nw); free(qn); free(kn); free(gn);
 }
 
+/* The split count and keys per split a one-row dispatch takes for n_keys
+ * keys (ds4_gpu_qwen4_attn_decode_tensor with partials). */
+static void qwen35_attn_split(uint32_t n_keys, uint32_t split_keys, uint32_t *n_splits, uint32_t *keys_per_split) {
+    uint32_t n = (n_keys + split_keys - 1) / split_keys;
+    if (n < 1) n = 1;
+    if (n > 64) n = 64;
+    *n_splits = n;
+    *keys_per_split = (n_keys + n - 1) / n;
+}
+
+/* Verify attention over T rows at pos0 against T one-row decode dispatches
+ * at pos0 + t, split keys 32 as qwen35 decodes.  Depths about 100, 2,600
+ * and 9,700, and per split regime (below and at the 64-split cap) a pos0
+ * where row 0 and row T-1 split differently, checked on the host. */
+static void qwen35_graph_attention(const char *shape, uint32_t H, uint32_t Hkv, uint32_t D) {
+    const uint32_t R = 8, split_keys = 32, n_pos = 5;
+    const char *saved = getenv("DS4_QWEN4_ATTN_SPLIT_KEYS");
+    char *restore = saved ? strdup(saved) : NULL;
+    setenv("DS4_QWEN4_ATTN_SPLIT_KEYS", "32", 1);
+    const uint32_t pos_of[5] = { 100, 2600, 9700, 4 * split_keys - 1, 152 * 64 - 1 };
+    const uint32_t cap = pos_of[4] + R + 1;
+    const uint64_t qd = (uint64_t)H * D, kvd = (uint64_t)Hkv * D;
+    const float scale = 1.0f / sqrtf((float)D);
+    uint16_t *kh = malloc((uint64_t)cap * kvd * 2), *vh = malloc((uint64_t)cap * kvd * 2);
+    for (uint64_t i = 0; i < (uint64_t)cap * kvd; i++) { kh[i] = f32_to_f16(frand()); vh[i] = f32_to_f16(frand()); }
+    ds4_gpu_tensor *kc = ds4_gpu_tensor_alloc((uint64_t)cap * kvd * 2), *vc = ds4_gpu_tensor_alloc((uint64_t)cap * kvd * 2);
+    ds4_gpu_tensor *pos3 = upload(NULL, (uint64_t)cap * 4);
+    ds4_gpu_tensor *table = ds4_gpu_tensor_alloc((uint64_t)R * DS4_GPU_QWEN4_ATTN_ROW_BYTES);
+    require_ok(kc && vc && table && ds4_gpu_tensor_write(kc, 0, kh, (uint64_t)cap * kvd * 2) &&
+               ds4_gpu_tensor_write(vc, 0, vh, (uint64_t)cap * kvd * 2), "qwen35 attention: caches");
+    float *q = rand_vec((uint64_t)R * qd, 1.0f), *gate = rand_vec((uint64_t)R * qd, 1.0f);
+    ds4_gpu_tensor *gq = upload(q, (uint64_t)R * qd), *gg = upload(gate, (uint64_t)R * qd);
+    ds4_gpu_tensor *part1 = upload(NULL, ds4_gpu_qwen4_attn_part_floats(1, H, D));
+    ds4_gpu_tensor *partR = upload(NULL, ds4_gpu_qwen4_attn_part_floats(R, H, D));
+    char name[128];
+    for (uint32_t T = 1; T <= R; T++) {
+        for (uint32_t c = 0; c < n_pos; c++) {
+            const uint32_t pos0 = pos_of[c];
+            if (c >= 3 && T >= 2) {
+                uint32_t s0, k0, s1, k1;
+                qwen35_attn_split(pos0 + 1, split_keys, &s0, &k0);
+                qwen35_attn_split(pos0 + T, split_keys, &s1, &k1);
+                if (s0 == s1 && k0 == k1) {
+                    fprintf(stderr, "qwen35 attention: pos0 %u T=%u splits rows 0 and T-1 alike (%u x %u)\n",
+                            pos0, T, s0, k0);
+                    exit(1);
+                }
+            }
+            ds4_gpu_tensor *out[2] = { upload(NULL, (uint64_t)T * qd), upload(NULL, (uint64_t)T * qd) };
+            for (uint32_t t = 0; t < T; t++) {
+                ds4_gpu_tensor *vq = graph_row(gq, t, qd), *vg = graph_row(gg, t, qd), *vo = graph_row(out[0], t, qd);
+                require_ok(ds4_gpu_qwen4_attn_decode_tensor(vo, vq, vg, kc, vc, NULL, NULL, part1, 1, H, Hkv, D,
+                                                            pos0 + t, false, 0u, scale), "qwen35 attention: one row");
+                ds4_gpu_tensor_free(vo); ds4_gpu_tensor_free(vg); ds4_gpu_tensor_free(vq);
+            }
+            ds4_gpu_tensor *vq = graph_row(gq, 0, (uint64_t)T * qd), *vg = graph_row(gg, 0, (uint64_t)T * qd);
+            require_ok(ds4_gpu_qwen35_attn_verify_tensor(out[1], vq, vg, kc, vc, pos3, table, 0, partR, T, H, Hkv, D,
+                                                         pos0, scale), "qwen35 attention: verify rows");
+            ds4_gpu_tensor_free(vg); ds4_gpu_tensor_free(vq);
+            snprintf(name, sizeof(name), "attention %s T=%u pos0=%u output", shape, T, pos0);
+            graph_same_bytes(name, out[0], out[1], (uint64_t)T * qd * 4, qd * 4);
+            ds4_gpu_tensor_free(out[0]); ds4_gpu_tensor_free(out[1]);
+        }
+    }
+    printf("  qwen35 attention %s (%u/%u heads of %u): verify rows T=1..8 at pos0 %u, %u, %u and the split "
+           "boundaries %u, %u byte-exact against one row\n", shape, H, Hkv, D,
+           pos_of[0], pos_of[1], pos_of[2], pos_of[3], pos_of[4]);
+    if (restore) { setenv("DS4_QWEN4_ATTN_SPLIT_KEYS", restore, 1); free(restore); }
+    else unsetenv("DS4_QWEN4_ATTN_SPLIT_KEYS");
+    ds4_gpu_tensor_free(partR); ds4_gpu_tensor_free(part1); ds4_gpu_tensor_free(gg); ds4_gpu_tensor_free(gq);
+    ds4_gpu_tensor_free(table); ds4_gpu_tensor_free(pos3); ds4_gpu_tensor_free(vc); ds4_gpu_tensor_free(kc);
+    free(gate); free(q); free(vh); free(kh);
+}
+
 /* Shapes: A the 27B's, B small and odd, C Qwen3.8 Flash's for the kernels
  * the two share.  The random stream is restored afterwards, so the suite's
  * later tests see the inputs they saw before these were added. */
@@ -1714,6 +1788,8 @@ static void test_qwen35_graph(arena_t *a) {
     qwen35_graph_gdn(a, "C", 16, 48, 128, 2560, 8u);
     qwen35_graph_row_ops(a, "A", 5120, 17408, 24, 4, 256, 64, 48, 128);
     qwen35_graph_row_ops(a, "B", 256, 260, 4, 2, 128, 64, 6, 128);
+    qwen35_graph_attention("A", 24, 4, 256);
+    qwen35_graph_attention("C", 24, 2, 256);
     g_rng = rng;
 }
 

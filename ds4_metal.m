@@ -49732,6 +49732,32 @@ int ds4_gpu_qwen4_attn_decode_rows_tensor(
                           MTLSizeMake(n_head, n_rows, 1), MTLSizeMake(head_dim, 1, 1), 0);
 }
 
+int ds4_gpu_qwen35_attn_verify_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *pos3,
+        ds4_gpu_tensor *table, uint64_t entry0, ds4_gpu_tensor *part,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+        uint32_t pos0, float scale) {
+    /* Every row is a dense decode row on this layer's caches; the rows
+     * kernels read only K, V, pos and use_sel, so the indexer and block-key
+     * slots alias the K cache (the stage refuses NULL), and sel_tokens and
+     * n_sel bind q with a zero stride. */
+    if (n_tokens == 0 || n_tokens > QWEN4_ATTN_ROWS_MAX) return 0;
+    ds4_gpu_qwen4_attn_row rows[QWEN4_ATTN_ROWS_MAX];
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        rows[t].k_cache = k_cache;
+        rows[t].v_cache = v_cache;
+        rows[t].ik_cache = k_cache;
+        rows[t].block_key = k_cache;
+        rows[t].pos3 = pos3;
+        rows[t].pos = pos0 + t;
+        rows[t].use_sel = 0;
+    }
+    return ds4_gpu_qwen4_attn_rows_stage(table, entry0, rows, n_tokens, 1u) &&
+           ds4_gpu_qwen4_attn_decode_rows_tensor(out, q, gate, q, q, part, table, entry0, rows, n_tokens,
+                                                 n_head, n_head_kv, head_dim, 0u, scale);
+}
+
 int ds4_gpu_qwen4_moe_mid_tensor(
         ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
         const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,

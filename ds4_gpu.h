@@ -3438,6 +3438,17 @@ int ds4_gpu_qwen35_attn_prep_tensor(
         uint64_t g_q_offset, uint64_t g_k_offset,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
         uint32_t pos0, uint32_t cache_cap, float rope_base, float eps);
+/* qwen35 verify attention: row t of a batch at pos0 attends keys 0..pos0+t
+ * of one layer's caches with the key splits a one-row dispatch at that
+ * position takes.  table holds the rows from entry0
+ * (DS4_GPU_QWEN4_ATTN_ROW_BYTES each); part holds
+ * ds4_gpu_qwen4_attn_part_floats(n_tokens, ...) floats. */
+int ds4_gpu_qwen35_attn_verify_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *pos3,
+        ds4_gpu_tensor *table, uint64_t entry0, ds4_gpu_tensor *part,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+        uint32_t pos0, float scale);
 int ds4_gpu_qwen4_ple_gate_tensor(
         ds4_gpu_tensor *gated, ds4_gpu_tensor *normed, const ds4_gpu_tensor *R,
         const ds4_gpu_tensor *key, const ds4_gpu_tensor *value,
