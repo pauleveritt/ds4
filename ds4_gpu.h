@@ -3622,6 +3622,44 @@ int ds4_gpu_qwen4_mtp_stage_tensor(
 int ds4_gpu_qwen4_mtp_combine_tensor(
         ds4_gpu_tensor *R_out, const ds4_gpu_tensor *proj, uint32_t n_embd, uint32_t n_hc);
 
+/* DFlash2 drafter kernels (Metal only, metal/dflash.metal).
+ *
+ * head_norm_rope: per head of each row, RMS norm times the [head_dim] weight
+ * at weight_offset, then NeoX rope over the first rope_dims dims at position
+ * pos0 + row (base rope_base).  out may alias x. */
+int ds4_gpu_dflash_head_norm_rope_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_rows, uint32_t n_head, uint32_t head_dim, uint32_t pos0,
+        uint32_t rope_dims, float rope_base, float eps);
+/* The two-tap block convolution of one side (0 before the sublayer, 1 after
+ * it): dyn holds conv_proj's [n_rows][2*2*(n_embd/group)] output, the F32
+ * [2][2][n_embd] base sits at base_offset; row 0 of each block_rows block has
+ * no predecessor.  out must not alias x. */
+int ds4_gpu_dflash_conv_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const ds4_gpu_tensor *dyn,
+        const void *model_map, uint64_t model_size, uint64_t base_offset,
+        uint32_t n_rows, uint32_t block_rows, uint32_t n_embd, uint32_t group, uint32_t side);
+/* Non-causal windowed attention of a block's rows (row t at pos0 + t) over
+ * the ring slots holding a committed position tp (0 <= tp < pos0, within
+ * window of the row) and over every block row; f16 ring K/V, f32 block K/V,
+ * int32 ring tags (negative for empty). */
+int ds4_gpu_dflash_attn_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_blk, const ds4_gpu_tensor *v_blk,
+        const ds4_gpu_tensor *ring_k, const ds4_gpu_tensor *ring_v, const ds4_gpu_tensor *ring_pos,
+        uint32_t n_rows, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+        uint32_t ring_slots, uint32_t window, uint32_t pos0, float scale);
+/* The selector's lattice: for rows 1..n_rows-1, scores[t][j][i] is
+ * succ[cand[t][i]] . (pred[p] * gate[t]) + logits[t][cand[t][i]], p the
+ * anchor at row 1 and cand[t-1][j] after it; pred and succ are Q4_0
+ * [vocab][rank] tables in the model map.  Row 0 is left untouched. */
+int ds4_gpu_dflash_selector_tensor(
+        ds4_gpu_tensor *scores, const ds4_gpu_tensor *cand, const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *gate, const void *model_map, uint64_t model_size,
+        uint64_t pred_offset, uint64_t succ_offset,
+        uint32_t n_rows, uint32_t top_k, uint32_t rank, uint32_t vocab, uint32_t anchor);
+
 #ifdef __cplusplus
 }
 #endif

@@ -92,6 +92,7 @@ help:
 	@echo "  make test-qwen35-verify  Check the qwen35 verify-mode kernels against their one-row twins"
 	@echo "  make test-qwen4-vision  Compare the Qwen3.8 vision tower with HF (set DS4_QWEN4_SNAPSHOT, DS4_QWEN4_MMPROJ, DS4_QWEN4_IMAGE)"
 	@echo "  make test-qwen35-graph  Check the qwen35 verify rows against one-row dispatches"
+	@echo "  make test-dflash  Check the DFlash2 drafter kernels against a double reference"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth  Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean        Remove build outputs"
@@ -668,6 +669,10 @@ test-qwen4-vision: tests/test_qwen4_vision
 .PHONY: test-qwen35-graph
 test-qwen35-graph: $(QWEN4_KERNEL_TEST)
 	DS4_TEST_QWEN35_GRAPH_ONLY=1 ./$(QWEN4_KERNEL_TEST)
+
+.PHONY: test-dflash
+test-dflash: $(QWEN4_KERNEL_TEST)
+	DS4_TEST_DFLASH_ONLY=1 ./$(QWEN4_KERNEL_TEST)
 
 tests/test_glm53_kda_rocm.o: tests/test_glm53_kda.c ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
