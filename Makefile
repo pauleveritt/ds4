@@ -89,6 +89,7 @@ help:
 	@echo "  make test-mxfp4-metal  Check the MXFP4 half LUT, then run Metal MXFP4 exactness tests"
 	@echo "  make test-qwen4-kernels  Run the Qwen3.8 Metal kernel tests"
 	@echo "  make test-qwen4-q2       Check exact low-bit decode and prefill tile parity"
+	@echo "  make test-qwen35-verify  Check the qwen35 verify-mode kernels against their one-row twins"
 	@echo "  make test-qwen4-vision  Compare the Qwen3.8 vision tower with HF (set DS4_QWEN4_SNAPSHOT, DS4_QWEN4_MMPROJ, DS4_QWEN4_IMAGE)"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth  Run legacy MTP speculative verification smoke if MTP GGUF is present"
@@ -652,6 +653,10 @@ test-qwen4-kernels: $(QWEN4_KERNEL_TEST)
 test-qwen4-q2: $(QWEN4_KERNEL_TEST) tests/test_qwen4_moe_mm_specialize
 	DS4_TEST_QWEN4_MV_EXACT=1 ./$(QWEN4_KERNEL_TEST)
 	./tests/test_qwen4_moe_mm_specialize
+
+.PHONY: test-qwen35-verify
+test-qwen35-verify: $(QWEN4_KERNEL_TEST)
+	DS4_TEST_QWEN35_VERIFY_ONLY=1 ./$(QWEN4_KERNEL_TEST)
 
 # DS4_QWEN4_SNAPSHOT=<HF checkpoint dir> DS4_QWEN4_MMPROJ=<mmproj.gguf> DS4_QWEN4_IMAGE=<image>
 test-qwen4-vision: tests/test_qwen4_vision

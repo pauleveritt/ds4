@@ -230,6 +230,37 @@ static uint64_t arena_q4_K(arena_t *a, uint64_t rows, uint64_t cols, double **sh
     return off;
 }
 
+#ifdef __APPLE__
+/* q6_K rows: 210-byte super-blocks of 256 (ql nibbles, qh bit pairs, 16 int8
+ * scales, f16 d); element e of a block is d * scales[e/16] * (q - 32) */
+static uint64_t arena_q6_K(arena_t *a, uint64_t rows, uint64_t cols, double **shadow, float scale) {
+    const uint64_t blocks = cols / 256;
+    const uint64_t off = arena_alloc(a, rows * blocks * 210u);
+    uint8_t *w = a->base + off;
+    *shadow = malloc(rows * cols * sizeof(double));
+    for (uint64_t r = 0; r < rows; r++) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            uint8_t *blk = w + (r * blocks + b) * 210u;
+            uint8_t *ql = blk, *qh = blk + 128;
+            int8_t *sc = (int8_t *)(blk + 192);
+            const uint16_t dh = f32_to_f16(scale / 63.0f / 32.0f);
+            const float dq = f16_to_f32(dh);
+            memset(blk, 0, 192);
+            memcpy(blk + 208, &dh, 2);
+            for (int g = 0; g < 16; g++) sc[g] = (int8_t)(int)(63.0f * frand());
+            for (int e = 0; e < 256; e++) {
+                const int q = (int)(63.0f * (0.5f * frand() + 0.5f));
+                const int n = e / 128, k = (e % 128) / 32, l = e % 32;
+                ql[n * 64 + (k & 1) * 32 + l] |= (uint8_t)((q & 0xF) << ((k >> 1) * 4));
+                qh[n * 32 + l] |= (uint8_t)((q >> 4) << (2 * k));
+                (*shadow)[r * cols + b * 256 + e] = (double)dq * sc[e / 16] * (q - 32);
+            }
+        }
+    }
+    return off;
+}
+#endif
+
 /* q4_K rows with dyadic dequantized values (d a power of two, mins 0), so
  * d*sc*q is exactly representable in half and the weight-rounding share of
  * the error vanishes; the residual is activation rounding plus accumulation */
@@ -3528,6 +3559,49 @@ static void test_dense_mm_large(arena_t *a, uint32_t wtype) {
 }
 #endif
 
+#ifdef __APPLE__
+/* ---- qwen35 verify mode ---- */
+
+/* T rows of x (in_dim each) through a double weight shadow (out_dim rows) */
+static double *qwen35_mv_ref(const double *w, const float *x, uint32_t in_dim, uint32_t out_dim, uint32_t T) {
+    double *ref = malloc((uint64_t)T * out_dim * sizeof(double));
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t r = 0; r < out_dim; r++) {
+            double acc = 0.0;
+            for (uint32_t k = 0; k < in_dim; k++) acc += w[(uint64_t)r * in_dim + k] * x[(uint64_t)t * in_dim + k];
+            ref[(uint64_t)t * out_dim + r] = acc;
+        }
+    return ref;
+}
+
+/* the one-row Q6_K matvec against its double shadow: the reference the
+ * multi-row kernels are pinned to */
+static void test_qwen35_q6_K_one_row(arena_t *a, uint32_t in_dim, uint32_t out_dim) {
+    double *sh;
+    const uint64_t off = arena_q6_K(a, out_dim, in_dim, &sh, 0.5f);
+    float *x = rand_vec(in_dim, 1.0f);
+    double *ref = qwen35_mv_ref(sh, x, in_dim, out_dim, 1);
+    ds4_gpu_tensor *gx = upload(x, in_dim);
+    ds4_gpu_tensor *gout = upload(NULL, out_dim);
+    require_ok(ds4_gpu_matmul_q6_K_tensor(gout, a->base, a->size, off, in_dim, out_dim, gx, 1), "qwen35 Q6_K matvec");
+    char name[96];
+    snprintf(name, sizeof(name), "Q6_K matvec %u->%u", in_dim, out_dim);
+    check_tensor(name, gout, ref, out_dim, 1e-4);
+    free(ref); free(x); free(sh);
+    ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
+}
+
+/* DFlash verify mode, G1: the kernels a verify of up to 8 rows runs.
+ * Shapes: A the 27B's in-dims (5120, 17408), B small and odd (256 -> 7, 13). */
+static void test_qwen35_verify(arena_t *a) {
+    printf("qwen35 verify\n");
+    test_qwen35_q6_K_one_row(a, 256, 7);
+    test_qwen35_q6_K_one_row(a, 256, 13);
+    test_qwen35_q6_K_one_row(a, 5120, 1031);
+    test_qwen35_q6_K_one_row(a, 17408, 517);
+}
+#endif
+
 int main(void) {
     arena_t arena;
     arena.size = (uint64_t)1536 << 20;
@@ -3570,6 +3644,13 @@ int main(void) {
         printf("all Qwen MoE decode specialization tests passed\n");
         return 0;
     }
+#ifdef __APPLE__
+    if (getenv("DS4_TEST_QWEN35_VERIFY_ONLY")) {
+        test_qwen35_verify(&arena);
+        printf("all qwen35 verify tests passed\n");
+        return 0;
+    }
+#endif
     if (getenv("DS4_TEST_QWEN4_IDX_PREFILTER_ONLY")) { test_idx_prefilter(); printf("all qwen4 indexer prefilter tests passed\n"); return 0; }
     const char *q4k_ordered_only = getenv("DS4_TEST_QWEN4_Q4K_ORDERED_ONLY");
     if (q4k_ordered_only && q4k_ordered_only[0] && strcmp(q4k_ordered_only, "0") != 0) {
@@ -3713,6 +3794,9 @@ int main(void) {
     test_mtp(&arena, 64, 4);
     test_hc_norm_reuse(&arena);
     test_gdn_prefill_dispatch();
+#ifdef __APPLE__
+    test_qwen35_verify(&arena);
+#endif
     printf("all qwen4 kernel tests passed\n");
     return 0;
 }
