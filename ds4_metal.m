@@ -4787,6 +4787,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_QWEN4_SOURCE",      @"metal/qwen4.metal"],
         @[@"DS4_METAL_QWEN4_VISION_SOURCE", @"metal/qwen4_vision.metal"],
         @[@"DS4_METAL_QWEN35_MMA_SOURCE", @"metal/qwen35_mma.metal"],
+        @[@"DS4_METAL_DFLASH_SOURCE",     @"metal/dflash.metal"],
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
@@ -51030,4 +51031,137 @@ int ds4_gpu_qwen4_hc_mix_rows_tensor(ds4_gpu_tensor *mixed, const ds4_gpu_tensor
     }
     return qwen4_dispatch(QWEN4_K_HC_MIX_ROWS, &args, sizeof(args), b, 3,
                           MTLSizeMake((n_embd + 255) / 256, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
+}
+
+/* DFlash2 drafter kernels (metal/dflash.metal): one dispatch per wrapper,
+ * weights bound from the model map by offset like the Qwen3.8 wrappers. */
+
+static int dflash_dispatch(const char *name, const void *args, size_t args_len,
+                           const qwen4_bind *binds, int n_binds, MTLSize grid, MTLSize tg) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(name);
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:args length:args_len atIndex:0];
+        for (int i = 0; i < n_binds; i++) {
+            [enc setBuffer:binds[i].buf offset:binds[i].off atIndex:(NSUInteger)(i + 1)];
+        }
+        [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, name);
+    }
+}
+
+int ds4_gpu_dflash_head_norm_rope_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_rows, uint32_t n_head, uint32_t head_dim, uint32_t pos0,
+        uint32_t rope_dims, float rope_base, float eps) {
+    struct {
+        uint32_t n_rows, n_head, head_dim, rope_dims, pos0; float eps; uint32_t pad0, pad1;
+        float inv_freq[128];
+    } args = { n_rows, n_head, head_dim, rope_dims, pos0, eps, 0, 0, { 0 } };
+    if (n_rows == 0 || n_head == 0 || head_dim == 0 || head_dim > 256u || (head_dim % 32u) != 0 ||
+        (rope_dims % 2u) != 0 || rope_dims > head_dim || !(rope_base > 0.0f)) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < rope_dims / 2u; i++) {
+        args.inv_freq[i] = (float)pow((double)rope_base, -2.0 * (double)i / (double)rope_dims);
+    }
+    const uint64_t bytes = (uint64_t)n_rows * n_head * head_dim * sizeof(float);
+    qwen4_bind b[3];
+    if (!qwen4_bind_tensor(&b[0], x, bytes, "dflash head input") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, weight_offset, (uint64_t)head_dim * sizeof(float),
+                           "dflash head norm") ||
+        !qwen4_bind_tensor(&b[2], out, bytes, "dflash head output")) {
+        return 0;
+    }
+    return dflash_dispatch("kernel_dflash_head_norm_rope", &args, sizeof(args), b, 3,
+                           MTLSizeMake(n_head, n_rows, 1), MTLSizeMake(32, 1, 1));
+}
+
+int ds4_gpu_dflash_conv_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const ds4_gpu_tensor *dyn,
+        const void *model_map, uint64_t model_size, uint64_t base_offset,
+        uint32_t n_rows, uint32_t block_rows, uint32_t n_embd, uint32_t group, uint32_t side) {
+    struct { uint32_t n_rows, block_rows, n_embd, group, side, pad0, pad1, pad2; } args =
+        { n_rows, block_rows, n_embd, group, side, 0, 0, 0 };
+    if (n_rows == 0 || block_rows == 0 || n_embd == 0 || group == 0 || (n_embd % group) != 0 || side > 1u ||
+        out == x) {
+        return 0;
+    }
+    const uint64_t rows_bytes = (uint64_t)n_rows * n_embd * sizeof(float);
+    qwen4_bind b[4];
+    if (!qwen4_bind_tensor(&b[0], x, rows_bytes, "dflash conv input") ||
+        !qwen4_bind_tensor(&b[1], dyn, (uint64_t)n_rows * 4u * (n_embd / group) * sizeof(float),
+                           "dflash conv coefficients") ||
+        !qwen4_bind_weight(&b[2], model_map, model_size, base_offset, 4ull * n_embd * sizeof(float),
+                           "dflash conv base") ||
+        !qwen4_bind_tensor(&b[3], out, rows_bytes, "dflash conv output")) {
+        return 0;
+    }
+    return dflash_dispatch("kernel_dflash_conv", &args, sizeof(args), b, 4,
+                           MTLSizeMake((n_embd + 255u) / 256u, n_rows, 1), MTLSizeMake(256, 1, 1));
+}
+
+int ds4_gpu_dflash_attn_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_blk, const ds4_gpu_tensor *v_blk,
+        const ds4_gpu_tensor *ring_k, const ds4_gpu_tensor *ring_v, const ds4_gpu_tensor *ring_pos,
+        uint32_t n_rows, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+        uint32_t ring_slots, uint32_t window, uint32_t pos0, float scale) {
+    struct { uint32_t n_rows, n_head, n_head_kv, head_dim, ring_slots, window, pos0; float scale; } args =
+        { n_rows, n_head, n_head_kv, head_dim, ring_slots, window, pos0, scale };
+    if (n_rows == 0 || n_head == 0 || n_head_kv == 0 || (n_head % n_head_kv) != 0 ||
+        head_dim == 0 || head_dim > 256u || (head_dim % 32u) != 0 || ring_slots == 0 || window == 0) {
+        return 0;
+    }
+    const uint64_t q_bytes = (uint64_t)n_rows * n_head * head_dim * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)n_rows * n_head_kv * head_dim * sizeof(float);
+    const uint64_t ring_bytes = (uint64_t)ring_slots * n_head_kv * head_dim * sizeof(uint16_t);
+    qwen4_bind b[7];
+    if (!qwen4_bind_tensor(&b[0], q, q_bytes, "dflash attention q") ||
+        !qwen4_bind_tensor(&b[1], k_blk, kv_bytes, "dflash block k") ||
+        !qwen4_bind_tensor(&b[2], v_blk, kv_bytes, "dflash block v") ||
+        !qwen4_bind_tensor(&b[3], ring_k, ring_bytes, "dflash ring k") ||
+        !qwen4_bind_tensor(&b[4], ring_v, ring_bytes, "dflash ring v") ||
+        !qwen4_bind_tensor(&b[5], ring_pos, (uint64_t)ring_slots * sizeof(int32_t), "dflash ring tags") ||
+        !qwen4_bind_tensor(&b[6], out, q_bytes, "dflash attention output")) {
+        return 0;
+    }
+    return dflash_dispatch("kernel_dflash_attn", &args, sizeof(args), b, 7,
+                           MTLSizeMake(n_head, n_rows, 1), MTLSizeMake(32, 4, 1));
+}
+
+int ds4_gpu_dflash_selector_tensor(
+        ds4_gpu_tensor *scores, const ds4_gpu_tensor *cand, const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *gate, const void *model_map, uint64_t model_size,
+        uint64_t pred_offset, uint64_t succ_offset,
+        uint32_t n_rows, uint32_t top_k, uint32_t rank, uint32_t vocab, uint32_t anchor) {
+    const uint64_t row_bytes = (uint64_t)(rank / 32u) * 18u;
+    struct { uint32_t n_rows, top_k, rank, vocab, anchor, pad0; uint64_t row_bytes; } args =
+        { n_rows, top_k, rank, vocab, anchor, 0, row_bytes };
+    if (n_rows < 2u || top_k == 0 || top_k > 16u || rank == 0 || rank > 1024u || (rank % 32u) != 0 ||
+        vocab == 0 || anchor >= vocab) {
+        return 0;
+    }
+    qwen4_bind b[6];
+    if (!qwen4_bind_tensor(&b[0], cand, (uint64_t)n_rows * top_k * sizeof(int32_t), "dflash candidates") ||
+        !qwen4_bind_tensor(&b[1], logits, (uint64_t)n_rows * vocab * sizeof(float), "dflash logits") ||
+        !qwen4_bind_tensor(&b[2], gate, (uint64_t)n_rows * rank * sizeof(float), "dflash selector gate") ||
+        !qwen4_bind_weight(&b[3], model_map, model_size, pred_offset, (uint64_t)vocab * row_bytes,
+                           "dflash selector predecessor") ||
+        !qwen4_bind_weight(&b[4], model_map, model_size, succ_offset, (uint64_t)vocab * row_bytes,
+                           "dflash selector successor") ||
+        !qwen4_bind_tensor(&b[5], scores, (uint64_t)n_rows * top_k * top_k * sizeof(float),
+                           "dflash selector scores")) {
+        return 0;
+    }
+    return dflash_dispatch("kernel_dflash_selector", &args, sizeof(args), b, 6,
+                           MTLSizeMake(top_k, n_rows - 1u, 1), MTLSizeMake(32u * top_k, 1, 1));
 }

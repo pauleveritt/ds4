@@ -2989,6 +2989,7 @@ typedef enum {
     DS4_SUPPORT_NONE = 0,
     DS4_SUPPORT_MTP_LEGACY,
     DS4_SUPPORT_DSPARK,
+    DS4_SUPPORT_DFLASH,
 } ds4_support_kind;
 
 static bool model_get_u32_any(const ds4_model *m, const char *const *keys,
@@ -3281,6 +3282,7 @@ static const char *support_kind_name(ds4_support_kind kind) {
     switch (kind) {
     case DS4_SUPPORT_MTP_LEGACY: return "legacy MTP";
     case DS4_SUPPORT_DSPARK:     return "DSpark";
+    case DS4_SUPPORT_DFLASH:     return "DFlash";
     case DS4_SUPPORT_NONE:       return "none";
     }
     return "unknown";
@@ -3293,6 +3295,15 @@ static ds4_support_kind support_model_detect(
     if (stages_out) *stages_out = 0;
     if (summary_out) memset(summary_out, 0, sizeof(*summary_out));
     if (!m) return DS4_SUPPORT_NONE;
+
+    /* A DFlash2 drafter in llama.cpp's layout (the selector marks DFlash2;
+     * DFlash1 and llama.cpp's DSpark lack it and stay unsupported). */
+    ds4_str arch = {0};
+    if (model_get_string(m, "general.architecture", &arch) &&
+        ds4_streq(arch, "dflash") &&
+        model_find_tensor(m, "selector_hidden.weight")) {
+        return DS4_SUPPORT_DFLASH;
+    }
 
     ds4_dspark_summary s = model_dspark_summary(m);
     if (summary_out) *summary_out = s;
@@ -4795,6 +4806,101 @@ typedef struct {
     bool has_target_layers;
     ds4_dspark_stage_weights stage[DS4_DSPARK_MAX_STAGES];
 } ds4_dspark_weights;
+
+/* A DFlash2 drafter for dense qwen35 (llama.cpp's dflash architecture): its
+ * own shapes, never the target's DS4_* shape macros. */
+#define DS4_DFLASH_MAX_BLOCKS 8
+#define DS4_DFLASH_MAX_TARGET_LAYERS 8
+#define DS4_DFLASH_MAX_BLOCK_SIZE 16
+#define DS4_DFLASH_RING 2048u        /* ring slots per drafter block */
+#define DS4_DFLASH_DEFAULT_DRAFTS 7
+
+typedef struct {
+    ds4_tensor *attn_norm;
+    ds4_tensor *attn_conv_proj;
+    ds4_tensor *attn_conv_base;
+    ds4_tensor *attn_q;
+    ds4_tensor *attn_k;
+    ds4_tensor *attn_v;
+    ds4_tensor *attn_q_norm;
+    ds4_tensor *attn_k_norm;
+    ds4_tensor *attn_output;
+    ds4_tensor *ffn_norm;
+    ds4_tensor *ffn_conv_proj;
+    ds4_tensor *ffn_conv_base;
+    ds4_tensor *ffn_gate;
+    ds4_tensor *ffn_up;
+    ds4_tensor *ffn_down;
+} ds4_dflash_block_weights;
+
+typedef struct {
+    uint32_t n_block;
+    uint32_t n_embd;
+    uint32_t n_ff;
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t head_dim;
+    uint32_t window;
+    uint32_t block_size;
+    uint32_t conv_kernel;
+    uint32_t conv_group;
+    uint32_t selector_rank;
+    uint32_t selector_top_k;
+    uint32_t mask_token;
+    uint32_t n_draft;            /* drafts per block: n_max, <= block_size - 1 */
+    uint32_t n_target_layers;
+    uint32_t target_layers[DS4_DFLASH_MAX_TARGET_LAYERS];
+    uint32_t rope_dims;
+    float rope_base;
+    float rms_eps;
+    uint64_t mapped_bytes;
+    ds4_tensor *fc;
+    ds4_tensor *enc_output_norm;
+    ds4_tensor *output_norm;
+    ds4_tensor *selector_hidden;
+    ds4_tensor *selector_pred;
+    ds4_tensor *selector_succ;
+    ds4_dflash_block_weights block[DS4_DFLASH_MAX_BLOCKS];
+} ds4_dflash_weights;
+
+/* The loaded drafter's part of the dense qwen35 memory plan: set when an
+ * engine opens with a drafter, cleared when it closes (one engine per
+ * process, as for g_ds4_shape). */
+static const ds4_dflash_weights *g_ds4_dflash_plan;
+
+/* A DFlash drafter's buffers in the dense qwen35 plan, in bytes, at the
+ * drafter's shapes: [0] the feature capture (a window of rows, every tap),
+ * [1] the per-block K/V rings with their position tags, [2] the GDN commit
+ * rows (pre-conv rows, post-front rows, decay and beta for 8 rows per GDN
+ * layer), [3] the verify buffers (8-row attention partials and rows table,
+ * 7 more logit rows and the 8-row host copy), [4] drafter activations (one
+ * injection sub-batch of 256 rows and one block's rows).
+ * qwen35_graph_verify_alloc allocates [3] on the first verify-mode forward;
+ * [0], [1], [2] and [4] belong to steps not written yet (S4's capture and
+ * ring, S2's commit rows, S5's activations) and are counted from the DFlash
+ * spec's section 3.9 so the plan admits them from the start. */
+static uint64_t dflash_plan_buffers(const ds4_dflash_weights *dw, uint64_t parts[5]) {
+    const uint64_t E = dw->n_embd, kv_dim = (uint64_t)dw->n_head_kv * dw->head_dim;
+    const uint64_t q_dim = (uint64_t)dw->n_head * dw->head_dim;
+    const uint64_t conv_rows = 2ull * dw->conv_kernel * (E / dw->conv_group);
+    const uint64_t rows = 8u;
+    uint32_t n_attn = 0, n_lin = 0;
+    for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
+        if (ds4_qwen4_layer_is_linear(il)) n_lin++;
+        else n_attn++;
+    }
+    parts[0] = (uint64_t)dw->window * dw->n_target_layers * E * sizeof(float);
+    parts[1] = (uint64_t)dw->n_block * DS4_DFLASH_RING * (2u * kv_dim * sizeof(uint16_t) + sizeof(int32_t));
+    parts[2] = (uint64_t)n_lin * rows * (2u * DS4_N_LIN_CONV_DIM + 2u * DS4_N_LIN_V_HEAD) * sizeof(float);
+    parts[3] = rows * DS4_N_HEAD * 64u * (2u + DS4_N_HEAD_DIM) * sizeof(float) +
+               (uint64_t)n_attn * rows * 64u +
+               (2u * rows - 1u) * DS4_N_VOCAB * sizeof(float);
+    parts[4] = (256u * (E + 2u * kv_dim) +
+                (uint64_t)dw->block_size * (8u * E + 3u * dw->n_ff + 3u * q_dim + 2u * kv_dim + 2u * conv_rows +
+                                            DS4_N_VOCAB + dw->selector_top_k * (1u + dw->selector_top_k) +
+                                            dw->selector_rank)) * sizeof(float);
+    return parts[0] + parts[1] + parts[2] + parts[3] + parts[4];
+}
 
 /* =========================================================================
  * Fixed Weight Binding and Model Validation.
@@ -9132,6 +9238,290 @@ static void dspark_weights_bind_optional(
     }
 
     dspark_weights_validate_layout(dw);
+}
+
+/* DFlash drafter binding.  Every check names the GGUF field it rejects, so a
+ * refused drafter says which key or tensor to look at. */
+static bool dflash_refuse(char *err, size_t errlen, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(err, errlen, fmt, ap);
+    va_end(ap);
+    return false;
+}
+
+static bool dflash_key_u32(const ds4_model *m, const char *key, uint32_t *out,
+                           char *err, size_t errlen) {
+    uint64_t v = 0;
+    if (!model_get_u64_compat(m, key, &v)) return dflash_refuse(err, errlen, "%s is missing", key);
+    if (v > UINT32_MAX) return dflash_refuse(err, errlen, "%s %" PRIu64 " is out of range", key, v);
+    *out = (uint32_t)v;
+    return true;
+}
+
+static ds4_tensor *dflash_tensor(const ds4_model *m, const char *name, uint32_t type,
+                                 uint64_t d0, uint64_t d1, uint64_t d2,
+                                 char *err, size_t errlen) {
+    ds4_tensor *t = model_find_tensor(m, name);
+    const uint32_t ndim = d2 ? 3u : d1 ? 2u : 1u;
+    if (!t) {
+        dflash_refuse(err, errlen, "tensor %s is missing", name);
+        return NULL;
+    }
+    if (t->type != type) {
+        dflash_refuse(err, errlen, "tensor %s has type %s, expected %s",
+                      name, tensor_type_name(t->type), tensor_type_name(type));
+        return NULL;
+    }
+    if (t->ndim != ndim || t->dim[0] != d0 || (ndim > 1u && t->dim[1] != d1) ||
+        (ndim > 2u && t->dim[2] != d2)) {
+        dflash_refuse(err, errlen,
+                      "tensor %s has shape [%" PRIu64 ", %" PRIu64 ", %" PRIu64 "], expected [%" PRIu64
+                      ", %" PRIu64 ", %" PRIu64 "]",
+                      name, t->dim[0], t->ndim > 1u ? t->dim[1] : 0, t->ndim > 2u ? t->dim[2] : 0,
+                      d0, d1, d2);
+        return NULL;
+    }
+    return t;
+}
+
+/* The dflash.* keys this engine reads; any other changes the drafter's
+ * arithmetic in a way the drafter graph does not implement. */
+static bool dflash_key_known(ds4_str key) {
+    static const char *const known[] = {
+        "dflash.block_count", "dflash.context_length", "dflash.embedding_length",
+        "dflash.feed_forward_length", "dflash.attention.head_count", "dflash.attention.head_count_kv",
+        "dflash.attention.causal", "dflash.rope.freq_base", "dflash.attention.layer_norm_rms_epsilon",
+        "dflash.attention.key_length", "dflash.attention.value_length", "dflash.block_size",
+        "dflash.conv_kernel_size", "dflash.conv_group_size", "dflash.selector_rank",
+        "dflash.selector_top_k", "dflash.target_layers", "dflash.attention.sliding_window",
+        "dflash.attention.sliding_window_pattern", "dflash.rope.dimension_sections",
+        "dflash.sample_from_anchor",
+    };
+    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+        if (ds4_streq(key, known[i])) return true;
+    }
+    return false;
+}
+
+/* Bind a DFlash2 drafter (llama.cpp's dflash architecture with the DFlash2
+ * selector) and check it against the open dense qwen35 target: width,
+ * vocabulary, target layers, mask token, block size, head shapes and Q4_0/F32
+ * types.  requested_drafts <= 0 takes the default n_max of 7; it is clamped
+ * to block_size - 1, the positions a block drafts after its anchor. */
+static bool dflash_weights_bind(ds4_dflash_weights *dw, const ds4_model *m,
+                                int requested_drafts, char *err, size_t errlen) {
+    memset(dw, 0, sizeof(*dw));
+    const uint32_t target_width = DS4_N_EMBD, target_vocab = DS4_N_VOCAB;
+    const uint32_t target_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+
+    for (uint64_t i = 0; i < m->n_kv; i++) {
+        ds4_str key = m->kv[i].key;
+        if (ds4_str_starts_with(key, "dflash.") && !dflash_key_known(key)) {
+            return dflash_refuse(err, errlen, "%.*s is not supported", (int)key.len, key.ptr);
+        }
+    }
+    bool causal = true;
+    if (!model_get_bool(m, "dflash.attention.causal", &causal)) {
+        return dflash_refuse(err, errlen, "dflash.attention.causal is missing");
+    }
+    if (causal) return dflash_refuse(err, errlen, "dflash.attention.causal is true, expected false");
+
+    if (!dflash_key_u32(m, "dflash.embedding_length", &dw->n_embd, err, errlen)) return false;
+    if (dw->n_embd != target_width) {
+        return dflash_refuse(err, errlen, "dflash.embedding_length %u differs from the target's width %u",
+                             dw->n_embd, target_width);
+    }
+    if (!dflash_key_u32(m, "dflash.block_count", &dw->n_block, err, errlen)) return false;
+    if (dw->n_block == 0 || dw->n_block > DS4_DFLASH_MAX_BLOCKS) {
+        return dflash_refuse(err, errlen, "dflash.block_count %u is outside 1..%u",
+                             dw->n_block, DS4_DFLASH_MAX_BLOCKS);
+    }
+    if (!dflash_key_u32(m, "dflash.feed_forward_length", &dw->n_ff, err, errlen)) return false;
+    if (dw->n_ff == 0 || (dw->n_ff % 32u) != 0) {
+        return dflash_refuse(err, errlen, "dflash.feed_forward_length %u is not a positive multiple of 32",
+                             dw->n_ff);
+    }
+    uint32_t key_len = 0, value_len = 0;
+    if (!dflash_key_u32(m, "dflash.attention.head_count", &dw->n_head, err, errlen) ||
+        !dflash_key_u32(m, "dflash.attention.head_count_kv", &dw->n_head_kv, err, errlen) ||
+        !dflash_key_u32(m, "dflash.attention.key_length", &key_len, err, errlen) ||
+        !dflash_key_u32(m, "dflash.attention.value_length", &value_len, err, errlen)) {
+        return false;
+    }
+    if (key_len != 128u || value_len != 128u) {
+        return dflash_refuse(err, errlen, "dflash.attention.key_length/value_length %u/%u, expected 128/128",
+                             key_len, value_len);
+    }
+    dw->head_dim = key_len;
+    if (dw->n_head == 0 || dw->n_head_kv == 0 || (dw->n_head % dw->n_head_kv) != 0) {
+        return dflash_refuse(err, errlen,
+                             "dflash.attention.head_count %u is not a multiple of head_count_kv %u",
+                             dw->n_head, dw->n_head_kv);
+    }
+    if (!dflash_key_u32(m, "dflash.attention.sliding_window", &dw->window, err, errlen)) return false;
+    if (dw->window == 0 || dw->window > DS4_DFLASH_RING) {
+        return dflash_refuse(err, errlen, "dflash.attention.sliding_window %u is outside 1..%u",
+                             dw->window, DS4_DFLASH_RING);
+    }
+    ds4_array_ref pattern = {0};
+    if (!model_get_array(m, "dflash.attention.sliding_window_pattern", &pattern) ||
+        pattern.type != GGUF_VALUE_BOOL || pattern.len != dw->n_block) {
+        return dflash_refuse(err, errlen,
+                             "dflash.attention.sliding_window_pattern is not %u booleans", dw->n_block);
+    }
+    for (uint64_t i = 0; i < pattern.len; i++) {
+        if (m->map[pattern.data_pos + i] == 0) {
+            return dflash_refuse(err, errlen,
+                                 "dflash.attention.sliding_window_pattern[%" PRIu64 "] is false", i);
+        }
+    }
+    if (!model_get_f32_compat(m, "dflash.rope.freq_base", &dw->rope_base) || !(dw->rope_base > 0.0f)) {
+        return dflash_refuse(err, errlen, "dflash.rope.freq_base is missing or not positive");
+    }
+    if (!model_get_f32_compat(m, "dflash.attention.layer_norm_rms_epsilon", &dw->rms_eps) ||
+        !(dw->rms_eps > 0.0f)) {
+        return dflash_refuse(err, errlen, "dflash.attention.layer_norm_rms_epsilon is missing or not positive");
+    }
+    /* llama.cpp ropes an M-RoPE target's drafter with sections [n_rot/2, 0,
+     * 0, 0]: every pair takes the temporal position, which is NeoX over all
+     * head dims; without sections it is NeoX too. */
+    dw->rope_dims = dw->head_dim;
+    ds4_array_ref sections = {0};
+    if (model_get_array(m, "dflash.rope.dimension_sections", &sections)) {
+        uint32_t sec[4] = {0}, n_sec = 0;
+        static const char *const key[] = { "dflash.rope.dimension_sections" };
+        if (sections.len != 4 ||
+            !model_get_u32_array_any(m, key, 1, sec, 4, &n_sec) || n_sec != 4 ||
+            sec[0] != dw->head_dim / 2u || sec[1] || sec[2] || sec[3]) {
+            return dflash_refuse(err, errlen, "dflash.rope.dimension_sections is not [%u, 0, 0, 0]",
+                                 dw->head_dim / 2u);
+        }
+    }
+    if (!dflash_key_u32(m, "dflash.block_size", &dw->block_size, err, errlen)) return false;
+    if (dw->block_size < 2u || dw->block_size > DS4_DFLASH_MAX_BLOCK_SIZE) {
+        return dflash_refuse(err, errlen, "dflash.block_size %u is outside 2..%u",
+                             dw->block_size, DS4_DFLASH_MAX_BLOCK_SIZE);
+    }
+    if (!dflash_key_u32(m, "dflash.conv_kernel_size", &dw->conv_kernel, err, errlen)) return false;
+    if (dw->conv_kernel != 2u) {
+        return dflash_refuse(err, errlen, "dflash.conv_kernel_size %u, expected 2", dw->conv_kernel);
+    }
+    if (!dflash_key_u32(m, "dflash.conv_group_size", &dw->conv_group, err, errlen)) return false;
+    if (dw->conv_group == 0 || (dw->n_embd % dw->conv_group) != 0 ||
+        ((2u * dw->conv_kernel * (dw->n_embd / dw->conv_group)) % 32u) != 0) {
+        return dflash_refuse(err, errlen, "dflash.conv_group_size %u does not divide the width %u",
+                             dw->conv_group, dw->n_embd);
+    }
+    if (!dflash_key_u32(m, "dflash.selector_rank", &dw->selector_rank, err, errlen)) return false;
+    if (dw->selector_rank == 0 || (dw->selector_rank % 32u) != 0 || dw->selector_rank > 1024u) {
+        return dflash_refuse(err, errlen, "dflash.selector_rank %u is not a multiple of 32 up to 1024",
+                             dw->selector_rank);
+    }
+    if (!dflash_key_u32(m, "dflash.selector_top_k", &dw->selector_top_k, err, errlen)) return false;
+    if (dw->selector_top_k == 0 || dw->selector_top_k > 16u) {
+        return dflash_refuse(err, errlen, "dflash.selector_top_k %u is outside 1..16", dw->selector_top_k);
+    }
+
+    static const char *const target_key[] = { "dflash.target_layers" };
+    ds4_array_ref taps = {0};
+    if (!model_get_array(m, "dflash.target_layers", &taps) || taps.len == 0 ||
+        taps.len > DS4_DFLASH_MAX_TARGET_LAYERS ||
+        !model_get_u32_array_any(m, target_key, 1, dw->target_layers,
+                                 DS4_DFLASH_MAX_TARGET_LAYERS, &dw->n_target_layers) ||
+        dw->n_target_layers != taps.len) {
+        return dflash_refuse(err, errlen, "dflash.target_layers is missing or not 1..%u integers",
+                             DS4_DFLASH_MAX_TARGET_LAYERS);
+    }
+    /* llama.cpp's ids are the HF layer ids plus one: id k taps the output of
+     * target block k - 1, so it lies in 1..n_layer. */
+    for (uint32_t i = 0; i < dw->n_target_layers; i++) {
+        if (dw->target_layers[i] < 1u || dw->target_layers[i] > target_layers) {
+            return dflash_refuse(err, errlen, "dflash.target_layers[%u] = %u is outside the target's 1..%u",
+                                 i, dw->target_layers[i], target_layers);
+        }
+    }
+
+    ds4_array_ref tokens = {0};
+    if (!model_get_array(m, "tokenizer.ggml.tokens", &tokens) || tokens.len != target_vocab) {
+        return dflash_refuse(err, errlen, "tokenizer.ggml.tokens holds %" PRIu64 " tokens, the target %u",
+                             tokens.len, target_vocab);
+    }
+    int mask = -1;
+    if (!model_get_token_id(m, "tokenizer.ggml.mask_token_id", &mask)) {
+        return dflash_refuse(err, errlen, "tokenizer.ggml.mask_token_id is missing");
+    }
+    if ((uint32_t)mask >= target_vocab) {
+        return dflash_refuse(err, errlen, "tokenizer.ggml.mask_token_id %d is not below the vocabulary %u",
+                             mask, target_vocab);
+    }
+    dw->mask_token = (uint32_t)mask;
+    dw->n_draft = requested_drafts > 0 ? (uint32_t)requested_drafts : DS4_DFLASH_DEFAULT_DRAFTS;
+    if (dw->n_draft > dw->block_size - 1u) dw->n_draft = dw->block_size - 1u;
+
+    const uint64_t E = dw->n_embd, F = dw->n_ff, D = dw->head_dim;
+    const uint64_t q_dim = (uint64_t)dw->n_head * D, kv_dim = (uint64_t)dw->n_head_kv * D;
+    const uint64_t conv_rows = 2ull * dw->conv_kernel * (E / dw->conv_group);
+    const uint32_t Q = DS4_TENSOR_Q4_0, F32 = DS4_TENSOR_F32;
+#define DFLASH_BIND(dst, name, type, d0, d1, d2) \
+    do { if (!((dst) = dflash_tensor(m, (name), (type), (d0), (d1), (d2), err, errlen))) return false; } while (0)
+    DFLASH_BIND(dw->fc, "fc.weight", Q, (uint64_t)dw->n_target_layers * E, E, 0);
+    DFLASH_BIND(dw->enc_output_norm, "enc.output_norm.weight", F32, E, 0, 0);
+    DFLASH_BIND(dw->output_norm, "output_norm.weight", F32, E, 0, 0);
+    DFLASH_BIND(dw->selector_hidden, "selector_hidden.weight", Q, E, dw->selector_rank, 0);
+    DFLASH_BIND(dw->selector_pred, "selector_predecessor.weight", Q, dw->selector_rank, target_vocab, 0);
+    DFLASH_BIND(dw->selector_succ, "selector_successor.weight", Q, dw->selector_rank, target_vocab, 0);
+    for (uint32_t il = 0; il < dw->n_block; il++) {
+        ds4_dflash_block_weights *b = &dw->block[il];
+        char name[96];
+#define DFLASH_BIND_BLOCK(field, suffix, type, d0, d1, d2) \
+        do { snprintf(name, sizeof(name), "blk.%u.%s", il, (suffix)); \
+             DFLASH_BIND(b->field, name, (type), (d0), (d1), (d2)); } while (0)
+        DFLASH_BIND_BLOCK(attn_norm, "attn_norm.weight", F32, E, 0, 0);
+        DFLASH_BIND_BLOCK(attn_conv_proj, "attn_conv_proj.weight", Q, E, conv_rows, 0);
+        DFLASH_BIND_BLOCK(attn_conv_base, "attn_conv_base", F32, E, dw->conv_kernel, 2);
+        DFLASH_BIND_BLOCK(attn_q, "attn_q.weight", Q, E, q_dim, 0);
+        DFLASH_BIND_BLOCK(attn_k, "attn_k.weight", Q, E, kv_dim, 0);
+        DFLASH_BIND_BLOCK(attn_v, "attn_v.weight", Q, E, kv_dim, 0);
+        DFLASH_BIND_BLOCK(attn_q_norm, "attn_q_norm.weight", F32, D, 0, 0);
+        DFLASH_BIND_BLOCK(attn_k_norm, "attn_k_norm.weight", F32, D, 0, 0);
+        DFLASH_BIND_BLOCK(attn_output, "attn_output.weight", Q, q_dim, E, 0);
+        DFLASH_BIND_BLOCK(ffn_norm, "ffn_norm.weight", F32, E, 0, 0);
+        DFLASH_BIND_BLOCK(ffn_conv_proj, "ffn_conv_proj.weight", Q, E, conv_rows, 0);
+        DFLASH_BIND_BLOCK(ffn_conv_base, "ffn_conv_base", F32, E, dw->conv_kernel, 2);
+        DFLASH_BIND_BLOCK(ffn_gate, "ffn_gate.weight", Q, E, F, 0);
+        DFLASH_BIND_BLOCK(ffn_up, "ffn_up.weight", Q, E, F, 0);
+        DFLASH_BIND_BLOCK(ffn_down, "ffn_down.weight", Q, F, E, 0);
+#undef DFLASH_BIND_BLOCK
+    }
+#undef DFLASH_BIND
+
+    /* Anything else (its own token_embd or output head, d2t, DSpark's Markov
+     * head, post norms, sinks, rope factors) changes what the graph computes. */
+    const uint64_t bound = 6ull + 15ull * dw->n_block;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        bool found = t == dw->fc || t == dw->enc_output_norm || t == dw->output_norm ||
+                     t == dw->selector_hidden || t == dw->selector_pred || t == dw->selector_succ;
+        for (uint32_t il = 0; il < dw->n_block && !found; il++) {
+            const ds4_dflash_block_weights *b = &dw->block[il];
+            found = t == b->attn_norm || t == b->attn_conv_proj || t == b->attn_conv_base ||
+                    t == b->attn_q || t == b->attn_k || t == b->attn_v || t == b->attn_q_norm ||
+                    t == b->attn_k_norm || t == b->attn_output || t == b->ffn_norm ||
+                    t == b->ffn_conv_proj || t == b->ffn_conv_base || t == b->ffn_gate ||
+                    t == b->ffn_up || t == b->ffn_down;
+        }
+        if (!found) {
+            return dflash_refuse(err, errlen, "tensor %.*s is not part of a DFlash2 drafter",
+                                 (int)t->name.len, t->name.ptr);
+        }
+    }
+    if (m->n_tensors != bound) {
+        return dflash_refuse(err, errlen, "the drafter holds %" PRIu64 " tensors, expected %" PRIu64,
+                             m->n_tensors, bound);
+    }
+    dw->mapped_bytes = m->size > m->tensor_data_pos ? m->size - m->tensor_data_pos : 0;
+    return true;
 }
 
 static void weights_free(ds4_weights *w) {
@@ -39971,6 +40361,13 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         m.scratch_bytes += (uint64_t)n_lin *
             (v_dim * DS4_N_LIN_HEAD_DIM + (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM) * sizeof(float);
         m.total_bytes = m.raw_bytes + m.scratch_bytes;
+        if (g_ds4_dflash_plan) {
+            /* a loaded DFlash drafter: its buffers, and its mapped tensors in
+             * the total (the print shows them as their own term) */
+            uint64_t parts[5];
+            m.scratch_bytes += dflash_plan_buffers(g_ds4_dflash_plan, parts);
+            m.total_bytes = m.raw_bytes + m.scratch_bytes + g_ds4_dflash_plan->mapped_bytes;
+        }
         return m;
     }
     if (ds4_backend_uses_graph(backend) && ds4_model_is_qwen4()) {
@@ -42570,6 +42967,7 @@ struct ds4_engine {
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
     ds4_dspark_weights dspark_weights;
+    ds4_dflash_weights dflash_weights;
 #ifndef DS4_NO_GPU
     ds4_glm53_vision_weights vision_weights;
     ds4_deepseek4_vision_weights deepseek4_vision_weights;
@@ -42620,6 +43018,7 @@ struct ds4_engine {
     ds4_engine_tp_state tp;
     bool metal_ready;
     bool mtp_ready;
+    bool dflash_ready;          /* a DFlash drafter is bound (dense qwen35) */
     bool vision_ready;
     bool vision_map_ready;
     bool share_session_prefill_workspace;
@@ -42775,6 +43174,8 @@ static void ds4_engine_print_startup_memory(
     total = ds4_add_sat_u64(total, resident_model_bytes);
     total = ds4_add_sat_u64(total, dynamic_expert_cache_bytes);
     total = ds4_add_sat_u64(total, expert_reserved_bytes);
+    const uint64_t drafter_bytes = e->dflash_ready ? e->dflash_weights.mapped_bytes : 0;
+    total = ds4_add_sat_u64(total, drafter_bytes);
 
     const bool color = ds4_log_is_tty(stderr);
     const char *green = color ? "\x1b[32m" : "";
@@ -42800,11 +43201,25 @@ static void ds4_engine_print_startup_memory(
                 " + prefill expert reserve %.2f GiB",
                 ds4_bytes_to_gib(expert_reserved_bytes));
     }
+    if (drafter_bytes != 0) {
+        fprintf(stderr, " + drafter %.2f GiB", ds4_bytes_to_gib(drafter_bytes));
+    }
     fprintf(stderr,
             " = %s%.2f GiB planned%s\n",
             bright_green,
             ds4_bytes_to_gib(total),
             reset);
+    if (e->dflash_ready && ds4_model_is_qwen35()) {
+        uint64_t parts[5];
+        const uint64_t buffers = dflash_plan_buffers(&e->dflash_weights, parts);
+        const double mib = 1048576.0;
+        fprintf(stderr,
+                "%sds4: memory detail: dflash buffers %.1f MiB in the buffers above: capture %.1f, "
+                "rings %.1f, GDN commit rows %.1f, verify %.1f, activations %.1f "
+                "(capture, rings, commit rows and activations from spec section 3.9)%s\n",
+                green, (double)buffers / mib, (double)parts[0] / mib, (double)parts[1] / mib,
+                (double)parts[2] / mib, (double)parts[3] / mib, (double)parts[4] / mib, reset);
+    }
 
     fprintf(stderr,
             "%sds4: memory detail: ctx=%d prefill_cap=%u raw_kv_rows=%u "
@@ -71417,6 +71832,56 @@ int ds4_engine_create_with_gpu_config(ds4_engine **out,
     return ds4_engine_open_internal(out, opt, gpu_cfg);
 }
 
+/* The support model opened as a DFlash drafter: admitted only for a dense
+ * qwen35 target, as a DFlash2 drafter that fits the target.  A refusal
+ * names the field that fails. */
+static bool engine_dflash_load(ds4_engine *e, const ds4_engine_options *opt) {
+    char err[320] = {0};
+    if (!ds4_model_is_qwen35()) {
+        fprintf(stderr, "ds4: DFlash drafter %s refused: a DFlash drafter needs a dense qwen35 target, not %s\n",
+                opt->mtp_path, DS4_MODEL_SHAPE_NAME);
+        return false;
+    }
+    if (e->support_kind != DS4_SUPPORT_DFLASH) {
+        ds4_str arch = {0};
+        const bool dflash_arch = model_get_string(&e->mtp_model, "general.architecture", &arch) &&
+                                 ds4_streq(arch, "dflash");
+        if (dflash_arch && model_find_tensor(&e->mtp_model, "markov_w1.weight")) {
+            snprintf(err, sizeof(err), "markov_w1.weight marks a DSpark drafter; only DFlash2 drafters are supported");
+        } else if (dflash_arch) {
+            snprintf(err, sizeof(err), "selector_hidden.weight is missing: a DFlash1 drafter; only DFlash2 drafters are supported");
+        } else if (e->support_kind != DS4_SUPPORT_NONE) {
+            snprintf(err, sizeof(err), "a %s support model; only DFlash2 drafters are supported",
+                     support_kind_name(e->support_kind));
+        } else {
+            snprintf(err, sizeof(err), "general.architecture is %.*s, expected dflash",
+                     (int)arch.len, arch.ptr ? arch.ptr : "");
+        }
+        fprintf(stderr, "ds4: DFlash drafter %s refused: %s\n", opt->mtp_path, err);
+        return false;
+    }
+    ds4_dflash_weights *dw = &e->dflash_weights;
+    if (!dflash_weights_bind(dw, &e->mtp_model, opt->mtp_draft_tokens, err, sizeof(err))) {
+        fprintf(stderr, "ds4: DFlash drafter %s refused: %s\n", opt->mtp_path, err);
+        return false;
+    }
+    char taps[96] = {0};
+    for (uint32_t i = 0, n = 0; i < dw->n_target_layers && n < sizeof(taps); i++) {
+        n += (uint32_t)snprintf(taps + n, sizeof(taps) - n, "%s%u", i ? "," : "", dw->target_layers[i] - 1u);
+    }
+    fprintf(stderr,
+            "ds4: DFlash drafter loaded: %s (%u blocks, width %u, ffn %u, %u/%u heads of %u, "
+            "window %u, block %u, %u drafts, taps after target blocks %s, mask token %u, "
+            "neox rope %u dims base %.0f, selector rank %u top %u; %.2f GiB mapped)\n",
+            opt->mtp_path, dw->n_block, dw->n_embd, dw->n_ff, dw->n_head, dw->n_head_kv, dw->head_dim,
+            dw->window, dw->block_size, dw->n_draft, taps, dw->mask_token,
+            dw->rope_dims, (double)dw->rope_base, dw->selector_rank, dw->selector_top_k,
+            (double)dw->mapped_bytes / 1073741824.0);
+    e->dflash_ready = true;
+    g_ds4_dflash_plan = dw;
+    return true;
+}
+
 static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
                                      const ds4_gpu_config *gpu_cfg) {
@@ -71567,7 +72032,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             (gpu_cfg && gpu_cfg->n_gpus > 1) ||
             opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice ||
             e->ssd_streaming || opt->dspark || e->power_percent != 100 ||
-            (opt->mtp_path && opt->mtp_path[0])) {
+            (opt->mtp_path && opt->mtp_path[0] && !ds4_model_is_qwen35())) {
             fprintf(stderr, "ds4: Qwen3.8 requires Metal or single-GPU CUDA (or --cpu --first-token-test); "
                             "tensor parallelism, pipeline execution, SSD streaming, DSpark, "
                             "external MTP models and power throttling are not supported\n");
@@ -72103,7 +72568,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        if (e->support_kind == DS4_SUPPORT_MTP_LEGACY) {
+        if (ds4_model_is_qwen4() || e->support_kind == DS4_SUPPORT_DFLASH) {
+            if (!engine_dflash_load(e, opt)) {
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+        } else if (e->support_kind == DS4_SUPPORT_MTP_LEGACY) {
             if (opt->tp.role != DS4_TP_NONE) {
                 fprintf(stderr,
                         "ds4: legacy MTP support is ignored under tensor parallelism; "
@@ -72611,7 +73082,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                        tp_shard_rank);
         }
         const bool support_model_runtime_ready =
-            e->mtp_ready ||
+            e->mtp_ready || e->dflash_ready ||
             (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
         bool support_uses_secondary_rocm_cache = false;
 #ifdef DS4_ROCM_BUILD
@@ -72831,6 +73302,10 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
 bool ds4_engine_is_qwen4(ds4_engine *e) {
     (void)e;
     return ds4_model_is_qwen4();
+}
+
+bool ds4_engine_has_dflash(ds4_engine *e) {
+    return e && e->dflash_ready;
 }
 
 void ds4_engine_sampling_defaults(ds4_engine *e, float *temperature,
@@ -73636,6 +74111,7 @@ void ds4_engine_close(ds4_engine *e) {
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
+    if (g_ds4_dflash_plan == &e->dflash_weights) g_ds4_dflash_plan = NULL;
     if (e->mtp_model.map) model_close(&e->mtp_model);
     if (e->vision_model.map) model_close(&e->vision_model);
     model_close(&e->model);

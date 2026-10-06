@@ -178,6 +178,12 @@ typedef struct {
     ds4_tp_options tp;
 } ds4_engine_options;
 
+/* DFlash (dense qwen35 only): mtp_path may name a DFlash2 drafter GGUF
+ * (llama.cpp's dflash architecture); mtp_draft_tokens is then n_max, 7 when
+ * 0, clamped to the drafter's block_size - 1.  The engine checks the drafter
+ * against the target at open and refuses a mismatch naming the field. */
+bool ds4_engine_has_dflash(ds4_engine *e);
+
 typedef struct {
     float *data;
     uint32_t token_count;
