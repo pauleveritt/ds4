@@ -58594,14 +58594,22 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
     return true;
 }
 
-/* Forget every drafter position: nothing is pending, nothing captured.  A
- * reset, a payload load or a fresh test sequence starts here. */
-static bool qwen35_dflash_forget(ds4_qwen35_dflash *d, uint32_t pos) {
-    if (!d) return true;
+/* Positions below pos count as injected: nothing is pending, nothing
+ * captured; the ring stays as it is (a payload trailer restored it). */
+static void qwen35_dflash_resume(ds4_qwen35_dflash *d, uint32_t pos) {
+    if (!d) return;
     d->inject_pos = pos;
     d->feat_end = pos;
     d->cap_hi = pos;
     d->cap_from = 0;
+}
+
+/* Forget every drafter position: nothing is pending, nothing captured, the
+ * ring empty.  A reset, a payload load without a trailer or a fresh test
+ * sequence starts here. */
+static bool qwen35_dflash_forget(ds4_qwen35_dflash *d, uint32_t pos) {
+    if (!d) return true;
+    qwen35_dflash_resume(d, pos);
     int32_t empty[DS4_DFLASH_RING];
     for (uint32_t i = 0; i < DS4_DFLASH_RING; i++) empty[i] = -1;
     return ds4_gpu_tensor_write(d->ring_pos, 0, empty, sizeof(empty)) != 0;
@@ -64028,6 +64036,7 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 #ifdef DS4_HAS_QWEN4_GPU
 static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows);
 static uint64_t qwen35_payload_tensor_bytes(uint32_t rows);
+static uint64_t qwen35_dflash_payload_bytes(const ds4_qwen35_dflash *d);
 #endif
 
 bool ds4_session_supports_payload(ds4_session *s) {
@@ -64045,7 +64054,9 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
         bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
         bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);
         const uint32_t rows = (uint32_t)s->checkpoint.len;
-        if (ds4_model_is_qwen35()) return bytes + qwen35_payload_tensor_bytes(rows);
+        if (ds4_model_is_qwen35()) {
+            return bytes + qwen35_payload_tensor_bytes(rows) + qwen35_dflash_payload_bytes(s->qwen4_graph.dflash);
+        }
         const uint32_t mtp_rows = s->qwen4_graph.mtp_pos < rows ? s->qwen4_graph.mtp_pos : rows;
         bytes += qwen4_payload_tensor_bytes(rows, mtp_rows);
         return bytes;
@@ -64246,6 +64257,84 @@ static uint64_t qwen35_payload_tensor_bytes(uint32_t rows) {
     return bytes;
 }
 
+/* The DFlash trailer of a qwen35 payload (DFlash spec section 3.8), written
+ * when the session has a drafter, after its pending rows are injected: the
+ * tag, the ring geometry (slots, blocks, K/V width) and the position the
+ * ring is injected to (the payload's rows), the slots' position tags, then
+ * per block the ring's f16 K and V.  The drafter is advisory, so the
+ * trailer only keeps its speed across a resume: a loader whose drafter has
+ * the same geometry restores the ring, any other loader skips it, and a
+ * payload without one starts with an empty ring.  The bytes left after the
+ * payload tell whether it is there, so the payload version stays. */
+#define DS4_DFLASH_PAYLOAD_TAG 0x324c4644u   /* "DFL2" */
+#define DS4_DFLASH_TRAILER_U32 5u
+
+static uint64_t qwen35_dflash_trailer_bytes(uint32_t slots, uint32_t blocks, uint32_t kv) {
+    return (uint64_t)DS4_DFLASH_TRAILER_U32 * sizeof(uint32_t) + (uint64_t)slots * sizeof(int32_t) +
+           (uint64_t)blocks * 2u * slots * kv * sizeof(uint16_t);
+}
+
+static uint64_t qwen35_dflash_payload_bytes(const ds4_qwen35_dflash *d) {
+    if (!d) return 0;
+    return qwen35_dflash_trailer_bytes(DS4_DFLASH_RING, d->dw->n_block, d->dw->n_head_kv * d->dw->head_dim);
+}
+
+static int qwen35_dflash_save_trailer(const ds4_qwen35_dflash *d, uint32_t rows, FILE *fp, uint8_t *buf,
+                                      char *err, size_t errlen) {
+    const uint32_t kv = d->dw->n_head_kv * d->dw->head_dim;
+    const uint32_t h[DS4_DFLASH_TRAILER_U32] = { DS4_DFLASH_PAYLOAD_TAG, DS4_DFLASH_RING, d->dw->n_block, kv, rows };
+    for (uint32_t i = 0; i < DS4_DFLASH_TRAILER_U32; i++) {
+        if (payload_write_u32(fp, h[i], err, errlen) != 0) return 1;
+    }
+    const uint64_t ring_bytes = (uint64_t)DS4_DFLASH_RING * kv * sizeof(uint16_t);
+    int rc = payload_write_tensor_span(fp, d->ring_pos, 0, (uint64_t)DS4_DFLASH_RING * sizeof(int32_t),
+                                       buf, DS4_SESSION_IO_CHUNK, err, errlen);
+    for (uint32_t b = 0; rc == 0 && b < d->dw->n_block; b++) {
+        rc = payload_write_tensor_span(fp, d->ring_k[b], 0, ring_bytes, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        if (rc == 0) rc = payload_write_tensor_span(fp, d->ring_v[b], 0, ring_bytes, buf, DS4_SESSION_IO_CHUNK,
+                                                    err, errlen);
+    }
+    return rc;
+}
+
+/* With *remaining bytes left after a qwen35 payload of `rows` rows: none is
+ * no trailer; a trailer goes into d's ring when d is a drafter of its
+ * geometry and it was injected to `rows` (*restored set), else is skipped;
+ * anything else fails the load. */
+static int qwen35_dflash_load_trailer(ds4_qwen35_dflash *d, uint32_t rows, FILE *fp, uint8_t *buf,
+                                      uint64_t *remaining, bool *restored, char *err, size_t errlen) {
+    *restored = false;
+    if (*remaining == 0) return 0;
+    uint32_t h[DS4_DFLASH_TRAILER_U32];
+    for (uint32_t i = 0; i < DS4_DFLASH_TRAILER_U32; i++) {
+        if (*remaining < sizeof(uint32_t) || payload_read_u32(fp, &h[i], remaining, err, errlen) != 0) {
+            payload_set_err(err, errlen, "KV checkpoint has trailing bytes that are not a DFlash trailer");
+            return 1;
+        }
+    }
+    if (h[0] != DS4_DFLASH_PAYLOAD_TAG || h[1] == 0 || h[1] > (1u << 20) || h[2] == 0 ||
+        h[2] > DS4_DFLASH_MAX_BLOCKS || h[3] == 0 || h[3] > (1u << 16) ||
+        qwen35_dflash_trailer_bytes(h[1], h[2], h[3]) - DS4_DFLASH_TRAILER_U32 * sizeof(uint32_t) != *remaining) {
+        payload_set_err(err, errlen, "KV checkpoint has trailing bytes that are not a DFlash trailer");
+        return 1;
+    }
+    if (!d || h[1] != DS4_DFLASH_RING || h[2] != d->dw->n_block || h[3] != d->dw->n_head_kv * d->dw->head_dim ||
+        h[4] != rows) {
+        return payload_skip_bytes(fp, *remaining, buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+    }
+    const uint64_t ring_bytes = (uint64_t)DS4_DFLASH_RING * h[3] * sizeof(uint16_t);
+    int rc = payload_read_tensor_span(fp, d->ring_pos, 0, (uint64_t)DS4_DFLASH_RING * sizeof(int32_t),
+                                      buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+    for (uint32_t b = 0; rc == 0 && b < d->dw->n_block; b++) {
+        rc = payload_read_tensor_span(fp, d->ring_k[b], 0, ring_bytes, buf, DS4_SESSION_IO_CHUNK, remaining,
+                                      err, errlen);
+        if (rc == 0) rc = payload_read_tensor_span(fp, d->ring_v[b], 0, ring_bytes, buf, DS4_SESSION_IO_CHUNK,
+                                                   remaining, err, errlen);
+    }
+    *restored = rc == 0;
+    return rc;
+}
+
 static int qwen35_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
     ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
     const uint32_t rows = (uint32_t)s->checkpoint.len;
@@ -64253,6 +64342,11 @@ static int qwen35_session_save_payload(ds4_session *s, FILE *fp, char *err, size
         payload_set_err(err, errlen, "qwen35 snapshot requires sync or eval after rewind");
         return 1;
     }
+#ifdef DS4_HAS_QWEN4_METAL
+    /* the trailer's ring holds every committed row; a failed injection
+     * leaves holes, which cost acceptance only */
+    if (g->dflash) (void)qwen35_dflash_inject(g->dflash);
+#endif
     if (ds4_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "failed to synchronize accelerator before qwen35 snapshot");
         return 1;
@@ -64287,6 +64381,7 @@ static int qwen35_session_save_payload(ds4_session *s, FILE *fp, char *err, size
     if (rc == 0) rc = payload_write_u32(fp, (uint32_t)g->mrope_delta, err, errlen);
     if (rc == 0) rc = payload_write_tensor_span(fp, g->pos3, 0, (uint64_t)rows * 16u,
                                                 buf, DS4_SESSION_IO_CHUNK, err, errlen);
+    if (rc == 0 && g->dflash) rc = qwen35_dflash_save_trailer(g->dflash, rows, fp, buf, err, errlen);
     free(buf);
     return rc;
 }
@@ -64348,6 +64443,8 @@ static int qwen35_session_load_payload(ds4_session *s, FILE *fp, const uint32_t 
     }
     if (rc == 0) rc = payload_read_tensor_span(fp, g->pos3, 0, (uint64_t)rows * 16u,
                                                buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+    bool ring_restored = false;
+    if (rc == 0) rc = qwen35_dflash_load_trailer(g->dflash, rows, fp, buf, remaining, &ring_restored, err, errlen);
     free(buf);
     if (rc != 0) {
         token_vec_free(&new_checkpoint);
@@ -64357,7 +64454,8 @@ static int qwen35_session_load_payload(ds4_session *s, FILE *fp, const uint32_t 
     }
     g->pos = rows;
     g->mtp_pos = 0;
-    qwen35_dflash_forget(g->dflash, rows);
+    if (ring_restored) qwen35_dflash_resume(g->dflash, rows);
+    else qwen35_dflash_forget(g->dflash, rows);
     token_vec_free(&s->checkpoint);
     s->checkpoint = new_checkpoint;
     s->checkpoint_valid = true;

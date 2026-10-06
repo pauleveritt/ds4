@@ -18,7 +18,9 @@
  * Exit status 0 when every tap of every generated position is >= 0.999.
  *
  * inject: see run_inject; the recompute is the host's s4 data dir's
- * inject_check.py.  g7 and spec: see run_g7 and run_spec.
+ * inject_check.py.  g7 and spec: see run_g7 and run_spec.  payload-save and
+ * payload-load: see run_payload_save; the comparison is the host's s6 data
+ * dir's payload_check.py.
  *
  * Usage: test_dflash_live capture MODEL DRAFTER PROMPTS FILLER [--prompts N]
  *                                 [--depths D,D,...] [--ctx N]
@@ -30,6 +32,9 @@
  *                                 [--first I] [--ctx N]
  *        test_dflash_live spec MODEL DRAFTER PROMPTS FILLER [--prompts N] [--first I]
  *                                 [--depths D] [--ctx N] [--tokens M]
+ *        test_dflash_live payload-save MODEL DRAFTER PROMPTS FILLER OUT [--first I]
+ *                                 [--depths D] [--ctx N] [--tokens M]
+ *        test_dflash_live payload-load MODEL DRAFTER|- IN OUT|- [--ctx N] [--tokens M]
  * PROMPTS holds JSON lines with "name" and "prompt", as for
  * test_qwen35_verify_live. */
 #define _POSIX_C_SOURCE 200809L
@@ -165,12 +170,15 @@ static live_args parse_args(int argc, char **argv, int n_fixed) {
     return a;
 }
 
+/* the engine with the drafter, or without one when DRAFTER is "-" */
 static ds4_engine *open_or_die(const live_args *a) {
-    ds4_engine_options opt = {.model_path = a->model, .mtp_path = a->drafter, .context_size = a->ctx,
-                              .backend = DS4_BACKEND_METAL};
+    const bool none = !strcmp(a->drafter, "-");
+    ds4_engine_options opt = {.model_path = a->model, .mtp_path = none ? NULL : a->drafter,
+                              .context_size = a->ctx, .backend = DS4_BACKEND_METAL};
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) die("engine open failed", a->model);
-    if (!ds4_engine_has_dflash(engine)) die("the engine has no drafter", a->drafter);
+    if (ds4_engine_has_dflash(engine) == none) die(none ? "the engine has a drafter" : "the engine has no drafter",
+                                                   a->drafter);
     return engine;
 }
 
@@ -620,6 +628,197 @@ static int run_spec(int argc, char **argv) {
     return cases > 0 && passed == cases ? 0 : 1;
 }
 
+#define RING_BLOCKS 8    /* DS4_DFLASH_MAX_BLOCKS: blocks past the drafter's read as absent */
+#define RING_KV 1024     /* the drafter's 8 K/V heads of 128 */
+#define RING_SLOTS 2048
+#define PAYLOAD_EVALS 5  /* greedy evals before the save: rows a save must inject */
+
+static uint64_t fnv1a(uint64_t h, const void *p, size_t n) {
+    const unsigned char *b = p;
+    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
+/* FNV-1a-64 over every block's ring entries for the window of positions
+ * before pos (an absent entry as a zero byte, a present one as a one byte
+ * and its K and V floats); *present counts the present entries */
+static uint64_t ring_digest(ds4_session *s, int pos, int *present) {
+    static float k[RING_KV], v[RING_KV];
+    uint64_t h = 1469598103934665603ull;
+    *present = 0;
+    for (int b = 0; b < RING_BLOCKS; b++) {
+        for (int p = pos > RING_SLOTS ? pos - RING_SLOTS : 0; p < pos; p++) {
+            const unsigned char has = ds4_session_dflash_ring(s, b, p, k, v) == 0;
+            h = fnv1a(h, &has, 1);
+            if (!has) continue;
+            (*present)++;
+            h = fnv1a(h, k, sizeof(k));
+            h = fnv1a(h, v, sizeof(v));
+        }
+    }
+    return h;
+}
+
+/* a draft at the session's position after its argmax; drafts and an
+ * FNV-1a-64 of the lattice of rows 1..n (K candidates per row) */
+static int draft_digest(ds4_session *s, int K, int *draft, uint64_t *lattice) {
+    int *cand = malloc((size_t)ROWS * K * sizeof(int));
+    float *scores = malloc((size_t)ROWS * K * K * sizeof(float));
+    char err[256] = {0};
+    const int n = ds4_session_dflash_draft_at(s, ds4_session_pos(s), ds4_session_argmax(s), ROWS - 1, draft, cand,
+                                              scores, err, sizeof(err));
+    if (n < 0) die("draft failed", err);
+    *lattice = fnv1a(fnv1a(1469598103934665603ull, cand + K, (size_t)n * K * sizeof(int)),
+                     scores + (size_t)K * K, (size_t)n * K * K * sizeof(float));
+    free(cand); free(scores);
+    return n;
+}
+
+static void print_ints(const char *key, const int *v, int n) {
+    printf(",\"%s\":[", key);
+    for (int i = 0; i < n; i++) printf("%s%d", i ? "," : "", v[i]);
+    printf("]");
+}
+
+/* the ring and a draft as JSON fields, when the session has a drafter */
+static void print_ring_and_draft(ds4_session *s, int K) {
+    int present = 0, draft[ROWS];
+    uint64_t lattice = 0;
+    const uint64_t ring = ring_digest(s, ds4_session_pos(s), &present);
+    const int n = draft_digest(s, K, draft, &lattice);
+    printf(",\"ring\":\"%016llx\",\"present\":%d", (unsigned long long)ring, present);
+    print_ints("drafts", draft, n);
+    printf(",\"lattice\":\"%016llx\"", (unsigned long long)lattice);
+}
+
+/* tokens greedy tokens, one eval each: the tokens and each step's logits
+ * as an FNV-1a-64, as one JSON line */
+static void print_continuation(ds4_session *s, const char *label, int tokens) {
+    static float logits[1 << 18];
+    printf("{\"case\":\"%s\",\"pos\":%d,\"tokens\":[", label, ds4_session_pos(s));
+    uint64_t *h = malloc((size_t)tokens * sizeof(uint64_t));
+    for (int i = 0; i < tokens; i++) {
+        const int n = ds4_session_copy_logits(s, logits, 1 << 18);
+        if (n <= 0) die("no logits", NULL);
+        h[i] = fnv1a(1469598103934665603ull, logits, (size_t)n * sizeof(float));
+        const int t = ds4_session_argmax(s);
+        printf("%s%d", i ? "," : "", t);
+        eval_or_die(s, t);
+    }
+    printf("],\"logits\":[");
+    for (int i = 0; i < tokens; i++) printf("%s\"%016llx\"", i ? "," : "", (unsigned long long)h[i]);
+    printf("]}\n");
+    fflush(stdout);
+    free(h);
+}
+
+static uint64_t save_payload_or_die(ds4_session *s, const char *path) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) die("cannot open", path);
+    char err[256] = {0};
+    if (ds4_session_save_payload(s, fp, err, sizeof(err)) != 0) die("payload save failed", err);
+    const long n = ftell(fp);
+    if (fclose(fp) != 0 || n < 0) die("cannot write", path);
+    return (uint64_t)n;
+}
+
+/* S6, the payload trailer (spec section 3.8).  payload-save: a session with
+ * the drafter syncs FILLER's tokens and prompt --first's chat to the depth,
+ * evaluates PAYLOAD_EVALS greedy tokens one at a time (rows the drafter has
+ * not injected yet) and saves its payload to OUT.  A snapshot of it loads
+ * into a second session, whose ring must equal the first's after the
+ * first's draft has injected anything still pending (presence and K/V bytes
+ * of every block over the last window), and whose draft at the same anchor
+ * must equal the first's (drafts and lattice).  Then the first session
+ * decodes --tokens greedy tokens.  payload-load: a session (with the
+ * drafter, or none when DRAFTER is "-") loads IN, reports its ring and a
+ * draft when it has a drafter, saves its own payload to OUT unless OUT is
+ * "-", and decodes --tokens greedy tokens.  The verdicts across runs are
+ * payload_check.py's. */
+static int run_payload_save(int argc, char **argv) {
+    if (argc < 7) die("payload-save needs MODEL DRAFTER PROMPTS FILLER OUT", NULL);
+    live_args a = parse_args(argc, argv, 3);
+    ds4_engine *engine = open_or_die(&a);
+    ds4_session *s = NULL, *t = NULL;
+    if (ds4_session_create(&s, engine, a.ctx) != 0 || ds4_session_create(&t, engine, a.ctx) != 0) {
+        die("session create failed", NULL);
+    }
+    char *filler_text = read_file(a.rest[1]);
+    ds4_tokens filler = {0};
+    ds4_tokenize_text(engine, filler_text, &filler);
+    free(filler_text);
+    char *prompts = read_file(a.rest[0]), *line = strtok(prompts, "\n");
+    for (int i = 0; line && i < a.first; i++) line = strtok(NULL, "\n");
+    if (!line) die("no such prompt", NULL);
+    char *name = json_field(line, "name"), *prompt = json_field(line, "prompt");
+    ds4_tokens chat = {0}, prefix = {0};
+    ds4_encode_chat_prompt(engine, NULL, prompt, DS4_THINK_HIGH, &chat);
+    for (int i = 0; i + chat.len < a.depths[0]; i++) ds4_tokens_push(&prefix, filler.v[i % filler.len]);
+    for (int i = 0; i < chat.len; i++) ds4_tokens_push(&prefix, chat.v[i]);
+    if (prefix.len + PAYLOAD_EVALS + a.tokens + ROWS > a.ctx) die("prefix does not fit the context", name);
+    sync_or_die(s, &prefix);
+    for (int i = 0; i < PAYLOAD_EVALS; i++) eval_or_die(s, ds4_session_argmax(s));
+    const uint64_t bytes = save_payload_or_die(s, a.rest[2]);
+    printf("{\"case\":\"save\",\"prompt\":\"%s\",\"depth\":%d,\"pos\":%d,\"bytes\":%llu}\n", name, a.depths[0],
+           ds4_session_pos(s), (unsigned long long)bytes);
+    ds4_session_snapshot snap = {0};
+    char err[256] = {0};
+    if (ds4_session_save_snapshot(s, &snap, err, sizeof(err)) != 0) die("snapshot save failed", err);
+    if (ds4_session_load_snapshot(t, &snap, err, sizeof(err)) != 0) die("snapshot load failed", err);
+    int present_t = 0;
+    const uint64_t ring_t = ring_digest(t, ds4_session_pos(t), &present_t);
+    int draft_s[ROWS], draft_t[ROWS];
+    uint64_t lat_s = 0, lat_t = 0;
+    const int K = ds4_engine_dflash_top_k(engine);
+    const int n_s = draft_digest(s, K, draft_s, &lat_s);
+    int present_s = 0;
+    const uint64_t ring_s = ring_digest(s, ds4_session_pos(s), &present_s);
+    const int n_t = draft_digest(t, K, draft_t, &lat_t);
+    const bool pass = ring_s == ring_t && present_s == present_t && n_s == n_t &&
+                      !memcmp(draft_s, draft_t, (size_t)n_s * sizeof(int)) && lat_s == lat_t;
+    printf("{\"case\":\"roundtrip\",\"snapshot_bytes\":%llu,\"ring\":\"%016llx\",\"present\":%d,"
+           "\"ring_loaded\":\"%016llx\",\"present_loaded\":%d",
+           (unsigned long long)snap.len, (unsigned long long)ring_s, present_s, (unsigned long long)ring_t,
+           present_t);
+    print_ints("drafts", draft_s, n_s);
+    print_ints("drafts_loaded", draft_t, n_t);
+    printf(",\"lattice\":\"%016llx\",\"lattice_loaded\":\"%016llx\",\"pass\":%s}\n", (unsigned long long)lat_s,
+           (unsigned long long)lat_t, pass ? "true" : "false");
+    print_continuation(s, "continue", a.tokens);
+    ds4_session_snapshot_free(&snap);
+    ds4_tokens_free(&prefix); ds4_tokens_free(&chat); ds4_tokens_free(&filler);
+    free(name); free(prompt); free(prompts);
+    ds4_session_free(t);
+    ds4_session_free(s);
+    ds4_engine_close(engine);
+    return pass ? 0 : 1;
+}
+
+static int run_payload_load(int argc, char **argv) {
+    if (argc < 6) die("payload-load needs MODEL DRAFTER|- IN OUT|-", NULL);
+    live_args a = parse_args(argc, argv, 2);
+    ds4_engine *engine = open_or_die(&a);
+    ds4_session *s = NULL;
+    if (ds4_session_create(&s, engine, a.ctx) != 0) die("session create failed", NULL);
+    FILE *fp = fopen(a.rest[0], "rb");
+    if (!fp || fseek(fp, 0, SEEK_END) != 0) die("cannot open", a.rest[0]);
+    const long bytes = ftell(fp);
+    char err[256] = {0};
+    if (bytes <= 0 || fseek(fp, 0, SEEK_SET) != 0) die("cannot size", a.rest[0]);
+    if (ds4_session_load_payload(s, fp, (uint64_t)bytes, err, sizeof(err)) != 0) die("payload load failed", err);
+    fclose(fp);
+    const bool drafter = strcmp(a.drafter, "-") != 0;
+    printf("{\"case\":\"load\",\"drafter\":%s,\"in_bytes\":%ld,\"pos\":%d", drafter ? "true" : "false", bytes,
+           ds4_session_pos(s));
+    if (drafter) print_ring_and_draft(s, ds4_engine_dflash_top_k(engine));
+    if (strcmp(a.rest[1], "-")) printf(",\"out_bytes\":%llu", (unsigned long long)save_payload_or_die(s, a.rest[1]));
+    printf("}\n");
+    print_continuation(s, "continue", a.tokens);
+    ds4_session_free(s);
+    ds4_engine_close(engine);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s capture MODEL DRAFTER PROMPTS FILLER [options]\n"
@@ -632,6 +831,8 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "inject")) return run_inject(argc, argv);
     if (!strcmp(argv[1], "g7")) return run_g7(argc, argv);
     if (!strcmp(argv[1], "spec")) return run_spec(argc, argv);
+    if (!strcmp(argv[1], "payload-save")) return run_payload_save(argc, argv);
+    if (!strcmp(argv[1], "payload-load")) return run_payload_load(argc, argv);
     die("unknown command", argv[1]);
     return 2;
 }
