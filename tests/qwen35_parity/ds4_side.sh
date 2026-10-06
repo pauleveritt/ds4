@@ -15,7 +15,7 @@ mkdir -p "$OUT"
 python3 -c 'import json,sys; [print(p["name"]) for p in json.load(open(sys.argv[1]))]' "$DIR/prompts.json" |
 while read -r name; do
     prompt=$(python3 -c 'import json,sys; print(next(p["prompt"] for p in json.load(open(sys.argv[1])) if p["name"] == sys.argv[2]))' "$DIR/prompts.json" "$name")
-    ./ds4 -m "$MODEL" --ctx 4096 --system "$SYSTEM" --dump-chat-tokens -p "$prompt" "$@" 2>/dev/null |
+    ./ds4 -m "$MODEL" --ctx 4096 --system "$SYSTEM" --dump-tokens -p "$prompt" "$@" 2>/dev/null |
         grep '^\[' > "$OUT/$name.tokens"
     ./ds4 -m "$MODEL" --ctx 4096 --system "$SYSTEM" --dump-logprobs "$OUT/$name.json" \
         --logprobs-top-k 5 -n 64 -p "$prompt" "$@" > "$OUT/$name.log" 2>&1
