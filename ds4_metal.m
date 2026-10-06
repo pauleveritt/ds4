@@ -51076,6 +51076,27 @@ int ds4_gpu_dflash_capture_tensor(
                            MTLSizeMake((n + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1));
 }
 
+int ds4_gpu_dflash_ring_write_tensor(
+        ds4_gpu_tensor *ring_k, ds4_gpu_tensor *ring_v, ds4_gpu_tensor *ring_pos,
+        const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        uint32_t n_rows, uint32_t width, uint32_t pos0, uint32_t ring_slots) {
+    struct { uint32_t n_rows, pos0, cache_cap, width; } args = { n_rows, pos0, ring_slots, width };
+    if (n_rows == 0 || width == 0 || ring_slots == 0 || n_rows > ring_slots || pos0 > INT32_MAX - n_rows) return 0;
+    const uint64_t rows_bytes = (uint64_t)n_rows * width * sizeof(float);
+    const uint64_t ring_bytes = (uint64_t)ring_slots * width * sizeof(uint16_t);
+    qwen4_bind b[5];
+    if (!qwen4_bind_tensor(&b[0], k, rows_bytes, "dflash ring write k") ||
+        !qwen4_bind_tensor(&b[1], v, rows_bytes, "dflash ring write v") ||
+        !qwen4_bind_tensor(&b[2], ring_k, ring_bytes, "dflash ring k") ||
+        !qwen4_bind_tensor(&b[3], ring_v, ring_bytes, "dflash ring v") ||
+        !qwen4_bind_tensor(&b[4], ring_pos, (uint64_t)ring_slots * sizeof(int32_t), "dflash ring tags")) {
+        return 0;
+    }
+    const uint64_t n = (uint64_t)n_rows * width;
+    return dflash_dispatch("kernel_dflash_ring_write", &args, sizeof(args), b, 5,
+                           MTLSizeMake((n + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1));
+}
+
 int ds4_gpu_dflash_head_norm_rope_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,

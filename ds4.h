@@ -639,6 +639,10 @@ void ds4_session_spec_stats(ds4_session *s, ds4_spec_stats *out);
  * rows included, while it is still in the capture ring; nonzero otherwise. */
 int ds4_engine_dflash_feature_floats(ds4_engine *e);
 int ds4_session_dflash_features(ds4_session *s, int pos, float *out);
+/* ds4_session_dflash_ring copies drafter block `block`'s injected K and V
+ * rows of position pos (n_head_kv x head_dim floats each, from f16) while
+ * the ring's slot holds pos; nonzero otherwise. */
+int ds4_session_dflash_ring(ds4_session *s, int block, int pos, float *k, float *v);
 /* TP worker side of a mirrored speculative-verify block: run its half of the
  * batch verify for KV side effects, then obey the leader's commit frame
  * (keep, or roll back and replay). Only called from ds4_tp_worker_run. */

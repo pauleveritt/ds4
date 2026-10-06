@@ -3652,6 +3652,10 @@ int ds4_gpu_qwen4_mtp_combine_tensor(
  * feature rows ([n_slots][n_taps][n_embd]), row r at slot
  * (dst_row0 + r) % n_slots; a NaN becomes 0 and an infinity +-65504.
  *
+ * ring_write: n_rows rows of f32 K and V ([n_rows][width]) into the f16
+ * rings ([ring_slots][width]), row r at slot (pos0 + r) % ring_slots, and
+ * that slot's int32 tag set to pos0 + r.
+ *
  * head_norm_rope: per head of each row, RMS norm times the [head_dim] weight
  * at weight_offset, then NeoX rope over the first rope_dims dims at position
  * pos0 + row (base rope_base).  out may alias x. */
@@ -3659,6 +3663,10 @@ int ds4_gpu_dflash_capture_tensor(
         ds4_gpu_tensor *features, const ds4_gpu_tensor *src,
         uint32_t n_rows, uint32_t n_embd, uint32_t n_taps, uint32_t tap,
         uint32_t src_row0, uint32_t dst_row0, uint32_t n_slots);
+int ds4_gpu_dflash_ring_write_tensor(
+        ds4_gpu_tensor *ring_k, ds4_gpu_tensor *ring_v, ds4_gpu_tensor *ring_pos,
+        const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        uint32_t n_rows, uint32_t width, uint32_t pos0, uint32_t ring_slots);
 int ds4_gpu_dflash_head_norm_rope_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,

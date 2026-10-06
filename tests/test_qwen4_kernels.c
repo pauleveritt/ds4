@@ -4560,6 +4560,137 @@ static void test_dflash_capture(uint32_t n_rows, uint32_t E, uint32_t n_taps, ui
     free(src); free(feat); free(want); free(got);
 }
 
+/* S4.2's ring: K/V rows written through positions 0..5,000 in sub-batches
+ * of uneven size that cross the wrap, the f16 rows and tags compared with a
+ * host mirror byte for byte; at anchors along the way (the ring then written
+ * 7 positions past the anchor, as a verify's rows would be if they were ever
+ * injected), the attention over the ring against a double reference that
+ * admits a slot only when its tag t has q - t < window and t < p. */
+static uint16_t f16_rne(float f) {
+    const __fp16 h = (__fp16)f;
+    uint16_t u;
+    memcpy(&u, &h, 2);
+    return u;
+}
+
+static void test_dflash_ring(void) {
+    const uint32_t slots = 2048, window = 2048, H = 4, Hkv = 2, D = 32, width = Hkv * D, rows = 8, last = 5000;
+    const float scale = 1.0f / sqrtf((float)D);
+    uint16_t *mk = malloc((uint64_t)slots * width * 2), *mv = malloc((uint64_t)slots * width * 2);
+    int32_t *mtag = malloc(slots * sizeof(int32_t));
+    for (uint64_t i = 0; i < (uint64_t)slots * width; i++) { mk[i] = 0; mv[i] = 0; }
+    for (uint32_t i = 0; i < slots; i++) mtag[i] = -1;
+    ds4_gpu_tensor *rk = upload_raw(mk, (uint64_t)slots * width * 2), *rv = upload_raw(mv, (uint64_t)slots * width * 2);
+    ds4_gpu_tensor *rt = upload_raw(mtag, slots * sizeof(int32_t));
+    ds4_gpu_tensor *tk = upload(NULL, 256u * width), *tv = upload(NULL, 256u * width);
+    const uint32_t anchors[] = { 1, 5, 100, 2040, 2047, 2048, 2049, 2055, 2500, 3333, 4095, 4096, 4097, 4600, 4993 };
+    const uint32_t sizes[] = { 1, 7, 256, 100, 3, 64, 255, 17 };
+    uint32_t written = 0, size_i = 0, n_anchor = 0, checks = 0;
+    for (uint32_t ai = 0; ai <= sizeof(anchors) / sizeof(anchors[0]); ai++) {
+        const uint32_t target = ai < sizeof(anchors) / sizeof(anchors[0]) ? anchors[ai] + rows : last + 1u;
+        while (written < target) {
+            uint32_t n = sizes[size_i++ % (sizeof(sizes) / sizeof(sizes[0]))];
+            if (n > target - written) n = target - written;
+            float *k = rand_vec((uint64_t)n * width, 2.0f), *v = rand_vec((uint64_t)n * width, 2.0f);
+            require_ok(ds4_gpu_tensor_write(tk, 0, k, (uint64_t)n * width * 4) &&
+                       ds4_gpu_tensor_write(tv, 0, v, (uint64_t)n * width * 4), "ring rows");
+            require_ok(ds4_gpu_dflash_ring_write_tensor(rk, rv, rt, tk, tv, n, width, written, slots), "dflash ring write");
+            for (uint32_t r = 0; r < n; r++) {
+                const uint32_t slot = (written + r) % slots;
+                for (uint32_t c = 0; c < width; c++) {
+                    mk[(uint64_t)slot * width + c] = f16_rne(k[(uint64_t)r * width + c]);
+                    mv[(uint64_t)slot * width + c] = f16_rne(v[(uint64_t)r * width + c]);
+                }
+                mtag[slot] = (int32_t)(written + r);
+            }
+            written += n;
+            free(k); free(v);
+        }
+        uint16_t *gk = malloc((uint64_t)slots * width * 2), *gv = malloc((uint64_t)slots * width * 2);
+        int32_t *gt = malloc(slots * sizeof(int32_t));
+        require_ok(ds4_gpu_tensor_read(rk, 0, gk, (uint64_t)slots * width * 2) &&
+                   ds4_gpu_tensor_read(rv, 0, gv, (uint64_t)slots * width * 2) &&
+                   ds4_gpu_tensor_read(rt, 0, gt, slots * sizeof(int32_t)), "ring read");
+        if (memcmp(gk, mk, (uint64_t)slots * width * 2) || memcmp(gv, mv, (uint64_t)slots * width * 2) ||
+            memcmp(gt, mtag, slots * sizeof(int32_t))) {
+            uint32_t bad = 0;
+            while (bad < slots && gt[bad] == mtag[bad] &&
+                   !memcmp(gk + (uint64_t)bad * width, mk + (uint64_t)bad * width, width * 2) &&
+                   !memcmp(gv + (uint64_t)bad * width, mv + (uint64_t)bad * width, width * 2)) bad++;
+            fprintf(stderr, "dflash ring through %u: slot %u differs (tag %d, want %d)\n", written - 1u, bad,
+                    bad < slots ? gt[bad] : -2, bad < slots ? mtag[bad] : -2);
+            exit(1);
+        }
+        checks++;
+        free(gk); free(gv); free(gt);
+        if (ai == sizeof(anchors) / sizeof(anchors[0])) break;
+
+        const uint32_t p = anchors[ai];
+        float *q = rand_vec((uint64_t)rows * H * D, 1.0f), *kb = rand_vec((uint64_t)rows * width, 1.0f);
+        float *vb = rand_vec((uint64_t)rows * width, 1.0f);
+        double *ref = malloc((uint64_t)rows * H * D * sizeof(double)), *lg = malloc((slots + rows) * sizeof(double));
+        uint32_t keys0 = 0;
+        for (uint32_t t = 0; t < rows; t++) {
+            const int64_t qp = (int64_t)p + t;
+            for (uint32_t h = 0; h < H; h++) {
+                const uint32_t kh = h / (H / Hkv);
+                const float *qr = q + ((uint64_t)t * H + h) * D;
+                double mx = -1e300, sum = 0.0;
+                for (uint32_t k = 0; k < slots + rows; k++) {
+                    lg[k] = -1e300;
+                    if (k < slots) {
+                        if (mtag[k] < 0 || mtag[k] >= (int32_t)p || qp - mtag[k] >= (int64_t)window) continue;
+                        if (t == 0 && h == 0) keys0++;
+                    } else if (qp - ((int64_t)p + (k - slots)) >= (int64_t)window) {
+                        continue;
+                    }
+                    double dot = 0.0;
+                    for (uint32_t i = 0; i < D; i++) {
+                        dot += (double)qr[i] * (k < slots ? f16_to_f32(mk[(uint64_t)k * width + kh * D + i])
+                                                          : kb[(uint64_t)(k - slots) * width + kh * D + i]);
+                    }
+                    lg[k] = dot * scale;
+                    if (lg[k] > mx) mx = lg[k];
+                }
+                double *dst = ref + ((uint64_t)t * H + h) * D;
+                for (uint32_t i = 0; i < D; i++) dst[i] = 0.0;
+                for (uint32_t k = 0; k < slots + rows; k++) {
+                    if (lg[k] <= -1e299) continue;
+                    const double w = exp(lg[k] - mx);
+                    sum += w;
+                    for (uint32_t i = 0; i < D; i++) {
+                        dst[i] += w * (k < slots ? f16_to_f32(mv[(uint64_t)k * width + kh * D + i])
+                                                 : vb[(uint64_t)(k - slots) * width + kh * D + i]);
+                    }
+                }
+                for (uint32_t i = 0; i < D; i++) dst[i] /= sum;
+            }
+        }
+        const uint32_t want0 = p < window - rows ? p : window - rows;
+        if (keys0 != want0) {
+            fprintf(stderr, "dflash ring at anchor %u: the reference admits %u ring keys at row 0, expected %u\n",
+                    p, keys0, want0);
+            exit(1);
+        }
+        ds4_gpu_tensor *tq = upload(q, (uint64_t)rows * H * D), *tkb = upload(kb, (uint64_t)rows * width);
+        ds4_gpu_tensor *tvb = upload(vb, (uint64_t)rows * width), *tout = upload(NULL, (uint64_t)rows * H * D);
+        require_ok(ds4_gpu_dflash_attn_tensor(tout, tq, tkb, tvb, rk, rv, rt, rows, H, Hkv, D, slots, window, p, scale),
+                   "dflash attention over the ring");
+        char name[128];
+        snprintf(name, sizeof(name), "dflash ring anchor %u (written through %u, %u ring keys at row 0)",
+                 p, written - 1u, keys0);
+        check_tensor(name, tout, ref, (uint64_t)rows * H * D, 1e-3);
+        n_anchor++;
+        ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(tkb); ds4_gpu_tensor_free(tvb); ds4_gpu_tensor_free(tout);
+        free(q); free(kb); free(vb); free(ref); free(lg);
+    }
+    printf("  dflash ring positions 0..%u in %u writes: rows and tags exact at %u checks, %u anchors\n",
+           written - 1u, size_i, checks, n_anchor);
+    ds4_gpu_tensor_free(rk); ds4_gpu_tensor_free(rv); ds4_gpu_tensor_free(rt);
+    ds4_gpu_tensor_free(tk); ds4_gpu_tensor_free(tv);
+    free(mk); free(mv); free(mtag);
+}
+
 static void test_dflash_drafter(arena_t *a) {
     printf("dflash drafter\n");
     test_dflash_head_norm_rope(a, 8, 32, 128, 128, 5000);
@@ -4579,6 +4710,7 @@ static void test_dflash_drafter(arena_t *a) {
     test_dflash_capture(1, 5120, 5, 4, 0, 63, 64);
     test_dflash_capture(300, 256, 5, 0, 0, 400, 512);
     test_dflash_capture(37, 96, 3, 1, 11, 0, 37);
+    test_dflash_ring();
 }
 #endif
 
@@ -4639,6 +4771,11 @@ int main(void) {
         return 0;
     }
     if (getenv("DS4_TEST_QWEN35_VERIFY_BENCH")) { bench_qwen35_verify(&arena); return 0; }
+    if (getenv("DS4_TEST_DFLASH_ONLY") && !strcmp(getenv("DS4_TEST_DFLASH_ONLY"), "ring")) {
+        test_dflash_ring();
+        printf("all dflash ring tests passed\n");
+        return 0;
+    }
     if (getenv("DS4_TEST_DFLASH_ONLY")) {
         test_dflash_drafter(&arena);
         printf("all dflash drafter tests passed\n");

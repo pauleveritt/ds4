@@ -46,6 +46,41 @@ kernel void kernel_dflash_capture_rows(
     features[dst] = value;
 }
 
+/* --- the drafter's K/V ring ---------------------------------------------- */
+
+struct ds4_metal_args_dflash_ring_write {
+    uint32_t n_rows;
+    uint32_t pos0;         /* position of row 0; row r goes to slot (pos0 + r) % cache_cap */
+    uint32_t cache_cap;
+    uint32_t width;        /* n_head_kv * head_dim */
+};
+
+/* antirez's kernel_dflash_commit_kv_f16 (laguna-s2.1, 8f620f3,
+ * metal/dflash.metal:84-101), which writes K and V rows as f16 at slot
+ * position % cache_cap, plus the slot's position tag, which the attention's
+ * rule reads (a slot counts only for a query at q from an anchor at p with
+ * q - tag < window and tag < p). */
+kernel void kernel_dflash_ring_write(
+        constant ds4_metal_args_dflash_ring_write &args,
+        device const float *k,
+        device const float *v,
+        device        half *key_cache,
+        device        half *value_cache,
+        device     int32_t *tags,
+        uint gid [[thread_position_in_grid]]) {
+    const uint64_t count = (uint64_t)args.n_rows * args.width;
+    if ((uint64_t)gid >= count || args.cache_cap == 0u) return;
+
+    const uint row = gid / args.width;
+    const uint col = gid - row * args.width;
+    const uint cache_row = (args.pos0 + row) % args.cache_cap;
+    const uint64_t src = (uint64_t)row * args.width + col;
+    const uint64_t dst = (uint64_t)cache_row * args.width + col;
+    key_cache[dst] = (half)k[src];
+    value_cache[dst] = (half)v[src];
+    if (col == 0u) tags[cache_row] = (int32_t)(args.pos0 + row);
+}
+
 /* --- q/k head norm with rope ---------------------------------------------- */
 
 struct ds4_metal_args_dflash_head_norm_rope {

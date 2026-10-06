@@ -17,10 +17,15 @@
  * position's features are compared with llama.cpp's, tap by tap, by cosine.
  * Exit status 0 when every tap of every generated position is >= 0.999.
  *
+ * inject: see run_inject; the recompute is the host's s4 data dir's
+ * inject_check.py.
+ *
  * Usage: test_dflash_live capture MODEL DRAFTER PROMPTS FILLER [--prompts N]
  *                                 [--depths D,D,...] [--ctx N]
  *        test_dflash_live features MODEL DRAFTER INDEX FEATURES [--prompts N]
  *                                 [--first I] [--ctx N]
+ *        test_dflash_live inject MODEL DRAFTER PROMPTS FILLER OUT [--first I]
+ *                                 [--depths D] [--ctx N]
  * PROMPTS holds JSON lines with "name" and "prompt", as for
  * test_qwen35_verify_live. */
 #define _POSIX_C_SOURCE 200809L
@@ -374,6 +379,79 @@ static int run_features(int argc, char **argv) {
     return pass ? 0 : 1;
 }
 
+/* S4.2 live: one prompt at one depth.  The session syncs the prefix (the
+ * sync injects the rows it captured), verifies [x0, 7 filler drafts] and
+ * commits 5 rows, which injects them.  For the 16 positions N - 11 .. N + 4
+ * it writes each position's captured features and every block's ring K and
+ * V to OUT (int32 header: positions, feature floats, blocks, K/V floats;
+ * int32 positions; then per position its features and per block K and V,
+ * f32), for a double recompute from the drafter's weights.  The 3 rejected
+ * rows must have no ring entry. */
+static int run_inject(int argc, char **argv) {
+    if (argc < 7) die("inject needs MODEL DRAFTER PROMPTS FILLER OUT", NULL);
+    live_args a = parse_args(argc, argv, 3);
+    ds4_engine *engine = open_or_die(&a);
+    const int width = ds4_engine_dflash_feature_floats(engine), n_block = 5, kv = 1024, n_pos = 16;
+    ds4_session *s = NULL;
+    if (ds4_session_create(&s, engine, a.ctx) != 0) die("session create failed", NULL);
+    if (ds4_session_set_verify_mode(s, DS4_VERIFY_MODE_MMA) != 0) die("DFlash mode refused", NULL);
+    char *filler_text = read_file(a.rest[1]);
+    ds4_tokens filler = {0};
+    ds4_tokenize_text(engine, filler_text, &filler);
+    free(filler_text);
+    char *prompts = read_file(a.rest[0]);
+    char *line = strtok(prompts, "\n");
+    for (int i = 0; line && i < a.first; i++) line = strtok(NULL, "\n");
+    char *prompt = line ? json_field(line, "prompt") : NULL;
+    if (!prompt) die("no prompt", a.rest[0]);
+    ds4_tokens chat = {0}, prefix = {0};
+    ds4_encode_chat_prompt(engine, NULL, prompt, DS4_THINK_HIGH, &chat);
+    for (int i = 0; i + chat.len < a.depths[0]; i++) ds4_tokens_push(&prefix, filler.v[i % filler.len]);
+    for (int i = 0; i < chat.len; i++) ds4_tokens_push(&prefix, chat.v[i]);
+    const int n = prefix.len;
+    sync_or_die(s, &prefix);
+    int drafts[ROWS - 1];
+    for (int i = 0; i < ROWS - 1; i++) drafts[i] = filler.v[(n + i) % filler.len];
+    char err[256] = {0};
+    if (ds4_session_verify(s, ds4_session_argmax(s), drafts, ROWS - 1, err, sizeof(err)) != 0) die("verify failed", err);
+    if (ds4_session_verify_commit(s, 5, err, sizeof(err)) != 0) die("commit failed", err);
+    float *f = malloc((size_t)width * sizeof(float)), *k = malloc((size_t)kv * sizeof(float));
+    float *v = malloc((size_t)kv * sizeof(float));
+    int rejected_absent = 0;
+    for (int p = n + 5; p < n + ROWS; p++) {
+        int absent = 1;
+        for (int b = 0; b < n_block; b++) absent &= ds4_session_dflash_ring(s, b, p, k, v) != 0;
+        rejected_absent += absent;
+    }
+    FILE *fp = fopen(a.rest[2], "wb");
+    if (!fp) die("cannot write", a.rest[2]);
+    const int32_t header[4] = { n_pos, width, n_block, kv };
+    fwrite(header, sizeof(header), 1, fp);
+    for (int i = 0; i < n_pos; i++) {
+        const int32_t p = n - 11 + i;
+        fwrite(&p, sizeof(p), 1, fp);
+    }
+    for (int i = 0; i < n_pos; i++) {
+        const int p = n - 11 + i;
+        features_or_die(s, p, f);
+        fwrite(f, sizeof(float), (size_t)width, fp);
+        for (int b = 0; b < n_block; b++) {
+            if (ds4_session_dflash_ring(s, b, p, k, v) != 0) die("a committed position has no ring entry", NULL);
+            fwrite(k, sizeof(float), (size_t)kv, fp);
+            fwrite(v, sizeof(float), (size_t)kv, fp);
+        }
+    }
+    fclose(fp);
+    printf("{\"depth\":%d,\"pos0\":%d,\"positions\":[%d,%d],\"committed\":5,\"rejected_rows_absent\":%d}\n",
+           a.depths[0], n, n - 11, n + 4, rejected_absent);
+    free(f); free(k); free(v);
+    ds4_tokens_free(&prefix); ds4_tokens_free(&chat); ds4_tokens_free(&filler);
+    free(prompt); free(prompts);
+    ds4_session_free(s);
+    ds4_engine_close(engine);
+    return rejected_absent == ROWS - 5 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s capture MODEL DRAFTER PROMPTS FILLER [options]\n"
@@ -383,6 +461,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[1], "capture")) return run_capture(argc, argv);
     if (!strcmp(argv[1], "features")) return run_features(argc, argv);
+    if (!strcmp(argv[1], "inject")) return run_inject(argc, argv);
     die("unknown command", argv[1]);
     return 2;
 }

@@ -58334,11 +58334,21 @@ enum { DS4_QWEN35_VERIFY_OFF = 0, DS4_QWEN35_VERIFY_EXACT = 1, DS4_QWEN35_VERIFY
  * captured, except sync rows older than the window of the prompt's end.
  * Features of committed positions [inject_pos, feat_end) wait for injection;
  * a verify's rows are captured but become committed only at its commit, so
- * a rejected row is never injected. */
+ * a rejected row is never injected.  Injection (spec section 3.3) turns
+ * committed features into each drafter block's K and V, written at slot
+ * pos % DS4_DFLASH_RING of that block's ring with the position as the
+ * slot's tag; it runs after each sync chunk, at a verify's commit, before a
+ * draft, and from eval once DS4_DFLASH_INJECT_ROWS rows wait. */
+#define DS4_DFLASH_INJECT_ROWS 256u
+
 typedef struct ds4_qwen35_dflash {
     const ds4_dflash_weights *dw;
     const ds4_model *dm;          /* the drafter's map */
     ds4_gpu_tensor *features;     /* [DS4_DFLASH_RING][n_target_layers][E] f32 */
+    ds4_gpu_tensor *ring_k[DS4_DFLASH_MAX_BLOCKS];  /* [DS4_DFLASH_RING][n_head_kv * head_dim] f16 */
+    ds4_gpu_tensor *ring_v[DS4_DFLASH_MAX_BLOCKS];
+    ds4_gpu_tensor *ring_pos;     /* [DS4_DFLASH_RING] int32 position tags, -1 empty; one for every block */
+    ds4_gpu_tensor *inj_g, *inj_gn, *inj_k, *inj_v;  /* one injection sub-batch */
     uint32_t inject_pos;          /* positions below are injected, or skipped as out of every window */
     uint32_t feat_end;            /* committed features end here */
     uint32_t cap_from;            /* a forward captures only rows at positions >= cap_from (set by sync) */
@@ -58578,29 +58588,49 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
 
 /* Forget every drafter position: nothing is pending, nothing captured.  A
  * reset, a payload load or a fresh test sequence starts here. */
-static void qwen35_dflash_forget(ds4_qwen35_dflash *d, uint32_t pos) {
-    if (!d) return;
+static bool qwen35_dflash_forget(ds4_qwen35_dflash *d, uint32_t pos) {
+    if (!d) return true;
     d->inject_pos = pos;
     d->feat_end = pos;
     d->cap_hi = pos;
     d->cap_from = 0;
+    int32_t empty[DS4_DFLASH_RING];
+    for (uint32_t i = 0; i < DS4_DFLASH_RING; i++) empty[i] = -1;
+    return ds4_gpu_tensor_write(d->ring_pos, 0, empty, sizeof(empty)) != 0;
 }
 
 static void qwen35_dflash_free(ds4_qwen35_dflash *d) {
     if (!d) return;
     ds4_gpu_tensor_free(d->features);
+    for (uint32_t b = 0; b < DS4_DFLASH_MAX_BLOCKS; b++) {
+        ds4_gpu_tensor_free(d->ring_k[b]);
+        ds4_gpu_tensor_free(d->ring_v[b]);
+    }
+    ds4_gpu_tensor *rest[] = { d->ring_pos, d->inj_g, d->inj_gn, d->inj_k, d->inj_v };
+    for (size_t i = 0; i < sizeof(rest) / sizeof(rest[0]); i++) ds4_gpu_tensor_free(rest[i]);
     free(d);
 }
 
 /* The drafter state of a session whose engine holds a drafter: the capture
- * ring (200 MiB at the 27B's width and five taps). */
+ * ring (200 MiB at the 27B's width and five taps), the K/V rings (40 MiB)
+ * and the injection's sub-batch buffers. */
 static ds4_qwen35_dflash *qwen35_dflash_alloc(const ds4_dflash_weights *dw, const ds4_model *dm) {
     ds4_qwen35_dflash *d = xcalloc(1, sizeof(*d));
     d->dw = dw;
     d->dm = dm;
     const uint64_t row = (uint64_t)dw->n_target_layers * dw->n_embd;
-    d->features = ds4_gpu_tensor_alloc((uint64_t)DS4_DFLASH_RING * row * sizeof(float));
-    if (!d->features) {
+    const uint64_t kv = (uint64_t)dw->n_head_kv * dw->head_dim;
+    bool ok = (d->features = ds4_gpu_tensor_alloc((uint64_t)DS4_DFLASH_RING * row * sizeof(float))) != NULL &&
+              (d->ring_pos = ds4_gpu_tensor_alloc((uint64_t)DS4_DFLASH_RING * sizeof(int32_t))) != NULL &&
+              (d->inj_g = ds4_gpu_tensor_alloc((uint64_t)DS4_DFLASH_INJECT_ROWS * dw->n_embd * sizeof(float))) &&
+              (d->inj_gn = ds4_gpu_tensor_alloc((uint64_t)DS4_DFLASH_INJECT_ROWS * dw->n_embd * sizeof(float))) &&
+              (d->inj_k = ds4_gpu_tensor_alloc((uint64_t)DS4_DFLASH_INJECT_ROWS * kv * sizeof(float))) &&
+              (d->inj_v = ds4_gpu_tensor_alloc((uint64_t)DS4_DFLASH_INJECT_ROWS * kv * sizeof(float)));
+    for (uint32_t b = 0; ok && b < dw->n_block; b++) {
+        ok = (d->ring_k[b] = ds4_gpu_tensor_alloc((uint64_t)DS4_DFLASH_RING * kv * sizeof(uint16_t))) &&
+             (d->ring_v[b] = ds4_gpu_tensor_alloc((uint64_t)DS4_DFLASH_RING * kv * sizeof(uint16_t)));
+    }
+    if (!ok || !qwen35_dflash_forget(d, 0)) {
         fprintf(stderr, "ds4: DFlash drafter state allocation failed\n");
         qwen35_dflash_free(d);
         return NULL;
@@ -59867,6 +59897,55 @@ static bool qwen35_dflash_capture(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t 
         }
     }
     return true;
+}
+
+/* Inject the pending committed features [inject_pos, feat_end) into every
+ * block's ring, in sub-batches of DS4_DFLASH_INJECT_ROWS that never cross
+ * the capture ring's wrap: g = rmsnorm(fc . f) * enc.output_norm, then per
+ * block K = rope(rmsnorm_head(wk . g) * attn_k_norm) at the row's position
+ * and V = wv . g (llama.cpp src/models/dflash.cpp:606-675), written with
+ * their tags.  Rows older than the ring are skipped.  On failure nothing
+ * stays pending: holes cost acceptance, never correctness. */
+static bool qwen35_dflash_inject(ds4_qwen35_dflash *d) {
+    if (!d || d->feat_end <= d->inject_pos) return true;
+    if (d->feat_end - d->inject_pos > DS4_DFLASH_RING) d->inject_pos = d->feat_end - DS4_DFLASH_RING;
+    const ds4_dflash_weights *dw = d->dw;
+    const ds4_model *dm = d->dm;
+    const uint64_t E = dw->n_embd, in = (uint64_t)dw->n_target_layers * E;
+    const uint32_t kv = dw->n_head_kv * dw->head_dim;
+    if (!glm_graph_begin_commands_if_needed()) return false;
+    bool ok = true;
+    for (uint32_t pos = d->inject_pos; ok && pos < d->feat_end;) {
+        const uint32_t slot = pos % DS4_DFLASH_RING;
+        uint32_t n = d->feat_end - pos;
+        if (n > DS4_DFLASH_INJECT_ROWS) n = DS4_DFLASH_INJECT_ROWS;
+        if (n > DS4_DFLASH_RING - slot) n = DS4_DFLASH_RING - slot;
+        ds4_gpu_tensor *f = ds4_gpu_tensor_view(d->features, (uint64_t)slot * in * sizeof(float),
+                                                (uint64_t)n * in * sizeof(float));
+        ok = f != NULL &&
+             ds4_gpu_matmul_quant_tensor(d->inj_g, dm->map, dm->size, dw->fc->abs_offset, dw->fc->type,
+                                         in, E, f, n) != 0 &&
+             ds4_gpu_rms_norm_weight_rows_tensor(d->inj_gn, d->inj_g, dm->map, dm->size,
+                                                 dw->enc_output_norm->abs_offset, (uint32_t)E, n, dw->rms_eps) != 0;
+        ds4_gpu_tensor_free(f);
+        for (uint32_t b = 0; ok && b < dw->n_block; b++) {
+            const ds4_dflash_block_weights *bw = &dw->block[b];
+            ok = ds4_gpu_matmul_quant_tensor(d->inj_k, dm->map, dm->size, bw->attn_k->abs_offset, bw->attn_k->type,
+                                             E, kv, d->inj_gn, n) != 0 &&
+                 ds4_gpu_matmul_quant_tensor(d->inj_v, dm->map, dm->size, bw->attn_v->abs_offset, bw->attn_v->type,
+                                             E, kv, d->inj_gn, n) != 0 &&
+                 ds4_gpu_dflash_head_norm_rope_tensor(d->inj_k, d->inj_k, dm->map, dm->size,
+                                                      bw->attn_k_norm->abs_offset, n, dw->n_head_kv, dw->head_dim,
+                                                      pos, dw->rope_dims, dw->rope_base, dw->rms_eps) != 0 &&
+                 ds4_gpu_dflash_ring_write_tensor(d->ring_k[b], d->ring_v[b], d->ring_pos, d->inj_k, d->inj_v,
+                                                  n, kv, pos, DS4_DFLASH_RING) != 0;
+        }
+        pos += n;
+    }
+    if (!ds4_gpu_end_commands()) ok = false;
+    d->inject_pos = d->feat_end;
+    if (!ok) fprintf(stderr, "ds4: DFlash feature injection failed; the drafter's ring keeps holes\n");
+    return ok;
 }
 
 /* The capture's bookkeeping around one forward of T rows at pos0.  Before:
@@ -76925,6 +77004,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->checkpoint_valid = true;
             s->qwen4_rewound = false;
             s->mtp_draft_valid = false;
+#ifdef DS4_HAS_QWEN4_METAL
+            (void)qwen35_dflash_inject(dflash);
+#endif
             if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
         }
         s->qwen4_graph.vis_spans = NULL;
@@ -78957,6 +79039,12 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         s->checkpoint_valid = true;
         s->qwen4_rewound = false;
         s->mtp_draft_valid = false;
+#ifdef DS4_HAS_QWEN4_METAL
+        ds4_qwen35_dflash *dflash = s->qwen4_graph.dflash;
+        if (dflash && dflash->feat_end >= dflash->inject_pos + DS4_DFLASH_INJECT_ROWS) {
+            (void)qwen35_dflash_inject(dflash);
+        }
+#endif
         (void)probe_mtp;
         return 0;
     }
@@ -86883,6 +86971,7 @@ int ds4_session_verify_commit(ds4_session *s, int n_rows, char *err, size_t errl
     s->mtp_draft_valid = false;
     memcpy(s->logits, s->qwen4_graph.qwen35_verify_host + (size_t)(n_rows - 1) * DS4_N_VOCAB,
            (size_t)DS4_N_VOCAB * sizeof(float));
+    (void)qwen35_dflash_inject(s->qwen4_graph.dflash);
     ds4_spec_stats *st = &s->qwen35_spec_stats;
     st->steps++;
     st->drafted += s->qwen35_verify_rows - 1u;
@@ -86912,6 +87001,28 @@ int ds4_session_dflash_features(ds4_session *s, int pos, float *out) {
     return ds4_gpu_tensor_read(d->features, (uint64_t)((uint32_t)pos % DS4_DFLASH_RING) * row, out, row) ? 0 : 1;
 #else
     (void)s; (void)pos; (void)out;
+    return 1;
+#endif
+}
+
+int ds4_session_dflash_ring(ds4_session *s, int block, int pos, float *k, float *v) {
+#ifdef DS4_HAS_QWEN4_METAL
+    const ds4_qwen35_dflash *d = s && s->qwen4_graph_ready ? s->qwen4_graph.dflash : NULL;
+    if (!d || !k || !v || block < 0 || (uint32_t)block >= d->dw->n_block || pos < 0) return 1;
+    const uint32_t slot = (uint32_t)pos % DS4_DFLASH_RING, kv = d->dw->n_head_kv * d->dw->head_dim;
+    int32_t tag = -1;
+    uint16_t *h = xmalloc((size_t)kv * 2u * sizeof(uint16_t));
+    bool ok = ds4_gpu_tensor_read(d->ring_pos, (uint64_t)slot * sizeof(int32_t), &tag, sizeof(tag)) && tag == pos &&
+              ds4_gpu_tensor_read(d->ring_k[block], (uint64_t)slot * kv * 2u, h, (uint64_t)kv * 2u) &&
+              ds4_gpu_tensor_read(d->ring_v[block], (uint64_t)slot * kv * 2u, h + kv, (uint64_t)kv * 2u);
+    for (uint32_t i = 0; ok && i < kv; i++) {
+        k[i] = f16_to_f32(h[i]);
+        v[i] = f16_to_f32(h[kv + i]);
+    }
+    free(h);
+    return ok ? 0 : 1;
+#else
+    (void)s; (void)block; (void)pos; (void)k; (void)v;
     return 1;
 #endif
 }
