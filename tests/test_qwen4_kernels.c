@@ -1528,6 +1528,195 @@ static void test_attention_rows(arena_t *a) {
     free(gq_w); free(gk_w); free(giq_w); free(gik_w);
 }
 
+/* ---- qwen35 verify mode (DFlash S1) ----
+ *
+ * A verify of T <= 8 rows must give every row the bytes a one-token decode
+ * at its position gives.  Each case runs T one-row dispatches and one T-row
+ * dispatch on identical inputs and compares every byte. */
+
+static void graph_same_bytes(const char *what, const ds4_gpu_tensor *ta, const ds4_gpu_tensor *tb,
+                             uint64_t bytes, uint64_t row_bytes) {
+    uint8_t *x = malloc(bytes), *y = malloc(bytes);
+    require_ok(ds4_gpu_tensor_read(ta, 0, x, bytes) && ds4_gpu_tensor_read(tb, 0, y, bytes), "qwen35 graph read");
+    for (uint64_t i = 0; i < bytes; i++) {
+        if (x[i] != y[i]) {
+            fprintf(stderr, "qwen35 graph: %s differs in row %llu at byte %llu (%02x vs %02x)\n", what,
+                    (unsigned long long)(i / row_bytes), (unsigned long long)(i % row_bytes), x[i], y[i]);
+            exit(1);
+        }
+    }
+    free(x); free(y);
+}
+
+static ds4_gpu_tensor *graph_row(ds4_gpu_tensor *t, uint32_t row, uint64_t floats) {
+    ds4_gpu_tensor *v = ds4_gpu_tensor_view(t, (uint64_t)row * floats * 4u, floats * 4u);
+    require_ok(v != NULL, "qwen35 graph row view");
+    return v;
+}
+
+/* The fused GDN front (conv, alpha/beta rows, q/k norm) and the scan over T
+ * rows with the verify rows set, against T one-row dispatches: post-front
+ * rows, decay, beta, scan output, and the history and state after the last
+ * row. */
+static void qwen35_graph_gdn(arena_t *a, const char *shape, uint32_t Hk, uint32_t Hv, uint32_t D,
+                             uint32_t E, uint32_t wtype) {
+    const uint32_t K = 4, C = 2 * Hk * D + Hv * D, vd = Hv * D, R = 8;
+    const uint64_t S = (uint64_t)Hv * D * D, Hn = (uint64_t)(K - 1) * C;
+    double *conv_w, *ssm_a, *dt, *alpha_w, *beta_w;
+    const uint64_t conv_off = arena_f32(a, (uint64_t)C * K, &conv_w, -0.5f, 0.5f);
+    const uint64_t a_off = arena_f32(a, Hv, &ssm_a, -8.0f, -0.1f);
+    const uint64_t dt_off = arena_f32(a, Hv, &dt, 0.2f, 1.5f);
+    const uint64_t alpha_off = wtype == 12u ? arena_q4_K(a, Hv, E, &alpha_w, 0.05f) : arena_q8_0(a, Hv, E, &alpha_w, 0.05f);
+    const uint64_t beta_off = wtype == 12u ? arena_q4_K(a, Hv, E, &beta_w, 0.05f) : arena_q8_0(a, Hv, E, &beta_w, 0.05f);
+    float *qkv = rand_vec((uint64_t)R * C, 1.0f), *mixed = rand_vec((uint64_t)R * E, 1.0f);
+    float *state0 = rand_vec(S, 0.1f), *hist0 = rand_vec(Hn, 1.0f);
+    char name[128];
+    for (uint32_t T = 1; T <= R; T++) {
+        ds4_gpu_tensor *gq[2], *ga[2], *gb[2], *gs[2], *gh[2], *go[2];
+        ds4_gpu_tensor *gm = upload(mixed, (uint64_t)T * E);
+        for (int p = 0; p < 2; p++) {
+            gq[p] = upload(qkv, (uint64_t)T * C); ga[p] = upload(NULL, (uint64_t)T * Hv);
+            gb[p] = upload(NULL, (uint64_t)T * Hv); gs[p] = upload(state0, S);
+            gh[p] = upload(hist0, Hn); go[p] = upload(NULL, (uint64_t)T * vd);
+        }
+        for (uint32_t t = 0; t < T; t++) {
+            ds4_gpu_tensor *vq = graph_row(gq[0], t, C), *va = graph_row(ga[0], t, Hv), *vb = graph_row(gb[0], t, Hv);
+            ds4_gpu_tensor *vm = graph_row(gm, t, E), *vo = graph_row(go[0], t, vd);
+            require_ok(ds4_gpu_qwen4_gdn_front_tensor(vq, gh[0], vm, va, vb, a->base, a->size, conv_off, alpha_off,
+                                                      beta_off, a_off, dt_off, wtype, 1, Hk, Hv, D, K, E,
+                                                      NULL, 0u, NULL, 0u), "qwen35 gdn: one-row front");
+            require_ok(ds4_gpu_qwen4_gdn_scan_tensor(vo, gs[0], vq, va, vb, 1, Hk, Hv, D, NULL, 0u, NULL, 0u),
+                       "qwen35 gdn: one-row scan");
+            ds4_gpu_tensor_free(vo); ds4_gpu_tensor_free(vm); ds4_gpu_tensor_free(vb);
+            ds4_gpu_tensor_free(va); ds4_gpu_tensor_free(vq);
+        }
+        ds4_gpu_qwen35_set_verify_rows(T);
+        require_ok(ds4_gpu_qwen4_gdn_front_tensor(gq[1], gh[1], gm, ga[1], gb[1], a->base, a->size, conv_off, alpha_off,
+                                                  beta_off, a_off, dt_off, wtype, T, Hk, Hv, D, K, E,
+                                                  NULL, 0u, NULL, 0u), "qwen35 gdn: rows front");
+        require_ok(ds4_gpu_qwen4_gdn_scan_tensor(go[1], gs[1], gq[1], ga[1], gb[1], T, Hk, Hv, D, NULL, 0u, NULL, 0u),
+                   "qwen35 gdn: rows scan");
+        ds4_gpu_qwen35_set_verify_rows(0);
+        const char *what[6] = { "post-front qkv", "decay", "beta", "scan output", "conv history", "state" };
+        ds4_gpu_tensor *const *ts[6] = { gq, ga, gb, go, gh, gs };
+        const uint64_t row[6] = { C, Hv, Hv, vd, C, (uint64_t)D * D };
+        const uint64_t n[6] = { (uint64_t)T * C, (uint64_t)T * Hv, (uint64_t)T * Hv, (uint64_t)T * vd, Hn, S };
+        for (int i = 0; i < 6; i++) {
+            snprintf(name, sizeof(name), "gdn %s T=%u %s", shape, T, what[i]);
+            graph_same_bytes(name, ts[i][0], ts[i][1], n[i] * 4u, row[i] * 4u);
+        }
+        ds4_gpu_tensor_free(gm);
+        for (int p = 0; p < 2; p++) {
+            ds4_gpu_tensor_free(gq[p]); ds4_gpu_tensor_free(ga[p]); ds4_gpu_tensor_free(gb[p]);
+            ds4_gpu_tensor_free(gs[p]); ds4_gpu_tensor_free(gh[p]); ds4_gpu_tensor_free(go[p]);
+        }
+    }
+    printf("  qwen35 gdn %s (%u/%u heads of %u, in %u, type %u): front and scan, T=1..8 byte-exact against one row\n",
+           shape, Hk, Hv, D, E, wtype);
+    free(hist0); free(state0); free(mixed); free(qkv);
+    free(conv_w); free(ssm_a); free(dt); free(alpha_w); free(beta_w);
+}
+
+/* The rest of the qwen35 forward over T rows against one row at a time:
+ * the weighted RMS norm, the residual add, SwiGLU, the attention prep (q,
+ * gate and the K/V cache rows it writes at pos0 + t) and the GDN output
+ * norm. */
+static void qwen35_graph_row_ops(arena_t *a, const char *shape, uint32_t E, uint32_t F, uint32_t H, uint32_t Hkv,
+                                 uint32_t D, uint32_t n_rot, uint32_t Hv, uint32_t Dv) {
+    const uint32_t R = 8, pos0 = 100, cap = pos0 + R;
+    const uint64_t qd = (uint64_t)H * D, kvd = (uint64_t)Hkv * D, gd = (uint64_t)Hv * Dv;
+    const float base = 1.0e7f, eps = 1e-6f;
+    double *nw, *qn, *kn, *gn;
+    const uint64_t nw_off = arena_f32(a, E, &nw, 0.5f, 1.5f);
+    const uint64_t qn_off = arena_f32(a, D, &qn, 0.5f, 1.5f);
+    const uint64_t kn_off = arena_f32(a, D, &kn, 0.5f, 1.5f);
+    const uint64_t gn_off = arena_f32(a, Dv, &gn, 0.5f, 1.5f);
+    float *x = rand_vec((uint64_t)R * E, 1.0f), *y = rand_vec((uint64_t)R * E, 1.0f);
+    float *g = rand_vec((uint64_t)R * F, 1.0f), *u = rand_vec((uint64_t)R * F, 1.0f);
+    float *qg = rand_vec((uint64_t)R * 2 * qd, 1.0f), *kp = rand_vec((uint64_t)R * kvd, 1.0f);
+    float *vp = rand_vec((uint64_t)R * kvd, 1.0f), *o = rand_vec((uint64_t)R * gd, 1.0f), *z = rand_vec((uint64_t)R * gd, 1.0f);
+    uint32_t *p3 = calloc((size_t)cap * 4, sizeof(uint32_t));
+    for (uint32_t p = 0; p < cap; p++) p3[p * 4] = p3[p * 4 + 1] = p3[p * 4 + 2] = p;
+    ds4_gpu_tensor *pos3 = ds4_gpu_tensor_alloc((uint64_t)cap * 16);
+    require_ok(pos3 && ds4_gpu_tensor_write(pos3, 0, p3, (uint64_t)cap * 16), "qwen35 rows: pos3");
+    char name[128];
+    for (uint32_t T = 1; T <= R; T++) {
+        ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E), *gy = upload(y, (uint64_t)T * E);
+        ds4_gpu_tensor *gg = upload(g, (uint64_t)T * F), *gu = upload(u, (uint64_t)T * F);
+        ds4_gpu_tensor *gqg = upload(qg, (uint64_t)T * 2 * qd), *gkp = upload(kp, (uint64_t)T * kvd);
+        ds4_gpu_tensor *gvp = upload(vp, (uint64_t)T * kvd), *gz = upload(z, (uint64_t)T * gd);
+        ds4_gpu_tensor *norm[2], *sum[2], *mid[2], *q[2], *gate[2], *kc[2], *vc[2], *go[2];
+        for (int p = 0; p < 2; p++) {
+            norm[p] = upload(NULL, (uint64_t)T * E); sum[p] = upload(NULL, (uint64_t)T * E);
+            mid[p] = upload(NULL, (uint64_t)T * F); q[p] = upload(NULL, (uint64_t)T * qd);
+            gate[p] = upload(NULL, (uint64_t)T * qd); kc[p] = upload(NULL, (uint64_t)cap * kvd / 2);
+            vc[p] = upload(NULL, (uint64_t)cap * kvd / 2); go[p] = upload(o, (uint64_t)T * gd);
+        }
+        for (uint32_t t = 0; t < T; t++) {
+            ds4_gpu_tensor *v[14] = {
+                graph_row(gx, t, E), graph_row(gy, t, E), graph_row(norm[0], t, E), graph_row(sum[0], t, E),
+                graph_row(gg, t, F), graph_row(gu, t, F), graph_row(mid[0], t, F),
+                graph_row(gqg, t, 2 * qd), graph_row(gkp, t, kvd), graph_row(gvp, t, kvd),
+                graph_row(q[0], t, qd), graph_row(gate[0], t, qd), graph_row(go[0], t, gd), graph_row(gz, t, gd) };
+            require_ok(ds4_gpu_rms_norm_weight_rows_tensor(v[2], v[0], a->base, a->size, nw_off, E, 1, eps),
+                       "qwen35 rows: one-row norm");
+            require_ok(ds4_gpu_add_tensor(v[3], v[0], v[1], E), "qwen35 rows: one-row add");
+            require_ok(ds4_gpu_swiglu_tensor(v[6], v[4], v[5], F, 0.0f, 1.0f), "qwen35 rows: one-row swiglu");
+            require_ok(ds4_gpu_qwen35_attn_prep_tensor(v[10], v[11], kc[0], vc[0], v[7], v[8], v[9], pos3, a->base, a->size,
+                                                       qn_off, kn_off, 1, H, Hkv, D, n_rot, pos0 + t, cap, base, eps),
+                       "qwen35 rows: one-row attention prep");
+            require_ok(ds4_gpu_qwen35_gdn_out_tensor(v[12], v[13], a->base, a->size, gn_off, 1, Hv, Dv, eps),
+                       "qwen35 rows: one-row gdn out");
+            for (int i = 0; i < 14; i++) ds4_gpu_tensor_free(v[i]);
+        }
+        require_ok(ds4_gpu_rms_norm_weight_rows_tensor(norm[1], gx, a->base, a->size, nw_off, E, T, eps),
+                   "qwen35 rows: norm");
+        require_ok(ds4_gpu_add_tensor(sum[1], gx, gy, T * E), "qwen35 rows: add");
+        require_ok(ds4_gpu_swiglu_tensor(mid[1], gg, gu, T * F, 0.0f, 1.0f), "qwen35 rows: swiglu");
+        require_ok(ds4_gpu_qwen35_attn_prep_tensor(q[1], gate[1], kc[1], vc[1], gqg, gkp, gvp, pos3, a->base, a->size,
+                                                   qn_off, kn_off, T, H, Hkv, D, n_rot, pos0, cap, base, eps),
+                   "qwen35 rows: attention prep");
+        require_ok(ds4_gpu_qwen35_gdn_out_tensor(go[1], gz, a->base, a->size, gn_off, T, Hv, Dv, eps),
+                   "qwen35 rows: gdn out");
+        const char *what[8] = { "rms norm", "add", "swiglu", "attention q", "attention gate",
+                                "k cache", "v cache", "gdn out" };
+        ds4_gpu_tensor *const *ts[8] = { norm, sum, mid, q, gate, kc, vc, go };
+        const uint64_t row[8] = { E, E, F, qd, qd, kvd / 2, kvd / 2, gd };
+        const uint64_t n[8] = { (uint64_t)T * E, (uint64_t)T * E, (uint64_t)T * F, (uint64_t)T * qd, (uint64_t)T * qd,
+                                (uint64_t)cap * kvd / 2, (uint64_t)cap * kvd / 2, (uint64_t)T * gd };
+        for (int i = 0; i < 8; i++) {
+            snprintf(name, sizeof(name), "rows %s T=%u %s", shape, T, what[i]);
+            graph_same_bytes(name, ts[i][0], ts[i][1], n[i] * 4u, row[i] * 4u);
+        }
+        ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gy); ds4_gpu_tensor_free(gg); ds4_gpu_tensor_free(gu);
+        ds4_gpu_tensor_free(gqg); ds4_gpu_tensor_free(gkp); ds4_gpu_tensor_free(gvp); ds4_gpu_tensor_free(gz);
+        for (int p = 0; p < 2; p++) {
+            ds4_gpu_tensor_free(norm[p]); ds4_gpu_tensor_free(sum[p]); ds4_gpu_tensor_free(mid[p]);
+            ds4_gpu_tensor_free(q[p]); ds4_gpu_tensor_free(gate[p]); ds4_gpu_tensor_free(kc[p]);
+            ds4_gpu_tensor_free(vc[p]); ds4_gpu_tensor_free(go[p]);
+        }
+    }
+    printf("  qwen35 rows %s (E %u, F %u, %u/%u heads of %u, GDN %u of %u): norm, add, swiglu, attention prep, "
+           "gdn out, T=1..8 byte-exact against one row\n", shape, E, F, H, Hkv, D, Hv, Dv);
+    ds4_gpu_tensor_free(pos3);
+    free(p3); free(z); free(o); free(vp); free(kp); free(qg); free(u); free(g); free(y); free(x);
+    free(nw); free(qn); free(kn); free(gn);
+}
+
+/* Shapes: A the 27B's, B small and odd, C Qwen3.8 Flash's for the kernels
+ * the two share.  The random stream is restored afterwards, so the suite's
+ * later tests see the inputs they saw before these were added. */
+static void test_qwen35_graph(arena_t *a) {
+    const uint32_t rng = g_rng;
+    printf("qwen35 verify rows\n");
+    qwen35_graph_gdn(a, "A", 16, 48, 128, 5120, 12u);
+    qwen35_graph_gdn(a, "B", 2, 6, 128, 256, 12u);
+    qwen35_graph_gdn(a, "C", 16, 48, 128, 2560, 8u);
+    qwen35_graph_row_ops(a, "A", 5120, 17408, 24, 4, 256, 64, 48, 128);
+    qwen35_graph_row_ops(a, "B", 256, 260, 4, 2, 128, 64, 6, 128);
+    g_rng = rng;
+}
+
 #endif
 
 /* ---- routed experts ---- */
@@ -3557,6 +3746,14 @@ int main(void) {
         return 0;
     }
 #endif
+#ifdef __APPLE__
+    const char *qwen35_graph_only = getenv("DS4_TEST_QWEN35_GRAPH_ONLY");
+    if (qwen35_graph_only && qwen35_graph_only[0] && strcmp(qwen35_graph_only, "0") != 0) {
+        test_qwen35_graph(&arena);
+        printf("all qwen35 verify rows tests passed\n");
+        return 0;
+    }
+#endif
     if (getenv("DS4_TEST_QWEN4_DECODE_FUSIONS")) { test_decode_fusions(&arena); return 0; }
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
         test_moe_types(&arena, 8, 6, 2560, 640, 1, 16u, 10u);
@@ -3646,6 +3843,7 @@ int main(void) {
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
 #ifdef __APPLE__
     test_attention_rows(&arena);
+    test_qwen35_graph(&arena);
 #endif
     printf("routed experts\n");
     test_moe(&arena, 16, 10, 2560, 640, 2, 8u);

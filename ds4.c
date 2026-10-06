@@ -57907,6 +57907,11 @@ static const ds4_vision_span *qwen4_fake_spans(size_t *count) {
     X(moe_lists) X(moe_counts) X(sh_gate) X(sh_up) X(sh_mid) X(sh_out) \
     X(hc_u) X(hc_lo_act)
 
+/* qwen35 verify mode for forwards of 2..8 rows (DFlash): every row gets the
+ * bytes a one-token decode at its position gets.  EXACT and MMA differ only
+ * in the multi-row matvecs. */
+enum { DS4_QWEN35_VERIFY_OFF = 0, DS4_QWEN35_VERIFY_EXACT = 1, DS4_QWEN35_VERIFY_MMA = 2 };
+
 typedef struct ds4_qwen4_gpu_graph {
     uint32_t ctx_cap;
     uint32_t pos;
@@ -57979,6 +57984,7 @@ typedef struct ds4_qwen4_gpu_graph {
     bool snap_after_first;   /* set by the caller for a 2-token verify: snapshot the state after row 0 */
     bool snap_after_second;  /* 3-token verify: also snapshot the state after row 1 */
     bool verify_rows_exact;  /* 3-token verify: split attention into 2/1-row sub-batches */
+    uint32_t qwen35_verify;  /* qwen35 verify mode for 2..8-row forwards: DS4_QWEN35_VERIFY_* */
     bool snap_valid;
     /* multimodal: per-position (t, h, w) rope positions, the text counter
      * offset, and the image spans of the prompt being prefilled */
@@ -58723,6 +58729,8 @@ static bool qwen4_graph_fused(const ds4_qwen4_gpu_graph *g, uint32_t T) {
     static int no_fuse = -1;
     if (no_fuse < 0) no_fuse = getenv("DS4_QWEN4_NO_FUSE") != NULL;
     if (no_fuse || T <= 2u) return T <= 2u && !no_fuse;
+    /* a qwen35 verify keeps every row on the decode front */
+    if (g->qwen35_verify != DS4_QWEN35_VERIFY_OFF && T <= 8u) return true;
     /* T = 3 takes the fused kernels for the speculative verify only; prefill
      * tails of three tokens keep their historical kernel selection. */
     return T == 3u && g->verify_rows_exact;

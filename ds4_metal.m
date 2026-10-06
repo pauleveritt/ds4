@@ -48839,6 +48839,15 @@ int ds4_gpu_qwen4_gdn_prep_tensor(
                           MTLSizeMake(n_k_head, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
 }
 
+/* Rows of a qwen35 verify (0 off, at most 8): batches up to this many rows
+ * take the decode scan, so each row's state update is a one-row decode's.
+ * Separate from qwen4's verify_rows_exact, which also moves the mv_ext lane
+ * map that Qwen3.8 Flash uses at three rows. */
+static uint32_t g_qwen35_verify_rows;
+void ds4_gpu_qwen35_set_verify_rows(uint32_t n_rows) {
+    g_qwen35_verify_rows = n_rows <= 8u ? n_rows : 8u;
+}
+
 int ds4_gpu_qwen4_gdn_scan_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *qkv,
         const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
@@ -48869,7 +48878,8 @@ int ds4_gpu_qwen4_gdn_scan_tensor(
     } else {
         bd[6] = bd[3];
     }
-    const bool decode_r4 = (n_tokens <= 2u || (n_tokens == 3u && g_qwen4_verify_rows_exact)) &&
+    const bool decode_r4 = (n_tokens <= 2u || (n_tokens == 3u && g_qwen4_verify_rows_exact) ||
+                            n_tokens <= g_qwen35_verify_rows) &&
         getenv("DS4_QWEN4_NO_GDN_R4") == NULL;
     if (head_dim == 128u && (n_tokens > 8u || decode_r4)) {
         /* SIMD groups own independent value rows, so changing their grouping

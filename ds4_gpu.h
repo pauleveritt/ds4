@@ -3412,6 +3412,9 @@ int ds4_gpu_qwen4_gdn_prep_tensor(
 /* snap_state/snap2_state (optional) receive the state right after tokens
  * snap_tok/snap2_tok; two points serve the 3-row MTP verifier */
 void ds4_gpu_qwen4_set_verify_rows_exact(bool on);
+/* qwen35 verify mode (Metal only): batches of up to n_rows rows (0 off, at
+ * most 8) take the decode scan, so each row matches a one-row dispatch */
+void ds4_gpu_qwen35_set_verify_rows(uint32_t n_rows);
 int ds4_gpu_qwen4_gdn_scan_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *qkv,
         const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
