@@ -3651,6 +3651,11 @@ static void test_qwen35_verify(arena_t *a) {
         test_qwen35_rows_exact(a, "Q4_K", ds4_gpu_matmul_q4_K_rows_tensor, qwen35_q4_K_one_row,
                                mv_shapes[i][0], mv_shapes[i][1]);
     }
+    for (uint32_t i = 0; i < sizeof(mv_shapes) / sizeof(mv_shapes[0]); i++) {
+        test_qwen35_rows_exact(a, "Q6_K", ds4_gpu_matmul_q6_K_rows_tensor, ds4_gpu_matmul_q6_K_tensor,
+                               mv_shapes[i][0], mv_shapes[i][1]);
+    }
+    test_qwen35_rows_exact(a, "Q6_K", ds4_gpu_matmul_q6_K_rows_tensor, ds4_gpu_matmul_q6_K_tensor, 5120, 4099);
 }
 
 /* One weight type in the verify bench: its one-row matvec (also today's one

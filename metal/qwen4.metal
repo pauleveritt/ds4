@@ -1069,6 +1069,115 @@ kernel void kernel_qwen35_q6_K_matmul_f32(
     }
 }
 
+/* qwen35 verify: the Q6_K matvec above over 1..8 rows of x (args.n_tokens)
+ * in one dispatch, grid (ceil(out_dim / 4), 1). Same lane map and simdgroups
+ * of two rows; each block's quants, scales and d load once, then a token loop
+ * runs the one-row body for every x row into sums[t][r]. Row t therefore sums
+ * in the one-row kernel's order and is bitwise kernel_qwen35_q6_K_matmul_f32
+ * on that row alone. */
+kernel void kernel_qwen35_q6_K_rows_f32(
+        constant ds4_metal_args_qwen35_q6_matmul &args,
+        device const char  *weight,
+        device const float *x,
+        device float       *out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simd_group [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint rows_per_simd = 2u;
+    constexpr uint simd_groups = 2u;
+    constexpr uint max_tok = 8u;
+    constexpr uint kmask1 = 0x03u;
+    constexpr uint kmask2 = 0x0Cu;
+    constexpr uint kmask3 = 0x30u;
+    constexpr uint kmask4 = 0xC0u;
+    constexpr uint qk_k = 256u;
+
+    const uint row0 = (tgpig.x * simd_groups + simd_group) * rows_per_simd;
+    const uint n_tok = min(args.n_tokens, max_tok);
+    if (row0 >= args.out_dim) return;
+
+    const int n_blocks = (int)(args.in_dim / qk_k);
+    const short tid = (short)(lane / 2u);
+    const short ix = (short)(lane & 1u);
+    const short ip = (short)(tid / 8);
+    const short il = (short)(tid % 8);
+    const short l0 = (short)(4 * il);
+    const short is = (short)(8 * ip + l0 / 16);
+    const short y_offset = (short)(128 * ip + l0);
+    const short q_offset_l = (short)(64 * ip + l0);
+    const short q_offset_h = (short)(32 * ip + l0);
+    float sums[max_tok][rows_per_simd] = {{0.0f}};
+    float yl[16];
+
+    for (int ib = ix; ib < n_blocks; ib += 2) {
+        uchar q1w[rows_per_simd][4];
+        uchar q2w[rows_per_simd][4];
+        uchar qhw[rows_per_simd][4];
+        char scw[rows_per_simd][4];
+        half dw[rows_per_simd];
+        for (uint r = 0u; r < rows_per_simd && row0 + r < args.out_dim; r++) {
+            device const block_q6_K *block =
+                (device const block_q6_K *)(weight +
+                    (uint64_t)(row0 + r) * args.row_bytes) + ib;
+            device const uchar *q1 = block->ql + q_offset_l;
+            device const uchar *q2 = q1 + 32;
+            device const uchar *qh = block->qh + q_offset_h;
+            device const char *sc = block->scales + is;
+            for (short l = 0; l < 4; l++) {
+                q1w[r][l] = q1[l];
+                q2w[r][l] = q2[l];
+                qhw[r][l] = qh[l];
+            }
+            scw[r][0] = sc[0];
+            scw[r][1] = sc[2];
+            scw[r][2] = sc[4];
+            scw[r][3] = sc[6];
+            dw[r] = block->d;
+        }
+
+        for (uint t = 0u; t < n_tok; t++) {
+            device const float *y = x + (uint64_t)t * args.in_dim + (uint64_t)ib * qk_k + y_offset;
+            for (short l = 0; l < 4; l++) {
+                yl[4 * l + 0] = y[l + 0];
+                yl[4 * l + 1] = y[l + 32];
+                yl[4 * l + 2] = y[l + 64];
+                yl[4 * l + 3] = y[l + 96];
+            }
+
+            for (uint r = 0u; r < rows_per_simd && row0 + r < args.out_dim; r++) {
+                thread const uchar *q1 = q1w[r];
+                thread const uchar *q2 = q2w[r];
+                thread const uchar *qh = qhw[r];
+                thread const char *sc = scw[r];
+                float4 part = float4(0.0f);
+                for (short l = 0; l < 4; l++) {
+                    const uint h = (uint)qh[l];
+                    part[0] += yl[4 * l + 0] *
+                        (float)((int)((q1[l] & 0x0Fu) | ((h & kmask1) << 4u)) - 32);
+                    part[1] += yl[4 * l + 1] *
+                        (float)((int)((q2[l] & 0x0Fu) | ((h & kmask2) << 2u)) - 32);
+                    part[2] += yl[4 * l + 2] *
+                        (float)((int)((q1[l] >> 4u) | (h & kmask3)) - 32);
+                    part[3] += yl[4 * l + 3] *
+                        (float)((int)((q2[l] >> 4u) | ((h & kmask4) >> 2u)) - 32);
+                }
+                sums[t][r] += (float)dw[r] *
+                    (part[0] * (float)sc[0] + part[1] * (float)sc[1] +
+                     part[2] * (float)sc[2] + part[3] * (float)sc[3]);
+            }
+        }
+    }
+
+    for (uint t = 0u; t < n_tok; t++) {
+        for (uint r = 0u; r < rows_per_simd && row0 + r < args.out_dim; r++) {
+            const float sum = simd_sum(sums[t][r]);
+            if (lane == 0u) {
+                out[(uint64_t)t * args.out_dim + row0 + r] = sum;
+            }
+        }
+    }
+}
+
 /* Dense qwen35 prompt batches of Q6_K weights: dense.metal's tiled matrix
  * kernel with moe.metal's Q6_K dequantizer, the instantiation llama.cpp's
  * kernel_mul_mm_q6_K_f32 uses. */
