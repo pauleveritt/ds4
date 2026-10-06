@@ -583,6 +583,48 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  float top_p, float min_p, uint64_t *rng,
                                  int *accepted, int accepted_cap,
                                  char *err, size_t errlen);
+/* DFlash speculative verify (dense qwen35 on Metal).
+ *
+ * ds4_engine_verify_rows: the rows one verify takes, anchor included (8),
+ * or 0 where verify is unsupported.
+ *
+ * ds4_session_set_verify_mode: DS4_VERIFY_MODE_MMA puts the session in
+ * DFlash mode, where every forward of up to 8 rows (a one-token eval, a
+ * verify, a short sync tail) runs its Q4_K and Q6_K matvecs on the few-row
+ * MMA kernel and its GDN and attention on the per-row paths, so a verify
+ * row is bitwise the one-token eval it stands for.  DS4_VERIFY_MODE_OFF is
+ * the ordinary numerics.  Returns 0, or nonzero when unsupported, unknown or
+ * a verify is open.
+ *
+ * ds4_session_verify evaluates [anchor, draft...] (1 + n_draft rows) at the
+ * session position without advancing it: every row's logits are kept, the
+ * recurrent state is not written, and the session logits stay as they were.
+ * Needs DFlash mode, no drafter.  ds4_session_verify_select(row) copies a
+ * row's logits into the session logits, so sample, argmax, copy_logits and
+ * set_logits act on it.  ds4_session_verify_commit(n_rows), 1 <= n_rows <=
+ * rows, keeps the first n_rows tokens: the state is recomputed through them,
+ * the position advances by n_rows, and the session logits become row
+ * n_rows - 1 as computed.  While a verify is open, eval, sync, payload and
+ * snapshot save or load, rewind, a mode change and another verify are
+ * refused.  All return 0 on success. */
+#define DS4_VERIFY_MODE_OFF 0
+#define DS4_VERIFY_MODE_MMA 1
+typedef struct {
+    uint64_t steps;              /* verifies committed */
+    uint64_t drafted;            /* draft rows of the committed verifies */
+    uint64_t accepted;           /* drafts committed */
+    uint64_t accepted_hist[8];   /* commits by drafts kept, 0..7 */
+    double   draft_ms;
+    double   verify_ms;
+    double   commit_ms;
+} ds4_spec_stats;
+int  ds4_engine_verify_rows(ds4_engine *e);
+int  ds4_session_set_verify_mode(ds4_session *s, int mode);
+int  ds4_session_verify(ds4_session *s, int anchor, const int *draft, int n_draft,
+                        char *err, size_t errlen);
+int  ds4_session_verify_select(ds4_session *s, int row);
+int  ds4_session_verify_commit(ds4_session *s, int n_rows, char *err, size_t errlen);
+void ds4_session_spec_stats(ds4_session *s, ds4_spec_stats *out);
 /* TP worker side of a mirrored speculative-verify block: run its half of the
  * batch verify for KV side effects, then obey the leader's commit frame
  * (keep, or roll back and replay). Only called from ds4_tp_worker_run. */

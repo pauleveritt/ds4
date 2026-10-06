@@ -57984,12 +57984,18 @@ typedef struct ds4_qwen4_gpu_graph {
     bool snap_after_first;   /* set by the caller for a 2-token verify: snapshot the state after row 0 */
     bool snap_after_second;  /* 3-token verify: also snapshot the state after row 1 */
     bool verify_rows_exact;  /* 3-token verify: split attention into 2/1-row sub-batches */
-    uint32_t qwen35_verify;  /* qwen35 verify mode for 2..8-row forwards: DS4_QWEN35_VERIFY_* */
+    /* the session's DFlash mode (ds4_session_set_verify_mode): OFF, or MMA
+     * for every qwen35 forward of up to 8 rows */
+    uint32_t qwen35_verify;
     uint32_t qwen35_verify_now;  /* the mode of the qwen35 forward being encoded (off outside one) */
+    bool qwen35_no_write_back;   /* the forward being encoded is a verify (qwen35_graph_verify) */
     /* qwen35 verify buffers, allocated by the first verify-mode forward:
-     * attention partials and the rows table for 8 rows, and the host copy of
-     * 8 logit rows (g->logits grows to 8 rows with them) */
+     * attention partials and the rows table for 8 rows, the host copy of 8
+     * logit rows (g->logits grows to 8 rows with them), and per GDN layer the
+     * verify's 8 pre-conv rows, post-front rows, decay and beta, which its
+     * commit replays */
     ds4_gpu_tensor *qwen35_verify_part, *qwen35_verify_table;
+    ds4_gpu_tensor *qwen35_gdn_pre, *qwen35_gdn_qkv, *qwen35_gdn_ga, *qwen35_gdn_gb;
     float *qwen35_verify_host;
     bool snap_valid;
     /* multimodal: per-position (t, h, w) rope positions, the text counter
@@ -58143,6 +58149,7 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         &g->snap_ple_hist, &g->snap2_ple_hist, &g->snap0_ple_hist, &g->pos3,
         &g->draft_head, &g->steer_dirs, &g->ffn_gate, &g->ffn_up, &g->ffn_mid,
         &g->qwen35_verify_part, &g->qwen35_verify_table,
+        &g->qwen35_gdn_pre, &g->qwen35_gdn_qkv, &g->qwen35_gdn_ga, &g->qwen35_gdn_gb,
     };
     if (g->owns_scratch) {
         ds4_gpu_tensor **scratch[] = {
@@ -58844,8 +58851,53 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                                   up->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC_LOWRANK);
 }
 
+#if defined(__APPLE__)
+/* The verify's saved rows of GDN layer il: its slot of an 8-row buffer of
+ * row_floats per row, one slot per GDN layer in layer order. */
+static ds4_gpu_tensor *qwen35_gdn_rows_view(ds4_gpu_tensor *t, uint32_t il, uint64_t row_floats) {
+    uint64_t slot = 0;
+    for (uint32_t i = 0; i < il; i++) slot += ds4_qwen4_layer_is_linear(i) ? 1u : 0u;
+    const uint64_t bytes = 8u * row_floats * sizeof(float);
+    return ds4_gpu_tensor_view(t, slot * bytes, bytes);
+}
+
+/* A GDN layer under a qwen35 verify: the decode-front path of
+ * qwen4_graph_linear, except that the post-front rows, decay, beta and
+ * pre-conv rows land in the layer's saved slots and neither the conv history
+ * nor the state is written back (qwen35_graph_commit replays the rows). */
+static bool qwen35_graph_linear_verify(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                       uint32_t il, uint32_t T) {
+    ds4_gpu_tensor *pre = qwen35_gdn_rows_view(g->qwen35_gdn_pre, il, DS4_N_LIN_CONV_DIM);
+    ds4_gpu_tensor *qkv = qwen35_gdn_rows_view(g->qwen35_gdn_qkv, il, DS4_N_LIN_CONV_DIM);
+    ds4_gpu_tensor *ga = qwen35_gdn_rows_view(g->qwen35_gdn_ga, il, DS4_N_LIN_V_HEAD);
+    ds4_gpu_tensor *gb = qwen35_gdn_rows_view(g->qwen35_gdn_gb, il, DS4_N_LIN_V_HEAD);
+    const bool ok = pre && qkv && ga && gb &&
+        qwen4_graph_gemv(g, qkv, m, l->lin_qkv, g->mixed, T) &&
+        qwen4_graph_gemv(g, g->z, m, l->lin_gate, g->mixed, T) &&
+        ds4_gpu_qwen35_gdn_front_verify_tensor(qkv, g->layer_lin_hist[il], g->mixed, ga, gb, pre, m->map, m->size,
+                                               l->lin_conv->abs_offset, l->lin_alpha->abs_offset,
+                                               l->lin_beta->abs_offset, l->lin_a->abs_offset,
+                                               l->lin_dt_bias->abs_offset, l->lin_alpha->type, T,
+                                               DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM,
+                                               DS4_N_LIN_CONV, DS4_N_EMBD) != 0 &&
+        ds4_gpu_qwen35_gdn_scan_verify_tensor(g->lin_o, g->layer_lin_state[il], qkv, ga, gb, T,
+                                              DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM) != 0 &&
+        ds4_gpu_qwen35_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset, T,
+                                      DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0 &&
+        qwen4_graph_gemv(g, g->blk, m, l->lin_out, g->lin_o, T);
+    ds4_gpu_tensor_free(gb);
+    ds4_gpu_tensor_free(ga);
+    ds4_gpu_tensor_free(qkv);
+    ds4_gpu_tensor_free(pre);
+    return ok;
+}
+#endif
+
 static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                uint32_t il, uint32_t T) {
+#if defined(__APPLE__)
+    if (g->qwen35_no_write_back) return qwen35_graph_linear_verify(g, m, l, il, T);
+#endif
     const uint32_t conv_dim = DS4_N_LIN_CONV_DIM;
     bool paired = false;
     if (T == 1u && !g->mtp_R && ds4_gpu_qwen4_decode_fusions_enabled() &&
@@ -59246,18 +59298,19 @@ static bool qwen35_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, c
     return attn && qwen4_graph_gemv(g, g->blk, m, l->attn_output, g->attn_o, T);
 }
 
-/* The verify mode of one qwen35 forward: the graph's, else the diagnostic
- * DS4_QWEN35_VERIFY=exact|mma (read per call, as the attention split keys
- * are, so a tool can switch it per step); 2..8 rows only.  One row is
- * decode, unless DS4_QWEN35_VERIFY_T1=mma (also per call) puts it on the
- * MMA matvecs too, so serial passes match MMA verify rows bit for bit. */
+/* The verify mode of one qwen35 forward.  The session's DFlash mode MMA
+ * takes every forward of 1..8 rows.  Off, the diagnostics decide (read per
+ * call, as the attention split keys are, so a tool can switch them per
+ * step): DS4_QWEN35_VERIFY=exact|mma for 2..8 rows, and for one row
+ * DS4_QWEN35_VERIFY_T1=mma, which puts it on the MMA matvecs too; unset, a
+ * row is today's decode. */
 static uint32_t qwen35_graph_verify_mode(const ds4_qwen4_gpu_graph *g, uint32_t T) {
+    if (T > 8u) return DS4_QWEN35_VERIFY_OFF;
+    if (g->qwen35_verify == DS4_QWEN35_VERIFY_MMA) return DS4_QWEN35_VERIFY_MMA;
     if (T == 1u) {
         const char *t1 = getenv("DS4_QWEN35_VERIFY_T1");
         return t1 && strcmp(t1, "mma") == 0 ? DS4_QWEN35_VERIFY_MMA : DS4_QWEN35_VERIFY_OFF;
     }
-    if (T > 8u) return DS4_QWEN35_VERIFY_OFF;
-    if (g->qwen35_verify != DS4_QWEN35_VERIFY_OFF) return g->qwen35_verify;
     const char *env = getenv("DS4_QWEN35_VERIFY");
     if (!env || !env[0]) return DS4_QWEN35_VERIFY_OFF;
     if (strcmp(env, "exact") == 0) return DS4_QWEN35_VERIFY_EXACT;
@@ -59272,23 +59325,36 @@ static uint32_t qwen35_graph_verify_mode(const ds4_qwen4_gpu_graph *g, uint32_t 
 
 /* The verify buffers, on the first verify-mode forward: attention partials
  * for 8 rows, the rows table (8 entries per attention layer), 8 logit rows
- * (g->logits grows to them, so n_logit_rows becomes 8) and their host copy.
- * A graph that never verifies allocates none of them. */
+ * (g->logits grows to them, so n_logit_rows becomes 8) and their host copy,
+ * and the GDN layers' saved rows for a commit (30 MiB on the 27B).  A graph
+ * that never verifies allocates none of them. */
 static bool qwen35_graph_verify_alloc(ds4_qwen4_gpu_graph *g) {
     if (g->qwen35_verify_host) return true;
     const uint32_t rows = 8u, n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     uint32_t n_attn = 0;
     for (uint32_t il = 0; il < n_trunk; il++) n_attn += ds4_qwen4_layer_is_linear(il) ? 0u : 1u;
+    const uint64_t n_lin = (uint64_t)n_trunk - n_attn;
     ds4_gpu_tensor *part = qwen4_graph_alloc_f32(ds4_gpu_qwen4_attn_part_floats(rows, DS4_N_HEAD, DS4_N_HEAD_DIM));
     ds4_gpu_tensor *table = ds4_gpu_tensor_alloc((uint64_t)(n_attn ? n_attn : 1u) * rows * DS4_GPU_QWEN4_ATTN_ROW_BYTES);
     ds4_gpu_tensor *logits = g->n_logit_rows < rows ? qwen4_graph_alloc_f32((uint64_t)rows * DS4_N_VOCAB) : NULL;
-    if (!part || !table || (g->n_logit_rows < rows && !logits)) {
+    ds4_gpu_tensor *gdn[4] = {
+        qwen4_graph_alloc_f32((n_lin ? n_lin : 1u) * rows * DS4_N_LIN_CONV_DIM),
+        qwen4_graph_alloc_f32((n_lin ? n_lin : 1u) * rows * DS4_N_LIN_CONV_DIM),
+        qwen4_graph_alloc_f32((n_lin ? n_lin : 1u) * rows * DS4_N_LIN_V_HEAD),
+        qwen4_graph_alloc_f32((n_lin ? n_lin : 1u) * rows * DS4_N_LIN_V_HEAD),
+    };
+    if (!part || !table || (g->n_logit_rows < rows && !logits) || !gdn[0] || !gdn[1] || !gdn[2] || !gdn[3]) {
         fprintf(stderr, "ds4: qwen35 verify buffer allocation failed\n");
+        for (int i = 0; i < 4; i++) ds4_gpu_tensor_free(gdn[i]);
         ds4_gpu_tensor_free(logits);
         ds4_gpu_tensor_free(table);
         ds4_gpu_tensor_free(part);
         return false;
     }
+    g->qwen35_gdn_pre = gdn[0];
+    g->qwen35_gdn_qkv = gdn[1];
+    g->qwen35_gdn_ga = gdn[2];
+    g->qwen35_gdn_gb = gdn[3];
     if (logits) {
         ds4_gpu_tensor_free(g->logits);
         g->logits = logits;
@@ -59382,7 +59448,62 @@ static bool qwen35_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model 
     } else if (ok && logits_out) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, (uint64_t)rows * DS4_N_VOCAB * sizeof(float)) != 0;
     }
-    if (ok) g->pos += T;
+    if (ok && !g->qwen35_no_write_back) g->pos += T;
+    return ok;
+}
+
+/* A DFlash verify of T <= 8 rows at g->pos in the graph's mode (MMA):
+ * every row's logits land in qwen35_verify_host; the GDN layers write back
+ * neither conv history nor state and keep their rows for qwen35_graph_commit;
+ * K/V and rope rows pos..pos+T-1 are written by position, as a forward
+ * writes them, and are overwritten before they are read if not committed.
+ * g->pos stays. */
+static bool qwen35_graph_verify(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                const int *tokens, uint32_t T) {
+    if (g->qwen35_verify != DS4_QWEN35_VERIFY_MMA || T == 0 || T > 8u || T > g->cap_tokens ||
+        g->pos + T > g->ctx_cap) {
+        return false;
+    }
+    for (uint32_t t = 0; t < T; t++) {
+        if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) return false;
+    }
+    g->qwen35_no_write_back = true;
+    const bool ok = qwen35_graph_forward_tokens(g, m, w, tokens, T, NULL, false);
+    g->qwen35_no_write_back = false;
+    return ok;
+}
+
+/* Keep the first n rows of the last verify (spec section 3.5): per GDN layer
+ * the conv history takes the last rows of [history; pre-conv rows 0..n-1]
+ * and the decode scan reruns post-front rows 0..n-1 from the state the
+ * verify left alone, with write-back, its outputs discarded; then g->pos
+ * advances by n.  Each step is bitwise what n one-row forwards leave. */
+static bool qwen35_graph_commit(ds4_qwen4_gpu_graph *g, uint32_t n) {
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    if (n == 0 || n > 8u || !g->qwen35_gdn_pre || g->pos + n > g->ctx_cap) return false;
+    if (!glm_graph_begin_commands_if_needed()) return false;
+    ds4_gpu_qwen35_set_verify_rows(n);
+    bool ok = true;
+    for (uint32_t il = 0; il < n_trunk && ok; il++) {
+        if (!ds4_qwen4_layer_is_linear(il)) continue;
+        ds4_gpu_tensor *pre = qwen35_gdn_rows_view(g->qwen35_gdn_pre, il, DS4_N_LIN_CONV_DIM);
+        ds4_gpu_tensor *qkv = qwen35_gdn_rows_view(g->qwen35_gdn_qkv, il, DS4_N_LIN_CONV_DIM);
+        ds4_gpu_tensor *ga = qwen35_gdn_rows_view(g->qwen35_gdn_ga, il, DS4_N_LIN_V_HEAD);
+        ds4_gpu_tensor *gb = qwen35_gdn_rows_view(g->qwen35_gdn_gb, il, DS4_N_LIN_V_HEAD);
+        ok = pre && qkv && ga && gb &&
+             ds4_gpu_qwen35_gdn_hist_commit_tensor(g->layer_lin_hist[il], pre, n, DS4_N_LIN_CONV_DIM,
+                                                   DS4_N_LIN_CONV) != 0 &&
+             ds4_gpu_qwen4_gdn_scan_tensor(g->lin_o, g->layer_lin_state[il], qkv, ga, gb, n,
+                                           DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM,
+                                           NULL, 0u, NULL, 0u) != 0;
+        ds4_gpu_tensor_free(gb);
+        ds4_gpu_tensor_free(ga);
+        ds4_gpu_tensor_free(qkv);
+        ds4_gpu_tensor_free(pre);
+    }
+    ds4_gpu_qwen35_set_verify_rows(0u);
+    if (!ds4_gpu_end_commands()) ok = false;
+    if (ok) g->pos += n;
     return ok;
 }
 #endif
@@ -60922,6 +61043,12 @@ struct ds4_session {
     float *qwen4_verify_logits;
     uint64_t qwen4_spec_cycles;
     uint64_t qwen4_spec_accepted;
+    /* DFlash (qwen35): a verify awaiting its commit, its rows and tokens,
+     * and the speculation counters */
+    bool qwen35_verify_open;
+    uint32_t qwen35_verify_rows;
+    int qwen35_verify_tokens[8];
+    ds4_spec_stats qwen35_spec_stats;
 #endif
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state.  parent is the token that conditioned the
@@ -61006,6 +61133,24 @@ struct ds4_session {
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
 };
+
+/* Between ds4_session_verify and its commit the graph holds verify rows the
+ * session has not taken: every call that moves, reads out or replaces the
+ * session's state refuses, naming the open verify. */
+static bool ds4_session_verify_refuses(const ds4_session *s, const char *what, char *err, size_t errlen) {
+#ifdef DS4_HAS_QWEN4_GPU
+    if (s && s->qwen35_verify_open) {
+        if (err && errlen) {
+            snprintf(err, errlen, "%s refused: a verify of %u rows at position %d is open; commit it first",
+                     what, s->qwen35_verify_rows, s->checkpoint.len);
+        }
+        return true;
+    }
+#else
+    (void)s; (void)what; (void)err; (void)errlen;
+#endif
+    return false;
+}
 
 static bool ds4_session_tp_leader(const ds4_session *s);
 
@@ -63261,6 +63406,7 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
         return 1;
     }
     memset(out, 0, sizeof(*out));
+    if (ds4_session_verify_refuses(s, "payload staging", err, errlen)) return 1;
     if (!s || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to stage");
         return 1;
@@ -63680,6 +63826,7 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
 #endif
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    if (ds4_session_verify_refuses(s, "payload save", err, errlen)) return 1;
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
@@ -64031,6 +64178,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    if (ds4_session_verify_refuses(s, "payload load", err, errlen)) return 1;
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -64664,6 +64812,7 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
         payload_set_err(err, errlen, "invalid session snapshot save");
         return 1;
     }
+    if (ds4_session_verify_refuses(s, "snapshot save", err, errlen)) return 1;
     if (s->distributed) {
         payload_set_err(err, errlen, "distributed session snapshots are not supported yet");
         return 1;
@@ -64710,6 +64859,7 @@ int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, 
         payload_set_err(err, errlen, "invalid session snapshot load");
         return 1;
     }
+    if (ds4_session_verify_refuses(s, "snapshot load", err, errlen)) return 1;
     if (s->distributed) {
         payload_set_err(err, errlen, "distributed session snapshots are not supported yet");
         return 1;
@@ -75938,6 +76088,7 @@ static int ds4_session_sync_lockstep(ds4_session *s, const ds4_tokens *prompt,
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    if (ds4_session_verify_refuses(s, "sync", err, errlen)) return 1;
     if (s && s->checkpoint_valid && !ds4_session_vision_prefix_matches(
                      s, s->sync_images, s->sync_image_count)) {
         ds4_session_invalidate(s);
@@ -76036,6 +76187,7 @@ int ds4_session_sync_multimodal(
         snprintf(err, errlen, "invalid multimodal prompt");
         return 1;
     }
+    if (ds4_session_verify_refuses(s, "sync", err, errlen)) return 1;
     if (image_count != 0 && !s->engine->vision_ready) {
         snprintf(err, errlen, "vision encoder is not loaded");
         return 1;
@@ -78137,6 +78289,7 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
+    if (ds4_session_verify_refuses(s, "eval", err, errlen)) return 1;
     if (s->distributed) {
         if (!s->checkpoint_valid) {
             if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
@@ -80772,6 +80925,7 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
             if (err && errlen) snprintf(err, errlen, "decode batch item %d has an invalid token", i);
             return 1;
         }
+        if (ds4_session_verify_refuses(s, "batch decode", err, errlen)) return 1;
         for (int j = 0; j < i; j++) {
             if (items[j].session == s) {
                 if (err && errlen) snprintf(err, errlen, "decode batch repeats session at items %d and %d", j, i);
@@ -80973,6 +81127,7 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
             }
             return 1;
         }
+        if (ds4_session_verify_refuses(s, "batch decode", err, errlen)) return 1;
         for (int j = 0; j < i; j++) {
             if (items[j].session == s) {
                 if (err && errlen) {
@@ -81027,6 +81182,10 @@ int ds4_sessions_eval_batch_with_prefill(
         !prefill_session->engine) {
         if (err && errlen) snprintf(err, errlen, "invalid mixed model batch");
         return 1;
+    }
+    if (ds4_session_verify_refuses(prefill_session, "mixed prefill", err, errlen)) return 1;
+    for (int k = 0; k < count; k++) {
+        if (ds4_session_verify_refuses(items[k].session, "batch decode", err, errlen)) return 1;
     }
     if (!prefill_session->checkpoint_valid ||
         prefill_prompt->len <= prefill_session->checkpoint.len ||
@@ -84999,6 +85158,7 @@ static int ds4_session_eval_speculative_argmax_impl(
         int *accepted, int accepted_cap,
         char *err, size_t errlen) {
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
+    if (ds4_session_verify_refuses(s, "speculative decode", err, errlen)) return -1;
     if (!s->checkpoint_valid) {
         payload_set_err(err, errlen, "speculative decode requires a synchronized checkpoint");
         return -1;
@@ -85878,6 +86038,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
     if (!s || !accepted || !rng || max_tokens <= 0 || accepted_cap <= 0) {
         return 0;
     }
+    if (ds4_session_verify_refuses(s, "speculative decode", err, errlen)) return -1;
     if (!s->checkpoint_valid) {
         payload_set_err(err, errlen, "speculative decode requires a synchronized checkpoint");
         return -1;
@@ -86011,6 +86172,151 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
 #endif
 }
 
+int ds4_engine_verify_rows(ds4_engine *e) {
+#ifdef DS4_HAS_QWEN4_METAL
+    return e && e->backend == DS4_BACKEND_METAL && ds4_model_is_qwen35() ? 8 : 0;
+#else
+    (void)e;
+    return 0;
+#endif
+}
+
+#ifdef DS4_HAS_QWEN4_METAL
+static bool ds4_session_verify_supported(const ds4_session *s) {
+    return s && s->engine && !s->distributed && !s->engine->tp.active &&
+           ds4_engine_verify_rows(s->engine) > 0 && s->qwen4_graph_ready;
+}
+#endif
+
+int ds4_session_set_verify_mode(ds4_session *s, int mode) {
+    if (!s || (mode != DS4_VERIFY_MODE_OFF && mode != DS4_VERIFY_MODE_MMA)) return 1;
+    if (ds4_session_verify_refuses(s, "verify mode change", NULL, 0)) return 1;
+#ifdef DS4_HAS_QWEN4_METAL
+    if (ds4_session_verify_supported(s)) {
+        s->qwen4_graph.qwen35_verify = mode == DS4_VERIFY_MODE_MMA ? DS4_QWEN35_VERIFY_MMA : DS4_QWEN35_VERIFY_OFF;
+        return 0;
+    }
+#endif
+    return mode == DS4_VERIFY_MODE_OFF ? 0 : 1;
+}
+
+int ds4_session_verify(ds4_session *s, int anchor, const int *draft, int n_draft,
+                       char *err, size_t errlen) {
+    if (!s) return 1;
+    if (ds4_session_verify_refuses(s, "verify", err, errlen)) return 1;
+#ifdef DS4_HAS_QWEN4_METAL
+    if (!ds4_session_verify_supported(s)) {
+        payload_set_err(err, errlen, "verify needs a dense qwen35 session on Metal");
+        return 1;
+    }
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    if (g->qwen35_verify != DS4_QWEN35_VERIFY_MMA) {
+        payload_set_err(err, errlen, "verify needs DFlash mode (ds4_session_set_verify_mode)");
+        return 1;
+    }
+    if (!s->checkpoint_valid) {
+        payload_set_err(err, errlen, "verify requires a synchronized checkpoint");
+        return 1;
+    }
+    const int max_rows = ds4_engine_verify_rows(s->engine);
+    if (n_draft < 0 || n_draft + 1 > max_rows || (n_draft > 0 && !draft)) {
+        if (err && errlen) snprintf(err, errlen, "verify takes 1..%d rows, anchor included; got %d", max_rows, n_draft + 1);
+        return 1;
+    }
+    int tokens[8];
+    tokens[0] = anchor;
+    for (int i = 0; i < n_draft; i++) tokens[i + 1] = draft[i];
+    const uint32_t rows = (uint32_t)n_draft + 1u;
+    for (uint32_t i = 0; i < rows; i++) {
+        if (tokens[i] < 0 || tokens[i] >= (int)DS4_N_VOCAB) {
+            if (err && errlen) snprintf(err, errlen, "verify token %d at row %u is outside the vocabulary", tokens[i], i);
+            return 1;
+        }
+    }
+    if (qwen4_session_replay_if_stale(s, err, errlen) != 0) return 1;
+    if (g->pos + rows > g->ctx_cap) {
+        if (err && errlen) {
+            snprintf(err, errlen, "verify of %u rows at position %u passes the context (%u)", rows, g->pos, g->ctx_cap);
+        }
+        return 1;
+    }
+    const double t0 = now_sec();
+    if (!qwen35_graph_verify(g, &s->engine->model, &s->engine->weights, tokens, rows)) {
+        payload_set_err(err, errlen, "qwen35 verify failed");
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    s->qwen35_spec_stats.verify_ms += (now_sec() - t0) * 1000.0;
+    memcpy(s->qwen35_verify_tokens, tokens, sizeof(tokens));
+    s->qwen35_verify_rows = rows;
+    s->qwen35_verify_open = true;
+    return 0;
+#else
+    (void)anchor; (void)draft; (void)n_draft;
+    payload_set_err(err, errlen, "verify is not supported in this build");
+    return 1;
+#endif
+}
+
+int ds4_session_verify_select(ds4_session *s, int row) {
+#ifdef DS4_HAS_QWEN4_METAL
+    if (!s || !s->qwen35_verify_open || row < 0 || (uint32_t)row >= s->qwen35_verify_rows) return 1;
+    memcpy(s->logits, s->qwen4_graph.qwen35_verify_host + (size_t)row * DS4_N_VOCAB,
+           (size_t)DS4_N_VOCAB * sizeof(float));
+    return 0;
+#else
+    (void)s; (void)row;
+    return 1;
+#endif
+}
+
+int ds4_session_verify_commit(ds4_session *s, int n_rows, char *err, size_t errlen) {
+#ifdef DS4_HAS_QWEN4_METAL
+    if (!s || !s->qwen35_verify_open) {
+        payload_set_err(err, errlen, "verify commit needs an open verify");
+        return 1;
+    }
+    if (n_rows < 1 || (uint32_t)n_rows > s->qwen35_verify_rows) {
+        if (err && errlen) snprintf(err, errlen, "verify commit keeps 1..%u rows; got %d", s->qwen35_verify_rows, n_rows);
+        return 1;
+    }
+    const double t0 = now_sec();
+    s->qwen35_verify_open = false;
+    if (!qwen35_graph_commit(&s->qwen4_graph, (uint32_t)n_rows)) {
+        payload_set_err(err, errlen, "qwen35 verify commit failed");
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    for (int i = 0; i < n_rows; i++) token_vec_push(&s->checkpoint, s->qwen35_verify_tokens[i]);
+    s->checkpoint_valid = true;
+    s->qwen4_rewound = false;
+    s->mtp_draft_valid = false;
+    memcpy(s->logits, s->qwen4_graph.qwen35_verify_host + (size_t)(n_rows - 1) * DS4_N_VOCAB,
+           (size_t)DS4_N_VOCAB * sizeof(float));
+    ds4_spec_stats *st = &s->qwen35_spec_stats;
+    st->steps++;
+    st->drafted += s->qwen35_verify_rows - 1u;
+    st->accepted += (uint64_t)n_rows - 1u;
+    st->accepted_hist[n_rows - 1]++;
+    st->commit_ms += (now_sec() - t0) * 1000.0;
+    return 0;
+#else
+    (void)s; (void)n_rows;
+    payload_set_err(err, errlen, "verify is not supported in this build");
+    return 1;
+#endif
+}
+
+void ds4_session_spec_stats(ds4_session *s, ds4_spec_stats *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+#ifdef DS4_HAS_QWEN4_GPU
+    if (s) *out = s->qwen35_spec_stats;
+#else
+    (void)s;
+#endif
+}
+
 void ds4_session_invalidate(ds4_session *s) {
     if (!s) return;
     if (ds4_session_tp_leader(s) &&
@@ -86020,6 +86326,9 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+#ifdef DS4_HAS_QWEN4_GPU
+    s->qwen35_verify_open = false;
+#endif
     free(s->checkpoint_images);
     s->checkpoint_images = NULL;
     s->checkpoint_image_count = 0;
@@ -86034,6 +86343,11 @@ void ds4_session_invalidate(ds4_session *s) {
 
 void ds4_session_rewind(ds4_session *s, int pos) {
     if (!s) return;
+    char refusal[160];
+    if (ds4_session_verify_refuses(s, "rewind", refusal, sizeof(refusal))) {
+        fprintf(stderr, "ds4: %s\n", refusal);
+        return;
+    }
     if (pos < 0) pos = 0;
     if (pos >= s->checkpoint.len) return;
     if (ds4_session_tp_leader(s) &&
