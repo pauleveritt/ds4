@@ -232,12 +232,13 @@ static uint64_t arena_q4_K(arena_t *a, uint64_t rows, uint64_t cols, double **sh
 
 #ifdef __APPLE__
 /* q6_K rows: 210-byte super-blocks of 256 (ql nibbles, qh bit pairs, 16 int8
- * scales, f16 d); element e of a block is d * scales[e/16] * (q - 32) */
+ * scales, f16 d); element e of a block is d * scales[e/16] * (q - 32); a NULL
+ * shadow skips the reference (the bench's head-sized matrix) */
 static uint64_t arena_q6_K(arena_t *a, uint64_t rows, uint64_t cols, double **shadow, float scale) {
     const uint64_t blocks = cols / 256;
     const uint64_t off = arena_alloc(a, rows * blocks * 210u);
     uint8_t *w = a->base + off;
-    *shadow = malloc(rows * cols * sizeof(double));
+    if (shadow) *shadow = malloc(rows * cols * sizeof(double));
     for (uint64_t r = 0; r < rows; r++) {
         for (uint64_t b = 0; b < blocks; b++) {
             uint8_t *blk = w + (r * blocks + b) * 210u;
@@ -253,7 +254,7 @@ static uint64_t arena_q6_K(arena_t *a, uint64_t rows, uint64_t cols, double **sh
                 const int n = e / 128, k = (e % 128) / 32, l = e % 32;
                 ql[n * 64 + (k & 1) * 32 + l] |= (uint8_t)((q & 0xF) << ((k >> 1) * 4));
                 qh[n * 32 + l] |= (uint8_t)((q >> 4) << (2 * k));
-                (*shadow)[r * cols + b * 256 + e] = (double)dq * sc[e / 16] * (q - 32);
+                if (shadow) (*shadow)[r * cols + b * 256 + e] = (double)dq * sc[e / 16] * (q - 32);
             }
         }
     }
@@ -3637,6 +3638,88 @@ static void test_qwen35_rows_exact(arena_t *a, const char *type, qwen35_mv_fn ro
     ds4_gpu_tensor_free(gone); ds4_gpu_tensor_free(gx);
 }
 
+static int qwen35_mma_q4_K(ds4_gpu_tensor *out, const void *map, uint64_t size, uint64_t off,
+                           uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    return ds4_gpu_matmul_mma_rows_tensor(out, map, size, off, 12u, in_dim, out_dim, x, n_tok);
+}
+
+static int qwen35_mma_q6_K(ds4_gpu_tensor *out, const void *map, uint64_t size, uint64_t off,
+                           uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    return ds4_gpu_matmul_mma_rows_tensor(out, map, size, off, 14u, in_dim, out_dim, x, n_tok);
+}
+
+/* The few-row MMA matvec.  Within 1e-3 (relative to the largest output) of
+ * the double shadow, and row t independent of the row count and of the
+ * other rows, byte for byte: for T = 1..8, row t of a T-row dispatch equals
+ * row t of an 8-row dispatch whose rows T..7 hold other values, and a
+ * one-row dispatch on row t alone.  Also prints max|d| against today's
+ * one-row kernel (`one` at n_tok 8, per row the n_tok 1 result). */
+static void test_qwen35_mma(arena_t *a, const char *type, qwen35_mv_fn mma, qwen35_mv_fn one,
+                            uint32_t in_dim, uint32_t out_dim) {
+    double *sh;
+    const uint64_t off = type[1] == '6' ? arena_q6_K(a, out_dim, in_dim, &sh, 0.5f)
+                                        : arena_q4_K(a, out_dim, in_dim, &sh, 0.05f);
+    const uint64_t in_bytes = (uint64_t)in_dim * 4u, out_bytes = (uint64_t)out_dim * 4u;
+    float *x = rand_vec(8ull * in_dim, 1.0f), *other = rand_vec(8ull * in_dim, 1.0f);
+    double *ref = qwen35_mv_ref(sh, x, in_dim, out_dim, 8);
+    ds4_gpu_tensor *gx = upload(x, 8ull * in_dim);
+    ds4_gpu_tensor *gmix = upload(NULL, 8ull * in_dim);
+    ds4_gpu_tensor *gtoday = upload(NULL, 8ull * out_dim);
+    ds4_gpu_tensor *glone = upload(NULL, 8ull * out_dim);
+    ds4_gpu_tensor *gmixout = upload(NULL, 8ull * out_dim);
+    require_ok(one(gtoday, a->base, a->size, off, in_dim, out_dim, gx, 8), "qwen35 one-row matvec at n_tok 8");
+    for (uint32_t t = 0; t < 8; t++) {
+        ds4_gpu_tensor *xt = ds4_gpu_tensor_view(gx, t * in_bytes, in_bytes);
+        ds4_gpu_tensor *ot = ds4_gpu_tensor_view(glone, t * out_bytes, out_bytes);
+        require_ok(xt && ot, "qwen35 mma row views");
+        require_ok(mma(ot, a->base, a->size, off, in_dim, out_dim, xt, 1), "qwen35 mma matvec on one row");
+        ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(ot);
+    }
+    float *today = download(gtoday, 8ull * out_dim);
+    double worst_rel = 0.0, worst_today = 0.0;
+    char name[96];
+    for (uint32_t T = 1; T <= 8; T++) {
+        const uint64_t n = (uint64_t)T * out_dim;
+        ds4_gpu_tensor *gout = upload(NULL, n);
+        require_ok(ds4_gpu_tensor_fill_f32(gout, 17.25f, n), "qwen35 mma guard fill");
+        require_ok(mma(gout, a->base, a->size, off, in_dim, out_dim, gx, T), "qwen35 mma matvec");
+        float *got = download(gout, n);
+        double scale = 1e-6, worst = 0.0;
+        uint64_t worst_i = 0;
+        for (uint64_t i = 0; i < n; i++) {
+            require_ok(isfinite(got[i]), "qwen35 mma finite output");
+            const double d = fabs((double)got[i] - ref[i]);
+            if (d > worst) { worst = d; worst_i = i; }
+            if (fabs(ref[i]) > scale) scale = fabs(ref[i]);
+            const double dt = fabs((double)got[i] - (double)today[i]);
+            if (dt > worst_today) worst_today = dt;
+        }
+        if (worst > 1e-3 * scale) {
+            fprintf(stderr, "qwen35 %s mma %u->%u T=%u: max|d| %.3e (rel %.3e) at %llu: got %.6f ref %.6f\n",
+                    type, in_dim, out_dim, T, worst, worst / scale, (unsigned long long)worst_i, got[worst_i], ref[worst_i]);
+            exit(1);
+        }
+        if (worst / scale > worst_rel) worst_rel = worst / scale;
+        float *mixed = malloc(8ull * in_bytes);
+        memcpy(mixed, other, 8ull * in_bytes);
+        memcpy(mixed, x, (uint64_t)T * in_bytes);
+        require_ok(ds4_gpu_tensor_write(gmix, 0, mixed, 8ull * in_bytes), "qwen35 mma mixed rows write");
+        require_ok(mma(gmixout, a->base, a->size, off, in_dim, out_dim, gmix, 8), "qwen35 mma matvec on mixed rows");
+        snprintf(name, sizeof(name), "qwen35 %s mma %u->%u T=%u", type, in_dim, out_dim, T);
+        for (uint32_t t = 0; t < T; t++) {
+            same_bytes(name, t, gout, t * out_bytes, gmixout, t * out_bytes, out_bytes);
+            same_bytes(name, t, gout, t * out_bytes, glone, t * out_bytes, out_bytes);
+        }
+        free(mixed); free(got);
+        ds4_gpu_tensor_free(gout);
+    }
+    printf("  %s mma %u->%u T=1..8: rel %.2e of the shadow; row t byte-equal across T, other rows, alone;"
+           " max|d| vs one-row %.2e\n", type, in_dim, out_dim, worst_rel, worst_today);
+    free(today); free(ref); free(x); free(other); free(sh);
+    ds4_gpu_tensor_free(gmixout); ds4_gpu_tensor_free(glone); ds4_gpu_tensor_free(gtoday);
+    ds4_gpu_tensor_free(gmix); ds4_gpu_tensor_free(gx);
+}
+
 /* DFlash verify mode, G1: the kernels a verify of up to 8 rows runs.
  * Matvec shapes: A the 27B's in-dims (5120, 17408), B small and odd
  * (256 -> 7, 13), C Qwen3.8 Flash's hidden width (2560). */
@@ -3651,6 +3734,11 @@ static void test_qwen35_verify(arena_t *a) {
         test_qwen35_rows_exact(a, "Q4_K", ds4_gpu_matmul_q4_K_rows_tensor, qwen35_q4_K_one_row,
                                mv_shapes[i][0], mv_shapes[i][1]);
     }
+    for (uint32_t i = 0; i < sizeof(mv_shapes) / sizeof(mv_shapes[0]); i++) {
+        test_qwen35_mma(a, "Q4_K", qwen35_mma_q4_K, qwen35_q4_K_one_row, mv_shapes[i][0], mv_shapes[i][1]);
+        test_qwen35_mma(a, "Q6_K", qwen35_mma_q6_K, ds4_gpu_matmul_q6_K_tensor, mv_shapes[i][0], mv_shapes[i][1]);
+    }
+    test_qwen35_mma(a, "Q6_K", qwen35_mma_q6_K, ds4_gpu_matmul_q6_K_tensor, 5120, 4099);
 }
 
 /* One weight type in the verify bench: its one-row matvec (also today's one
@@ -3697,22 +3785,25 @@ static double qwen35_median20(const double *samples) {
 /* DS4_TEST_QWEN35_VERIFY_BENCH=1: microseconds per call (a batch of 10 calls
  * including its final GPU wait; median of 20 batches, variants alternating)
  * of T one-row dispatches, today's one dispatch over T grid rows, and each
- * multi-row variant, at the 27B's projection shapes. No pass/fail. */
+ * multi-row variant, at the 27B's projection shapes and, for Q6_K, the
+ * output head (5120 -> 248320, about 1 GiB of the arena). No pass/fail. */
 static void bench_qwen35_verify(arena_t *a) {
     const qwen35_bench_type types[] = {
-        {"Q4_K", qwen35_q4_K_one_row, {"rows", NULL}, {ds4_gpu_matmul_q4_K_rows_tensor, NULL}},
+        {"Q4_K", qwen35_q4_K_one_row, {"rows", "mma"}, {ds4_gpu_matmul_q4_K_rows_tensor, qwen35_mma_q4_K}},
+        {"Q6_K", ds4_gpu_matmul_q6_K_tensor, {"mma", NULL}, {qwen35_mma_q6_K, NULL}},
     };
-    const uint32_t shapes[][2] = {{5120, 17408}, {17408, 5120}, {5120, 12288}};
+    const uint32_t shapes[][2] = {{5120, 17408}, {17408, 5120}, {5120, 12288}, {5120, 248320}};
     printf("qwen35 verify bench: us/call, median of 20 batches of 10 calls\n");
     for (uint32_t ti = 0; ti < sizeof(types) / sizeof(types[0]); ti++) {
         const qwen35_bench_type *bt = &types[ti];
+        const bool q6 = bt->type[1] == '6';
         const uint32_t n_var = 2u + (bt->rows[0] != NULL) + (bt->rows[1] != NULL);
-        for (uint32_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
+        for (uint32_t si = 0; si < (q6 ? 4u : 3u); si++) {
             const uint32_t in_dim = shapes[si][0], out_dim = shapes[si][1];
             const uint64_t in_bytes = (uint64_t)in_dim * 4u, out_bytes = (uint64_t)out_dim * 4u;
-            double *sh;
-            const uint64_t off = bt->type[1] == '6' ? arena_q6_K(a, out_dim, in_dim, &sh, 0.5f)
-                                                    : arena_q4_K(a, out_dim, in_dim, &sh, 0.05f);
+            double *sh = NULL;
+            const uint64_t off = q6 ? arena_q6_K(a, out_dim, in_dim, si == 3 ? NULL : &sh, 0.5f)
+                                    : arena_q4_K(a, out_dim, in_dim, &sh, 0.05f);
             free(sh);
             float *x = rand_vec(8ull * in_dim, 1.0f);
             ds4_gpu_tensor *gx = upload(x, 8ull * in_dim);
@@ -3735,7 +3826,8 @@ static void bench_qwen35_verify(arena_t *a) {
                 for (uint32_t v = 0; v < n_var; v++) med[v] = qwen35_median20(samples[v]);
                 printf("  %s %u->%u T=%u: one-row x%u %.1f  n_tok=%u %.1f", bt->type, in_dim, out_dim, T, T, med[0], T, med[1]);
                 for (uint32_t v = 2; v < n_var; v++)
-                    printf("  %s %.1f (%.3f of one-row x%u)", bt->rows_name[v - 2], med[v], med[v] / med[0], T);
+                    printf("  %s %.1f (%.3f of one-row x%u, %.3f of n_tok=%u)", bt->rows_name[v - 2], med[v],
+                           med[v] / med[0], T, med[v] / med[1], T);
                 printf("\n");
             }
             for (uint32_t t = 0; t < 8; t++) { ds4_gpu_tensor_free(xs[t]); ds4_gpu_tensor_free(os[t]); }

@@ -4786,6 +4786,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
         @[@"DS4_METAL_QWEN4_SOURCE",      @"metal/qwen4.metal"],
         @[@"DS4_METAL_QWEN4_VISION_SOURCE", @"metal/qwen4_vision.metal"],
+        @[@"DS4_METAL_QWEN35_MMA_SOURCE", @"metal/qwen35_mma.metal"],
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
@@ -20219,6 +20220,111 @@ int ds4_gpu_matmul_q6_K_tensor(
              threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen35 Q6_K matmul")) return 0;
+    }
+    return 1;
+}
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne11;
+    int32_t  pad0;
+    uint64_t nb01;
+    uint64_t nb11;
+} ds4_gpu_qwen35_mma_args;
+
+int ds4_gpu_matmul_mma_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              weight_type,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !model_map || !x || n_tok == 0 || n_tok > 8u ||
+        (weight_type != DS4_METAL_TENSOR_Q4_K && weight_type != DS4_METAL_TENSOR_Q6_K) ||
+        in_dim == 0 || (in_dim % 256u) != 0 ||
+        in_dim > INT32_MAX || out_dim == 0 || out_dim > INT32_MAX) {
+        return 0;
+    }
+
+    const bool q6 = weight_type == DS4_METAL_TENSOR_Q6_K;
+    const uint64_t row_bytes = (in_dim / 256u) * (q6 ? 210u : 144u);
+    if (out_dim > UINT64_MAX / row_bytes) return 0;
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
+    const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+    if (weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset ||
+        ds4_gpu_tensor_bytes(x) < x_bytes ||
+        ds4_gpu_tensor_bytes(out) < out_bytes) {
+        fprintf(stderr, "ds4: Metal MMA rows matmul received an invalid model range or activation buffer\n");
+        return 0;
+    }
+
+    /*
+     * llama.cpp's few-row tiling at one 8-row src1 tile
+     * (ggml_metal_op_mul_mat_mma_tiling, ggml-metal-device.cpp, a46709b):
+     * NSG simdgroups split K, from 32 for at most 64 weight rows down to 8
+     * above 6144, never more than the 64-weight chunks; NT 8-row weight tiles
+     * per threadgroup, at most 4, fewer when the reduction buffer would pass
+     * 16 KiB or fewer than 128 threadgroups would fill the GPU.  Both depend
+     * on the weight shape only, never on n_tok, which keeps each output row
+     * independent of the row count.
+     */
+    int16_t nsg = out_dim <= 64u ? 32 : out_dim <= 6144u ? 16 : 8;
+    while (nsg > 1 && (uint64_t)nsg > in_dim / 64u) nsg /= 2;
+    const uint64_t nt_smem = 16384u / ((uint64_t)nsg * 256u);
+    const uint64_t nt_rows = out_dim / (128u * 8u);
+    const uint64_t nt_limit = nt_smem < nt_rows ? nt_smem : nt_rows;
+    int nt = 4;
+    while (nt > 1 && (uint64_t)nt > nt_limit) nt /= 2;
+
+    char fn_name[64];
+    snprintf(fn_name, sizeof(fn_name), "kernel_qwen35_mma_%s_f32_nt%d", q6 ? "q6_K" : "q4_K", nt);
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map,
+                                                      model_size,
+                                                      weight_offset,
+                                                      weight_bytes,
+                                                      &inner_offset);
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, 8);
+        while (pipeline && nsg > 1 && pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)nsg * 32u) {
+            nsg /= 2;
+            pipeline = ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, 8);
+        }
+        if (!xbuf || !outbuf || !wbuf || !pipeline) return 0;
+
+        ds4_gpu_qwen35_mma_args args = {
+            .ne00 = (int32_t)in_dim,
+            .ne01 = (int32_t)out_dim,
+            .ne11 = (int32_t)n_tok,
+            .nb01 = row_bytes,
+            .nb11 = in_dim * sizeof(float),
+        };
+        const uint64_t rows_ptg = 8u * (uint64_t)nt;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:(NSUInteger)nsg * (NSUInteger)nt * 256u atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + rows_ptg - 1u) / rows_ptg, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "qwen35 MMA rows matmul")) return 0;
     }
     return 1;
 }
