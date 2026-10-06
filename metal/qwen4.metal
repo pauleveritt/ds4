@@ -1084,7 +1084,7 @@ kernel void kernel_qwen35_q6_K_rows_f32(
         ushort lane [[thread_index_in_simdgroup]],
         ushort simd_group [[simdgroup_index_in_threadgroup]]) {
     constexpr uint rows_per_simd = 2u;
-    constexpr uint simd_groups = 2u;
+    constexpr uint simd_groups = 1u;
     constexpr uint max_tok = 8u;
     constexpr uint kmask1 = 0x03u;
     constexpr uint kmask2 = 0x0Cu;
@@ -1135,6 +1135,7 @@ kernel void kernel_qwen35_q6_K_rows_f32(
             dw[r] = block->d;
         }
 
+#pragma clang loop unroll(disable)
         for (uint t = 0u; t < n_tok; t++) {
             device const float *y = x + (uint64_t)t * args.in_dim + (uint64_t)ib * qk_k + y_offset;
             for (short l = 0; l < 4; l++) {
