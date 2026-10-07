@@ -59164,10 +59164,21 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
 #if defined(__APPLE__)
 /* Dense qwen35 gated GQA attention over positions 0..pos: [q|gate] per head,
  * RMS-normed q and k with partial NeoX rope, f16 K/V, softmax(qk/sqrt(D))v
- * times sigmoid(gate), then the output projection. */
+ * times sigmoid(gate), then the output projection.
+ *
+ * Prompt batches (T > 8) take llama.cpp's flash-attention tiling
+ * (ds4_gpu_qwen35_attn_fa_tensor) when DS4_QWEN35_PREFILL_FA=1, read per
+ * call so an A/B harness can switch it per session; otherwise, and for
+ * decode and verify rows, kernel_qwen4_attn_mm and the decode kernels. */
+static bool qwen35_prefill_fa(uint32_t T) {
+    const char *mode = getenv("DS4_QWEN35_PREFILL_FA");
+    return T > 8u && mode && strcmp(mode, "1") == 0;
+}
+
 static bool qwen35_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                    uint32_t il, uint32_t pos0, uint32_t T) {
     const float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    const bool fa = qwen35_prefill_fa(T);
     return qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T) &&
            qwen4_gemv(g->kp, m, l->attn_k, g->mixed, T) &&
            qwen4_gemv(g->vp, m, l->attn_v, g->mixed, T) &&
@@ -59176,9 +59187,13 @@ static bool qwen35_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, c
                                            l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                            T, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
                                            pos0, g->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) &&
-           ds4_gpu_qwen4_attn_decode_tensor(g->attn_o, g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il],
-                                            NULL, NULL, T <= 2u ? g->attn_part : NULL, T,
-                                            DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, false, 0u, scale) &&
+           (fa ? ds4_gpu_qwen35_attn_fa_tensor(g->attn_o, g->q, g->gate, g->layer_k_cache[il],
+                                               g->layer_v_cache[il], T, DS4_N_HEAD, DS4_N_HEAD_KV,
+                                               DS4_N_HEAD_DIM, pos0, scale)
+               : ds4_gpu_qwen4_attn_decode_tensor(g->attn_o, g->q, g->gate, g->layer_k_cache[il],
+                                                  g->layer_v_cache[il], NULL, NULL,
+                                                  T <= 2u ? g->attn_part : NULL, T, DS4_N_HEAD,
+                                                  DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, false, 0u, scale)) &&
            qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
 }
 

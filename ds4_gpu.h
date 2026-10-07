@@ -3438,6 +3438,16 @@ int ds4_gpu_qwen35_attn_prep_tensor(
         uint64_t g_q_offset, uint64_t g_k_offset,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
         uint32_t pos0, uint32_t cache_cap, float rope_base, float eps);
+/* Dense qwen35 prefill attention with llama.cpp's flash-attention tiling
+ * (kernel_flash_attn_ext: 8 queries of one head per threadgroup, 64 keys per
+ * step): causal over the f16 caches' rows 0..pos0+n_tokens-1, out =
+ * softmax(q.k*scale)v * sigmoid(gate), the dense contract of
+ * ds4_gpu_qwen4_attn_decode_tensor.  Head dim 256 only. */
+int ds4_gpu_qwen35_attn_fa_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+        uint32_t pos0, float scale);
 int ds4_gpu_qwen4_ple_gate_tensor(
         ds4_gpu_tensor *gated, ds4_gpu_tensor *normed, const ds4_gpu_tensor *R,
         const ds4_gpu_tensor *key, const ds4_gpu_tensor *value,
