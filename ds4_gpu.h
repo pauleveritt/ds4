@@ -259,6 +259,7 @@ enum {
     DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT = 1u << 4,
     DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4 = 1u << 5,
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
+    DS4_GPU_TEST_Q6_K_MM_BYTEWISE = 1u << 7,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
@@ -741,7 +742,9 @@ int ds4_gpu_matmul_q6_K_tensor(
 
 /* The same product through the tiled prefill kernel (Metal only): each
  * weight is read once per 32 tokens instead of once per token.  Dense
- * qwen35 uses it for prompt batches. */
+ * qwen35 uses it for prompt batches.  DS4_GPU_TEST_Q6_K_MM_BYTEWISE runs
+ * the tile with the bytewise Q6_K dequantizer it had before, the reference
+ * the packed one must match byte for byte. */
 int ds4_gpu_matmul_q6_K_mm_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,

@@ -1069,10 +1069,51 @@ kernel void kernel_qwen35_q6_K_matmul_f32(
     }
 }
 
+/* llama.cpp's dequantize_q6_K (ggml/src/ggml-metal/kernels/dequantize.h,
+ * a46709b, MIT, Copyright (c) 2023-2026 The ggml authors): four weights per
+ * 32-bit load of ql and qh, where moe.metal's dequantize_q6_K builds each
+ * weight from byte loads.  Both give the same floats: d is a half, the scale
+ * an int8 and q six bits, so d*sc*q - 32*d*sc and d*sc*(q - 32) are exact in
+ * float, and so are the dl1..dl3 rescalings by powers of two. */
+template <typename type4x4>
+void dequantize_q6_K_packed(device const block_q6_K *xb, short il, thread type4x4 & reg) {
+    const half d_all = xb->d;
+    device const uint16_t * ql = (device const uint16_t *)xb->ql;
+    device const uint16_t * qh = (device const uint16_t *)xb->qh;
+    device const int8_t * scales = (device const int8_t *)xb->scales;
+
+    ql = ql + 32*(il/8) + 16*((il/2)&1) + 8*(il&1);
+    qh = qh + 16*(il/8) + 8*(il&1);
+    float sc = scales[(il%2) + 2 * ((il/2))];
+    il = (il/2) & 3;
+
+    const uint32_t kmask1 = il>1 ? (il>2 ? 0xC0C0C0C0 : 0x30303030) : (il>0 ? 0x0C0C0C0C : 0x03030303);
+    const uint32_t kmask2 = il>1 ? 0xF0F0F0F0                       : 0x0F0F0F0F;
+    const float ml = d_all * sc * 32.f;
+    const float dl0 = d_all * sc;
+    const float dl1 = dl0 / 256.f;
+    const float dl2 = dl0 / (256.f * 256.f);
+    const float dl3 = dl0 / (256.f * 256.f * 256.f);
+    const uint8_t shr_h = il>2 ? 2 : 0;
+    const uint8_t shl_h = il>1 ? 0 : (il>0 ? 2 : 4);
+    const uint8_t shr_l = il>1 ? 4 : 0;
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t  low = (ql[2*i] | (uint32_t)(ql[2*i+1] << 16)) & kmask2;
+        const uint32_t high = (qh[2*i] | (uint32_t)(qh[2*i+1] << 16)) & kmask1;
+        const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+        reg[i][0] = dl0 *  ((half)(q & 0xFF))       - ml;
+        reg[i][1] = dl1 * ((float)(q & 0xFF00))     - ml;
+        reg[i][2] = dl2 * ((float)(q & 0xFF0000))   - ml;
+        reg[i][3] = dl3 * ((float)(q & 0xFF000000)) - ml;
+    }
+}
+
 /* Dense qwen35 prompt batches of Q6_K weights: dense.metal's tiled matrix
- * kernel with moe.metal's Q6_K dequantizer, the instantiation llama.cpp's
- * kernel_mul_mm_q6_K_f32 uses. */
-template [[host_name("kernel_mul_mm_q6_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, 16, dequantize_q6_K, float, float4x4, float, float2x4>;
+ * kernel with the packed Q6_K dequantizer above, the instantiation llama.cpp's
+ * kernel_mul_mm_q6_K_f32 uses.  The _bytewise kernel keeps moe.metal's
+ * dequantizer as the tests' reference (DS4_GPU_TEST_Q6_K_MM_BYTEWISE). */
+template [[host_name("kernel_mul_mm_q6_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, 16, dequantize_q6_K_packed, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_q6_K_f32_bytewise")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, 16, dequantize_q6_K, float, float4x4, float, float2x4>;
 
 /* --- PLE ---------------------------------------------------------------- */
 

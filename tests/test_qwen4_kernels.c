@@ -3528,6 +3528,147 @@ static void test_dense_mm_large(arena_t *a, uint32_t wtype) {
 }
 #endif
 
+#ifdef __APPLE__
+static uint32_t urand(void) {
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 17;
+    g_rng ^= g_rng << 5;
+    return g_rng;
+}
+
+/* q6_K rows of random bytes, so every ql nibble, qh bit pair and int8 scale
+ * occurs; d is a random-signed half from 2^-18 to 2^-5 (subnormal below
+ * 2^-14), small enough that no weight d*sc*(q-32) overflows a half. */
+static uint64_t arena_q6_K_bytes(arena_t *a, uint64_t rows, uint64_t cols) {
+    const uint64_t n = rows * (cols / 256u);
+    const uint64_t off = arena_alloc(a, n * 210u);
+    uint8_t *w = a->base + off;
+    for (uint64_t b = 0; b < n; b++) {
+        uint8_t *blk = w + b * 210u;
+        for (int i = 0; i < 208; i++) blk[i] = (uint8_t)(urand() >> 13);
+        const float mag = ldexpf(1.0f + 0.4999f * (frand() + 1.0f), -18 + (int)(urand() % 13u));
+        const uint16_t dh = f32_to_f16((urand() & 1u) ? -mag : mag);
+        memcpy(blk + 208, &dh, 2);
+    }
+    return off;
+}
+
+/* round to half to nearest even, as Metal stages the tile's operands; the
+ * file's f32_to_f16 rounds ties up, and a Q6_K weight d*sc*(q-32) is often a
+ * tie */
+static double q6_K_half(double w) {
+    return (double)(float)(__fp16)(float)w;
+}
+
+/* ggml's dequantize_row_q6_K, each weight rounded to half as the tile stages it */
+static double *q6_K_rows_double(const arena_t *a, uint64_t off, uint64_t rows, uint64_t cols) {
+    double *y = malloc(rows * cols * sizeof(double));
+    for (uint64_t b = 0; b < rows * (cols / 256u); b++) {
+        const uint8_t *blk = a->base + off + b * 210u;
+        const int8_t *scales = (const int8_t *)(blk + 192);
+        uint16_t dh;
+        memcpy(&dh, blk + 208, 2);
+        const double d = f16_to_f32(dh);
+        double *out = y + b * 256u;
+        for (int n = 0; n < 2; n++) {
+            const uint8_t *ql = blk + 64 * n, *qh = blk + 128 + 32 * n;
+            const int8_t *sc = scales + 8 * n;
+            for (int l = 0; l < 32; l++) {
+                const int is = l / 16;
+                out[128 * n + l]      = q6_K_half(d * sc[is + 0] * (((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32));
+                out[128 * n + l + 32] = q6_K_half(d * sc[is + 2] * (((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32));
+                out[128 * n + l + 64] = q6_K_half(d * sc[is + 4] * (((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32));
+                out[128 * n + l + 96] = q6_K_half(d * sc[is + 6] * (((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32));
+            }
+        }
+    }
+    return y;
+}
+
+static ds4_gpu_tensor *q6_K_mm(const arena_t *a, uint64_t off, uint32_t in_dim, uint32_t rows,
+                               const ds4_gpu_tensor *gx, uint32_t T, bool bytewise, float fill) {
+    ds4_gpu_tensor *out = upload(NULL, (uint64_t)T * rows);
+    require_ok(ds4_gpu_tensor_fill_f32(out, fill, (uint64_t)T * rows), "Q6_K mm output fill");
+    ds4_gpu_test_set_flags(bytewise ? DS4_GPU_TEST_Q6_K_MM_BYTEWISE : 0u);
+    const int ok = ds4_gpu_matmul_q6_K_mm_tensor(out, a->base, a->size, off, in_dim, rows, gx, T);
+    ds4_gpu_test_set_flags(0u);
+    require_ok(ok, bytewise ? "Q6_K mm, bytewise dequantizer" : "Q6_K mm, packed dequantizer");
+    return out;
+}
+
+/* The prefill Q6_K tile with llama.cpp's packed dequantizer against the same
+ * tile with the bytewise one it replaced: every output float byte-equal. */
+static void test_q6_K_mm_packed(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T) {
+    const uint64_t off = arena_q6_K_bytes(a, rows, in_dim);
+    const uint64_t n = (uint64_t)T * rows;
+    float *x = rand_vec((uint64_t)T * in_dim, 1.0f);
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * in_dim);
+    ds4_gpu_tensor *gold = q6_K_mm(a, off, in_dim, rows, gx, T, true, 1.0f);
+    ds4_gpu_tensor *gnew = q6_K_mm(a, off, in_dim, rows, gx, T, false, 2.0f);
+    float *old = download(gold, n), *got = download(gnew, n);
+    uint64_t differ = 0, first = 0, nonzero = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        require_ok(isfinite(old[i]), "Q6_K mm bytewise output finite");
+        if (old[i] != 0.0f) nonzero++;
+        if (memcmp(&old[i], &got[i], sizeof(float)) != 0) {
+            if (differ == 0) first = i;
+            differ++;
+        }
+    }
+    if (differ) {
+        fprintf(stderr, "Q6_K mm packed %u->%u T=%u: %llu of %llu floats differ; first at row %llu col %llu: "
+                        "packed %.9g (0x%08x) bytewise %.9g (0x%08x)\n",
+                in_dim, rows, T, (unsigned long long)differ, (unsigned long long)n,
+                (unsigned long long)(first / rows), (unsigned long long)(first % rows),
+                got[first], *(uint32_t *)&got[first], old[first], *(uint32_t *)&old[first]);
+        exit(1);
+    }
+    require_ok(nonzero > n / 2, "Q6_K mm output mostly nonzero");
+    printf("  Q6_K mm packed %u->%u T=%u: %llu floats byte-equal to the bytewise dequantizer\n",
+           in_dim, rows, T, (unsigned long long)n);
+    free(got); free(old); free(x);
+    ds4_gpu_tensor_free(gnew); ds4_gpu_tensor_free(gold); ds4_gpu_tensor_free(gx);
+}
+
+/* The packed tile against ggml's dequantization in double, at a small shape
+ * with a ragged output tile: the two dequantizers agreeing is not enough. */
+static void test_q6_K_mm_reference(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T) {
+    const uint64_t off = arena_q6_K_bytes(a, rows, in_dim);
+    double *w = q6_K_rows_double(a, off, rows, in_dim);
+    float *x = rand_vec((uint64_t)T * in_dim, 1.0f);
+    double *ref = malloc((uint64_t)T * rows * sizeof(double));
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t r = 0; r < rows; r++) {
+            double acc = 0.0;
+            for (uint32_t k = 0; k < in_dim; k++) {
+                const double xh = q6_K_half(x[(uint64_t)t * in_dim + k]);
+                acc += w[(uint64_t)r * in_dim + k] * xh;
+            }
+            ref[(uint64_t)t * rows + r] = acc;
+        }
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * in_dim);
+    ds4_gpu_tensor *gnew = q6_K_mm(a, off, in_dim, rows, gx, T, false, 2.0f);
+    char name[96];
+    snprintf(name, sizeof(name), "Q6_K mm packed %u->%u T=%u vs double", in_dim, rows, T);
+    check_tensor(name, gnew, ref, (uint64_t)T * rows, 3e-5);
+    free(ref); free(x); free(w);
+    ds4_gpu_tensor_free(gnew); ds4_gpu_tensor_free(gx);
+}
+
+/* runs on a saved random stream, so the tests after it draw what they drew
+ * before it was added */
+static void test_q6_K_mm(arena_t *a) {
+    const uint32_t rng = g_rng;
+    const uint32_t shapes[][2] = {{5120, 6144}, {17408, 5120}, {5120, 4099}};
+    const uint32_t Ts[] = {64, 512, 2048};
+    for (uint32_t s = 0; s < 3; s++)
+        for (uint32_t t = 0; t < 3; t++)
+            test_q6_K_mm_packed(a, shapes[s][0], shapes[s][1], Ts[t]);
+    test_q6_K_mm_reference(a, 512, 72, 40);
+    g_rng = rng;
+}
+#endif
+
 int main(void) {
     arena_t arena;
     arena.size = (uint64_t)1536 << 20;
@@ -3558,6 +3699,9 @@ int main(void) {
     }
 #endif
     if (getenv("DS4_TEST_QWEN4_DECODE_FUSIONS")) { test_decode_fusions(&arena); return 0; }
+#ifdef __APPLE__
+    if (getenv("DS4_TEST_QWEN4_Q6K_MM_ONLY")) { test_q6_K_mm(&arena); printf("all qwen4 Q6_K mm tests passed\n"); return 0; }
+#endif
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
         test_moe_types(&arena, 8, 6, 2560, 640, 1, 16u, 10u);
         test_moe_types(&arena, 8, 6, 2560, 640, 2, 16u, 10u);
@@ -3705,6 +3849,9 @@ int main(void) {
     }
 #endif
     test_dense_mm(&arena, 64, 32, 70, 0u);
+#ifdef __APPLE__
+    test_q6_K_mm(&arena);
+#endif
     printf("multi gemv\n");
     test_multi_gemv(&arena, 2560, 2);
     test_multi_gemv(&arena, 64, 3);

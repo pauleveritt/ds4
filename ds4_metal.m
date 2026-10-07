@@ -20194,7 +20194,10 @@ int ds4_gpu_matmul_q6_K_mm_tensor(
                                                        &inner_offset);
         const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_q6_K_f32", false, bc_out);
+            ds4_gpu_get_mul_mm_pipeline((g_test_flags & DS4_GPU_TEST_Q6_K_MM_BYTEWISE) != 0u
+                                            ? "kernel_mul_mm_q6_K_f32_bytewise"
+                                            : "kernel_mul_mm_q6_K_f32",
+                                        false, bc_out);
         if (!xbuf || !outbuf || !wbuf || !pipeline) return 0;
 
         ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
