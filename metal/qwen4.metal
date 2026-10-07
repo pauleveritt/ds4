@@ -3022,6 +3022,245 @@ kernel void kernel_qwen35_attn_fa(
     }
 }
 
+/* --- dense qwen35 verify attention, shared K/V tiles --------------------- */
+
+/* A DFlash verify of 1..8 rows over one layer's f16 caches.  A threadgroup
+ * takes one key split of one KV head for every row: each 16-key K/V tile is
+ * loaded once into threadgroup memory and used by all rows and all GROUP
+ * query heads.  The per-row decode kernels read the caches once per row and
+ * spend most of their time on a cross-lane sum and a softmax step per key
+ * and head; here the work is 8x8 simdgroup MMAs.
+ *
+ * Simdgroup (g, part) holds query head g of the KV head for every row: the
+ * batch rows are the rows of its 8x8 matrices (rows past n_rows zero), and
+ * it owns dims part*64..+63 of the queries and of the output.  Per 16 keys
+ * the four parts score their dims (8 MMAs each into two 8x8 tiles), add the
+ * four partial scores in order through threadgroup memory, run the same
+ * online-softmax step per row on the lanes that hold that row, and add P V
+ * for their dims (16 MMAs).  Keys past a row's position get probability 0.
+ *
+ * Exactness.  Row r (position p = pos0 + r) splits its keys 0..p at
+ * multiples of the host's split size for p + 1 keys (a multiple of 16, a
+ * function of p alone; the host dispatches rows of another split size apart,
+ * at most twice a batch), tiles and steps start at multiples of 16, and the
+ * merge combines the splits in order.  An output row of an MMA depends only
+ * on the same row of its first operand (as the verify matvecs rely on), so
+ * nothing in row r's arithmetic depends on the number of rows or on the
+ * other rows, except the sign of a zero: a masked key adds 0 * v, whose sign
+ * follows v.  That changes no nonzero sum, and outputs that are zero are
+ * written as +0.  So row r is bitwise the same in any batch and in a
+ * one-row pass at p.  D 256 and GROUP query heads per KV head. */
+
+#define QWEN35_VATTN_NSGR 4      /* simdgroups per query head, each 64 dims */
+#define QWEN35_VATTN_KT   16     /* keys per tile and per step */
+#define QWEN35_VATTN_DP   264    /* tile row stride in halves, padded */
+
+struct ds4_metal_args_qwen35_attn_verify {
+    uint32_t n_rows;         /* rows of this dispatch */
+    uint32_t row0;           /* its first row in the batch */
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t pos0;           /* batch row r sits at position pos0 + r */
+    uint32_t split_keys;     /* keys per split of every row of this dispatch */
+    uint32_t part_splits;    /* the partials' split stride */
+    float    scale;
+    uint32_t row_splits[8];  /* each batch row's split count */
+};
+
+/* the row and the first of the two columns lane l holds in an 8x8
+ * simdgroup matrix (thread_elements()[e] is column col + e) */
+static inline ushort qwen35_vattn_lane_row(ushort l) { return ((l / 4) & 4) + ((l / 2) % 4); }
+static inline ushort qwen35_vattn_lane_col(ushort l) { return ((l / 4) & 2) * 2 + (l % 2) * 2; }
+
+/* +0 for either zero, so a zero's sign cannot carry another row's values */
+static inline float qwen35_vattn_plus_zero(float x) {
+    return (as_type<uint>(x) & 0x7fffffffu) == 0u ? 0.0f : x;
+}
+
+template <uint GROUP>
+kernel void kernel_qwen35_attn_verify(
+        constant ds4_metal_args_qwen35_attn_verify & args,
+        device const float *q,        /* [R][H*D] */
+        device const float *gate,     /* [R][H*D] */
+        device const half  *k_cache,  /* [cap][Hkv*D] */
+        device const half  *v_cache,  /* [cap][Hkv*D] */
+        device float       *out,      /* [R][H*D] */
+        device float       *part,     /* [R][Hkv][part_splits][GROUP][2+D] */
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    constexpr uint D = 256, NSGR = QWEN35_VATTN_NSGR, KT = QWEN35_VATTN_KT, DP = QWEN35_VATTN_DP;
+    constexpr uint DD = D / NSGR, NF = DD / 8, C8 = D / 8, NB = KT / 8;
+    constexpr uint n_threads = GROUP * NSGR * 32u;
+    const uint split = tgpig.x, kvh = tgpig.y;
+    const uint H = args.n_head, Hkv = args.n_head_kv;
+    const uint S = args.split_keys;
+    const uint k0 = split * S;
+    const uint k1 = min(k0 + S, args.pos0 + args.row0 + args.n_rows);
+    const uint g = sgitg / NSGR, dpart = sgitg % NSGR, d0 = dpart * DD;
+    const ushort fm = qwen35_vattn_lane_row(tiisg), fn = qwen35_vattn_lane_col(tiisg);
+    const bool live = fm < args.n_rows;
+    const uint r = args.row0 + (live ? fm : 0u);
+    const uint p = args.pos0 + r;
+    const uint h = kvh * GROUP + g;
+
+    threadgroup half Kt[KT * DP], Vt[KT * DP];
+    threadgroup float Sx[GROUP][NSGR][NB][64];
+
+    simdgroup_float8x8 Q[NF], O[NF];
+    device const float *qr = q + ((uint64_t)r * H + h) * D + d0 + fn;
+#pragma unroll
+    for (uint j = 0; j < NF; j++) {
+        Q[j].thread_elements()[0] = live ? qr[8u * j] * args.scale : 0.0f;
+        Q[j].thread_elements()[1] = live ? qr[8u * j + 1u] * args.scale : 0.0f;
+        O[j] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+    float m = -3.0e38f, l = 0.0f;
+    threadgroup float *sx = &Sx[g][0][0][0];
+
+    for (uint t0 = k0; t0 < k1; t0 += KT) {
+        const uint nk = min(KT, k1 - t0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < KT * C8; i += n_threads) {
+            const uint key = i / C8, c = i % C8;
+            uint4 kx = uint4(0u), vx = uint4(0u);
+            if (key < nk) {
+                const uint64_t at = ((uint64_t)(t0 + key) * Hkv + kvh) * C8 + c;
+                kx = ((device const uint4 *)k_cache)[at];
+                vx = ((device const uint4 *)v_cache)[at];
+            }
+            *(threadgroup uint4 *)(Kt + key * DP + c * 8u) = kx;
+            *(threadgroup uint4 *)(Vt + key * DP + c * 8u) = vx;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 Sm[NB];
+#pragma unroll
+        for (uint b = 0; b < NB; b++) Sm[b] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+#pragma unroll
+        for (uint j = 0; j < NF; j++) {
+#pragma unroll
+            for (uint b = 0; b < NB; b++) {
+                simdgroup_half8x8 Kj;
+                simdgroup_load(Kj, Kt + 8u * b * DP + d0 + 8u * j, DP, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(Sm[b], Q[j], Kj, Sm[b]);
+            }
+        }
+#pragma unroll
+        for (uint b = 0; b < NB; b++) {
+            sx[(dpart * NB + b) * 64u + tiisg * 2u] = Sm[b].thread_elements()[0];
+            sx[(dpart * NB + b) * 64u + tiisg * 2u + 1u] = Sm[b].thread_elements()[1];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float sv[NB][2];
+        float bm = -3.0e38f;
+#pragma unroll
+        for (uint b = 0; b < NB; b++) {
+#pragma unroll
+            for (uint e = 0; e < 2; e++) {
+                float s = sx[b * 64u + tiisg * 2u + e];
+#pragma unroll
+                for (uint u = 1; u < NSGR; u++) s = s + sx[(u * NB + b) * 64u + tiisg * 2u + e];
+                sv[b][e] = t0 + 8u * b + fn + e <= p ? s : -3.0e38f;
+                bm = max(bm, sv[b][e]);
+            }
+        }
+        bm = max(bm, simd_shuffle_xor(bm, 1));
+        bm = max(bm, simd_shuffle_xor(bm, 8));
+        const float m_new = max(m, bm);
+        const float corr = exp(m - m_new);
+        float ps = 0.0f;
+        simdgroup_float8x8 P[NB];
+#pragma unroll
+        for (uint b = 0; b < NB; b++) {
+#pragma unroll
+            for (uint e = 0; e < 2; e++) {
+                const float pv = t0 + 8u * b + fn + e <= p ? exp(sv[b][e] - m_new) : 0.0f;
+                P[b].thread_elements()[e] = pv;
+                ps = ps + pv;
+            }
+        }
+        ps = ps + simd_shuffle_xor(ps, 1);
+        ps = ps + simd_shuffle_xor(ps, 8);
+        l = fma(l, corr, ps);
+        m = m_new;
+#pragma unroll
+        for (uint j = 0; j < NF; j++) {
+            O[j].thread_elements()[0] *= corr;
+            O[j].thread_elements()[1] *= corr;
+#pragma unroll
+            for (uint b = 0; b < NB; b++) {
+                simdgroup_half8x8 Vj;
+                simdgroup_load(Vj, Vt + 8u * b * DP + d0 + 8u * j, DP, ulong2(0, 0), false);
+                simdgroup_multiply_accumulate(O[j], P[b], Vj, O[j]);
+            }
+        }
+    }
+    if (!live || k0 > p) return;
+    if (args.row_splits[r] == 1u) {
+        device float *dst = out + ((uint64_t)r * H + h) * D + d0 + fn;
+        device const float *gt = gate + ((uint64_t)r * H + h) * D + d0 + fn;
+        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+#pragma unroll
+        for (uint j = 0; j < NF; j++) {
+#pragma unroll
+            for (uint e = 0; e < 2; e++)
+                dst[8u * j + e] = qwen35_vattn_plus_zero(O[j].thread_elements()[e] * inv * qwen4_sigmoid(gt[8u * j + e]));
+        }
+    } else {
+        device float *dst = part + ((((uint64_t)r * Hkv + kvh) * args.part_splits + split) * GROUP + g) * (2u + D);
+        if (dpart == 0 && fn == 0) { dst[0] = m; dst[1] = l; }
+#pragma unroll
+        for (uint j = 0; j < NF; j++) {
+            dst[2u + d0 + 8u * j + fn] = O[j].thread_elements()[0];
+            dst[2u + d0 + 8u * j + fn + 1u] = O[j].thread_elements()[1];
+        }
+    }
+}
+
+/* The merge of each row's splits in order, one thread per dim; rows with
+ * one split were written directly.  One dispatch for the whole batch. */
+template <uint GROUP>
+kernel void kernel_qwen35_attn_verify_merge(
+        constant ds4_metal_args_qwen35_attn_verify & args,
+        device const float *part,
+        device const float *gate,
+        device float       *out,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]]) {
+    constexpr uint D = 256;
+    const uint h = tgpig.x;
+    if (h >= args.n_head || tgpig.y >= args.n_rows || tid >= D) return;
+    const uint r = args.row0 + tgpig.y;
+    const uint n_splits = args.row_splits[r];
+    if (n_splits == 1u) return;
+    const uint kvh = h / GROUP, g = h % GROUP;
+    const uint64_t stride = (uint64_t)GROUP * (2u + D);
+    device const float *base = part + (((uint64_t)r * args.n_head_kv + kvh) * args.part_splits * GROUP + g) * (2u + D);
+    float mm = -3.0e38f;
+    for (uint s = 0; s < n_splits; s++) mm = max(mm, base[s * stride]);
+    float ll = 0.0f, o = 0.0f;
+    for (uint s = 0; s < n_splits; s++) {
+        device const float *ps = base + s * stride;
+        const float c = ps[1] > 0.0f ? exp(ps[0] - mm) : 0.0f;
+        ll = fma(ps[1], c, ll);
+        o = fma(ps[2u + tid], c, o);
+    }
+    const float inv = ll > 0.0f ? 1.0f / ll : 0.0f;
+    const uint64_t at = ((uint64_t)r * args.n_head + h) * D + tid;
+    out[at] = qwen35_vattn_plus_zero(o * inv * qwen4_sigmoid(gate[at]));
+}
+
+template [[host_name("kernel_qwen35_attn_verify_g6")]]
+kernel void kernel_qwen35_attn_verify<6>(constant ds4_metal_args_qwen35_attn_verify &, device const float *,
+        device const float *, device const half *, device const half *, device float *, device float *,
+        uint3, ushort, ushort, ushort);
+template [[host_name("kernel_qwen35_attn_verify_merge_g6")]]
+kernel void kernel_qwen35_attn_verify_merge<6>(constant ds4_metal_args_qwen35_attn_verify &,
+        device const float *, device const float *, device float *, uint3, ushort);
+
 /* --- routed experts ----------------------------------------------------- */
 
 #define QWEN4_MOE_NSG 4

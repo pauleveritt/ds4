@@ -48531,6 +48531,8 @@ enum {
     QWEN4_K_QWEN35_GDN_HIST_COMMIT,
     QWEN4_K_QWEN35_ATTN_FA,
     QWEN4_K_QWEN35_ATTN_FA_PAD,
+    QWEN4_K_QWEN35_ATTN_VERIFY_G6,
+    QWEN4_K_QWEN35_ATTN_VERIFY_MERGE_G6,
     QWEN4_K_COUNT,
 };
 
@@ -48640,6 +48642,8 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen35_gdn_hist_commit",
     "kernel_qwen35_attn_fa",
     "kernel_qwen35_attn_fa_pad",
+    "kernel_qwen35_attn_verify_g6",
+    "kernel_qwen35_attn_verify_merge_g6",
 };
 
 typedef struct {
@@ -50040,6 +50044,72 @@ int ds4_gpu_qwen35_attn_verify_tensor(
     return ds4_gpu_qwen4_attn_rows_stage(table, entry0, rows, n_tokens, 1u) &&
            ds4_gpu_qwen4_attn_decode_rows_tensor(out, q, gate, q, q, part, table, entry0, rows, n_tokens,
                                                  n_head, n_head_kv, head_dim, 0u, scale);
+}
+
+/* Keys per split of a row with n_keys keys: the smallest multiple of 16,
+ * at least 32, that gives at most QWEN35_VATTN_SPLITS splits.  Eight splits
+ * (32 threadgroups for 4 KV heads) measured fastest on the M4 Max among 4 to
+ * 64 at depths 2,600 to 14,000. */
+#define QWEN35_VATTN_SPLITS 8u
+uint32_t ds4_gpu_qwen35_attn_verify_split_keys(uint32_t n_keys) {
+    const uint32_t per = (n_keys + QWEN35_VATTN_SPLITS - 1u) / QWEN35_VATTN_SPLITS;
+    const uint32_t s = (per + 15u) & ~15u;
+    return s < 32u ? 32u : s;
+}
+
+int ds4_gpu_qwen35_attn_verify_shared_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+        uint32_t pos0, float scale) {
+    struct { uint32_t n_rows, row0, n_head, n_head_kv, pos0, split_keys, part_splits; float scale;
+             uint32_t row_splits[8]; } args;
+    const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+    const uint64_t cache_bytes = ((uint64_t)pos0 + n_tokens) * n_head_kv * head_dim * 2u;
+    const uint64_t part_bytes = ds4_gpu_qwen4_attn_part_floats(n_tokens, n_head, head_dim) * sizeof(float);
+    qwen4_bind b[6];
+    if (n_tokens == 0 || n_tokens > 8u || head_dim != 256u || n_head_kv == 0 || n_head != 6u * n_head_kv ||
+        !qwen4_bind_tensor(&b[0], q, q_bytes, "verify attn q") ||
+        !qwen4_bind_tensor(&b[1], gate, q_bytes, "verify attn gate") ||
+        !qwen4_bind_tensor(&b[2], k_cache, cache_bytes, "verify attn k cache") ||
+        !qwen4_bind_tensor(&b[3], v_cache, cache_bytes, "verify attn v cache") ||
+        !qwen4_bind_tensor(&b[4], out, q_bytes, "verify attn out") ||
+        !qwen4_bind_tensor(&b[5], part, part_bytes, "verify attn partials")) {
+        return 0;
+    }
+    memset(&args, 0, sizeof(args));
+    args.n_head = n_head;
+    args.n_head_kv = n_head_kv;
+    args.pos0 = pos0;
+    args.part_splits = QWEN4_ATTN_MAX_SPLITS;
+    args.scale = scale;
+    bool merge = false;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const uint32_t n_keys = pos0 + t + 1u, s = ds4_gpu_qwen35_attn_verify_split_keys(n_keys);
+        args.row_splits[t] = (n_keys + s - 1u) / s;
+        if (args.row_splits[t] > QWEN4_ATTN_MAX_SPLITS) return 0;
+        merge = merge || args.row_splits[t] > 1u;
+    }
+    for (uint32_t r0 = 0; r0 < n_tokens;) {
+        const uint32_t s = ds4_gpu_qwen35_attn_verify_split_keys(pos0 + r0 + 1u);
+        uint32_t r1 = r0 + 1u;
+        while (r1 < n_tokens && ds4_gpu_qwen35_attn_verify_split_keys(pos0 + r1 + 1u) == s) r1++;
+        args.n_rows = r1 - r0;
+        args.row0 = r0;
+        args.split_keys = s;
+        if (!qwen4_dispatch(QWEN4_K_QWEN35_ATTN_VERIFY_G6, &args, sizeof(args), b, 6,
+                            MTLSizeMake((pos0 + r1 + s - 1u) / s, n_head_kv, 1),
+                            MTLSizeMake(6u * 4u * 32u, 1, 1), 0)) {
+            return 0;
+        }
+        r0 = r1;
+    }
+    if (!merge) return 1;
+    args.n_rows = n_tokens;
+    args.row0 = 0;
+    qwen4_bind mb[3] = { b[5], b[1], b[4] };
+    return qwen4_dispatch(QWEN4_K_QWEN35_ATTN_VERIFY_MERGE_G6, &args, sizeof(args), mb, 3,
+                          MTLSizeMake(n_head, n_tokens, 1), MTLSizeMake(head_dim, 1, 1), 0);
 }
 
 int ds4_gpu_qwen4_moe_mid_tensor(

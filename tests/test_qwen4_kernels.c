@@ -5053,6 +5053,237 @@ static void test_qwen35_attn_fa(void) {
     test_qwen35_attn_fa_case(45, 1001);
     g_rng = rng;
 }
+
+static void qwen35_vattn_rows_equal(const char *what, const float *got, const float *want, uint32_t rows,
+                                    uint64_t row_floats) {
+    for (uint64_t i = 0; i < (uint64_t)rows * row_floats; i++) {
+        if (memcmp(&got[i], &want[i], sizeof(float)) != 0) {
+            fprintf(stderr, "qwen35 verify attention: %s: row %llu head %llu dim %llu differs (%.9g vs %.9g)\n",
+                    what, (unsigned long long)(i / row_floats), (unsigned long long)(i % row_floats / 256u),
+                    (unsigned long long)(i % 256u), got[i], want[i]);
+            exit(1);
+        }
+    }
+}
+
+static void qwen35_vattn_put_rows(ds4_gpu_tensor *t, uint64_t row0, uint64_t n_rows, uint64_t row_floats,
+                                  const void *src, uint32_t elem) {
+    require_ok(ds4_gpu_tensor_write(t, row0 * row_floats * elem, (const uint8_t *)src + row0 * row_floats * elem,
+                                    n_rows * row_floats * elem), "qwen35 verify attention: write rows");
+}
+
+/* The shared-tile verify attention on the 27B's shape (24 query heads over 4
+ * KV heads, D 256) with 8 rows at pos0:
+ * - row t is byte-equal across T = 1..8 rows, where cache rows and query
+ *   rows past the batch hold NaN, so a read beyond row t's keys shows;
+ * - row t is byte-equal when every other row's query and gate and the K/V
+ *   of every later position change;
+ * - row t is byte-equal to a one-row call at pos0 + t (the DFlash-mode
+ *   serial pass);
+ * - every output is within 1e-3 of the output scale of attention in double;
+ * - the largest difference from the per-row path, reported. */
+static void qwen35_attn_verify_shared_case(uint32_t pos0) {
+    const uint32_t R = 8, H = 24, Hkv = 4, D = 256, cap = pos0 + R + 16;
+    const float scale = 0.0625f;
+    const uint64_t qd = (uint64_t)H * D, kvd = (uint64_t)Hkv * D, qn = (uint64_t)R * qd, kvn = (uint64_t)cap * kvd;
+    const uint16_t nan_bits = 0x7e00u;
+    const uint32_t nan32 = 0x7fc00000u;
+    float *q = rand_vec(qn, 4.0f), *gate = rand_vec(qn, 2.0f), *nanq = malloc(qn * 4);
+    _Float16 *kc = malloc(kvn * 2), *vc = malloc(kvn * 2), *nankv = malloc(kvn * 2);
+    require_ok(kc && vc && nanq && nankv, "qwen35 verify attention: host buffers");
+    for (uint64_t i = 0; i < kvn; i++) {
+        memcpy(&nankv[i], &nan_bits, 2);
+        if (i >= (uint64_t)(pos0 + R) * kvd) {
+            memcpy(&kc[i], &nan_bits, 2);
+            memcpy(&vc[i], &nan_bits, 2);
+        } else {
+            kc[i] = (_Float16)(2.0f * frand());
+            vc[i] = (_Float16)frand();
+        }
+    }
+    for (uint64_t i = 0; i < qn; i++) memcpy(&nanq[i], &nan32, 4);
+    ds4_gpu_tensor *gq = upload(q, qn), *gg = upload(gate, qn), *gout = upload(NULL, qn);
+    ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(kvn * 2), *gv = ds4_gpu_tensor_alloc(kvn * 2);
+    ds4_gpu_tensor *part = upload(NULL, ds4_gpu_qwen4_attn_part_floats(R, H, D));
+    require_ok(gk && gv && ds4_gpu_tensor_write(gk, 0, kc, kvn * 2) && ds4_gpu_tensor_write(gv, 0, vc, kvn * 2),
+               "qwen35 verify attention: caches");
+    if (pos0 == 2045) {
+        require_ok(ds4_gpu_qwen35_attn_verify_split_keys(pos0 + 1) != ds4_gpu_qwen35_attn_verify_split_keys(pos0 + R),
+                   "qwen35 verify attention: pos0 2045 splits rows 0 and 7 differently");
+    }
+
+    require_ok(ds4_gpu_qwen35_attn_verify_shared_tensor(gout, gq, gg, gk, gv, part, R, H, Hkv, D, pos0, scale),
+               "qwen35 verify attention: 8 rows");
+    float *y8 = download(gout, qn);
+
+    double *scores = malloc((size_t)(pos0 + R) * sizeof(double)), ref[256];
+    double err = 0.0, ref_scale = 1e-8;
+    for (uint32_t t = 0; t < R; t++) {
+        for (uint32_t h = 0; h < H; h++) {
+            qwen35_attn_ref_row(q, gate, kc, vc, H, Hkv, pos0, t, h, false, scale, scores, ref);
+            for (uint32_t d = 0; d < D; d++) {
+                const float g = y8[((uint64_t)t * H + h) * D + d];
+                require_ok(f32_finite(g), "qwen35 verify attention: finite output");
+                err = fmax(err, fabs((double)g - ref[d]));
+                ref_scale = fmax(ref_scale, fabs(ref[d]));
+            }
+        }
+    }
+
+    for (uint32_t T = 1; T < R; T++) {
+        qwen35_vattn_put_rows(gk, pos0 + T, R - T, kvd, nankv, 2);
+        qwen35_vattn_put_rows(gv, pos0 + T, R - T, kvd, nankv, 2);
+        qwen35_vattn_put_rows(gq, T, R - T, qd, nanq, 4);
+        qwen35_vattn_put_rows(gg, T, R - T, qd, nanq, 4);
+        require_ok(ds4_gpu_tensor_fill_f32(gout, 7.0f, qn), "qwen35 verify attention: clear");
+        require_ok(ds4_gpu_qwen35_attn_verify_shared_tensor(gout, gq, gg, gk, gv, part, T, H, Hkv, D, pos0, scale),
+                   "qwen35 verify attention: T rows");
+        float *yt = download(gout, (uint64_t)T * qd);
+        char what[96];
+        snprintf(what, sizeof(what), "pos0 %u T=%u against T=8", pos0, T);
+        qwen35_vattn_rows_equal(what, yt, y8, T, qd);
+        free(yt);
+        qwen35_vattn_put_rows(gk, pos0 + T, R - T, kvd, kc, 2);
+        qwen35_vattn_put_rows(gv, pos0 + T, R - T, kvd, vc, 2);
+        qwen35_vattn_put_rows(gq, T, R - T, qd, q, 4);
+        qwen35_vattn_put_rows(gg, T, R - T, qd, gate, 4);
+    }
+
+    float *q2 = rand_vec(qn, 4.0f), *gate2 = rand_vec(qn, 2.0f);
+    _Float16 *k2 = malloc((uint64_t)R * kvd * 2), *v2 = malloc((uint64_t)R * kvd * 2);
+    for (uint64_t i = 0; i < (uint64_t)R * kvd; i++) { k2[i] = (_Float16)(2.0f * frand()); v2[i] = (_Float16)frand(); }
+    for (uint32_t t = 0; t < R; t++) {
+        float *qt = malloc(qn * 4), *gt = malloc(qn * 4);
+        memcpy(qt, q2, qn * 4);
+        memcpy(gt, gate2, qn * 4);
+        memcpy(qt + (uint64_t)t * qd, q + (uint64_t)t * qd, qd * 4);
+        memcpy(gt + (uint64_t)t * qd, gate + (uint64_t)t * qd, qd * 4);
+        require_ok(ds4_gpu_tensor_write(gq, 0, qt, qn * 4) && ds4_gpu_tensor_write(gg, 0, gt, qn * 4),
+                   "qwen35 verify attention: other rows");
+        if (t + 1 < R) {
+            const uint64_t at = (uint64_t)(pos0 + t + 1) * kvd * 2, n = (uint64_t)(R - t - 1) * kvd * 2;
+            require_ok(ds4_gpu_tensor_write(gk, at, k2 + (uint64_t)(t + 1) * kvd, n) &&
+                       ds4_gpu_tensor_write(gv, at, v2 + (uint64_t)(t + 1) * kvd, n),
+                       "qwen35 verify attention: later keys");
+        }
+        require_ok(ds4_gpu_qwen35_attn_verify_shared_tensor(gout, gq, gg, gk, gv, part, R, H, Hkv, D, pos0, scale),
+                   "qwen35 verify attention: other contents");
+        float *yo = download(gout, qn);
+        char what[96];
+        snprintf(what, sizeof(what), "pos0 %u row %u with other rows and later keys changed", pos0, t);
+        qwen35_vattn_rows_equal(what, yo + (uint64_t)t * qd, y8 + (uint64_t)t * qd, 1, qd);
+        free(yo); free(qt); free(gt);
+        qwen35_vattn_put_rows(gk, pos0, R, kvd, kc, 2);
+        qwen35_vattn_put_rows(gv, pos0, R, kvd, vc, 2);
+    }
+    require_ok(ds4_gpu_tensor_write(gq, 0, q, qn * 4) && ds4_gpu_tensor_write(gg, 0, gate, qn * 4),
+               "qwen35 verify attention: restore rows");
+
+    for (uint32_t t = 0; t < R; t++) {
+        ds4_gpu_tensor *vq = graph_row(gq, t, qd), *vg = graph_row(gg, t, qd), *vo = graph_row(gout, 0, qd);
+        require_ok(ds4_gpu_qwen35_attn_verify_shared_tensor(vo, vq, vg, gk, gv, part, 1, H, Hkv, D, pos0 + t, scale),
+                   "qwen35 verify attention: one row");
+        float *y1 = download(gout, qd);
+        char what[96];
+        snprintf(what, sizeof(what), "pos0 %u row %u against one row at %u", pos0, t, pos0 + t);
+        qwen35_vattn_rows_equal(what, y1, y8 + (uint64_t)t * qd, 1, qd);
+        free(y1);
+        ds4_gpu_tensor_free(vo); ds4_gpu_tensor_free(vg); ds4_gpu_tensor_free(vq);
+    }
+
+    const char *saved = getenv("DS4_QWEN4_ATTN_SPLIT_KEYS");
+    char *restore = saved ? strdup(saved) : NULL;
+    setenv("DS4_QWEN4_ATTN_SPLIT_KEYS", "32", 1);
+    ds4_gpu_tensor *pos3 = upload(NULL, (uint64_t)cap * 4);
+    ds4_gpu_tensor *table = ds4_gpu_tensor_alloc((uint64_t)R * DS4_GPU_QWEN4_ATTN_ROW_BYTES);
+    ds4_gpu_tensor *gold = upload(NULL, qn);
+    require_ok(table != NULL, "qwen35 verify attention: rows table");
+    require_ok(ds4_gpu_qwen35_attn_verify_tensor(gold, gq, gg, gk, gv, pos3, table, 0, part, R, H, Hkv, D, pos0, scale),
+               "qwen35 verify attention: per-row path");
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    require_ok(ds4_gpu_qwen35_attn_verify_tensor(gold, gq, gg, gk, gv, pos3, table, 0, part, R, H, Hkv, D, pos0, scale),
+               "qwen35 verify attention: per-row path again");
+    const double old_s = seconds_since(&t0);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    require_ok(ds4_gpu_qwen35_attn_verify_shared_tensor(gout, gq, gg, gk, gv, part, R, H, Hkv, D, pos0, scale),
+               "qwen35 verify attention: 8 rows again");
+    const double new_s = seconds_since(&t0);
+    if (restore) { setenv("DS4_QWEN4_ATTN_SPLIT_KEYS", restore, 1); free(restore); }
+    else unsetenv("DS4_QWEN4_ATTN_SPLIT_KEYS");
+    float *yold = download(gold, qn), *yagain = download(gout, qn);
+    qwen35_vattn_rows_equal("8 rows run again", yagain, y8, R, qd);
+    double vs_old = 0.0;
+    for (uint64_t i = 0; i < qn; i++) vs_old = fmax(vs_old, fabs((double)y8[i] - yold[i]));
+
+    printf("  qwen35 verify attention pos0=%u: rows byte-equal over T=1..8, other rows, one-row calls; "
+           "vs double max|d|=%.2e (rel %.2e, scale %.2e); vs per-row path max|d|=%.2e; "
+           "shared %.2f ms, per-row %.2f ms\n",
+           pos0, err, err / ref_scale, ref_scale, vs_old, new_s * 1e3, old_s * 1e3);
+    require_ok(err <= 1e-3 * ref_scale, "qwen35 verify attention against double, 1e-3 of scale");
+
+    free(yold); free(yagain); free(scores); free(y8); free(q2); free(gate2); free(k2); free(v2);
+    free(q); free(gate); free(nanq); free(kc); free(vc); free(nankv);
+    ds4_gpu_tensor_free(gold); ds4_gpu_tensor_free(table); ds4_gpu_tensor_free(pos3);
+    ds4_gpu_tensor_free(part); ds4_gpu_tensor_free(gk); ds4_gpu_tensor_free(gv);
+    ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gg); ds4_gpu_tensor_free(gq);
+}
+
+/* us per call of the verify attention, median of 20 batches of 10 calls,
+ * shared tiles against the per-row path, at T = 1 and 8 */
+static void bench_qwen35_attn_verify(void) {
+    const uint32_t R = 8, H = 24, Hkv = 4, D = 256;
+    const uint32_t depths[] = {100, 2600, 9700, 14000};
+    const uint64_t qn = (uint64_t)R * H * D;
+    setenv("DS4_QWEN4_ATTN_SPLIT_KEYS", "32", 1);
+    printf("qwen35 verify attention bench: us/call, median of 20 batches of 10 calls\n");
+    for (uint32_t di = 0; di < sizeof(depths) / sizeof(depths[0]); di++) {
+        const uint32_t pos0 = depths[di], cap = pos0 + R;
+        const uint64_t kvn = (uint64_t)cap * Hkv * D;
+        float *q = rand_vec(qn, 4.0f), *gate = rand_vec(qn, 2.0f);
+        _Float16 *kc = malloc(kvn * 2), *vc = malloc(kvn * 2);
+        for (uint64_t i = 0; i < kvn; i++) { kc[i] = (_Float16)(2.0f * frand()); vc[i] = (_Float16)frand(); }
+        ds4_gpu_tensor *gq = upload(q, qn), *gg = upload(gate, qn), *gout = upload(NULL, qn);
+        ds4_gpu_tensor *gk = ds4_gpu_tensor_alloc(kvn * 2), *gv = ds4_gpu_tensor_alloc(kvn * 2);
+        ds4_gpu_tensor *part = upload(NULL, ds4_gpu_qwen4_attn_part_floats(R, H, D));
+        ds4_gpu_tensor *pos3 = upload(NULL, (uint64_t)cap * 4);
+        ds4_gpu_tensor *table = ds4_gpu_tensor_alloc((uint64_t)R * DS4_GPU_QWEN4_ATTN_ROW_BYTES);
+        require_ok(gk && gv && table && ds4_gpu_tensor_write(gk, 0, kc, kvn * 2) &&
+                   ds4_gpu_tensor_write(gv, 0, vc, kvn * 2), "qwen35 verify attention bench setup");
+        const uint32_t Ts[] = {1, 8};
+        for (uint32_t ti = 0; ti < 2; ti++) {
+            const uint32_t T = Ts[ti];
+            double samples[2][20];
+            for (uint32_t rep = 0; rep < 21; rep++) {
+                for (uint32_t v = 0; v < 2; v++) {
+                    const double t0 = bench_now();
+                    require_ok(ds4_gpu_begin_commands(), "bench begin");
+                    for (uint32_t c = 0; c < 10; c++) {
+                        require_ok(v == 0
+                            ? ds4_gpu_qwen35_attn_verify_shared_tensor(gout, gq, gg, gk, gv, part, T, H, Hkv, D, pos0, 0.0625f)
+                            : ds4_gpu_qwen35_attn_verify_tensor(gout, gq, gg, gk, gv, pos3, table, 0, part, T, H, Hkv, D,
+                                                                pos0, 0.0625f), "bench call");
+                    }
+                    require_ok(ds4_gpu_end_commands(), "bench end");
+                    if (rep) samples[v][rep - 1] = 1e6 * (bench_now() - t0) / 10.0;
+                }
+            }
+            printf("  depth %5u T=%u: shared %8.1f us, per-row %8.1f us\n", pos0, T,
+                   qwen35_median20(samples[0]), qwen35_median20(samples[1]));
+        }
+        free(q); free(gate); free(kc); free(vc);
+        ds4_gpu_tensor_free(gq); ds4_gpu_tensor_free(gg); ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gk);
+        ds4_gpu_tensor_free(gv); ds4_gpu_tensor_free(part); ds4_gpu_tensor_free(pos3); ds4_gpu_tensor_free(table);
+    }
+}
+
+static void test_qwen35_attn_verify_shared(void) {
+    const uint32_t rng = g_rng;
+    const uint32_t depths[] = {27, 100, 2045, 2600, 9701, 14000};
+    printf("qwen35 verify attention, shared K/V tiles\n");
+    for (uint32_t i = 0; i < sizeof(depths) / sizeof(depths[0]); i++) qwen35_attn_verify_shared_case(depths[i]);
+    g_rng = rng;
+}
 #endif
 
 int main(void) {
@@ -5088,6 +5319,7 @@ int main(void) {
     const char *qwen35_graph_only = getenv("DS4_TEST_QWEN35_GRAPH_ONLY");
     if (qwen35_graph_only && qwen35_graph_only[0] && strcmp(qwen35_graph_only, "0") != 0) {
         test_qwen35_graph(&arena);
+        test_qwen35_attn_verify_shared();
         printf("all qwen35 verify rows tests passed\n");
         return 0;
     }
@@ -5096,6 +5328,12 @@ int main(void) {
 #ifdef __APPLE__
     if (getenv("DS4_TEST_QWEN4_Q6K_MM_ONLY")) { test_q6_K_mm(&arena); printf("all qwen4 Q6_K mm tests passed\n"); return 0; }
     if (getenv("DS4_TEST_QWEN35_ATTN_FA_ONLY")) { test_qwen35_attn_fa(); printf("all qwen35 attn fa tests passed\n"); return 0; }
+    if (getenv("DS4_TEST_QWEN35_VERIFY_ATTN_BENCH")) { bench_qwen35_attn_verify(); return 0; }
+    if (getenv("DS4_TEST_QWEN35_VERIFY_ATTN_ONLY")) {
+        test_qwen35_attn_verify_shared();
+        printf("all qwen35 verify attention tests passed\n");
+        return 0;
+    }
 #endif
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
         test_moe_types(&arena, 8, 6, 2560, 640, 1, 16u, 10u);
@@ -5269,6 +5507,7 @@ int main(void) {
 #ifdef __APPLE__
     test_q6_K_mm(&arena);
     test_qwen35_attn_fa();
+    test_qwen35_attn_verify_shared();
 #endif
     printf("multi gemv\n");
     test_multi_gemv(&arena, 2560, 2);

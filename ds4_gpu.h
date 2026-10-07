@@ -3483,6 +3483,23 @@ int ds4_gpu_qwen35_attn_verify_tensor(
         ds4_gpu_tensor *table, uint64_t entry0, ds4_gpu_tensor *part,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
         uint32_t pos0, float scale);
+/* qwen35 verify attention with shared K/V tiles (kernel_qwen35_attn_verify):
+ * rows 0..n_tokens-1 (1..8) at pos0 + t over one layer's f16 caches, each
+ * 16-key tile loaded once into threadgroup memory for every row and query
+ * head, scores and P V on 8x8 simdgroup MMAs.  Row t's keys split at
+ * multiples of ds4_gpu_qwen35_attn_verify_split_keys(pos0 + t + 1), the
+ * splits merged in order, so row t is bitwise the same for any n_tokens, any
+ * other rows, and a one-row call at pos0 + t.  Head dim 256 and six query
+ * heads per KV head only; part holds
+ * ds4_gpu_qwen4_attn_part_floats(n_tokens, ...) floats. */
+int ds4_gpu_qwen35_attn_verify_shared_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+        uint32_t pos0, float scale);
+/* The keys per split of a row with n_keys keys under the shared-tile verify
+ * attention: a multiple of 16, at least 32, for at most 8 splits. */
+uint32_t ds4_gpu_qwen35_attn_verify_split_keys(uint32_t n_keys);
 /* Dense qwen35 prefill attention with llama.cpp's flash-attention tiling
  * (kernel_flash_attn_ext: 8 queries of one head per threadgroup, 64 keys per
  * step): causal over the f16 caches' rows 0..pos0+n_tokens-1, out =

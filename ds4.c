@@ -59810,8 +59810,13 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
 /* Dense qwen35 gated GQA attention over positions 0..pos: [q|gate] per head,
  * RMS-normed q and k with partial NeoX rope, f16 K/V, softmax(qk/sqrt(D))v
  * times sigmoid(gate), then the output projection.  attn_slot numbers the
- * attention layers; under a verify, row t takes the key splits of a decode
- * at pos0 + t through the slot's 8 entries of the rows table.
+ * attention layers.  In DFlash mode (verify mode MMA) the rows take the
+ * shared-tile verify attention when the layer has six query heads per KV
+ * head of 256 (ds4_gpu_qwen35_attn_verify_shared_tensor),
+ * row t's arithmetic a function of pos0 + t alone; with
+ * DS4_QWEN35_VERIFY_ATTN_PER_ROW=1 (read per call), and under the exact
+ * diagnostic, row t takes the key splits of a decode at pos0 + t through the
+ * slot's 8 entries of the rows table.
  *
  * Off a verify, prompt batches (T > 8) take llama.cpp's flash-attention
  * tiling (ds4_gpu_qwen35_attn_fa_tensor) and decode rows (T <= 8) take the
@@ -59829,7 +59834,13 @@ static bool qwen35_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, c
                                           pos0, g->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS))) {
         return false;
     }
-    const bool attn = g->qwen35_verify_now != DS4_QWEN35_VERIFY_OFF
+    const bool shared = g->qwen35_verify_now == DS4_QWEN35_VERIFY_MMA && DS4_N_HEAD_DIM == 256u &&
+                        DS4_N_HEAD == 6u * DS4_N_HEAD_KV && !getenv("DS4_QWEN35_VERIFY_ATTN_PER_ROW");
+    const bool attn = shared
+        ? ds4_gpu_qwen35_attn_verify_shared_tensor(g->attn_o, g->q, g->gate, g->layer_k_cache[il],
+                                                   g->layer_v_cache[il], g->qwen35_verify_part, T, DS4_N_HEAD,
+                                                   DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, scale) != 0
+        : g->qwen35_verify_now != DS4_QWEN35_VERIFY_OFF
         ? ds4_gpu_qwen35_attn_verify_tensor(g->attn_o, g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il],
                                             g->pos3, g->qwen35_verify_table, (uint64_t)attn_slot * 8u,
                                             g->qwen35_verify_part, T, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
