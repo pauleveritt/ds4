@@ -59811,7 +59811,11 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
  * RMS-normed q and k with partial NeoX rope, f16 K/V, softmax(qk/sqrt(D))v
  * times sigmoid(gate), then the output projection.  attn_slot numbers the
  * attention layers; under a verify, row t takes the key splits of a decode
- * at pos0 + t through the slot's 8 entries of the rows table. */
+ * at pos0 + t through the slot's 8 entries of the rows table.
+ *
+ * Off a verify, prompt batches (T > 8) take llama.cpp's flash-attention
+ * tiling (ds4_gpu_qwen35_attn_fa_tensor) and decode rows (T <= 8) take the
+ * decode kernels. */
 static bool qwen35_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                    uint32_t il, uint32_t pos0, uint32_t T, uint32_t attn_slot) {
     const float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
@@ -59830,6 +59834,9 @@ static bool qwen35_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, c
                                             g->pos3, g->qwen35_verify_table, (uint64_t)attn_slot * 8u,
                                             g->qwen35_verify_part, T, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
                                             pos0, scale) != 0
+        : T > 8u
+        ? ds4_gpu_qwen35_attn_fa_tensor(g->attn_o, g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il],
+                                        T, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, scale) != 0
         : ds4_gpu_qwen4_attn_decode_tensor(g->attn_o, g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il],
                                            NULL, NULL, T <= 2u ? g->attn_part : NULL, T,
                                            DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, false, 0u, scale) != 0;

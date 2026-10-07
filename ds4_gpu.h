@@ -259,6 +259,7 @@ enum {
     DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT = 1u << 4,
     DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4 = 1u << 5,
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
+    DS4_GPU_TEST_Q6_K_MM_BYTEWISE = 1u << 7,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
@@ -772,7 +773,9 @@ int ds4_gpu_matmul_mma_rows_tensor(
 
 /* The same product through the tiled prefill kernel (Metal only): each
  * weight is read once per 32 tokens instead of once per token.  Dense
- * qwen35 uses it for prompt batches. */
+ * qwen35 uses it for prompt batches.  DS4_GPU_TEST_Q6_K_MM_BYTEWISE runs
+ * the tile with the bytewise Q6_K dequantizer it had before, the reference
+ * the packed one must match byte for byte. */
 int ds4_gpu_matmul_q6_K_mm_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -3478,6 +3481,16 @@ int ds4_gpu_qwen35_attn_verify_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
         ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *pos3,
         ds4_gpu_tensor *table, uint64_t entry0, ds4_gpu_tensor *part,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+        uint32_t pos0, float scale);
+/* Dense qwen35 prefill attention with llama.cpp's flash-attention tiling
+ * (kernel_flash_attn_ext: 8 queries of one head per threadgroup, 64 keys per
+ * step): causal over the f16 caches' rows 0..pos0+n_tokens-1, out =
+ * softmax(q.k*scale)v * sigmoid(gate), the dense contract of
+ * ds4_gpu_qwen4_attn_decode_tensor.  Head dim 256 only. */
+int ds4_gpu_qwen35_attn_fa_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
         uint32_t pos0, float scale);
 int ds4_gpu_qwen4_ple_gate_tensor(

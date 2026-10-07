@@ -1095,10 +1095,51 @@ kernel void kernel_qwen35_q6_K_matmul_f32(
     }
 }
 
+/* llama.cpp's dequantize_q6_K (ggml/src/ggml-metal/kernels/dequantize.h,
+ * a46709b, MIT, Copyright (c) 2023-2026 The ggml authors): four weights per
+ * 32-bit load of ql and qh, where moe.metal's dequantize_q6_K builds each
+ * weight from byte loads.  Both give the same floats: d is a half, the scale
+ * an int8 and q six bits, so d*sc*q - 32*d*sc and d*sc*(q - 32) are exact in
+ * float, and so are the dl1..dl3 rescalings by powers of two. */
+template <typename type4x4>
+void dequantize_q6_K_packed(device const block_q6_K *xb, short il, thread type4x4 & reg) {
+    const half d_all = xb->d;
+    device const uint16_t * ql = (device const uint16_t *)xb->ql;
+    device const uint16_t * qh = (device const uint16_t *)xb->qh;
+    device const int8_t * scales = (device const int8_t *)xb->scales;
+
+    ql = ql + 32*(il/8) + 16*((il/2)&1) + 8*(il&1);
+    qh = qh + 16*(il/8) + 8*(il&1);
+    float sc = scales[(il%2) + 2 * ((il/2))];
+    il = (il/2) & 3;
+
+    const uint32_t kmask1 = il>1 ? (il>2 ? 0xC0C0C0C0 : 0x30303030) : (il>0 ? 0x0C0C0C0C : 0x03030303);
+    const uint32_t kmask2 = il>1 ? 0xF0F0F0F0                       : 0x0F0F0F0F;
+    const float ml = d_all * sc * 32.f;
+    const float dl0 = d_all * sc;
+    const float dl1 = dl0 / 256.f;
+    const float dl2 = dl0 / (256.f * 256.f);
+    const float dl3 = dl0 / (256.f * 256.f * 256.f);
+    const uint8_t shr_h = il>2 ? 2 : 0;
+    const uint8_t shl_h = il>1 ? 0 : (il>0 ? 2 : 4);
+    const uint8_t shr_l = il>1 ? 4 : 0;
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t  low = (ql[2*i] | (uint32_t)(ql[2*i+1] << 16)) & kmask2;
+        const uint32_t high = (qh[2*i] | (uint32_t)(qh[2*i+1] << 16)) & kmask1;
+        const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+        reg[i][0] = dl0 *  ((half)(q & 0xFF))       - ml;
+        reg[i][1] = dl1 * ((float)(q & 0xFF00))     - ml;
+        reg[i][2] = dl2 * ((float)(q & 0xFF0000))   - ml;
+        reg[i][3] = dl3 * ((float)(q & 0xFF000000)) - ml;
+    }
+}
+
 /* Dense qwen35 prompt batches of Q6_K weights: dense.metal's tiled matrix
- * kernel with moe.metal's Q6_K dequantizer, the instantiation llama.cpp's
- * kernel_mul_mm_q6_K_f32 uses. */
-template [[host_name("kernel_mul_mm_q6_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, 16, dequantize_q6_K, float, float4x4, float, float2x4>;
+ * kernel with the packed Q6_K dequantizer above, the instantiation llama.cpp's
+ * kernel_mul_mm_q6_K_f32 uses.  The _bytewise kernel keeps moe.metal's
+ * dequantizer as the tests' reference (DS4_GPU_TEST_Q6_K_MM_BYTEWISE). */
+template [[host_name("kernel_mul_mm_q6_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, 16, dequantize_q6_K_packed, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_q6_K_f32_bytewise")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, 16, dequantize_q6_K, float, float4x4, float, float2x4>;
 
 /* --- PLE ---------------------------------------------------------------- */
 
@@ -2701,6 +2742,283 @@ kernel void kernel_qwen4_attn_mm(
         if (r >= group) continue;
         const uint64_t o = ((uint64_t)tok * H + kvh * group + r) * D + d;
         out[o] = ((threadgroup float *)KV)[r * D + d] * qwen4_sigmoid(gate[o]);
+    }
+}
+
+/* --- dense qwen35 prefill attention, flash-attention tiling ------------- */
+
+/* llama.cpp's kernel_flash_attn_ext (ggml/src/ggml-metal/kernels/fa_common.metal
+ * at a46709b, MIT) specialized to dense qwen35's prefill attention: D 256,
+ * f16 K/V read in place from the caches' [pos][Hkv*D] rows, 8 queries of one
+ * query head per threadgroup, 64 keys per step over 4 simdgroups, queries
+ * staged as half, scores, probabilities and the running output in f32.
+ * The causal mask is computed rather than read from a mask tensor:
+ * - a threadgroup stops after its last query's position, the blocks
+ *   llama.cpp's kernel_flash_attn_ext_blk pre-pass marks fully masked;
+ * - a block every query of the threadgroup sees skips the mask, as llama.cpp
+ *   does for blocks the pre-pass marks unmasked;
+ * - the last, partial block reads K/V from the zero-padded copy
+ *   kernel_qwen35_attn_fa_pad wrote (llama.cpp's kvpad), so no row past
+ *   pos0+T is read.
+ * The epilogue scales each output by sigmoid(gate), as kernel_qwen4_attn_mm. */
+
+#define QWEN35_FA_Q   8
+#define QWEN35_FA_C   64
+#define QWEN35_FA_NSG 4
+#define FOR_QWEN35_FA(x) _Pragma("clang loop unroll(full)") for (x)
+
+struct ds4_metal_args_qwen35_attn_fa {
+    uint32_t n_tokens;
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t pos0;        /* query row t sits at position pos0 + t */
+    float    scale;
+    uint32_t pad0, pad1, pad2;
+};
+
+/* the cache rows of the last partial key block, rows past pos0+T zero */
+kernel void kernel_qwen35_attn_fa_pad(
+        constant ds4_metal_args_qwen35_attn_fa & args,
+        device const half *k_cache,   /* [cap][Hkv*D] */
+        device const half *v_cache,
+        device half       *k_pad,     /* [C][Hkv*D] */
+        device half       *v_pad,
+        uint tid [[thread_position_in_grid]]) {
+    const uint row4 = args.n_head_kv * 256u / 8u;
+    if (tid >= QWEN35_FA_C * row4) return;
+    const uint n_kv = args.pos0 + args.n_tokens;
+    const uint r = tid / row4, c = tid % row4, ic = n_kv / QWEN35_FA_C * QWEN35_FA_C;
+    uint4 kx = uint4(0u), vx = uint4(0u);
+    if (ic + r < n_kv) {
+        kx = ((device const uint4 *)k_cache)[(uint64_t)(ic + r) * row4 + c];
+        vx = ((device const uint4 *)v_cache)[(uint64_t)(ic + r) * row4 + c];
+    }
+    ((device uint4 *)k_pad)[tid] = kx;
+    ((device uint4 *)v_pad)[tid] = vx;
+}
+
+kernel void kernel_qwen35_attn_fa(
+        constant ds4_metal_args_qwen35_attn_fa & args,
+        device const float *q,        /* [T][H*D] */
+        device const float *gate,     /* [T][H*D] */
+        device const half  *k_cache,  /* [cap][Hkv*D] */
+        device const half  *v_cache,  /* [cap][Hkv*D] */
+        device const half  *k_pad,    /* [C][Hkv*D], the last partial block */
+        device const half  *v_pad,
+        device float       *out,      /* [T][H*D] */
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short DK = 256, DV = 256, Q = QWEN35_FA_Q, C = QWEN35_FA_C, NSG = QWEN35_FA_NSG, NW = 32;
+    constexpr short DK4 = DK/4, DK8 = DK/8, DV4 = DV/4;
+    constexpr short PV = DV, PV4 = PV/4, PV8 = PV/8;
+    constexpr short NQ = Q/NSG;
+    constexpr short SH = 2*C;
+    constexpr short TQ = DK + 2*PV;
+
+    threadgroup half shmem_f16[Q*TQ + Q*2*SH];
+    threadgroup half   *sq  = shmem_f16;
+    threadgroup half4  *sq4 = (threadgroup half4 *)shmem_f16;
+    threadgroup float  *so  = (threadgroup float *)(shmem_f16 + Q*DK);
+    threadgroup float4 *so4 = (threadgroup float4 *)(shmem_f16 + Q*DK);
+    threadgroup float  *ss  = (threadgroup float *)(shmem_f16 + Q*TQ);
+    threadgroup float2 *ss2 = (threadgroup float2 *)(shmem_f16 + Q*TQ);
+
+    const int iq2 = tgpig.y;
+    const int iq1 = tgpig.x*Q;
+    const uint H = args.n_head, Hkv = args.n_head_kv, T = args.n_tokens;
+    const uint kvh = (uint)iq2/(H/Hkv);
+    const uint ns = Hkv*DK;
+    const uint n_kv = args.pos0 + T;
+    const uint kv_end = args.pos0 + min((uint)iq1 + Q, T);
+
+    FOR_QWEN35_FA (short jj = 0; jj < NQ; ++jj) {
+        const short j = jj*NSG + sgitg;
+        device const float4 *q4 = (device const float4 *)(q + ((uint64_t)(iq1 + j)*H + iq2)*DK);
+        for (short i = tiisg; i < DK4; i += NW) {
+            if ((uint)(iq1 + j) < T) {
+                sq4[j*DK4 + i] = (half4) q4[i];
+            } else {
+                sq4[j*DK4 + i] = 0;
+            }
+        }
+    }
+
+    FOR_QWEN35_FA (short jj = 0; jj < NQ; ++jj) {
+        const short j = jj*NSG + sgitg;
+        for (short i = tiisg; i < DV4; i += NW) {
+            so4[j*PV4 + i] = 0;
+        }
+        for (short i = tiisg; i < SH; i += NW) {
+            ss[j*SH + i] = 0.0f;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S[NQ] = { [0 ... NQ-1] = 0.0f };
+
+    {
+        float M[NQ] = { [0 ... NQ-1] = -FLT_MAX/2 };
+
+        for (uint ic = 0; ic < kv_end; ic += C) {
+            const bool tail = ic + C > n_kv;
+            device const half *kb = tail ? k_pad + kvh*DK : k_cache + ((uint64_t)ic*Hkv + kvh)*DK;
+            device const half *vb = tail ? v_pad + kvh*DK : v_cache + ((uint64_t)ic*Hkv + kvh)*DK;
+            const bool unmasked = ic + C - 1 <= args.pos0 + (uint)iq1;
+
+            {
+                device      const half * pk = kb;
+                threadgroup const half * pq = sq;
+                threadgroup       float * ps = ss;
+
+                pk += sgitg*(8*ns);
+                ps += sgitg*(8*1);
+
+                constexpr short NC = (C/8)/NSG;
+
+                FOR_QWEN35_FA (short cc = 0; cc < NC; ++cc) {
+                    simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+                    simdgroup_half8x8 mk[2];
+                    simdgroup_half8x8 mq[2];
+
+                    #pragma unroll (DK8/2)
+                    for (short i = 0; i < DK8/2; ++i) {
+                        simdgroup_barrier(mem_flags::mem_none);
+
+                        simdgroup_load(mq[0], pq + 0*8 + 16*i, DK);
+                        simdgroup_load(mq[1], pq + 1*8 + 16*i, DK);
+
+                        simdgroup_load(mk[0], pk + 0*8 + 16*i, ns, 0, true);
+                        simdgroup_load(mk[1], pk + 1*8 + 16*i, ns, 0, true);
+
+                        simdgroup_barrier(mem_flags::mem_none);
+
+                        simdgroup_multiply_accumulate(mqk, mq[0], mk[0], mqk);
+                        simdgroup_multiply_accumulate(mqk, mq[1], mk[1], mqk);
+                    }
+
+                    simdgroup_store(mqk, ps, SH, 0, false);
+
+                    pk += 8*(NSG*ns);
+                    ps += 8*(NSG);
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            FOR_QWEN35_FA (short jj = 0; jj < NQ; ++jj) {
+                const short j = jj*NSG + sgitg;
+
+                const float m = M[jj];
+
+                float2 s2 = ss2[j*SH/2 + tiisg]*args.scale;
+
+                if (!unmasked) {
+                    const uint qpos = args.pos0 + (uint)iq1 + j, k0 = ic + 2*tiisg;
+                    if (k0 > qpos) s2[0] = -FLT_MAX/2;
+                    if (k0 + 1 > qpos) s2[1] = -FLT_MAX/2;
+                }
+
+                M[jj] = simd_max(max(M[jj], max(s2[0], s2[1])));
+
+                const float  ms  = exp(m  - M[jj]);
+                const float2 vs2 = exp(s2 - M[jj]);
+
+                S[jj] = S[jj]*ms + simd_sum(vs2[0] + vs2[1]);
+
+                ss2[j*SH/2 + tiisg] = vs2;
+
+                FOR_QWEN35_FA (short ii = 0; ii < DV4/NW; ++ii) {
+                    const short i = ii*NW + tiisg;
+
+                    so4[j*PV4 + i] *= ms;
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            {
+                constexpr short NO = PV8/NSG;
+
+                simdgroup_float8x8 lo[NO];
+
+                {
+                    auto sot = so + 8*sgitg;
+
+                    FOR_QWEN35_FA (short ii = 0; ii < NO; ++ii) {
+                        simdgroup_load(lo[ii], sot, PV, 0, false);
+
+                        sot += 8*NSG;
+                    }
+                }
+
+                {
+                    device const half * pv = vb;
+
+                    pv += 8*sgitg;
+
+                    constexpr short NC = (C/8)/2;
+
+                    FOR_QWEN35_FA (short cc = 0; cc < NC; ++cc) {
+                        simdgroup_float8x8 vs[2];
+
+                        simdgroup_load(vs[0], ss + 16*cc + 0, SH, 0, false);
+                        simdgroup_load(vs[1], ss + 16*cc + 8, SH, 0, false);
+
+                        FOR_QWEN35_FA (short ii = 0; ii < NO/2; ++ii) {
+                            simdgroup_half8x8 mv[4];
+
+                            simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG + 0*8*ns, ns, 0, false);
+                            simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG + 0*8*ns, ns, 0, false);
+                            simdgroup_load(mv[2], pv + 0*NSG + 16*ii*NSG + 1*8*ns, ns, 0, false);
+                            simdgroup_load(mv[3], pv + 8*NSG + 16*ii*NSG + 1*8*ns, ns, 0, false);
+
+                            simdgroup_multiply_accumulate(lo[2*ii + 0], vs[0], mv[0], lo[2*ii + 0]);
+                            simdgroup_multiply_accumulate(lo[2*ii + 1], vs[0], mv[1], lo[2*ii + 1]);
+                            simdgroup_multiply_accumulate(lo[2*ii + 0], vs[1], mv[2], lo[2*ii + 0]);
+                            simdgroup_multiply_accumulate(lo[2*ii + 1], vs[1], mv[3], lo[2*ii + 1]);
+                        }
+
+                        pv  += 2*8*ns;
+                    }
+                }
+
+                {
+                    auto sot = so + 8*sgitg;
+
+                    FOR_QWEN35_FA (short ii = 0; ii < NO; ++ii) {
+                        simdgroup_store(lo[ii], sot, PV, 0, false);
+
+                        sot += 8*NSG;
+                    }
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    for (short jj = 0; jj < NQ; ++jj) {
+        const short j = jj*NSG + sgitg;
+        if ((uint)(iq1 + j) >= T) {
+            break;
+        }
+
+        const uint64_t o4 = ((uint64_t)(iq1 + j)*H + iq2)*DV4;
+        device float4       * dst4  = (device float4 *) out + o4;
+        device const float4 * gate4 = (device const float4 *) gate + o4;
+
+        const float scale = S[jj] == 0.0f ? 0.0f : 1.0f/S[jj];
+
+        FOR_QWEN35_FA (short ii = 0; ii < DV4/NW; ++ii) {
+            const short i = ii*NW + tiisg;
+            const float4 g = gate4[i];
+
+            dst4[i] = so4[j*PV4 + i]*scale*float4(qwen4_sigmoid(g.x), qwen4_sigmoid(g.y),
+                                                 qwen4_sigmoid(g.z), qwen4_sigmoid(g.w));
+        }
     }
 }
 
