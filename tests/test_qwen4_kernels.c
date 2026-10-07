@@ -4071,6 +4071,30 @@ static int qwen35_mma_q4_K_word(ds4_gpu_tensor *out, const void *map, uint64_t s
     return ok;
 }
 
+/* the Q4_K MMA with a forced dequantizer flag (the scales screen's A/B) */
+static int qwen35_mma_q4_K_flag(uint32_t flag, ds4_gpu_tensor *out, const void *map, uint64_t size, uint64_t off,
+                                uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    ds4_gpu_test_set_flags(flag);
+    const int ok = ds4_gpu_matmul_mma_rows_tensor(out, map, size, off, 12u, in_dim, out_dim, x, n_tok);
+    ds4_gpu_test_set_flags(0u);
+    return ok;
+}
+
+static int qwen35_mma_q4_K_vec(ds4_gpu_tensor *out, const void *map, uint64_t size, uint64_t off,
+                               uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    return qwen35_mma_q4_K_flag(DS4_GPU_TEST_Q4_K_MMA_VEC, out, map, size, off, in_dim, out_dim, x, n_tok);
+}
+
+static int qwen35_mma_q4_K_hdr(ds4_gpu_tensor *out, const void *map, uint64_t size, uint64_t off,
+                               uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    return qwen35_mma_q4_K_flag(DS4_GPU_TEST_Q4_K_MMA_HDR, out, map, size, off, in_dim, out_dim, x, n_tok);
+}
+
+static int qwen35_mma_q4_K_lane(ds4_gpu_tensor *out, const void *map, uint64_t size, uint64_t off,
+                                uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    return qwen35_mma_q4_K_flag(DS4_GPU_TEST_Q4_K_MMA_LANE, out, map, size, off, in_dim, out_dim, x, n_tok);
+}
+
 static int qwen35_mma_q6_K(ds4_gpu_tensor *out, const void *map, uint64_t size, uint64_t off,
                            uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     return ds4_gpu_matmul_mma_rows_tensor(out, map, size, off, 14u, in_dim, out_dim, x, n_tok);
@@ -4247,9 +4271,14 @@ static double qwen35_median20(const double *samples) {
  * DS4_TEST_QWEN35_VERIFY_BENCH=Q4_0: the DFlash drafter's Q4_0 shapes
  * instead (FFN, q, k/v, wo, conv_proj, fc).
  * DS4_TEST_QWEN35_VERIFY_BENCH=Q4_K: Q4_K alone, its MMA with the per-byte,
- * 32-bit-load and 16-byte-load dequantizers side by side. No pass/fail. */
+ * 32-bit-load and 16-byte-load dequantizers side by side.
+ * DS4_TEST_QWEN35_VERIFY_BENCH=Q4_K_SCALES: Q4_K alone, its MMA on the
+ * 16-byte loader and on the two head-load dequantizers (scales and mins from
+ * one 16-byte load, the piece's place per call or once per lane). No
+ * pass/fail. */
 static void bench_qwen35_verify(arena_t *a, const char *mode) {
-    const bool drafter = !strcmp(mode, "Q4_0"), q4_K_ab = !strcmp(mode, "Q4_K");
+    const bool drafter = !strcmp(mode, "Q4_0"), q4_K_ab = !strcmp(mode, "Q4_K"),
+               q4_K_scales = !strcmp(mode, "Q4_K_SCALES");
     static const uint32_t shapes[][2] = {{5120, 17408}, {17408, 5120}, {5120, 12288}, {5120, 248320}};
     static const uint32_t drafter_shapes[][2] = {{5120, 17408}, {17408, 5120}, {5120, 4096}, {5120, 1024},
                                                  {4096, 5120}, {5120, 1280}, {25600, 5120}};
@@ -4265,8 +4294,13 @@ static void bench_qwen35_verify(arena_t *a, const char *mode) {
         {"Q4_K", qwen35_q4_K_one_row, {"mma-byte", "mma-word", "mma-vec"},
          {qwen35_mma_q4_K_bytes, qwen35_mma_q4_K_word, qwen35_mma_q4_K}, shapes, 3},
     };
-    const qwen35_bench_type *types = drafter ? drafter_types : q4_K_ab ? q4_K_types : target_types;
-    const uint32_t n_types = drafter || q4_K_ab ? 1u : 2u;
+    const qwen35_bench_type q4_K_scales_types[] = {
+        {"Q4_K", qwen35_q4_K_one_row, {"mma-vec", "mma-hdr", "mma-lane"},
+         {qwen35_mma_q4_K_vec, qwen35_mma_q4_K_hdr, qwen35_mma_q4_K_lane}, shapes, 3},
+    };
+    const qwen35_bench_type *types = drafter ? drafter_types : q4_K_ab ? q4_K_types
+                                   : q4_K_scales ? q4_K_scales_types : target_types;
+    const uint32_t n_types = drafter || q4_K_ab || q4_K_scales ? 1u : 2u;
     printf("qwen35 verify bench: us/call, median of 20 batches of 10 calls\n");
     for (uint32_t ti = 0; ti < n_types; ti++) {
         const qwen35_bench_type *bt = &types[ti];
@@ -4977,8 +5011,10 @@ static void test_q4_K_mma_word_shape(arena_t *a, uint32_t in_dim, uint32_t rows,
     const uint64_t off = arena_q4_K_bytes(a, rows, in_dim, skew);
     float *x = rand_vec(8ull * in_dim, 1.0f);
     ds4_gpu_tensor *gx = upload(x, 8ull * in_dim);
-    static const uint32_t flags[] = {0u, DS4_GPU_TEST_Q4_K_MMA_WORD};
-    static const char *names[] = {"default", "word"};
+    static const uint32_t flags[] = {0u, DS4_GPU_TEST_Q4_K_MMA_WORD, DS4_GPU_TEST_Q4_K_MMA_VEC,
+                                     DS4_GPU_TEST_Q4_K_MMA_HDR, DS4_GPU_TEST_Q4_K_MMA_LANE};
+    static const char *names[] = {"default", "word", "vec", "hdr", "lane"};
+    const uint32_t n_flags = sizeof(flags) / sizeof(flags[0]);
     uint64_t nonzero = 0, total = 0;
     for (uint32_t T = 1; T <= 8; T++) {
         const uint64_t n = (uint64_t)T * rows;
@@ -4989,7 +5025,7 @@ static void test_q4_K_mma_word_shape(arena_t *a, uint32_t in_dim, uint32_t rows,
             if (old[i] != 0.0f) nonzero++;
         }
         total += n;
-        for (uint32_t v = 0; v < 2; v++) {
+        for (uint32_t v = 0; v < n_flags; v++) {
             ds4_gpu_tensor *gnew = q4_K_mma(a, off, in_dim, rows, gx, T, flags[v], 2.0f);
             float *got = download(gnew, n);
             for (uint64_t i = 0; i < n; i++) {
@@ -5008,7 +5044,7 @@ static void test_q4_K_mma_word_shape(arena_t *a, uint32_t in_dim, uint32_t rows,
         ds4_gpu_tensor_free(gold);
     }
     require_ok(nonzero > total / 2, "Q4_K mma output mostly nonzero");
-    printf("  Q4_K mma default, word %u->%u skew %u T=1..8: %llu floats byte-equal to the bytewise dequantizer\n",
+    printf("  Q4_K mma default, word, vec, hdr, lane %u->%u skew %u T=1..8: %llu floats byte-equal to the bytewise dequantizer\n",
            in_dim, rows, skew, (unsigned long long)total);
     free(x);
     ds4_gpu_tensor_free(gx);

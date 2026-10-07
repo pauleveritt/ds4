@@ -277,6 +277,145 @@ void qwen35_mma_dequantize_q4_K_vec(device const block_q4_K *xb, short il, threa
     }
 }
 
+// where a lane's 16-weight piece il sits in a Q4_K block: its quant bytes,
+// its sub-block j's scale and min bytes within the 12 scale bytes read as
+// three words, and its nibble
+struct qwen35_q4_K_lane {
+    ushort qs;
+    uint   shift;
+    bool   upper;
+    bool   high;
+};
+
+inline qwen35_q4_K_lane qwen35_q4_K_lane_init(short il) {
+    qwen35_q4_K_lane ln;
+    const short j = 2*(il/4) + (il & 3)/2;
+    ln.qs    = 16 + 32*(il/4) + 16*(il & 1);
+    ln.shift = 8*(j & 3);
+    ln.upper = j >= 4;
+    ln.high  = (il & 3) >= 2;
+    return ln;
+}
+
+// qwen35_mma_dequantize_q4_K_vec with d, dmin and the 12 scale bytes from
+// one 16-byte load of the block's head, the 6-bit scale and min cut from its
+// words (get_scale_min_k4_just2's bytes j, j + 4 and j + 8 or j - 4 are bytes
+// j%4 of words 1, 2 and 3): the same integers, so the same dl, ml and floats
+inline void qwen35_q4_K_lane_dequantize(device const block_q4_K * xb, thread const qwen35_q4_K_lane & ln,
+                                        thread float4x4 & reg) {
+    const uint4 h  = *(device const uint4 *) xb;
+    const uint4 qv = *(device const uint4 *)((device const uchar *) xb + ln.qs);
+
+    const uint s0 = h.y >> ln.shift;
+    const uint s1 = h.z >> ln.shift;
+    const uint s2 = h.w >> ln.shift;
+    const uint sc = ln.upper ? ((s2 & 0xF)        | ((s0 & 0xC0) >> 2)) : (s0 & 63);
+    const uint mn = ln.upper ? (((s2 >> 4) & 0xF) | ((s1 & 0xC0) >> 2)) : (s1 & 63);
+
+    const half2 dm = as_type<half2>(h.x);
+    const float d = ln.high ?
+        (float)dm[0] * (1.0f / 16.0f) :
+        (float)dm[0];
+    const float min = (float)dm[1];
+    const float dl = d * (float)sc;
+    const float ml = min * (float)mn;
+
+    const uint32_t mask = ln.high ? 0xF0F0F0F0 : 0x0F0F0F0F;
+    FOR_UNROLL (short i = 0; i < 4; ++i) {
+        const uint32_t w = qv[i] & mask;
+        reg[i][0] = dl * (float)( w        & 0xFF) - ml;
+        reg[i][1] = dl * (float)((w >>  8) & 0xFF) - ml;
+        reg[i][2] = dl * (float)((w >> 16) & 0xFF) - ml;
+        reg[i][3] = dl * (float)( w >> 24        ) - ml;
+    }
+}
+
+// the head-load dequantizer with the piece's place worked out per call
+template <typename type4x4>
+void qwen35_mma_dequantize_q4_K_hdr(device const block_q4_K *xb, short il, thread type4x4 & reg) {
+    const qwen35_q4_K_lane ln = qwen35_q4_K_lane_init(il);
+    qwen35_q4_K_lane_dequantize(xb, ln, reg);
+}
+
+// kernel_qwen35_mma_f32 for Q4_K on the head-load dequantizer with the
+// piece's place worked out once per lane: simdgroup sgitg takes the chunks
+// g = sgitg + k*NSG, so when NSG is a multiple of 4 (always, for in_dim a
+// multiple of 256) every chunk has g%4 = sgitg%4 and a lane's piece il =
+// 4*(g%4) + fn/2 is the same in every block
+template<short NT>
+kernel void kernel_qwen35_mma_q4_K_lane_f32(
+        constant ds4_metal_args_qwen35_mma & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const qwen35_mma_tile tile = qwen35_mma_tile_init<NT>(tgpig, tiisg);
+
+    device const block_q4_K * x[NT];
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        x[t] = (device const block_q4_K *) qwen35_mma_src0_row(tile, args, src0, t);
+    }
+
+    device const float4 * y[2];
+    bool live[2];
+    FOR_UNROLL (short e = 0; e < 2; ++e) {
+        live[e] = tile.fn + e < args.ne11;
+        y[e] = (device const float4 *) qwen35_mma_src1_row(tile, args, src1, e) + 4*(tile.fm/2) + 2*(tile.fm%2);
+    }
+
+    simdgroup_float8x8 mc[NT];
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        mc[t] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    const int nch = args.ne00/64;
+    const qwen35_q4_K_lane lane = qwen35_q4_K_lane_init(4*(sgitg & 3) + tile.fn/2);
+
+    for (int g = sgitg; g < nch; g += NSG) {
+        simdgroup_float8x8 mb[8];
+        {
+            const float4 a0 = live[0] ? y[0][16*g + 0] : float4(0.0f);
+            const float4 a1 = live[0] ? y[0][16*g + 1] : float4(0.0f);
+            const float4 b0 = live[1] ? y[1][16*g + 0] : float4(0.0f);
+            const float4 b1 = live[1] ? y[1][16*g + 1] : float4(0.0f);
+            FOR_UNROLL (short s = 0; s < 4; ++s) {
+                mb[s    ].thread_elements()[0] = a0[s];
+                mb[s    ].thread_elements()[1] = b0[s];
+                mb[s + 4].thread_elements()[0] = a1[s];
+                mb[s + 4].thread_elements()[1] = b1[s];
+            }
+        }
+
+        const qwen35_q4_K_lane ln = NSG % 4 == 0 ? lane : qwen35_q4_K_lane_init(4*(g & 3) + tile.fn/2);
+
+        FOR_UNROLL (short t = 0; t < NT; ++t) {
+            float4x4 w;
+            qwen35_q4_K_lane_dequantize(x[t] + g/4, ln, w);
+
+            FOR_UNROLL (short s = 0; s < 8; ++s) {
+                simdgroup_float8x8 ma;
+                ma.thread_elements()[0] = w[s/4    ][s%4];
+                ma.thread_elements()[1] = w[s/4 + 2][s%4];
+
+                simdgroup_multiply_accumulate(mc[t], ma, mb[s], mc[t]);
+            }
+        }
+    }
+
+    float acc[NT][2];
+    FOR_UNROLL (short t = 0; t < NT; ++t) {
+        acc[t][0] = mc[t].thread_elements()[0];
+        acc[t][1] = mc[t].thread_elements()[1];
+    }
+
+    qwen35_mma_store<NT>(acc, args, dst, shmem, tile, tiisg, sgitg);
+}
+
 // nl 16: a 256-weight super-block holds sixteen 16-weight pieces
 typedef decltype(kernel_qwen35_mma_f32<1, block_q4_K, 16, dequantize_q4_K>) qwen35_mma_t;
 
@@ -289,6 +428,12 @@ template [[host_name("kernel_qwen35_mma_q4_K_word_f32_nt4")]] kernel qwen35_mma_
 template [[host_name("kernel_qwen35_mma_q4_K_vec_f32_nt1")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<1, block_q4_K, 16, qwen35_mma_dequantize_q4_K_vec>;
 template [[host_name("kernel_qwen35_mma_q4_K_vec_f32_nt2")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<2, block_q4_K, 16, qwen35_mma_dequantize_q4_K_vec>;
 template [[host_name("kernel_qwen35_mma_q4_K_vec_f32_nt4")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<4, block_q4_K, 16, qwen35_mma_dequantize_q4_K_vec>;
+template [[host_name("kernel_qwen35_mma_q4_K_hdr_f32_nt1")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<1, block_q4_K, 16, qwen35_mma_dequantize_q4_K_hdr>;
+template [[host_name("kernel_qwen35_mma_q4_K_hdr_f32_nt2")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<2, block_q4_K, 16, qwen35_mma_dequantize_q4_K_hdr>;
+template [[host_name("kernel_qwen35_mma_q4_K_hdr_f32_nt4")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<4, block_q4_K, 16, qwen35_mma_dequantize_q4_K_hdr>;
+template [[host_name("kernel_qwen35_mma_q4_K_lane_f32_nt1")]] kernel qwen35_mma_t kernel_qwen35_mma_q4_K_lane_f32<1>;
+template [[host_name("kernel_qwen35_mma_q4_K_lane_f32_nt2")]] kernel qwen35_mma_t kernel_qwen35_mma_q4_K_lane_f32<2>;
+template [[host_name("kernel_qwen35_mma_q4_K_lane_f32_nt4")]] kernel qwen35_mma_t kernel_qwen35_mma_q4_K_lane_f32<4>;
 template [[host_name("kernel_qwen35_mma_q6_K_f32_nt1")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<1, block_q6_K, 16, qwen35_mma_dequantize_q6_K>;
 template [[host_name("kernel_qwen35_mma_q6_K_f32_nt2")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<2, block_q6_K, 16, qwen35_mma_dequantize_q6_K>;
 template [[host_name("kernel_qwen35_mma_q6_K_f32_nt4")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<4, block_q6_K, 16, qwen35_mma_dequantize_q6_K>;

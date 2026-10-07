@@ -20294,6 +20294,8 @@ int ds4_gpu_matmul_mma_rows_tensor(
     const bool q4_K_aligned16 = (((uintptr_t)model_map + weight_offset) & 15u) == 0u;
     const char *q4_K_name = (g_test_flags & DS4_GPU_TEST_Q4_K_MMA_BYTEWISE) != 0u ? "q4_K"
                           : (g_test_flags & DS4_GPU_TEST_Q4_K_MMA_WORD) != 0u || !q4_K_aligned16 ? "q4_K_word"
+                          : (g_test_flags & DS4_GPU_TEST_Q4_K_MMA_HDR) != 0u ? "q4_K_hdr"
+                          : (g_test_flags & DS4_GPU_TEST_Q4_K_MMA_LANE) != 0u ? "q4_K_lane"
                                                                                                   : "q4_K_vec";
     snprintf(fn_name, sizeof(fn_name), "kernel_qwen35_mma_%s_f32_nt%d", q4_0 ? "q4_0" : q6 ? "q6_K" : q4_K_name, nt);
 

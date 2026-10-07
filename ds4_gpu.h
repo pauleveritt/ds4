@@ -262,6 +262,9 @@ enum {
     DS4_GPU_TEST_Q6_K_MM_BYTEWISE = 1u << 7,
     DS4_GPU_TEST_Q4_K_MMA_BYTEWISE = 1u << 8,
     DS4_GPU_TEST_Q4_K_MMA_WORD = 1u << 9,
+    DS4_GPU_TEST_Q4_K_MMA_VEC = 1u << 10,
+    DS4_GPU_TEST_Q4_K_MMA_HDR = 1u << 11,
+    DS4_GPU_TEST_Q4_K_MMA_LANE = 1u << 12,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
