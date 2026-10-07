@@ -51229,7 +51229,9 @@ int ds4_gpu_dflash_attn_tensor(
         !qwen4_bind_tensor(&b[6], out, q_bytes, "dflash attention output")) {
         return 0;
     }
-    return dflash_dispatch("kernel_dflash_attn", &args, sizeof(args), b, 7,
+    char kernel[32] = "kernel_dflash_attn";
+    if (!getenv("DS4_METAL_DFLASH_ATTN_RUNTIME_DIM")) snprintf(kernel, sizeof(kernel), "kernel_dflash_attn_np%u", head_dim / 32u);
+    return dflash_dispatch(kernel, &args, sizeof(args), b, 7,
                            MTLSizeMake(n_head, n_rows, 1), MTLSizeMake(32, 4, 1));
 }
 

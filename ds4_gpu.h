@@ -3697,7 +3697,9 @@ int ds4_gpu_dflash_conv_tensor(
 /* Non-causal windowed attention of a block's rows (row t at pos0 + t) over
  * the ring slots holding a committed position tp (0 <= tp < pos0, within
  * window of the row) and over every block row; f16 ring K/V, f32 block K/V,
- * int32 ring tags (negative for empty). */
+ * int32 ring tags (negative for empty).  The kernel has head_dim fixed at
+ * compile time; DS4_METAL_DFLASH_ATTN_RUNTIME_DIM=1 runs the runtime
+ * head_dim kernel instead, bitwise the same and slower. */
 int ds4_gpu_dflash_attn_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *k_blk, const ds4_gpu_tensor *v_blk,

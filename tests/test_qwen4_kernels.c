@@ -4456,6 +4456,21 @@ static void test_dflash_attn(uint32_t n_rows, uint32_t H, uint32_t Hkv, uint32_t
     snprintf(name, sizeof(name), "dflash attn %u rows %u/%u x%u ring %u (%u holes, %u ring keys at row 0) window %u at %u",
              n_rows, H, Hkv, D, slots, holes, admitted0, window, pos0);
     check_tensor(name, tout, ref, q_n, 1e-3);
+    float *got = download(tout, q_n);
+    setenv("DS4_METAL_DFLASH_ATTN_RUNTIME_DIM", "1", 1);
+    require_ok(ds4_gpu_dflash_attn_tensor(tout, tq, tkb, tvb, trk, trv, ttag, n_rows, H, Hkv, D, slots, window,
+                                          pos0, scale), "dflash attention, runtime head_dim");
+    unsetenv("DS4_METAL_DFLASH_ATTN_RUNTIME_DIM");
+    float *runtime_dim = download(tout, q_n);
+    uint64_t differ = 0;
+    for (uint64_t i = 0; i < q_n; i++) differ += memcmp(&got[i], &runtime_dim[i], sizeof(float)) != 0;
+    if (differ) {
+        fprintf(stderr, "%s: %llu of %llu values differ from the runtime head_dim kernel's\n", name,
+                (unsigned long long)differ, (unsigned long long)q_n);
+        exit(1);
+    }
+    printf("  %-44s ok  byte-equal to the runtime head_dim kernel\n", name);
+    free(got); free(runtime_dim);
     ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(tkb); ds4_gpu_tensor_free(tvb);
     ds4_gpu_tensor_free(trk); ds4_gpu_tensor_free(trv); ds4_gpu_tensor_free(ttag); ds4_gpu_tensor_free(tout);
     free(q); free(kb); free(vb); free(rk); free(rv); free(tags); free(ref); free(lg); free(seen);

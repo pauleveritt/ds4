@@ -268,6 +268,92 @@ kernel void kernel_dflash_attn(
     for (uint k = 0; k < npt; k++) dst[tiisg + 32u * k] = o[k] * inv;
 }
 
+/* kernel_dflash_attn with head_dim = 32 * NPT fixed when the shader is
+ * compiled, so its loops unroll and qv, acc and o take constant indices;
+ * above, npt is a runtime value.  At a full ring the draft's attention is
+ * about four times faster this way.  The dot product is an explicit fma
+ * chain, the rounding the kernel above has; the unrolled `dot += q * k`
+ * rounds differently.  The rest is the same code: one key at a time in the
+ * same order and the same merge, so the output is bitwise the same
+ * (test-dflash compares the two). */
+template <uint NPT>
+kernel void kernel_dflash_attn_np(
+        constant ds4_metal_args_dflash_attn & args,
+        device const float   *q,
+        device const float   *k_blk,
+        device const float   *v_blk,
+        device const half    *ring_k,
+        device const half    *ring_v,
+        device const int32_t *ring_pos,
+        device float         *out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint h = tgpig.x, t = tgpig.y;
+    if (h >= args.n_head || t >= args.n_rows) return;
+    const uint D = 32u * NPT, Hkv = args.n_head_kv;
+    const uint kvh = h / (args.n_head / Hkv);
+    const int64_t qpos = (int64_t)args.pos0 + t;
+    device const float *qr = q + ((uint64_t)t * args.n_head + h) * D;
+    float qv[NPT], acc[NPT];
+    for (uint k = 0; k < NPT; k++) { qv[k] = qr[tiisg + 32u * k] * args.scale; acc[k] = 0.0f; }
+    float m = -1.0e30f, l = 0.0f;
+    const uint n_keys = args.ring_slots + args.n_rows;
+    for (uint key = sgitg; key < n_keys; key += DFLASH_ATTN_NSG) {
+        float kv[NPT], vv[NPT];
+        if (key < args.ring_slots) {
+            const int64_t tp = ring_pos[key];
+            if (tp < 0 || tp >= (int64_t)args.pos0 || qpos - tp >= (int64_t)args.window) continue;
+            device const half *kr = ring_k + ((uint64_t)key * Hkv + kvh) * D;
+            device const half *vr = ring_v + ((uint64_t)key * Hkv + kvh) * D;
+            for (uint k = 0; k < NPT; k++) { kv[k] = (float)kr[tiisg + 32u * k]; vv[k] = (float)vr[tiisg + 32u * k]; }
+        } else {
+            const uint j = key - args.ring_slots;
+            if (qpos - ((int64_t)args.pos0 + j) >= (int64_t)args.window) continue;
+            device const float *kr = k_blk + ((uint64_t)j * Hkv + kvh) * D;
+            device const float *vr = v_blk + ((uint64_t)j * Hkv + kvh) * D;
+            for (uint k = 0; k < NPT; k++) { kv[k] = kr[tiisg + 32u * k]; vv[k] = vr[tiisg + 32u * k]; }
+        }
+        float dot = 0.0f;
+        for (uint k = 0; k < NPT; k++) dot = fma(qv[k], kv[k], dot);
+        dot = simd_sum(dot);
+        const float m_new = max(m, dot);
+        const float corr = precise::exp(m - m_new), p = precise::exp(dot - m_new);
+        l = l * corr + p;
+        for (uint k = 0; k < NPT; k++) acc[k] = acc[k] * corr + p * vv[k];
+        m = m_new;
+    }
+    threadgroup float sg_m[DFLASH_ATTN_NSG], sg_l[DFLASH_ATTN_NSG];
+    threadgroup float sg_acc[DFLASH_ATTN_NSG][256];
+    if (tiisg == 0) { sg_m[sgitg] = m; sg_l[sgitg] = l; }
+    for (uint k = 0; k < NPT; k++) sg_acc[sgitg][tiisg + 32u * k] = acc[k];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg != 0) return;
+    float mt = -1.0e30f;
+    for (uint s = 0; s < DFLASH_ATTN_NSG; s++) mt = max(mt, sg_m[s]);
+    float lt = 0.0f, o[NPT];
+    for (uint k = 0; k < NPT; k++) o[k] = 0.0f;
+    for (uint s = 0; s < DFLASH_ATTN_NSG; s++) {
+        if (sg_l[s] == 0.0f) continue;
+        const float f = precise::exp(sg_m[s] - mt);
+        lt += sg_l[s] * f;
+        for (uint k = 0; k < NPT; k++) o[k] += sg_acc[s][tiisg + 32u * k] * f;
+    }
+    device float *dst = out + ((uint64_t)t * args.n_head + h) * D;
+    const float inv = lt > 0.0f ? 1.0f / lt : 0.0f;
+    for (uint k = 0; k < NPT; k++) dst[tiisg + 32u * k] = o[k] * inv;
+}
+
+typedef decltype(kernel_dflash_attn_np<4>) kernel_dflash_attn_np_t;
+template [[host_name("kernel_dflash_attn_np1")]] kernel kernel_dflash_attn_np_t kernel_dflash_attn_np<1>;
+template [[host_name("kernel_dflash_attn_np2")]] kernel kernel_dflash_attn_np_t kernel_dflash_attn_np<2>;
+template [[host_name("kernel_dflash_attn_np3")]] kernel kernel_dflash_attn_np_t kernel_dflash_attn_np<3>;
+template [[host_name("kernel_dflash_attn_np4")]] kernel kernel_dflash_attn_np_t kernel_dflash_attn_np<4>;
+template [[host_name("kernel_dflash_attn_np5")]] kernel kernel_dflash_attn_np_t kernel_dflash_attn_np<5>;
+template [[host_name("kernel_dflash_attn_np6")]] kernel kernel_dflash_attn_np_t kernel_dflash_attn_np<6>;
+template [[host_name("kernel_dflash_attn_np7")]] kernel kernel_dflash_attn_np_t kernel_dflash_attn_np<7>;
+template [[host_name("kernel_dflash_attn_np8")]] kernel kernel_dflash_attn_np_t kernel_dflash_attn_np<8>;
+
 /* --- the selector's lattice scores ---------------------------------------- */
 
 struct ds4_metal_args_dflash_selector {
