@@ -3668,6 +3668,124 @@ static void test_q6_K_mm(arena_t *a) {
     g_rng = rng;
 }
 
+static bool f32_finite(float f);
+static double seconds_since(const struct timespec *t0);
+
+/* q4_K rows of random bytes (every nibble and 6-bit scale/min occurs); d and
+ * dmin are random-signed halves from 2^-18 to 2^-9, small enough that no
+ * weight overflows a half */
+static uint64_t arena_q4_K_bytes(arena_t *a, uint64_t rows, uint64_t cols) {
+    const uint64_t n = rows * (cols / 256u);
+    const uint64_t off = arena_alloc(a, n * 144u);
+    uint8_t *w = a->base + off;
+    for (uint64_t b = 0; b < n; b++) {
+        uint8_t *blk = w + b * 144u;
+        for (int i = 4; i < 144; i++) blk[i] = (uint8_t)(urand() >> 13);
+        for (int h = 0; h < 2; h++) {
+            const float mag = ldexpf(1.0f + 0.4999f * (frand() + 1.0f), -18 + (int)(urand() % 10u));
+            const uint16_t v = f32_to_f16((urand() & 1u) ? -mag : mag);
+            memcpy(blk + 2 * h, &v, 2);
+        }
+    }
+    return off;
+}
+
+/* one prompt-batch tile matmul of Q4_K (wtype 12) or Q6_K (wtype 14) weights;
+ * full_tile keeps the single 32-row dispatch (DS4_GPU_TEST_MM_FULL_TILE) */
+static int mm_tile_run(const arena_t *a, uint32_t wtype, uint64_t off, uint32_t in_dim, uint32_t rows,
+                       const ds4_gpu_tensor *gx, ds4_gpu_tensor *out, uint32_t T, bool full_tile) {
+    ds4_gpu_test_set_flags(full_tile ? DS4_GPU_TEST_MM_FULL_TILE : 0u);
+    const int ok = wtype == 12u
+        ? ds4_gpu_matmul_quant_tensor(out, a->base, a->size, off, 12u, in_dim, rows, gx, T)
+        : ds4_gpu_matmul_q6_K_mm_tensor(out, a->base, a->size, off, in_dim, rows, gx, T);
+    ds4_gpu_test_set_flags(0u);
+    return ok;
+}
+
+static int cmp_double(const void *x, const void *y) {
+    const double a = *(const double *)x, b = *(const double *)y;
+    return a < b ? -1 : a > b;
+}
+
+/* A batch of 9..16 tokens on kernel_mul_mm_small, or the last partial token
+ * block on kernel_mul_mm_narrow, against kernel_mul_mm
+ * (DS4_GPU_TEST_MM_FULL_TILE): every output float byte-equal. With timed,
+ * both paths are also timed (median of 7 calls each, alternating). */
+static void test_mm_narrow_one(arena_t *a, uint32_t wtype, uint32_t in_dim, uint32_t rows,
+                               const uint32_t *Ts, uint32_t nT, bool timed) {
+    const char *tn = wtype == 12u ? "Q4_K" : "Q6_K";
+    const uint64_t off = wtype == 12u ? arena_q4_K_bytes(a, rows, in_dim) : arena_q6_K_bytes(a, rows, in_dim);
+    for (uint32_t ti = 0; ti < nT; ti++) {
+        const uint32_t T = Ts[ti];
+        const uint64_t n = (uint64_t)T * rows;
+        float *x = rand_vec((uint64_t)T * in_dim, 1.0f);
+        ds4_gpu_tensor *gx = upload(x, (uint64_t)T * in_dim);
+        ds4_gpu_tensor *gold = upload(NULL, n), *gnew = upload(NULL, n);
+        require_ok(ds4_gpu_tensor_fill_f32(gold, 1.0f, n), "narrow mm reference fill");
+        require_ok(ds4_gpu_tensor_fill_f32(gnew, 2.0f, n), "narrow mm output fill");
+        require_ok(mm_tile_run(a, wtype, off, in_dim, rows, gx, gold, T, true), "mm, single 32-row dispatch");
+        require_ok(mm_tile_run(a, wtype, off, in_dim, rows, gx, gnew, T, false), "mm, narrow last block");
+        float *old = download(gold, n), *got = download(gnew, n);
+        uint64_t differ = 0, first = 0, nonzero = 0;
+        for (uint64_t i = 0; i < n; i++) {
+            require_ok(f32_finite(old[i]), "narrow mm reference output finite");
+            if (old[i] != 0.0f) nonzero++;
+            if (memcmp(&old[i], &got[i], sizeof(float)) != 0) {
+                if (differ == 0) first = i;
+                differ++;
+            }
+        }
+        if (differ) {
+            fprintf(stderr, "%s mm narrow %u->%u T=%u: %llu of %llu floats differ; first at row %llu col %llu: "
+                            "narrow %.9g (0x%08x) full %.9g (0x%08x)\n",
+                    tn, in_dim, rows, T, (unsigned long long)differ, (unsigned long long)n,
+                    (unsigned long long)(first / rows), (unsigned long long)(first % rows),
+                    got[first], *(uint32_t *)&got[first], old[first], *(uint32_t *)&old[first]);
+            exit(1);
+        }
+        require_ok(nonzero > n / 2, "narrow mm output mostly nonzero");
+        if (timed) {
+            double tf[7], tw[7];
+            for (int r = 0; r < 7; r++) {
+                struct timespec t0;
+                clock_gettime(CLOCK_MONOTONIC, &t0);
+                require_ok(mm_tile_run(a, wtype, off, in_dim, rows, gx, gold, T, true), "timed full mm");
+                tf[r] = 1e3 * seconds_since(&t0);
+                clock_gettime(CLOCK_MONOTONIC, &t0);
+                require_ok(mm_tile_run(a, wtype, off, in_dim, rows, gx, gnew, T, false), "timed narrow mm");
+                tw[r] = 1e3 * seconds_since(&t0);
+            }
+            qsort(tf, 7, sizeof(double), cmp_double);
+            qsort(tw, 7, sizeof(double), cmp_double);
+            printf("  %s mm narrow %u->%u T=%u: %llu floats byte-equal to the 32-row tile; ms full %.3f narrow %.3f\n",
+                   tn, in_dim, rows, T, (unsigned long long)n, tf[3], tw[3]);
+        } else {
+            printf("  %s mm narrow %u->%u T=%u: %llu floats byte-equal to the 32-row tile\n",
+                   tn, in_dim, rows, T, (unsigned long long)n);
+        }
+        free(got); free(old); free(x);
+        ds4_gpu_tensor_free(gnew); ds4_gpu_tensor_free(gold); ds4_gpu_tensor_free(gx);
+    }
+}
+
+/* runs on a saved random stream, so the tests after it draw what they drew
+ * before it was added */
+static void test_mm_narrow(arena_t *a) {
+    const uint32_t rng = g_rng;
+    const uint32_t all[] = {9, 15, 16, 17, 23, 24, 25, 31, 33, 40, 47, 56, 63, 65, 100};
+    const uint32_t few[] = {9, 24, 40};
+    const uint32_t timed[] = {9, 16, 24, 31, 33, 48};
+    test_mm_narrow_one(a, 12u, 512, 72, all, 15, false);
+    test_mm_narrow_one(a, 14u, 512, 72, all, 15, false);
+    test_mm_narrow_one(a, 12u, 5120, 48, few, 3, false);
+    test_mm_narrow_one(a, 12u, 768, 4099, few, 3, false);
+    test_mm_narrow_one(a, 14u, 768, 4099, few, 3, false);
+    test_mm_narrow_one(a, 12u, 5120, 17408, timed, 6, true);
+    test_mm_narrow_one(a, 14u, 17408, 5120, timed, 6, true);
+    test_mm_narrow_one(a, 12u, 6144, 5120, timed, 6, true);
+    g_rng = rng;
+}
+
 /* causal gated attention of query row t, head h in double; q_half rounds the
  * query to half (round to nearest even) as both GPU kernels stage it */
 static void qwen35_attn_ref_row(const float *q, const float *gate, const _Float16 *kc, const _Float16 *vc,
@@ -3843,6 +3961,7 @@ int main(void) {
 #ifdef __APPLE__
     if (getenv("DS4_TEST_QWEN4_Q6K_MM_ONLY")) { test_q6_K_mm(&arena); printf("all qwen4 Q6_K mm tests passed\n"); return 0; }
     if (getenv("DS4_TEST_QWEN35_ATTN_FA_ONLY")) { test_qwen35_attn_fa(); printf("all qwen35 attn fa tests passed\n"); return 0; }
+    if (getenv("DS4_TEST_QWEN4_MM_NARROW_ONLY")) { test_mm_narrow(&arena); printf("all narrow mm tests passed\n"); return 0; }
 #endif
     if (getenv("DS4_TEST_QWEN4_MV_EXACT")) {
         test_moe_types(&arena, 8, 6, 2560, 640, 1, 16u, 10u);
@@ -3993,6 +4112,7 @@ int main(void) {
     test_dense_mm(&arena, 64, 32, 70, 0u);
 #ifdef __APPLE__
     test_q6_K_mm(&arena);
+    test_mm_narrow(&arena);
     test_qwen35_attn_fa();
 #endif
     printf("multi gemv\n");

@@ -19771,6 +19771,60 @@ static const char *ds4_gpu_q4_mv_ext_name(uint32_t weight_type, int16_t r1ptg) {
     }
 }
 
+/* A prompt-batch tile matmul whose last token block has 1..24 rows (the
+ * token count is not a multiple of 32, and its remainder is at most 24):
+ * kernel_mul_mm_narrow runs the whole 32-row blocks and the last block, on
+ * an 8-, 16- or 24-row tile, in one dispatch. A batch of 9..16 tokens runs
+ * kernel_mul_mm_small instead: one 16-row tile on 32-row weight tiles, for
+ * twice the threadgroups. Neither computes the padded rows a 32-row tile
+ * computes and discards, and every output element is accumulated from the
+ * same products in the same order as kernel_mul_mm computes it, so the
+ * result is bit-identical. narrow_fn is the instantiations' common prefix
+ * ("_n8", "_n16", "_n24" and "_s16" complete it). Returns 0 when this does
+ * not apply (the caller runs kernel_mul_mm) and -1 on a pipeline failure.
+ * DS4_GPU_TEST_MM_FULL_TILE keeps kernel_mul_mm for the tests' reference. */
+static int ds4_gpu_encode_mm_narrow(
+        id<MTLCommandBuffer> cb,
+        const char          *narrow_fn,
+        bool                 bc_inp,
+        id<MTLBuffer>        wbuf,
+        uint64_t             inner_offset,
+        id<MTLBuffer>        xbuf,
+        uint64_t             x_offset,
+        id<MTLBuffer>        outbuf,
+        uint64_t             out_offset,
+        uint64_t             in_dim,
+        uint64_t             out_dim,
+        uint64_t             n_tok,
+        uint64_t             row_bytes) {
+    const uint64_t rem = n_tok % 32u;
+    if (bc_inp || rem == 0 || rem > 24u || n_tok <= 8u ||
+        (g_test_flags & DS4_GPU_TEST_MM_FULL_TILE) != 0u) {
+        return 0;
+    }
+    const bool small = n_tok <= 16u;
+    char name[96];
+    snprintf(name, sizeof(name), "%s_%s%u", narrow_fn, small ? "s" : "n", (unsigned)(8u * ((rem + 7u) / 8u)));
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mm_pipeline(name, false, false);
+    if (!pipeline) return -1;
+
+    ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+    const NSUInteger tile_rows = small ? 32u : 64u;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+    [enc setBuffer:xbuf offset:(NSUInteger)x_offset atIndex:2];
+    [enc setBuffer:outbuf offset:(NSUInteger)out_offset atIndex:3];
+    [enc setThreadgroupMemoryLength:(small ? 4096u : 8192u) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok / 32u + 1u),
+                                          ((NSUInteger)out_dim + tile_rows - 1u) / tile_rows,
+                                          1)
+         threadsPerThreadgroup:MTLSizeMake(2u * tile_rows, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 static const char *ds4_gpu_q4_mm_name(uint32_t weight_type) {
     switch (weight_type) {
     case DS4_METAL_TENSOR_Q4_0: return "kernel_mul_mm_q4_0_f32";
@@ -19985,6 +20039,17 @@ static int ds4_gpu_matmul_quant_impl_tensor(
         const char *mm_fn = ds4_gpu_q4_mm_name(weight_type);
         const bool bc_inp = (in_dim % 32u) != 0;
         const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
+        if (weight_type == DS4_METAL_TENSOR_Q4_K) {
+            const int narrow = ds4_gpu_encode_mm_narrow(cb, "kernel_mul_mm_q4_K_f32", bc_inp,
+                                                      wbuf, inner_offset, xbuf, ds4_gpu_tensor_offset(x),
+                                                      outbuf, ds4_gpu_tensor_offset(out),
+                                                      in_dim, out_dim, n_tok, row_bytes);
+            if (narrow < 0) return 0;
+            if (narrow) {
+                if (!ds4_gpu_finish_command_buffer(cb, owned, "Q4 tensor matmul")) return 0;
+                return 1;
+            }
+        }
         id<MTLComputePipelineState> pipeline =
             mm_fn ? ds4_gpu_get_mul_mm_pipeline(mm_fn, bc_inp, bc_out) : nil;
         if (!pipeline) return 0;
@@ -20204,6 +20269,17 @@ int ds4_gpu_matmul_q6_K_mm_tensor(
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
+        if ((g_test_flags & DS4_GPU_TEST_Q6_K_MM_BYTEWISE) == 0u) {
+            const int narrow = ds4_gpu_encode_mm_narrow(cb, "kernel_mul_mm_q6_K_f32", false,
+                                                      wbuf, inner_offset, xbuf, ds4_gpu_tensor_offset(x),
+                                                      outbuf, ds4_gpu_tensor_offset(out),
+                                                      in_dim, out_dim, n_tok, row_bytes);
+            if (narrow < 0) return 0;
+            if (narrow) {
+                if (!ds4_gpu_finish_command_buffer(cb, owned, "Q6_K tensor matmul")) return 0;
+                return 1;
+            }
+        }
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];

@@ -1115,6 +1115,14 @@ void dequantize_q6_K_packed(device const block_q6_K *xb, short il, thread type4x
 template [[host_name("kernel_mul_mm_q6_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, 16, dequantize_q6_K_packed, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q6_K_f32_bytewise")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, 16, dequantize_q6_K, float, float4x4, float, float2x4>;
 
+/* The last partial token block of a Q6_K prompt batch: dense.metal's narrow
+ * tile with the packed dequantizer, 8, 16 or 24 token rows. */
+template [[host_name("kernel_mul_mm_q6_K_f32_n8")]]  kernel mul_mm_narrow_t kernel_mul_mm_narrow<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, 16, dequantize_q6_K_packed, float, float4x4, float, float2x4, 1>;
+template [[host_name("kernel_mul_mm_q6_K_f32_n16")]] kernel mul_mm_narrow_t kernel_mul_mm_narrow<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, 16, dequantize_q6_K_packed, float, float4x4, float, float2x4, 2>;
+template [[host_name("kernel_mul_mm_q6_K_f32_n24")]] kernel mul_mm_narrow_t kernel_mul_mm_narrow<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, 16, dequantize_q6_K_packed, float, float4x4, float, float2x4, 3>;
+/* Q6_K prompt batches of 9..16 tokens on 32-row weight tiles. */
+template [[host_name("kernel_mul_mm_q6_K_f32_s16")]] kernel mul_mm_small_t kernel_mul_mm_small<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K, 16, dequantize_q6_K_packed, float, float4x4, float, float2x4, 2>;
+
 /* --- PLE ---------------------------------------------------------------- */
 
 struct ds4_metal_args_qwen4_ple_gate {

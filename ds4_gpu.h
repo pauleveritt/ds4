@@ -260,6 +260,7 @@ enum {
     DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4 = 1u << 5,
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
     DS4_GPU_TEST_Q6_K_MM_BYTEWISE = 1u << 7,
+    DS4_GPU_TEST_MM_FULL_TILE = 1u << 8,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);

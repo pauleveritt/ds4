@@ -2712,6 +2712,336 @@ kernel void kernel_mul_mm(
     }
 }
 
+// One token block of kernel_mul_mm's product with a token tile of 8*NB rows
+// (NB = 1..3) and a weight tile of NR0 rows (64, or 32 for more threadgroups
+// on short batches), run by 2*NR0 threads. The weight dequantization, the
+// half staging of both operands, the K loop and the 8x8 simdgroup products
+// are kernel_mul_mm's, so every output element is accumulated from the same
+// products in the same order as kernel_mul_mm computes it, bit for bit. Each
+// simdgroup owns 16 weight rows and every token row of the tile, so a tile of
+// fewer than 32 rows does not compute the padded rows a 32-row tile computes
+// and discards. The input width must be a multiple of 32 (no bc_inp path).
+template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4, short NB, short NR0>
+inline void mul_mm_narrow_block(
+        constant ds4_metal_args_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        const int r0,
+        const int r1,
+        ushort tiitg,
+        ushort sgitg) {
+
+    threadgroup S0 * sa = (threadgroup S0 *)(shmem);
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + NR0*32u*sizeof(S0));
+
+    constexpr int NR1 = 8*NB;
+    constexpr int NT  = 2*NR0;
+    constexpr int RB  = NR0/8;
+
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+    const short nr1 = (args.ne1 - r1 < NR1) ? (args.ne1 - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+
+    const short il0 = (tiitg % NL0);
+
+    short il = il0;
+
+    const short offset1 = il0/nl;
+
+    device const block_q * x = (device const block_q *)(src0 + args.nb01*(r0 + lr0)) + offset1;
+
+    S0_8x8 ma[2];
+    S1_8x8 mb[NB];
+
+    simdgroup_float8x8 mc[2*NB];
+
+    for (short i = 0; i < 2*NB; i++){
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        S0_4x4 temp_a;
+        dequantize_func(x, il, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+
+            const short lx = (tiitg/NL0)%8;
+            const short ly = i%8;
+
+            const short ib = RB*sx + sy;
+
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        for (short t = tiitg; t < NL1*NR1; t += NT) {
+            const short tr1 = t/NL1;
+            const short lr1 = tr1 < nr1 ? tr1 : nr1 - 1;
+            const short sx = (t%NL1);
+            const short sy = tr1/8;
+
+            const short ly = tr1%8;
+
+            const short ib = NB*sx + sy;
+
+            device const T1 * y = (device const T1 *)(src1 + args.nb11*(r1 + lr1) + args.nb10*(8*sx)) + loop_k;
+
+            *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y));
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const S0 * lsma = (sa + 2*64*sgitg);
+        threadgroup const S1 * lsmb = sb;
+
+        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 2; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < NB; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 2*NB; i++){
+                simdgroup_multiply_accumulate(mc[i], mb[i/2], ma[i%2], mc[i]);
+            }
+
+            lsma += RB*64;
+            lsmb += NB*64;
+        }
+    }
+
+    if (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1) {
+        device float * C = (device float *) dst + (r0 + 16*sgitg) + r1 * args.ne0;
+
+        for (short i = 0; i < 2*NB; i++) {
+            simdgroup_store(mc[i], C + 8*(i%2) + 8*args.ne0*(i/2), args.ne0, 0, false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 16*sgitg;
+
+        for (short i = 0; i < 2*NB; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%2) + 8*NR0*(i/2), NR0, 0, false);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int k = tiitg; k < nr1*nr0; k += NT) {
+            const int j = k / nr0;
+            const int i = k % nr0;
+            *((device float *) dst + r0 + i + (r1 + j)*args.ne0) = *((threadgroup float *) shmem + j*NR0 + i);
+        }
+    }
+}
+
+// One whole 32-row token block of kernel_mul_mm, its code without the
+// bc_inp path (the input width must be a multiple of 32) and for one matrix.
+template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+inline void mul_mm_full_block(
+        constant ds4_metal_args_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        const int r0,
+        const int r1,
+        ushort tiitg,
+        ushort sgitg) {
+
+    threadgroup S0 * sa = (threadgroup S0 *)(shmem);
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 64u*32u*sizeof(S0));
+
+    constexpr int NR0 = 64;
+    constexpr int NR1 = 32;
+
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+    const short nr1 = (args.ne1 - r1 < NR1) ? (args.ne1 - r1) : NR1;
+
+    const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1;
+
+    const short il0 = (tiitg % NL0);
+
+    short il = il0;
+
+    const short offset1 = il0/nl;
+
+    device const block_q * x = (device const block_q *)(src0 + args.nb01*(r0 + lr0)) + offset1;
+
+    const short iy = 8*(tiitg % NL1);
+
+    device const T1 * y = (device const T1 *)(src1
+        + args.nb11*(r1 + lr1)
+        + args.nb10*iy);
+
+    S0_8x8 ma[4];
+    S1_8x8 mb[2];
+
+    simdgroup_float8x8 mc[8];
+
+    for (short i = 0; i < 8; i++){
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        S0_4x4 temp_a;
+        dequantize_func(x, il, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = (tiitg/NL0)/8;
+
+            const short lx = (tiitg/NL0)%8;
+            const short ly = i%8;
+
+            const short ib = 8*sx + sy;
+
+            *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+        }
+
+        {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+
+            const short ly = (tiitg/NL1)%8;
+
+            const short ib = 4*sx + sy;
+
+            *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y));
+        }
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
+
+        y += NK;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const S0 * lsma = (sa + 4*64*(sgitg%2));
+        threadgroup const S1 * lsmb = (sb + 2*64*(sgitg/2));
+
+        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 8; i++){
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            }
+
+            lsma += 8*64;
+            lsmb += 4*64;
+        }
+    }
+
+    if (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1) {
+        device float * C = (device float *) dst +
+            (r0 + 32*(sgitg &  1)) + \
+            (r1 + 16*(sgitg >> 1)) * args.ne0;
+
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
+
+        for (short i = 0; i < 8; i++) {
+            simdgroup_store(mc[i], temp_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int k = tiitg; k < nr1*nr0; k += 128) {
+            const int j = k / nr0;
+            const int i = k % nr0;
+            *((device float *) dst + r0 + i + (r1 + j)*args.ne0) = *((threadgroup float *) shmem + j*NR0 + i);
+        }
+    }
+}
+
+// A prompt batch of ne1 tokens whose last token block has at most 8*NB rows:
+// threadgroup columns 0 .. ne1/32 - 1 run whole 32-row blocks and column
+// ne1/32 runs the last block on an 8*NB-row tile (mul_mm_narrow_block), all
+// in one dispatch, so the last block's threadgroups run beside the others.
+// Bit-identical to kernel_mul_mm over the same rows.
+template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4, short NB>
+kernel void kernel_mul_mm_narrow(
+        constant ds4_metal_args_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int r0 = tgpig.y*64;
+    const int r1 = tgpig.x*32;
+    if (r1 + 32 <= args.ne1) {
+        mul_mm_full_block<S0, S0_4x4, S0_8x8, S1, S1_2x4, S1_8x8, block_q, nl, dequantize_func, T0, T0_4x4, T1, T1_2x4>(
+            args, src0, src1, dst, shmem, r0, r1, tiitg, sgitg);
+    } else {
+        mul_mm_narrow_block<S0, S0_4x4, S0_8x8, S1, S1_2x4, S1_8x8, block_q, nl, dequantize_func, T0, T0_4x4, T1, T1_2x4, NB, 64>(
+            args, src0, src1, dst, shmem, r0, r1, tiitg, sgitg);
+    }
+}
+
+// A prompt batch of at most 8*NB tokens (one partial token block) on 32-row
+// weight tiles run by 64 threads: twice the threadgroups of a 64-row tile.
+// Bit-identical to kernel_mul_mm over the same rows.
+template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4, short NB>
+kernel void kernel_mul_mm_small(
+        constant ds4_metal_args_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    mul_mm_narrow_block<S0, S0_4x4, S0_8x8, S1, S1_2x4, S1_8x8, block_q, nl, dequantize_func, T0, T0_4x4, T1, T1_2x4, NB, 32>(
+        args, src0, src1, dst, shmem, tgpig.y*32, 0, tiitg, sgitg);
+}
+
 // Legacy F16-weight/F32-RHS prefill matmul with a per-row RMS scale applied at
 // the existing F32-to-F16 RHS staging boundary.  The tile layout, half inputs,
 // float accumulators, and output path intentionally mirror kernel_mul_mm so the
@@ -2931,3 +3261,15 @@ template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<h
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;
+
+typedef decltype(kernel_mul_mm_narrow<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4, 1>) mul_mm_narrow_t;
+
+// The last partial token block of a Q4_K prompt batch: 8, 16 or 24 token rows.
+template [[host_name("kernel_mul_mm_q4_K_f32_n8")]]  kernel mul_mm_narrow_t kernel_mul_mm_narrow<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4, 1>;
+template [[host_name("kernel_mul_mm_q4_K_f32_n16")]] kernel mul_mm_narrow_t kernel_mul_mm_narrow<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4, 2>;
+template [[host_name("kernel_mul_mm_q4_K_f32_n24")]] kernel mul_mm_narrow_t kernel_mul_mm_narrow<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4, 3>;
+
+typedef decltype(kernel_mul_mm_small<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4, 1>) mul_mm_small_t;
+
+// Q4_K prompt batches of 9..16 tokens on 32-row weight tiles.
+template [[host_name("kernel_mul_mm_q4_K_f32_s16")]] kernel mul_mm_small_t kernel_mul_mm_small<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4, 2>;
