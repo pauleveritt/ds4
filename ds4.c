@@ -59167,18 +59167,12 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
  * times sigmoid(gate), then the output projection.
  *
  * Prompt batches (T > 8) take llama.cpp's flash-attention tiling
- * (ds4_gpu_qwen35_attn_fa_tensor) when DS4_QWEN35_PREFILL_FA=1, read per
- * call so an A/B harness can switch it per session; otherwise, and for
- * decode and verify rows, kernel_qwen4_attn_mm and the decode kernels. */
-static bool qwen35_prefill_fa(uint32_t T) {
-    const char *mode = getenv("DS4_QWEN35_PREFILL_FA");
-    return T > 8u && mode && strcmp(mode, "1") == 0;
-}
-
+ * (ds4_gpu_qwen35_attn_fa_tensor); decode and verify rows (T <= 8) take the
+ * decode kernels. */
 static bool qwen35_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                    uint32_t il, uint32_t pos0, uint32_t T) {
     const float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
-    const bool fa = qwen35_prefill_fa(T);
+    const bool fa = T > 8u;
     return qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T) &&
            qwen4_gemv(g->kp, m, l->attn_k, g->mixed, T) &&
            qwen4_gemv(g->vp, m, l->attn_v, g->mixed, T) &&

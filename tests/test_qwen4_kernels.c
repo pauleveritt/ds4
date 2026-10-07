@@ -3709,7 +3709,8 @@ static double seconds_since(const struct timespec *t0) {
 
 /* The 27B's prefill attention (24 query heads over 4 KV heads, D 256) with
  * llama.cpp's flash-attention tiling, against causal attention in double on
- * sampled query rows (every head), and against kernel_qwen4_attn_mm on every
+ * sampled query rows (every head), and against kernel_qwen4_attn_mm (Qwen3.8
+ * Flash's dense prompt-batch kernel, the 27B's before this one) on every
  * output.  Cache rows past pos0+T hold NaN, so a read beyond the causal range
  * shows.  Pass/fail: 1e-4 of the output scale against the reference with the
  * query rounded to half as the kernel stages it, and the suite's 4e-3 for
