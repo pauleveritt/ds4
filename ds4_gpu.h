@@ -260,6 +260,8 @@ enum {
     DS4_GPU_TEST_OUTPUT_HC_WEIGHTS4 = 1u << 5,
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
     DS4_GPU_TEST_Q6_K_MM_BYTEWISE = 1u << 7,
+    DS4_GPU_TEST_Q4_K_MMA_BYTEWISE = 1u << 8,
+    DS4_GPU_TEST_Q4_K_MMA_WORD = 1u << 9,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
@@ -759,7 +761,11 @@ int ds4_gpu_matmul_q6_K_tensor(
  * kernels), for qwen35's verify (Q4_K, Q6_K) and the DFlash drafter (Q4_0,
  * in_dim a multiple of 32).  Its sums are not in the one-row kernels' order, but its
  * tiling depends only on the weight shape, so row t of the output is bitwise
- * the same for every n_tok and whatever the other rows hold. */
+ * the same for every n_tok and whatever the other rows hold.  Q4_K dequantizes
+ * a 16-weight piece from one 16-byte load, or from four 32-bit loads when the
+ * weights are not 16-byte aligned (DS4_GPU_TEST_Q4_K_MMA_WORD forces that);
+ * DS4_GPU_TEST_Q4_K_MMA_BYTEWISE runs moe.metal's per-byte dequantizer it had
+ * before, the reference both must match byte for byte. */
 int ds4_gpu_matmul_mma_rows_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,

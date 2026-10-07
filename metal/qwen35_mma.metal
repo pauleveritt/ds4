@@ -5,9 +5,9 @@
 // (ggml-org/llama.cpp #29869, at a46709b; MIT, the ggml authors):
 // mul_mv_mma_tile_init, mul_mv_mma_src0_row, mul_mv_mma_src1_row,
 // mul_mv_mma_store and kernel_mul_mv_mma_gen at one 8-row src1 tile (RT 1),
-// with NT 1, 2 or 4 weight tiles, on moe.metal's dequantize_q4_K and a
-// port of llama.cpp's dequantize_q6_K (below); and for Q4_0,
-// mul_mv_mma_1024_plus, mul_mv_mma_q4_0, load_mma_blk_a, load_mma_blk_b and
+// with NT 1, 2 or 4 weight tiles, on moe.metal's dequantize_q4_K with
+// word loads and a port of llama.cpp's dequantize_q6_K (both below); and
+// for Q4_0, mul_mv_mma_1024_plus, mul_mv_mma_q4_0, load_mma_blk_a, load_mma_blk_b and
 // kernel_mul_mv_mma_blk at RT 1 (the row length a kernel argument, not a
 // function constant).
 //
@@ -218,12 +218,77 @@ void qwen35_mma_dequantize_q6_K(device const block_q6_K *xb, short il, thread ty
     }
 }
 
+// moe.metal's dequantize_q4_K from four 32-bit loads instead of sixteen
+// byte loads: the same 16 weights, each dl*q - ml on the same dl, ml and q,
+// so the same floats in the same order. A piece's 16 quant bytes start at
+// qs + 32*(il/4) + 16*(il&1), 4-byte aligned in a 144-byte block whose qs
+// starts at byte 16.
+template <typename type4x4>
+void qwen35_mma_dequantize_q4_K(device const block_q4_K *xb, short il, thread type4x4 & reg) {
+    device const uint32_t * q = (device const uint32_t *)(xb->qs + (il/4)*32 + 16*(il&1));
+
+    const short is = (il/4)*2;
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d = il < 2 ?
+        (float)xb->d :
+        (float)xb->d * (1.0f / 16.0f);
+    const float min = (float)xb->dmin;
+    const float dl = d * sc[0];
+    const float ml = min * sc[1];
+
+    const uint32_t mask = il < 2 ? 0x0F0F0F0F : 0xF0F0F0F0;
+    FOR_UNROLL (short i = 0; i < 4; ++i) {
+        const uint32_t w = q[i] & mask;
+        reg[i][0] = dl * (float)( w        & 0xFF) - ml;
+        reg[i][1] = dl * (float)((w >>  8) & 0xFF) - ml;
+        reg[i][2] = dl * (float)((w >> 16) & 0xFF) - ml;
+        reg[i][3] = dl * (float)( w >> 24        ) - ml;
+    }
+}
+
+// the same as qwen35_mma_dequantize_q4_K from one 16-byte load, the
+// default; a piece's bytes are 16-byte aligned when the block is, and the
+// host takes the 32-bit loads when the weights are not. At T = 8 the
+// per-byte loads cost 253.6 us at 5120->17408, 32-bit loads 236.2 and one
+// 16-byte load 209.0 (docs/superpowers/research/2026-10-07-mma-q4k-word.md
+// in the ds4-engine host repository).
+template <typename type4x4>
+void qwen35_mma_dequantize_q4_K_vec(device const block_q4_K *xb, short il, thread type4x4 & reg) {
+    const uint4 qv = *(device const uint4 *)(xb->qs + (il/4)*32 + 16*(il&1));
+
+    const short is = (il/4)*2;
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d = il < 2 ?
+        (float)xb->d :
+        (float)xb->d * (1.0f / 16.0f);
+    const float min = (float)xb->dmin;
+    const float dl = d * sc[0];
+    const float ml = min * sc[1];
+
+    const uint32_t mask = il < 2 ? 0x0F0F0F0F : 0xF0F0F0F0;
+    FOR_UNROLL (short i = 0; i < 4; ++i) {
+        const uint32_t w = qv[i] & mask;
+        reg[i][0] = dl * (float)( w        & 0xFF) - ml;
+        reg[i][1] = dl * (float)((w >>  8) & 0xFF) - ml;
+        reg[i][2] = dl * (float)((w >> 16) & 0xFF) - ml;
+        reg[i][3] = dl * (float)( w >> 24        ) - ml;
+    }
+}
+
 // nl 16: a 256-weight super-block holds sixteen 16-weight pieces
 typedef decltype(kernel_qwen35_mma_f32<1, block_q4_K, 16, dequantize_q4_K>) qwen35_mma_t;
 
 template [[host_name("kernel_qwen35_mma_q4_K_f32_nt1")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<1, block_q4_K, 16, dequantize_q4_K>;
 template [[host_name("kernel_qwen35_mma_q4_K_f32_nt2")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<2, block_q4_K, 16, dequantize_q4_K>;
 template [[host_name("kernel_qwen35_mma_q4_K_f32_nt4")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<4, block_q4_K, 16, dequantize_q4_K>;
+template [[host_name("kernel_qwen35_mma_q4_K_word_f32_nt1")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<1, block_q4_K, 16, qwen35_mma_dequantize_q4_K>;
+template [[host_name("kernel_qwen35_mma_q4_K_word_f32_nt2")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<2, block_q4_K, 16, qwen35_mma_dequantize_q4_K>;
+template [[host_name("kernel_qwen35_mma_q4_K_word_f32_nt4")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<4, block_q4_K, 16, qwen35_mma_dequantize_q4_K>;
+template [[host_name("kernel_qwen35_mma_q4_K_vec_f32_nt1")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<1, block_q4_K, 16, qwen35_mma_dequantize_q4_K_vec>;
+template [[host_name("kernel_qwen35_mma_q4_K_vec_f32_nt2")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<2, block_q4_K, 16, qwen35_mma_dequantize_q4_K_vec>;
+template [[host_name("kernel_qwen35_mma_q4_K_vec_f32_nt4")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<4, block_q4_K, 16, qwen35_mma_dequantize_q4_K_vec>;
 template [[host_name("kernel_qwen35_mma_q6_K_f32_nt1")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<1, block_q6_K, 16, qwen35_mma_dequantize_q6_K>;
 template [[host_name("kernel_qwen35_mma_q6_K_f32_nt2")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<2, block_q6_K, 16, qwen35_mma_dequantize_q6_K>;
 template [[host_name("kernel_qwen35_mma_q6_K_f32_nt4")]] kernel qwen35_mma_t kernel_qwen35_mma_f32<4, block_q6_K, 16, qwen35_mma_dequantize_q6_K>;
