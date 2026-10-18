@@ -2,6 +2,8 @@
 
 usage: compare.py A_DIR B_DIR [--table]
 
+PROMPTS names the prompts file when it is not prompts.json beside this script.
+
 Per prompt: whether the greedy tokens agree and where they first diverge
 (with both sides' top-2 at that step), whether the top-5 ids at the last
 prompt position agree in order, and the absolute logprob difference of the
@@ -64,7 +66,7 @@ def main():
     if table:
         print("| Prompt | Tokens | A top-5 (id: logprob) | B top-5 (id: logprob) | Same ids, same order | Max abs. diff |")
         print("|---|---|---|---|---|---|")
-    for p in json.load(open(os.path.join(HERE, "prompts.json"))):
+    for p in json.load(open(os.environ.get("PROMPTS", os.path.join(HERE, "prompts.json")))):
         na, a = load(os.path.join(a_dir, p["name"] + ".json"))
         nb, b = load(os.path.join(b_dir, p["name"] + ".json"))
         if na != nb:

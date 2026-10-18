@@ -2,7 +2,7 @@
 
 usage: llama_side.py MODEL TOKDIR OUTDIR [N_PREDICT]
 
-For every prompt in prompts.json, sends the token ids ds4 rendered
+For every prompt in prompts.json (or the file PROMPTS names), sends the token ids ds4 rendered
 (TOKDIR/NAME.tokens, from ds4_side.sh) to llama-server's /completion as a
 token array with temperature 0 and n_probs 5, so both engines see the same
 prompt tokens.  It also renders the same messages with the GGUF chat template
@@ -53,7 +53,7 @@ def main():
                     break
             except Exception:
                 time.sleep(0.5)
-        for p in json.load(open(os.path.join(HERE, "prompts.json"))):
+        for p in json.load(open(os.environ.get("PROMPTS", os.path.join(HERE, "prompts.json")))):
             ids = json.loads(open(os.path.join(tokdir, p["name"] + ".tokens")).read())
             messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": p["prompt"]}]
             rendered = call("/apply-template", {"messages": messages})["prompt"]

@@ -1,7 +1,7 @@
 #!/bin/sh
 # ds4_side.sh MODEL OUTDIR [ds4 args...]
 #
-# Runs every prompt of prompts.json through ./ds4 (run from the repository
+# Runs every prompt of prompts.json (or of the file PROMPTS names) through ./ds4 (run from the repository
 # root): the rendered chat tokens go to OUTDIR/NAME.tokens and a 64-token
 # greedy run with top-5 logprobs per step to OUTDIR/NAME.json.  The system
 # prompt is explicit so the dumped tokens are the ones generation uses.
@@ -11,10 +11,11 @@ OUT=$2
 shift 2
 DIR=$(cd "$(dirname "$0")" && pwd)
 SYSTEM="You are a helpful assistant"
+PROMPTS=${PROMPTS:-$DIR/prompts.json}
 mkdir -p "$OUT"
-python3 -c 'import json,sys; [print(p["name"]) for p in json.load(open(sys.argv[1]))]' "$DIR/prompts.json" |
+python3 -c 'import json,sys; [print(p["name"]) for p in json.load(open(sys.argv[1]))]' "$PROMPTS" |
 while read -r name; do
-    prompt=$(python3 -c 'import json,sys; print(next(p["prompt"] for p in json.load(open(sys.argv[1])) if p["name"] == sys.argv[2]))' "$DIR/prompts.json" "$name")
+    prompt=$(python3 -c 'import json,sys; print(next(p["prompt"] for p in json.load(open(sys.argv[1])) if p["name"] == sys.argv[2]))' "$PROMPTS" "$name")
     ./ds4 -m "$MODEL" --ctx 4096 --system "$SYSTEM" --dump-tokens -p "$prompt" "$@" 2>/dev/null |
         grep '^\[' > "$OUT/$name.tokens"
     ./ds4 -m "$MODEL" --ctx 4096 --system "$SYSTEM" --dump-logprobs "$OUT/$name.json" \
