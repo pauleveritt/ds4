@@ -11973,6 +11973,10 @@ static int ds4_gpu_quant_row_bytes(
         if ((n_embd % 256u) != 0) return 0;
         *row_bytes_out = ((uint64_t)n_embd / 256u) * 144u;
         return 1;
+    case DS4_METAL_TENSOR_Q5_K:
+        if ((n_embd % 256u) != 0) return 0;
+        *row_bytes_out = ((uint64_t)n_embd / 256u) * 176u;
+        return 1;
     default:
         return 0;
     }
@@ -19791,6 +19795,7 @@ static const char *ds4_gpu_q4_mm_name(uint32_t weight_type) {
     switch (weight_type) {
     case DS4_METAL_TENSOR_Q4_0: return "kernel_mul_mm_q4_0_f32";
     case DS4_METAL_TENSOR_Q4_K: return "kernel_mul_mm_q4_K_f32";
+    case DS4_METAL_TENSOR_Q5_K: return "kernel_mul_mm_q5_K_f32";
     default: return NULL;
     }
 }
@@ -19882,14 +19887,19 @@ static int ds4_gpu_matmul_quant_impl_tensor(
          * the mul_mv_ext family tops out around 220 GB/s on M5 for the GLM
          * DenseQ4 decode shapes while this impl streams 530-650 GB/s
          * (misc/q4mv_bench.m). Falls through to ext when unavailable.
+         * Q5_K (dense qwen35) takes the same lane map with qh's fifth bit;
+         * with the switch set it falls through to the tiled kernel.
          */
-        if (weight_type == DS4_METAL_TENSOR_Q4_K &&
+        if ((weight_type == DS4_METAL_TENSOR_Q4_K || weight_type == DS4_METAL_TENSOR_Q5_K) &&
             n_tok <= 8u &&
             (in_dim % 256u) == 0 &&
             getenv("DS4_METAL_DISABLE_Q4_MV_CLASSIC") == NULL) {
             const int16_t nsg = 2;
             id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_ext_pipeline("kernel_mul_mv_q4_K_dense_f32", nsg, 8);
+                ds4_gpu_get_mul_mv_ext_pipeline(weight_type == DS4_METAL_TENSOR_Q5_K
+                                                    ? "kernel_mul_mv_q5_K_dense_f32"
+                                                    : "kernel_mul_mv_q4_K_dense_f32",
+                                                nsg, 8);
             if (pipeline) {
                 ds4_gpu_q8_0_matvec_args args = {
                     .ne00 = (int32_t)in_dim,
@@ -19927,7 +19937,7 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                      threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
                 ds4_gpu_end_compute_encoder(cb, enc);
 
-                if (!ds4_gpu_finish_command_buffer(cb, owned, "Q4_K classic mul_mv")) return 0;
+                if (!ds4_gpu_finish_command_buffer(cb, owned, "K-quant classic mul_mv")) return 0;
                 return 1;
             }
         }
@@ -19995,7 +20005,8 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 if (!ds4_gpu_finish_command_buffer(cb, owned, "Q4 NAX tensor matmul")) return 0;
                 return 1;
             }
-            ds4_gpu_warn_mpp_fallback();
+            /* Q5_K has no NAX kernel to fall back from. */
+            if (nax_fn) ds4_gpu_warn_mpp_fallback();
         }
 
         const char *mm_fn = ds4_gpu_q4_mm_name(weight_type);

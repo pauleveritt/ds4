@@ -4939,6 +4939,116 @@ static void test_q6_K_mm(arena_t *a) {
     g_rng = rng;
 }
 
+/* q5_K rows of random bytes, so every 6-bit scale/min pair, nibble and qh
+ * bit occurs; d and dmin are random-signed halves from 2^-18 to 2^-6, small
+ * enough that no weight d*sc*q - dmin*m overflows a half. */
+static uint64_t arena_q5_K_bytes(arena_t *a, uint64_t rows, uint64_t cols) {
+    const uint64_t n = rows * (cols / 256u);
+    const uint64_t off = arena_alloc(a, n * 176u);
+    uint8_t *w = a->base + off;
+    for (uint64_t b = 0; b < n; b++) {
+        uint8_t *blk = w + b * 176u;
+        for (int i = 4; i < 176; i++) blk[i] = (uint8_t)(urand() >> 13);
+        for (int k = 0; k < 2; k++) {
+            const float mag = ldexpf(1.0f + 0.4999f * (frand() + 1.0f), -18 + (int)(urand() % 13u));
+            const uint16_t h = f32_to_f16((urand() & 1u) ? -mag : mag);
+            memcpy(blk + 2 * k, &h, 2);
+        }
+    }
+    return off;
+}
+
+/* ggml's get_scale_min_k4 */
+static void q5_K_scale_min(int j, const uint8_t *q, int *sc, int *m) {
+    if (j < 4) {
+        *sc = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+static double q5_K_round(double w, bool half_staged) {
+    return half_staged ? q6_K_half(w) : w;
+}
+
+/* ggml's dequantize_row_q5_K; with half_staged, each weight rounded to half
+ * as the tile stages it (the matvec multiplies in float) */
+static double *q5_K_rows_double(const arena_t *a, uint64_t off, uint64_t rows, uint64_t cols,
+                                bool half_staged) {
+    double *y = malloc(rows * cols * sizeof(double));
+    for (uint64_t b = 0; b < rows * (cols / 256u); b++) {
+        const uint8_t *blk = a->base + off + b * 176u;
+        uint16_t dh, mh;
+        memcpy(&dh, blk, 2);
+        memcpy(&mh, blk + 2, 2);
+        const double d = f16_to_f32(dh), dmin = f16_to_f32(mh);
+        const uint8_t *scales = blk + 4, *qh = blk + 16, *ql = blk + 48;
+        double *out = y + b * 256u;
+        uint8_t u1 = 1, u2 = 2;
+        for (int j = 0, is = 0; j < 256; j += 64, is += 2, ql += 32, u1 <<= 2, u2 <<= 2) {
+            int sc, m;
+            q5_K_scale_min(is, scales, &sc, &m);
+            const double d1 = d * sc, m1 = dmin * m;
+            q5_K_scale_min(is + 1, scales, &sc, &m);
+            const double d2 = d * sc, m2 = dmin * m;
+            for (int l = 0; l < 32; l++)
+                out[j + l] = q5_K_round(d1 * ((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1, half_staged);
+            for (int l = 0; l < 32; l++)
+                out[j + 32 + l] = q5_K_round(d2 * ((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2, half_staged);
+        }
+    }
+    return y;
+}
+
+/* Dense qwen35 Q5_K weights as ds4_gpu_matmul_quant_tensor dispatches them
+ * against ggml's dequantization in double, at a ragged output tile: 1..8
+ * rows take the matvec (kernel_mul_mv_q5_K_dense_f32), larger batches and
+ * every batch with DS4_METAL_DISABLE_Q4_MV_CLASSIC set the tiled kernel
+ * (kernel_mul_mm_q5_K_f32), which stages weights and inputs as half. */
+static void test_q5_K_reference(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T, bool force_tile) {
+    const bool tile = force_tile || T > 8u;
+    const uint64_t off = arena_q5_K_bytes(a, rows, in_dim);
+    double *w = q5_K_rows_double(a, off, rows, in_dim, tile);
+    float *x = rand_vec((uint64_t)T * in_dim, 1.0f);
+    double *ref = malloc((uint64_t)T * rows * sizeof(double));
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t r = 0; r < rows; r++) {
+            double acc = 0.0;
+            for (uint32_t k = 0; k < in_dim; k++) {
+                const double xk = q5_K_round(x[(uint64_t)t * in_dim + k], tile);
+                acc += w[(uint64_t)r * in_dim + k] * xk;
+            }
+            ref[(uint64_t)t * rows + r] = acc;
+        }
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * in_dim);
+    ds4_gpu_tensor *out = upload(NULL, (uint64_t)T * rows);
+    require_ok(ds4_gpu_tensor_fill_f32(out, 2.0f, (uint64_t)T * rows), "Q5_K output fill");
+    if (force_tile) setenv("DS4_METAL_DISABLE_Q4_MV_CLASSIC", "1", 1);
+    const int ok = ds4_gpu_matmul_quant_tensor(out, a->base, a->size, off, 13u, in_dim, rows, gx, T);
+    if (force_tile) unsetenv("DS4_METAL_DISABLE_Q4_MV_CLASSIC");
+    require_ok(ok, "Q5_K quant matmul dispatch");
+    char name[96];
+    snprintf(name, sizeof(name), "Q5_K %s %u->%u T=%u vs double", tile ? "mm" : "mv", in_dim, rows, T);
+    check_tensor(name, out, ref, (uint64_t)T * rows, 3e-5);
+    free(ref); free(x); free(w);
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(gx);
+}
+
+/* on a saved random stream and a rewound arena, as test_q6_K_mm */
+static void test_q5_K_mm(arena_t *a) {
+    const uint32_t rng = g_rng;
+    const uint64_t used = a->used;
+    const uint32_t Ts[] = {1, 3, 8, 40, 64};
+    for (uint32_t t = 0; t < 5; t++) test_q5_K_reference(a, 512, 72, Ts[t], false);
+    for (uint32_t t = 0; t < 3; t++) test_q5_K_reference(a, 512, 72, Ts[t], true);
+    test_q5_K_reference(a, 4096, 200, 1, false);
+    test_q5_K_reference(a, 512, 73, 2, false);
+    a->used = used;
+    g_rng = rng;
+}
+
 /* q4_K rows of random bytes, so every scale/min pair, nibble and il path
  * occurs; d and dmin are random-signed halves from 2^-18 to 2^-6.  The rows
  * start skew bytes past a 64-byte boundary. */
@@ -5446,6 +5556,7 @@ int main(void) {
     if (getenv("DS4_TEST_QWEN4_DECODE_FUSIONS")) { test_decode_fusions(&arena); return 0; }
 #ifdef __APPLE__
     if (getenv("DS4_TEST_QWEN4_Q6K_MM_ONLY")) { test_q6_K_mm(&arena); printf("all qwen4 Q6_K mm tests passed\n"); return 0; }
+    if (getenv("DS4_TEST_QWEN35_Q5K_MM_ONLY")) { test_q5_K_mm(&arena); printf("all qwen35 Q5_K mm tests passed\n"); return 0; }
     if (getenv("DS4_TEST_QWEN35_Q4K_MMA_ONLY")) { test_q4_K_mma_word(&arena); printf("all qwen35 Q4_K mma tests passed\n"); return 0; }
     if (getenv("DS4_TEST_QWEN35_ATTN_FA_ONLY")) { test_qwen35_attn_fa(); printf("all qwen35 attn fa tests passed\n"); return 0; }
     if (getenv("DS4_TEST_QWEN35_VERIFY_ATTN_BENCH")) { bench_qwen35_attn_verify(); return 0; }
@@ -5627,6 +5738,7 @@ int main(void) {
     test_dense_mm(&arena, 64, 32, 70, 0u);
 #ifdef __APPLE__
     test_q6_K_mm(&arena);
+    test_q5_K_mm(&arena);
     test_qwen35_attn_fa();
     test_qwen35_attn_verify_shared();
 #endif

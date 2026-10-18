@@ -5787,16 +5787,18 @@ static void weights_validate_qwen4_layout(
 }
 
 /* qwen35 projections: the qwen4 dense types plus the K-quants of the common
- * Q4_K_M recipes, which the Metal graph multiplies through the Q4_K and Q6_K
- * dense kernels. */
+ * Q4_K_M recipes, which the Metal graph multiplies through the Q4_K, Q5_K and
+ * Q6_K dense kernels.  Newer llama.cpp Q4_K_M files store the GDN attn_qkv
+ * as Q5_K (lmstudio-community's Qwen3.5-9B). */
 static bool tensor_type_is_qwen35_dense(uint32_t type) {
-    return tensor_type_is_qwen4_dense(type) || type == DS4_TENSOR_Q4_K || type == DS4_TENSOR_Q6_K;
+    return tensor_type_is_qwen4_dense(type) || type == DS4_TENSOR_Q4_K ||
+           type == DS4_TENSOR_Q5_K || type == DS4_TENSOR_Q6_K;
 }
 
 static void tensor_expect_qwen35_dense_layout(const ds4_tensor *t, uint64_t d0, uint64_t d1) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
     if (!tensor_type_is_qwen35_dense(t->type)) {
-        fprintf(stderr, "ds4: tensor %.*s has type %u, expected Q4_K, Q6_K, Q8_0, Q4_0, F16, BF16 or F32\n",
+        fprintf(stderr, "ds4: tensor %.*s has type %u, expected Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, F16, BF16 or F32\n",
                 (int)t->name.len, t->name.ptr, t->type);
         exit(1);
     }
@@ -58486,10 +58488,11 @@ static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
                   (t->dim[0] % 256u) == 0));
 }
 
-/* qwen35 dense projections: the qwen4 dense types plus Q4_K and Q6_K. */
+/* qwen35 dense projections: the qwen4 dense types plus Q4_K, Q5_K and Q6_K. */
 static bool qwen35_graph_dense_ok(const ds4_tensor *t) {
     return qwen4_graph_dense_ok(t) ||
-           (t && (t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q6_K) && (t->dim[0] % 256u) == 0);
+           (t && (t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q5_K || t->type == DS4_TENSOR_Q6_K) &&
+            (t->dim[0] % 256u) == 0);
 }
 
 static bool qwen35_graph_weights_supported(const ds4_weights *w) {
@@ -58502,10 +58505,8 @@ static bool qwen35_graph_weights_supported(const ds4_weights *w) {
         fprintf(stderr, "ds4: qwen35 GPU graph: unsupported embedding or output head type\n");
         return false;
     }
-    if (w->token_embd->type == DS4_TENSOR_Q6_K) {
-        fprintf(stderr, "ds4: qwen35 GPU graph: Q6_K token embeddings are not supported\n");
-        return false;
-    }
+    /* token rows are gathered on the host (qwen4_ref_row), which reads every
+     * type qwen35_graph_dense_ok admits, Q5_K and Q6_K included */
     for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         const ds4_tensor *dense[12] = {
@@ -58518,10 +58519,12 @@ static bool qwen35_graph_weights_supported(const ds4_weights *w) {
                 return false;
             }
         }
-        /* the fused decode front reads alpha/beta through qwen4_row_dot */
+        /* the fused decode front reads alpha/beta through qwen4_row_dot,
+         * which has no Q5_K or Q6_K row */
         if (ds4_qwen4_layer_is_linear(il) &&
-            (l->lin_beta->type != l->lin_alpha->type || l->lin_alpha->type == DS4_TENSOR_Q6_K)) {
-            fprintf(stderr, "ds4: qwen35 GPU graph needs matching non-Q6_K alpha/beta types (layer %u)\n", il);
+            (l->lin_beta->type != l->lin_alpha->type || l->lin_alpha->type == DS4_TENSOR_Q5_K ||
+             l->lin_alpha->type == DS4_TENSOR_Q6_K)) {
+            fprintf(stderr, "ds4: qwen35 GPU graph needs matching non-Q5_K, non-Q6_K alpha/beta types (layer %u)\n", il);
             return false;
         }
     }
@@ -59219,6 +59222,9 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
     case DS4_TENSOR_Q4_0:
     case DS4_TENSOR_Q4_K: rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
 #if defined(__APPLE__)
+    /* Q5_K: kernel_mul_mv_q5_K_dense_f32 for 1..8 rows, the tiled
+     * kernel_mul_mm_q5_K_f32 for prompt batches. */
+    case DS4_TENSOR_Q5_K: rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_Q6_K:
         rc = n_tok > 8u ? ds4_gpu_matmul_q6_K_mm_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok)
                         : ds4_gpu_matmul_q6_K_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok);
@@ -68904,6 +68910,60 @@ static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row,
                 const uint8_t *qs = p + 16 + (g >> 1) * 32u;
                 const uint32_t shift = (g & 1u) * 4u;
                 for (uint32_t j = 0; j < 32u; j++) out[b * 256u + g * 32u + j] = ds * (float)((qs[j] >> shift) & 0xFu) - dm;
+            }
+        }
+        break;
+    }
+    /* Q5_K and Q6_K rows: ggml's dequantize_row_q5_K and dequantize_row_q6_K.
+     * Dense qwen35 checkpoints that tie their output head to the embedding
+     * (Qwen3.5-4B) store token_embd as Q6_K, and the graph gathers each
+     * prompt token's row here. */
+    case DS4_TENSOR_Q5_K: {
+        const uint64_t blocks = n / 256u;
+        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 176u;
+        for (uint64_t b = 0; b < blocks; b++, p += 176u) {
+            uint16_t dh, mh;
+            memcpy(&dh, p, 2);
+            memcpy(&mh, p + 2, 2);
+            const float d = f16_to_f32(dh), dmin = f16_to_f32(mh);
+            const uint8_t *sc = p + 4, *qh = p + 16;
+            for (uint32_t g = 0; g < 8u; g++) {
+                uint32_t s, mn;
+                if (g < 4u) { s = sc[g] & 63u; mn = sc[g + 4] & 63u; }
+                else { s = (sc[g + 4] & 0xFu) | ((sc[g - 4] & 0xC0u) >> 2); mn = (sc[g + 4] >> 4) | ((sc[g] & 0xC0u) >> 2); }
+                const float ds = d * (float)s, dm = dmin * (float)mn;
+                const uint8_t *qs = p + 48 + (g >> 1) * 32u;
+                const uint32_t shift = (g & 1u) * 4u;
+                for (uint32_t j = 0; j < 32u; j++) {
+                    const uint32_t q = ((qs[j] >> shift) & 0xFu) | (((qh[j] >> g) & 1u) << 4);
+                    out[b * 256u + g * 32u + j] = ds * (float)q - dm;
+                }
+            }
+        }
+        break;
+    }
+    case DS4_TENSOR_Q6_K: {
+        const uint64_t blocks = n / 256u;
+        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 210u;
+        for (uint64_t b = 0; b < blocks; b++, p += 210u) {
+            uint16_t dh;
+            memcpy(&dh, p + 208, 2);
+            const float d = f16_to_f32(dh);
+            float *y = out + b * 256u;
+            for (uint32_t half = 0; half < 2u; half++) {
+                const uint8_t *ql = p + 64u * half, *qh = p + 128 + 32u * half;
+                const int8_t *sc = (const int8_t *)(p + 192) + 8u * half;
+                for (uint32_t l = 0; l < 32u; l++) {
+                    const uint32_t is = l / 16u;
+                    const int q1 = (int)((ql[l] & 0xFu) | (((qh[l] >> 0) & 3u) << 4)) - 32;
+                    const int q2 = (int)((ql[l + 32] & 0xFu) | (((qh[l] >> 2) & 3u) << 4)) - 32;
+                    const int q3 = (int)((ql[l] >> 4) | (((qh[l] >> 4) & 3u) << 4)) - 32;
+                    const int q4 = (int)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3u) << 4)) - 32;
+                    y[128u * half + l]      = d * (float)sc[is + 0] * (float)q1;
+                    y[128u * half + l + 32] = d * (float)sc[is + 2] * (float)q2;
+                    y[128u * half + l + 64] = d * (float)sc[is + 4] * (float)q3;
+                    y[128u * half + l + 96] = d * (float)sc[is + 6] * (float)q4;
+                }
             }
         }
         break;
