@@ -419,12 +419,17 @@ static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_dsv4_hc_barrier_cache;
 static NSMutableDictionary<NSString *, NSNumber *> *g_dsv4_hc_barrier_gen;
 static id<MTLComputePipelineState> g_hc_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_output_hc_weights4_pipeline;
-/* Smallest ragged prefill batch whose aligned prefix runs on the tensor (NAX)
- * kernels with the remainder on the generic one; Q8_0 and Q4_K/Q4_0 share it.
- * 96 is the PF.1 threshold screen's result for Q4_K (the 4B at 65 tokens and up
- * was faster split on every run, rounded up to a multiple of 32); the screen
- * did not measure Q8_0, which used 192 before the shared constant. */
-#define DS4_GPU_NAX_SPLIT_MIN_ROWS 96u
+/* Smallest ragged prefill batch whose 32-aligned prefix runs on the tensor
+ * (NAX) kernels with the remainder on the generic one, one value per weight
+ * format because each came from its own measurement.
+ *
+ * Q4_K/Q4_0: 96.  PF.1 threshold screen (Qwen3.5 4B, 65 tokens and up was faster
+ * split on every run, 65 rounded up to a multiple of 32); host repo
+ * docs/superpowers/research/2026-10-18-pf1-prefill-tensor-path/threshold.txt.
+ *
+ * Q8_0: 192, the value the Q8_0 split has always had; not measured by PF.1. */
+#define DS4_GPU_Q4_NAX_SPLIT_MIN_ROWS 96u
+#define DS4_GPU_Q8_NAX_SPLIT_MIN_ROWS 192u
 
 static uint32_t g_test_flags;
 static id<MTLComputePipelineState> g_hc_expand_pipeline;
@@ -19451,7 +19456,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
          * deliberately retains the single-kernel arithmetic schedule.
          */
         const bool split_nax_prefix =
-            !g_quality_mode && n_tok >= DS4_GPU_NAX_SPLIT_MIN_ROWS && (n_tok % 32u) != 0u;
+            !g_quality_mode && n_tok >= DS4_GPU_Q8_NAX_SPLIT_MIN_ROWS && (n_tok % 32u) != 0u;
         const uint64_t nax_rows =
             (n_tok % 32u) == 0u ? n_tok :
             (split_nax_prefix ? n_tok - (n_tok % 32u) : 0u);
@@ -19842,7 +19847,7 @@ static uint64_t ds4_gpu_nax_prefix_rows(uint64_t n_tok) {
     if ((n_tok % 32u) == 0u) return n_tok;
     if (g_quality_mode ||
         (g_test_flags & DS4_GPU_TEST_NAX_SPLIT_OFF) != 0u ||
-        n_tok < DS4_GPU_NAX_SPLIT_MIN_ROWS) {
+        n_tok < DS4_GPU_Q4_NAX_SPLIT_MIN_ROWS) {
         return 0u;
     }
     return n_tok - (n_tok % 32u);
