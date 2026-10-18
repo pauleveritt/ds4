@@ -766,6 +766,20 @@ else
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
 
+tests/test_qwen35_host.o: tests/test_qwen35_host.c ds4.c ds4.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_qwen35_host: tests/test_qwen35_host.o $(filter-out ds4.o,$(CORE_OBJS))
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+else
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+endif
+
+.PHONY: test-qwen35-host
+test-qwen35-host: tests/test_qwen35_host
+	./tests/test_qwen35_host
+
 tests/test_qwen4_prefill.o: tests/test_qwen4_prefill.c ds4.h
 	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
 
@@ -1048,7 +1062,7 @@ tests/test_web_recovery: tests/test_web_recovery.c ds4_web.c ds4_web.h
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory test-engram test-web-recovery \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	tests/test_deepseek4_vision_image tests/test_image_decode tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	tests/test_deepseek4_vision_image tests/test_image_decode tests/test_prompt_prefix $(SAMPLING_TEST) test-qwen35-host ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
@@ -1113,7 +1127,7 @@ tests/test_session_state_gpu.o: ds4_tool_text.h
 
 clean:
 	rm -f tests/test_qwen4_ngrams
-	rm -f tests/test_qwen4_ngram_state
+	rm -f tests/test_qwen4_ngram_state tests/test_qwen35_host
 	rm -f tests/test_web_recovery
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory

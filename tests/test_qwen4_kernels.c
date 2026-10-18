@@ -5043,6 +5043,9 @@ static void test_q5_K_mm(arena_t *a) {
     const uint32_t Ts[] = {1, 3, 8, 40, 64};
     for (uint32_t t = 0; t < 5; t++) test_q5_K_reference(a, 512, 72, Ts[t], false);
     for (uint32_t t = 0; t < 3; t++) test_q5_K_reference(a, 512, 72, Ts[t], true);
+    /* out_dim % 64 == 0 and T % 32 == 0: the full-tile variant (bc_out false)
+     * that production prompt batches take */
+    test_q5_K_reference(a, 512, 128, 64, false);
     test_q5_K_reference(a, 4096, 200, 1, false);
     test_q5_K_reference(a, 512, 73, 2, false);
     a->used = used;
