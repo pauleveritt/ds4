@@ -19814,6 +19814,28 @@ static const char *ds4_gpu_q4_nax_name(uint32_t weight_type, uint64_t tile_n) {
     return NULL;
 }
 
+/*
+ * Rows of a Q4_K/Q4_0 prefill batch that run on the tensor (NAX) kernels.
+ * The tensor kernels need a multiple of 32 rows; a ragged batch used to send
+ * everything through the boundary-checked simdgroup kernel, 1.7-1.8x slower.
+ * Run the aligned prefix on TensorOps and the remainder on the generic
+ * kernel.  Aligned batches are all tensor.  Tiny batches do not amortize the
+ * second dispatch, and --quality keeps its single-kernel arithmetic schedule.
+ * DS4_GPU_TEST_NAX_SPLIT_OFF restores the single-kernel schedule of a ragged
+ * batch.  Returns 0 when the batch is not split and is not aligned.
+ */
+#define DS4_GPU_NAX_SPLIT_MIN_ROWS 192u
+
+static uint64_t ds4_gpu_nax_prefix_rows(uint64_t n_tok) {
+    if ((n_tok % 32u) == 0u) return n_tok;
+    if (g_quality_mode ||
+        (g_test_flags & DS4_GPU_TEST_NAX_SPLIT_OFF) != 0u ||
+        n_tok < DS4_GPU_NAX_SPLIT_MIN_ROWS) {
+        return 0u;
+    }
+    return n_tok - (n_tok % 32u);
+}
+
 static int ds4_gpu_matmul_quant_impl_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -19972,22 +19994,30 @@ static int ds4_gpu_matmul_quant_impl_tensor(
             }
         }
 
+        /*
+         * A ragged batch runs its 32-aligned prefix on the tensor kernel and
+         * only the remainder (rows [generic_row0, n_tok)) on the generic one
+         * below, as the Q8_0 path does.  Q5_K has no tensor kernel, so it
+         * never splits.
+         */
+        const uint64_t nax_rows = ds4_gpu_nax_prefix_rows(n_tok);
+        uint64_t generic_row0 = 0u;
+        uint64_t generic_rows = n_tok;
         if (ds4_gpu_mpp_available() &&
-            n_tok >= 32u &&
+            nax_rows >= 32u &&
             (in_dim % 64u) == 0 &&
-            (out_dim % 64u) == 0 &&
-            (n_tok % 32u) == 0) {
+            (out_dim % 64u) == 0) {
             uint64_t nax_tile_n = 32u;
-            if ((n_tok % 128u) == 0) {
+            if ((nax_rows % 128u) == 0) {
                 nax_tile_n = 128u;
-            } else if ((n_tok % 64u) == 0) {
+            } else if ((nax_rows % 64u) == 0) {
                 nax_tile_n = 64u;
             }
             const char *nax_fn = ds4_gpu_q4_nax_name(weight_type, nax_tile_n);
             id<MTLComputePipelineState> pipeline =
                 nax_fn ? ds4_gpu_get_mul_mm_pipeline(nax_fn, false, false) : nil;
             if (pipeline) {
-                ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+                ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, nax_rows, row_bytes);
 
                 id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
                 [enc setComputePipelineState:pipeline];
@@ -19996,36 +20026,47 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
                 [enc setThreadgroupMemoryLength:2u * 64u * 32u * sizeof(uint16_t) atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok / nax_tile_n),
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(nax_rows / nax_tile_n),
                                                       (NSUInteger)out_dim / 64u,
                                                       1)
                      threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                 ds4_gpu_end_compute_encoder(cb, enc);
 
-                if (!ds4_gpu_finish_command_buffer(cb, owned, "Q4 NAX tensor matmul")) return 0;
-                return 1;
+                if (nax_rows == n_tok) {
+                    if (!ds4_gpu_finish_command_buffer(cb, owned, "Q4 NAX tensor matmul")) return 0;
+                    return 1;
+                }
+                generic_row0 = nax_rows;
+                generic_rows = n_tok - nax_rows;
+            } else if (nax_fn) {
+                /* Q5_K has no NAX kernel to fall back from. */
+                ds4_gpu_warn_mpp_fallback();
             }
-            /* Q5_K has no NAX kernel to fall back from. */
-            if (nax_fn) ds4_gpu_warn_mpp_fallback();
         }
 
         const char *mm_fn = ds4_gpu_q4_mm_name(weight_type);
         const bool bc_inp = (in_dim % 32u) != 0;
-        const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
+        const bool bc_out = (out_dim % 64u) != 0 || (generic_rows % 32u) != 0;
         id<MTLComputePipelineState> pipeline =
             mm_fn ? ds4_gpu_get_mul_mm_pipeline(mm_fn, bc_inp, bc_out) : nil;
         if (!pipeline) return 0;
 
-        ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+        ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, generic_rows, row_bytes);
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
-        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
-        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setBuffer:xbuf
+                offset:ds4_gpu_tensor_offset(x) +
+                       (NSUInteger)(generic_row0 * in_dim * sizeof(float))
+               atIndex:2];
+        [enc setBuffer:outbuf
+                offset:ds4_gpu_tensor_offset(out) +
+                       (NSUInteger)(generic_row0 * out_dim * sizeof(float))
+               atIndex:3];
         [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)generic_rows + 31u) / 32u,
                                               ((NSUInteger)out_dim + 63u) / 64u,
                                               1)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];

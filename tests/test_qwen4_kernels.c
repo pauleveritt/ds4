@@ -5145,6 +5145,196 @@ static void test_q4_K_mma_word(arena_t *a) {
     g_rng = rng;
 }
 
+/* ---- the ragged split of Q4_K and Q4_0 prefill (PF.1 step 1) ---- */
+
+/* One ds4_gpu_matmul_quant_tensor call at n rows with the given test flags and
+ * quality mode.  x is read from gx at x_row0 rows in, through a view when
+ * x_row0 is not zero; the output goes to a buffer of out_row0 + n + 1 rows
+ * filled with 17.25f, through a view from out_row0 on when that is not zero.
+ * Every float outside rows [out_row0, out_row0 + n) must still read 17.25f
+ * (the row after the last one is the guard).  Returns the n output rows. */
+static float *nax_call(arena_t *a, uint32_t wtype, uint64_t off, uint32_t in_dim, uint32_t out_dim,
+                       ds4_gpu_tensor *gx, uint64_t x_row0, uint32_t n, uint32_t flags, bool quality,
+                       uint64_t out_row0) {
+    const uint64_t total = (out_row0 + n + 1u) * out_dim;
+    ds4_gpu_tensor *base = upload(NULL, total);
+    require_ok(ds4_gpu_tensor_fill_f32(base, 17.25f, total), "nax split output fill");
+    ds4_gpu_tensor *xv = x_row0 ? ds4_gpu_tensor_view(gx, x_row0 * in_dim * 4u, (uint64_t)n * in_dim * 4u) : gx;
+    ds4_gpu_tensor *ov = out_row0 ? ds4_gpu_tensor_view(base, out_row0 * out_dim * 4u, ((uint64_t)n + 1u) * out_dim * 4u) : base;
+    require_ok(xv && ov, "nax split views");
+    ds4_gpu_test_set_flags(flags);
+    ds4_gpu_set_quality(quality);
+    const int ok = ds4_gpu_matmul_quant_tensor(ov, a->base, a->size, off, wtype, in_dim, out_dim, xv, n);
+    ds4_gpu_set_quality(false);
+    ds4_gpu_test_set_flags(0u);
+    require_ok(ok, "nax split matmul dispatch");
+    float *all = download(base, total);
+    for (uint64_t i = 0; i < total; i++) {
+        const bool inside = i >= out_row0 * out_dim && i < (out_row0 + n) * out_dim;
+        if (!inside && all[i] != 17.25f) {
+            fprintf(stderr, "nax split %s n=%u: float %llu (row %llu, col %llu) outside the output was written: %.9g\n",
+                    wtype == 12u ? "Q4_K" : "Q4_0", n, (unsigned long long)i, (unsigned long long)(i / out_dim),
+                    (unsigned long long)(i % out_dim), all[i]);
+            exit(1);
+        }
+    }
+    float *rows = malloc((uint64_t)n * out_dim * sizeof(float));
+    memcpy(rows, all + out_row0 * out_dim, (uint64_t)n * out_dim * sizeof(float));
+    free(all);
+    if (xv != gx) ds4_gpu_tensor_free(xv);
+    if (ov != base) ds4_gpu_tensor_free(ov);
+    ds4_gpu_tensor_free(base);
+    return rows;
+}
+
+/* index of the first differing row in [row0, row1) and the first differing column in it, or -1 */
+static int64_t nax_first_diff(const float *a, const float *b, uint64_t row0, uint64_t row1, uint32_t out_dim,
+                              uint64_t *col) {
+    for (uint64_t i = row0 * out_dim; i < row1 * out_dim; i++)
+        if (memcmp(&a[i], &b[i], sizeof(float)) != 0) { *col = i % out_dim; return (int64_t)(i / out_dim); }
+    return -1;
+}
+
+static void nax_expect_equal(const char *what, const char *type, uint32_t n, const float *a, const float *b,
+                             uint64_t row0, uint64_t row1, uint32_t out_dim) {
+    uint64_t col = 0;
+    const int64_t row = nax_first_diff(a, b, row0, row1, out_dim, &col);
+    if (row >= 0) {
+        fprintf(stderr, "nax split %s %s n=%u: rows [%llu, %llu) not byte-equal; first differing row %lld col %llu: "
+                        "%.9g (0x%08x) vs %.9g (0x%08x)\n",
+                type, what, n, (unsigned long long)row0, (unsigned long long)row1, (long long)row,
+                (unsigned long long)col, a[row * out_dim + col], *(const uint32_t *)&a[row * out_dim + col],
+                b[row * out_dim + col], *(const uint32_t *)&b[row * out_dim + col]);
+        exit(1);
+    }
+}
+
+static void nax_expect_differ(const char *what, const char *type, uint32_t n, const float *a, const float *b,
+                              uint64_t row0, uint64_t row1, uint32_t out_dim) {
+    uint64_t col = 0;
+    if (nax_first_diff(a, b, row0, row1, out_dim, &col) < 0) {
+        fprintf(stderr, "NOTE: tensor and simdgroup rows agree, split untestable (%s %s n=%u rows [%llu, %llu))\n",
+                type, what, n, (unsigned long long)row0, (unsigned long long)row1);
+        exit(1);
+    }
+}
+
+static void test_q4_nax_split_type(arena_t *a, const char *type, uint32_t wtype) {
+    const uint32_t in_dim = 2048, out_dim = 1024, view_rows = 256, SPLIT_OFF = DS4_GPU_TEST_NAX_SPLIT_OFF;
+    double *sh;
+    const uint64_t off = wtype == 12u ? arena_q4_K(a, out_dim, in_dim, &sh, 0.05f)
+                                      : arena_q4_0(a, out_dim, in_dim, &sh, 0.05f);
+    const uint32_t max_n = 2047;
+    float *x = rand_vec((uint64_t)max_n * in_dim, 1.0f);
+    float *junk = rand_vec((uint64_t)view_rows * in_dim, 1.0f);
+    float *padded = malloc(((uint64_t)view_rows + max_n) * in_dim * sizeof(float));
+    memcpy(padded, junk, (uint64_t)view_rows * in_dim * sizeof(float));
+    memcpy(padded + (uint64_t)view_rows * in_dim, x, (uint64_t)max_n * in_dim * sizeof(float));
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)max_n * in_dim);
+    ds4_gpu_tensor *gpad = upload(padded, ((uint64_t)view_rows + max_n) * in_dim);
+
+    /* split_rows_exact: the aligned prefix is the tensor kernel's, the remainder the generic kernel's */
+    static const uint32_t ns[] = {193, 225, 479, 511, 2047};
+    for (uint32_t i = 0; i < sizeof(ns) / sizeof(ns[0]); i++) {
+        const uint32_t n = ns[i], p = n - n % 32u;
+        float *full = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, n, 0u, false, 0);
+        float *aligned = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, p, 0u, false, 0);
+        float *off_n = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, n, SPLIT_OFF, false, 0);
+        nax_expect_equal("split_rows_exact (prefix vs aligned call)", type, n, full, aligned, 0, p, out_dim);
+        nax_expect_equal("split_rows_exact (remainder vs split-off call)", type, n, full, off_n, p, n, out_dim);
+        free(full); free(aligned); free(off_n);
+    }
+    printf("  %s split_rows_exact n=193,225,479,511,2047: prefix == aligned call, remainder == split-off rows, guard row intact\n", type);
+
+    /* split_is_discriminating: tensor and simdgroup rows must differ, or the test above proves nothing */
+    {
+        float *full = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 511, 0u, false, 0);
+        float *off_n = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 511, SPLIT_OFF, false, 0);
+        nax_expect_differ("split_is_discriminating", type, 511, full, off_n, 0, 480, out_dim);
+        free(full); free(off_n);
+    }
+    printf("  %s split_is_discriminating n=511: tensor rows differ from the simdgroup rows\n", type);
+
+    /* split_reference: against the double shadow (the half-staged operands bound the error) */
+    static const uint32_t ref_ns[] = {511, 2047};
+    for (uint32_t i = 0; i < 2; i++) {
+        const uint32_t n = ref_ns[i];
+        float *got = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, n, 0u, false, 0);
+        double *ref = qwen35_mv_ref(sh, x, in_dim, out_dim, n);
+        char name[96];
+        snprintf(name, sizeof(name), "%s split_reference %u->%u n=%u", type, in_dim, out_dim, n);
+        check_close(name, got, ref, (uint64_t)n * out_dim, 1e-3);
+        free(got); free(ref);
+    }
+
+    /* split_through_view: x and out at an offset of 256 rows into larger buffers */
+    {
+        float *plain = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 511, 0u, false, 0);
+        float *viewed = nax_call(a, wtype, off, in_dim, out_dim, gpad, view_rows, 511, 0u, false, view_rows);
+        nax_expect_equal("split_through_view", type, 511, plain, viewed, 0, 511, out_dim);
+        free(plain); free(viewed);
+    }
+    printf("  %s split_through_view n=511: 256-row views of x and out give the unviewed bytes\n", type);
+
+    /* declines, each with a sibling that engages the split */
+    {
+        float *off191 = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 191, SPLIT_OFF, false, 0);
+        float *on191 = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 191, 0u, false, 0);
+        nax_expect_equal("decline n=191 (below the minimum)", type, 191, on191, off191, 0, 191, out_dim);
+        float *off31 = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 31, SPLIT_OFF, false, 0);
+        float *on31 = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 31, 0u, false, 0);
+        nax_expect_equal("decline n=31 (below one tile)", type, 31, on31, off31, 0, 31, out_dim);
+        static const uint32_t above[] = {193, 511};
+        for (uint32_t i = 0; i < 2; i++) {
+            float *off_n = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, above[i], SPLIT_OFF, false, 0);
+            float *on_n = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, above[i], 0u, false, 0);
+            nax_expect_differ("sibling of the minimum", type, above[i], on_n, off_n, 0, above[i] - above[i] % 32u, out_dim);
+            free(off_n); free(on_n);
+        }
+        free(off191); free(on191); free(off31); free(on31);
+    }
+    {
+        float *off_n = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 511, SPLIT_OFF, false, 0);
+        float *quality = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 511, 0u, true, 0);
+        float *plain = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 511, 0u, false, 0);
+        nax_expect_equal("decline under --quality", type, 511, quality, off_n, 0, 511, out_dim);
+        nax_expect_differ("sibling of --quality (quality off)", type, 511, plain, quality, 0, 480, out_dim);
+        free(off_n); free(quality); free(plain);
+    }
+    printf("  %s declines: n=191 and n=31 and --quality equal the split-off call; n=193, 511 and quality off differ from it\n", type);
+    free(sh);
+    ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gpad);
+    free(x); free(junk); free(padded);
+}
+
+/* out_dim not a multiple of 64 never took the tensor kernel and must not split */
+static void test_q4_nax_split_odd_out(arena_t *a, const char *type, uint32_t wtype) {
+    const uint32_t in_dim = 2048, out_dim = 1000, n = 511;
+    double *sh;
+    const uint64_t off = wtype == 12u ? arena_q4_K(a, out_dim, in_dim, &sh, 0.05f)
+                                      : arena_q4_0(a, out_dim, in_dim, &sh, 0.05f);
+    float *x = rand_vec((uint64_t)n * in_dim, 1.0f);
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)n * in_dim);
+    float *on = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, n, 0u, false, 0);
+    float *off_n = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, n, DS4_GPU_TEST_NAX_SPLIT_OFF, false, 0);
+    nax_expect_equal("decline out_dim=1000 (not a multiple of 64)", type, n, on, off_n, 0, n, out_dim);
+    printf("  %s decline out_dim=1000 n=511: equals the split-off call\n", type);
+    free(on); free(off_n); free(sh); free(x);
+    ds4_gpu_tensor_free(gx);
+}
+
+static void test_q4_nax_split(arena_t *a) {
+    const uint32_t rng = g_rng;
+    const uint64_t used = a->used;
+    printf("qwen35 Q4_K/Q4_0 ragged prefill split\n");
+    test_q4_nax_split_type(a, "Q4_K", 12u);
+    test_q4_nax_split_type(a, "Q4_0", 2u);
+    test_q4_nax_split_odd_out(a, "Q4_K", 12u);
+    test_q4_nax_split_odd_out(a, "Q4_0", 2u);
+    a->used = used;
+    g_rng = rng;
+}
+
 /* causal gated attention of query row t, head h in double; q_half rounds the
  * query to half (round to nearest even) as both GPU kernels stage it */
 static void qwen35_attn_ref_row(const float *q, const float *gate, const _Float16 *kc, const _Float16 *vc,
@@ -5560,6 +5750,7 @@ int main(void) {
 #ifdef __APPLE__
     if (getenv("DS4_TEST_QWEN4_Q6K_MM_ONLY")) { test_q6_K_mm(&arena); printf("all qwen4 Q6_K mm tests passed\n"); return 0; }
     if (getenv("DS4_TEST_QWEN35_Q5K_MM_ONLY")) { test_q5_K_mm(&arena); printf("all qwen35 Q5_K mm tests passed\n"); return 0; }
+    if (getenv("DS4_TEST_QWEN35_NAX_SPLIT_ONLY")) { test_q4_nax_split(&arena); printf("all qwen35 nax split tests passed\n"); return 0; }
     if (getenv("DS4_TEST_QWEN35_Q4K_MMA_ONLY")) { test_q4_K_mma_word(&arena); printf("all qwen35 Q4_K mma tests passed\n"); return 0; }
     if (getenv("DS4_TEST_QWEN35_ATTN_FA_ONLY")) { test_qwen35_attn_fa(); printf("all qwen35 attn fa tests passed\n"); return 0; }
     if (getenv("DS4_TEST_QWEN35_VERIFY_ATTN_BENCH")) { bench_qwen35_attn_verify(); return 0; }
@@ -5756,6 +5947,7 @@ int main(void) {
 #ifdef __APPLE__
     test_qwen35_verify(&arena);
     test_q4_K_mma_word(&arena);
+    test_q4_nax_split(&arena);
     test_dflash_drafter(&arena);
 #endif
     printf("all qwen4 kernel tests passed\n");

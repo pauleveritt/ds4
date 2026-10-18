@@ -262,6 +262,11 @@ enum {
     DS4_GPU_TEST_Q6_K_MM_BYTEWISE = 1u << 7,
     DS4_GPU_TEST_Q4_K_MMA_BYTEWISE = 1u << 8,
     DS4_GPU_TEST_Q4_K_MMA_WORD = 1u << 9,
+    /* Run today's single-kernel schedule for ragged prefill batches: the
+     * whole Q4_K/Q4_0 batch through the boundary-checked kernel rather than
+     * its 32-aligned prefix through the tensor kernel.  Aligned batches keep
+     * the tensor path. */
+    DS4_GPU_TEST_NAX_SPLIT_OFF = 1u << 10,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
