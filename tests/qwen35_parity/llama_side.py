@@ -10,11 +10,13 @@ prompt tokens.  It also renders the same messages with the GGUF chat template
 produces the same ids as ds4.
 
 LLAMA_SERVER names the llama-server binary; LLAMA_ARGS adds server flags
-(default "-ngl 99"; "-ngl 0" runs llama.cpp's CPU backend).
+(default "-ngl 99"; "-ngl 0" runs llama.cpp's CPU backend).  The full
+server command line is written to OUTDIR/server-argv.txt.
 """
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -41,8 +43,11 @@ def main():
     os.makedirs(out, exist_ok=True)
     server = os.environ.get("LLAMA_SERVER", "llama-server")
     extra = os.environ.get("LLAMA_ARGS", "-ngl 99").split()
+    argv = [server, "-m", model, "-c", "4096", "--port", str(PORT), "-np", "1", "--no-webui", "--jinja"] + extra
+    with open(os.path.join(out, "server-argv.txt"), "w") as f:  # the exact command, flags such as -ub included
+        f.write(" ".join(shlex.quote(a) for a in argv) + "\n")
     srv = subprocess.Popen(
-        [server, "-m", model, "-c", "4096", "--port", str(PORT), "-np", "1", "--no-webui", "--jinja"] + extra,
+        argv,
         stdout=open(os.path.join(out, "server.log"), "w"),
         stderr=subprocess.STDOUT,
     )
