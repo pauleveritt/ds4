@@ -269,6 +269,9 @@ enum {
     DS4_GPU_TEST_NAX_SPLIT_OFF = 1u << 10,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
+/* 1 when the Metal 4 tensor API (the NAX kernels) is in use; tests skip NAX
+ * comparisons without it, as on a pre-M5 Mac or with DS4_METAL_DISABLE_METAL4. */
+int ds4_gpu_test_tensor_api_available(void);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }

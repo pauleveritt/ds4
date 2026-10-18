@@ -5323,7 +5323,15 @@ static void test_q4_nax_split_odd_out(arena_t *a, const char *type, uint32_t wty
     ds4_gpu_tensor_free(gx);
 }
 
+/* Q4_K and Q4_0 only: Q5_K has no NAX kernel on this branch, so it never splits
+ * (checked by reading ds4_gpu_q4_nax_name; Task 6 adds its kernel and its test).
+ * Without the Metal 4 tensor API every call takes the generic kernel, so the
+ * comparisons would pass vacuously: skipped, as the MoE NAX tests are. */
 static void test_q4_nax_split(arena_t *a) {
+    if (!ds4_gpu_test_tensor_api_available()) {
+        printf("qwen35 Q4_K/Q4_0 ragged prefill split: tensor API unavailable, skipped\n");
+        return;
+    }
     const uint32_t rng = g_rng;
     const uint64_t used = a->used;
     printf("qwen35 Q4_K/Q4_0 ragged prefill split\n");

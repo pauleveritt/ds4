@@ -419,6 +419,10 @@ static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_dsv4_hc_barrier_cache;
 static NSMutableDictionary<NSString *, NSNumber *> *g_dsv4_hc_barrier_gen;
 static id<MTLComputePipelineState> g_hc_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_output_hc_weights4_pipeline;
+/* Smallest ragged prefill batch whose aligned prefix runs on the tensor (NAX)
+ * kernels with the remainder on the generic one; Q8_0 and Q4_K/Q4_0 share it. */
+#define DS4_GPU_NAX_SPLIT_MIN_ROWS 192u
+
 static uint32_t g_test_flags;
 static id<MTLComputePipelineState> g_hc_expand_pipeline;
 static id<MTLComputePipelineState> g_unary_sigmoid_pipeline;
@@ -9215,6 +9219,10 @@ int ds4_gpu_test_mxfp4_down_half_lut(uint16_t *legacy_bits,
 
 void ds4_gpu_test_set_flags(uint32_t flags) {
     g_test_flags = flags;
+}
+
+int ds4_gpu_test_tensor_api_available(void) {
+    return g_metal4_tensor_api_enabled ? 1 : 0;
 }
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
@@ -19440,7 +19448,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
          * deliberately retains the single-kernel arithmetic schedule.
          */
         const bool split_nax_prefix =
-            !g_quality_mode && n_tok >= 192u && (n_tok % 32u) != 0u;
+            !g_quality_mode && n_tok >= DS4_GPU_NAX_SPLIT_MIN_ROWS && (n_tok % 32u) != 0u;
         const uint64_t nax_rows =
             (n_tok % 32u) == 0u ? n_tok :
             (split_nax_prefix ? n_tok - (n_tok % 32u) : 0u);
@@ -19817,15 +19825,16 @@ static const char *ds4_gpu_q4_nax_name(uint32_t weight_type, uint64_t tile_n) {
 /*
  * Rows of a Q4_K/Q4_0 prefill batch that run on the tensor (NAX) kernels.
  * The tensor kernels need a multiple of 32 rows; a ragged batch used to send
- * everything through the boundary-checked simdgroup kernel, 1.7-1.8x slower.
+ * everything through the boundary-checked simdgroup kernel: a 512-token
+ * prompt prefilled about 1.8x faster than a 511-token one (27B, whole-model
+ * prefill, median of 3; PF.1 step 0 baseline, host repo
+ * docs/superpowers/research/2026-10-18-pf1-prefill-tensor-path/baseline/summary.txt).
  * Run the aligned prefix on TensorOps and the remainder on the generic
  * kernel.  Aligned batches are all tensor.  Tiny batches do not amortize the
  * second dispatch, and --quality keeps its single-kernel arithmetic schedule.
  * DS4_GPU_TEST_NAX_SPLIT_OFF restores the single-kernel schedule of a ragged
  * batch.  Returns 0 when the batch is not split and is not aligned.
  */
-#define DS4_GPU_NAX_SPLIT_MIN_ROWS 192u
-
 static uint64_t ds4_gpu_nax_prefix_rows(uint64_t n_tok) {
     if ((n_tok % 32u) == 0u) return n_tok;
     if (g_quality_mode ||
