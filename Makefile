@@ -1062,7 +1062,7 @@ tests/test_web_recovery: tests/test_web_recovery.c ds4_web.c ds4_web.h
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory test-engram test-web-recovery \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	tests/test_deepseek4_vision_image tests/test_image_decode tests/test_prompt_prefix $(SAMPLING_TEST) test-qwen35-host ds4 ds4-server ds4-bench ds4-agent
+	tests/test_deepseek4_vision_image tests/test_image_decode tests/test_prompt_prefix $(SAMPLING_TEST) tests/test_qwen35_host ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
@@ -1073,6 +1073,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-
 	./tests/test_gpu_args_cli.sh
 	./tests/test_prompt_prefix
 	./tests/test_sampling
+	./tests/test_qwen35_host
 	./tests/test_deepseek4_vision_image
 	./tests/test_image_decode
 

@@ -136,7 +136,11 @@ static void test_ref_row(uint32_t type, uint64_t block_bytes, const char *name,
     free(data);
 }
 
-/* --- qwen35_graph_weights_supported ------------------------------------- */
+/* --- qwen35_graph_weights_supported -------------------------------------
+ * Compiled only where ds4.c defines it (DS4_HAS_QWEN4_GPU).  It returns
+ * false whenever __APPLE__ is undefined ("dense qwen35 runs on the Metal
+ * graph only"), so off Darwin the accept cases are pinned as declined. */
+#ifdef DS4_HAS_QWEN4_GPU
 
 static ds4_tensor g_t[DS4_TENSOR_MXFP4 + 1];
 
@@ -153,6 +157,7 @@ typedef struct {
 
 static bool run_case(const wcase *c) {
     /* three GDN layers and one attention layer, no MTP block */
+    const ds4_shape saved_shape = g_ds4_shape;
     g_ds4_shape = DS4_SHAPE_QWEN35;
     g_ds4_shape.n_layer = 4;
     g_ds4_shape.n_nextn_predict = 0;
@@ -179,6 +184,7 @@ static bool run_case(const wcase *c) {
         }
     }
     const bool ok = qwen35_graph_weights_supported(w);
+    g_ds4_shape = saved_shape;
     free(w);
     return ok;
 }
@@ -196,9 +202,15 @@ static void test_weights_supported(void) {
         {Q4K, Q4K, Q4K, Q4K, Q4K},   /* matching Q4_K alpha/beta */
         {Q4K, Q4K, Q4K, Q80, Q80},   /* matching Q8_0 alpha/beta */
     };
-    for (size_t i = 0; i < sizeof(accept) / sizeof(accept[0]); i++)
+    for (size_t i = 0; i < sizeof(accept) / sizeof(accept[0]); i++) {
+#if defined(__APPLE__)
         CHECK(run_case(&accept[i]), "accept case %zu (embd=%u out=%u qkv=%u alpha=%u beta=%u) was declined", i,
               accept[i].token_embd, accept[i].output, accept[i].qkv, accept[i].alpha, accept[i].beta);
+#else
+        /* the sibling of the refusals below, off Darwin: nothing is accepted */
+        CHECK(!run_case(&accept[i]), "case %zu was accepted off Darwin, where the graph is unsupported", i);
+#endif
+    }
     /* the refusals: alpha/beta the fused decode front cannot read */
     const wcase decline[] = {
         {Q4K, Q4K, Q4K, Q5K, Q5K},   /* Q5_K alpha and beta */
@@ -212,11 +224,14 @@ static void test_weights_supported(void) {
         CHECK(!run_case(&decline[i]), "decline case %zu (alpha=%u beta=%u) was accepted", i,
               decline[i].alpha, decline[i].beta);
 }
+#endif /* DS4_HAS_QWEN4_GPU */
 
 int main(void) {
     test_ref_row(DS4_TENSOR_Q5_K, 176, "Q5_K", ref_q5_K);
     test_ref_row(DS4_TENSOR_Q6_K, 210, "Q6_K", ref_q6_K);
+#ifdef DS4_HAS_QWEN4_GPU
     test_weights_supported();
+#endif
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("all qwen35 host tests passed\n");
     return 0;
