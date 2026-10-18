@@ -5234,7 +5234,7 @@ static void test_q4_nax_split_type(arena_t *a, const char *type, uint32_t wtype)
     ds4_gpu_tensor *gpad = upload(padded, ((uint64_t)view_rows + max_n) * in_dim);
 
     /* split_rows_exact: the aligned prefix is the tensor kernel's, the remainder the generic kernel's */
-    static const uint32_t ns[] = {193, 225, 479, 511, 2047};
+    static const uint32_t ns[] = {97, 191, 193, 225, 479, 511, 2047};
     for (uint32_t i = 0; i < sizeof(ns) / sizeof(ns[0]); i++) {
         const uint32_t n = ns[i], p = n - n % 32u;
         float *full = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, n, 0u, false, 0);
@@ -5244,7 +5244,7 @@ static void test_q4_nax_split_type(arena_t *a, const char *type, uint32_t wtype)
         nax_expect_equal("split_rows_exact (remainder vs split-off call)", type, n, full, off_n, p, n, out_dim);
         free(full); free(aligned); free(off_n);
     }
-    printf("  %s split_rows_exact n=193,225,479,511,2047: prefix == aligned call, remainder == split-off rows, guard row intact\n", type);
+    printf("  %s split_rows_exact n=97,191,193,225,479,511,2047: prefix == aligned call, remainder == split-off rows, guard row intact\n", type);
 
     /* split_is_discriminating: tensor and simdgroup rows must differ, or the test above proves nothing */
     {
@@ -5278,20 +5278,20 @@ static void test_q4_nax_split_type(arena_t *a, const char *type, uint32_t wtype)
 
     /* declines, each with a sibling that engages the split */
     {
-        float *off191 = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 191, SPLIT_OFF, false, 0);
-        float *on191 = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 191, 0u, false, 0);
-        nax_expect_equal("decline n=191 (below the minimum)", type, 191, on191, off191, 0, 191, out_dim);
+        float *off95 = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 95, SPLIT_OFF, false, 0);
+        float *on95 = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 95, 0u, false, 0);
+        nax_expect_equal("decline n=95 (below the minimum of 96)", type, 95, on95, off95, 0, 95, out_dim);
         float *off31 = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 31, SPLIT_OFF, false, 0);
         float *on31 = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 31, 0u, false, 0);
         nax_expect_equal("decline n=31 (below one tile)", type, 31, on31, off31, 0, 31, out_dim);
-        static const uint32_t above[] = {193, 511};
-        for (uint32_t i = 0; i < 2; i++) {
+        static const uint32_t above[] = {97, 191, 511};
+        for (uint32_t i = 0; i < 3; i++) {
             float *off_n = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, above[i], SPLIT_OFF, false, 0);
             float *on_n = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, above[i], 0u, false, 0);
             nax_expect_differ("sibling of the minimum", type, above[i], on_n, off_n, 0, above[i] - above[i] % 32u, out_dim);
             free(off_n); free(on_n);
         }
-        free(off191); free(on191); free(off31); free(on31);
+        free(off95); free(on95); free(off31); free(on31);
     }
     {
         float *off_n = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 511, SPLIT_OFF, false, 0);
@@ -5301,7 +5301,7 @@ static void test_q4_nax_split_type(arena_t *a, const char *type, uint32_t wtype)
         nax_expect_differ("sibling of --quality (quality off)", type, 511, plain, quality, 0, 480, out_dim);
         free(off_n); free(quality); free(plain);
     }
-    printf("  %s declines: n=191 and n=31 and --quality equal the split-off call; n=193, 511 and quality off differ from it\n", type);
+    printf("  %s declines: n=95 and n=31 and --quality equal the split-off call; n=97, 191, 511 and quality off differ from it\n", type);
     free(sh);
     ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gpad);
     free(x); free(junk); free(padded);

@@ -420,8 +420,11 @@ static NSMutableDictionary<NSString *, NSNumber *> *g_dsv4_hc_barrier_gen;
 static id<MTLComputePipelineState> g_hc_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_output_hc_weights4_pipeline;
 /* Smallest ragged prefill batch whose aligned prefix runs on the tensor (NAX)
- * kernels with the remainder on the generic one; Q8_0 and Q4_K/Q4_0 share it. */
-#define DS4_GPU_NAX_SPLIT_MIN_ROWS 192u
+ * kernels with the remainder on the generic one; Q8_0 and Q4_K/Q4_0 share it.
+ * 96 is the PF.1 threshold screen's result for Q4_K (the 4B at 65 tokens and up
+ * was faster split on every run, rounded up to a multiple of 32); the screen
+ * did not measure Q8_0, which used 192 before the shared constant. */
+#define DS4_GPU_NAX_SPLIT_MIN_ROWS 96u
 
 static uint32_t g_test_flags;
 static id<MTLComputePipelineState> g_hc_expand_pipeline;
