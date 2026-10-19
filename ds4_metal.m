@@ -432,6 +432,7 @@ static id<MTLComputePipelineState> g_output_hc_weights4_pipeline;
 #define DS4_GPU_Q8_NAX_SPLIT_MIN_ROWS 192u
 
 static uint32_t g_test_flags;
+static uint32_t g_test_nax_dispatches;
 static id<MTLComputePipelineState> g_hc_expand_pipeline;
 static id<MTLComputePipelineState> g_unary_sigmoid_pipeline;
 static id<MTLComputePipelineState> g_unary_silu_pipeline;
@@ -9227,6 +9228,10 @@ int ds4_gpu_test_mxfp4_down_half_lut(uint16_t *legacy_bits,
 
 void ds4_gpu_test_set_flags(uint32_t flags) {
     g_test_flags = flags;
+}
+
+uint32_t ds4_gpu_test_nax_dispatches(void) {
+    return g_test_nax_dispatches;
 }
 
 int ds4_gpu_test_tensor_api_available(void) {
@@ -19853,6 +19858,33 @@ static uint64_t ds4_gpu_nax_prefix_rows(uint64_t n_tok) {
     return n_tok - (n_tok % 32u);
 }
 
+/*
+ * The tensor tiling of a Q4_K/Q4_0 prefix of `rows` rows (a multiple of 32):
+ * the first rows - rows % 128 rows at the 128-wide tile, then the remaining
+ * 32, 64 or 96 rows as one dispatch at the widest of 64/32 that divides them
+ * (96 takes the 32-wide tile).  A prefix under 128 rows is the tail alone, as
+ * before.  DS4_GPU_TEST_NAX_SINGLE_TILE restores one dispatch at the widest of
+ * 128/64/32 dividing the whole prefix.  Returns the number of parts (1 or 2).
+ */
+static uint32_t ds4_gpu_nax_tile_parts(uint64_t rows, uint64_t row0[2], uint64_t count[2], uint64_t tile[2]) {
+    if ((g_test_flags & DS4_GPU_TEST_NAX_SINGLE_TILE) != 0u) {
+        row0[0] = 0u;
+        count[0] = rows;
+        tile[0] = (rows % 128u) == 0 ? 128u : (rows % 64u) == 0 ? 64u : 32u;
+        return 1u;
+    }
+    const uint64_t head = rows - rows % 128u;
+    const uint64_t tail = rows - head;
+    uint32_t n = 0u;
+    if (head != 0u) {
+        row0[n] = 0u; count[n] = head; tile[n] = 128u; n++;
+    }
+    if (tail != 0u) {
+        row0[n] = head; count[n] = tail; tile[n] = (tail % 64u) == 0 ? 64u : 32u; n++;
+    }
+    return n;
+}
+
 static int ds4_gpu_matmul_quant_impl_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -20024,40 +20056,56 @@ static int ds4_gpu_matmul_quant_impl_tensor(
             nax_rows >= 32u &&
             (in_dim % 64u) == 0 &&
             (out_dim % 64u) == 0) {
-            uint64_t nax_tile_n = 32u;
-            if ((nax_rows % 128u) == 0) {
-                nax_tile_n = 128u;
-            } else if ((nax_rows % 64u) == 0) {
-                nax_tile_n = 64u;
-            }
-            const char *nax_fn = ds4_gpu_q4_nax_name(weight_type, nax_tile_n);
-            id<MTLComputePipelineState> pipeline =
-                nax_fn ? ds4_gpu_get_mul_mm_pipeline(nax_fn, false, false) : nil;
-            if (pipeline) {
-                ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, nax_rows, row_bytes);
+            /*
+             * The prefix is tiled as a 128-wide part plus a narrower tail
+             * (ds4_gpu_nax_tile_parts): a prefix of 480 or 2,016 rows has no
+             * divisor of 128 and used to run all of it on the 32-wide tile.
+             * The tile widths give byte-identical rows, so only the schedule
+             * changes.  A missing kernel (Q5_K) ends the loop before the first
+             * dispatch.
+             */
+            uint64_t part_row0[2], part_rows[2], part_tile[2];
+            const uint32_t n_parts = ds4_gpu_nax_tile_parts(nax_rows, part_row0, part_rows, part_tile);
+            bool nax_ok = true;
+            for (uint32_t pi = 0; pi < n_parts; pi++) {
+                const char *nax_fn = ds4_gpu_q4_nax_name(weight_type, part_tile[pi]);
+                id<MTLComputePipelineState> pipeline =
+                    nax_fn ? ds4_gpu_get_mul_mm_pipeline(nax_fn, false, false) : nil;
+                if (!pipeline) {
+                    /* Q5_K has no NAX kernel to fall back from. */
+                    if (nax_fn) ds4_gpu_warn_mpp_fallback();
+                    nax_ok = false;
+                    break;
+                }
+                ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, part_rows[pi], row_bytes);
 
                 id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
                 [enc setComputePipelineState:pipeline];
                 [enc setBytes:&args length:sizeof(args) atIndex:0];
                 [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
-                [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
-                [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+                [enc setBuffer:xbuf
+                        offset:ds4_gpu_tensor_offset(x) +
+                               (NSUInteger)(part_row0[pi] * in_dim * sizeof(float))
+                       atIndex:2];
+                [enc setBuffer:outbuf
+                        offset:ds4_gpu_tensor_offset(out) +
+                               (NSUInteger)(part_row0[pi] * out_dim * sizeof(float))
+                       atIndex:3];
                 [enc setThreadgroupMemoryLength:2u * 64u * 32u * sizeof(uint16_t) atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(nax_rows / nax_tile_n),
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(part_rows[pi] / part_tile[pi]),
                                                       (NSUInteger)out_dim / 64u,
                                                       1)
                      threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                 ds4_gpu_end_compute_encoder(cb, enc);
-
+                g_test_nax_dispatches++;
+            }
+            if (nax_ok) {
                 if (nax_rows == n_tok) {
                     if (!ds4_gpu_finish_command_buffer(cb, owned, "Q4 NAX tensor matmul")) return 0;
                     return 1;
                 }
                 generic_row0 = nax_rows;
                 generic_rows = n_tok - nax_rows;
-            } else if (nax_fn) {
-                /* Q5_K has no NAX kernel to fall back from. */
-                ds4_gpu_warn_mpp_fallback();
             }
         }
 

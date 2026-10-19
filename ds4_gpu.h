@@ -267,11 +267,18 @@ enum {
      * its 32-aligned prefix through the tensor kernel.  Aligned batches keep
      * the tensor path. */
     DS4_GPU_TEST_NAX_SPLIT_OFF = 1u << 10,
+    /* Tile the tensor prefix of a Q4_K/Q4_0 batch as one dispatch at the widest
+     * of 128/64/32 dividing it, rather than a 128-wide part plus a narrower
+     * tail. */
+    DS4_GPU_TEST_NAX_SINGLE_TILE = 1u << 11,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
 /* 1 when the Metal 4 tensor API (the NAX kernels) is in use; tests skip NAX
  * comparisons without it, as on a pre-M5 Mac or with DS4_METAL_DISABLE_METAL4. */
 int ds4_gpu_test_tensor_api_available(void);
+/* Count of Q4_K/Q4_0 tensor (NAX) kernel dispatches encoded so far; tests take
+ * differences.  Counts only, never changes a schedule. */
+uint32_t ds4_gpu_test_nax_dispatches(void);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }

@@ -5307,6 +5307,67 @@ static void test_q4_nax_split_type(arena_t *a, const char *type, uint32_t wtype)
     free(x); free(junk); free(padded);
 }
 
+/* The prefix's tiling (PF.1 step 1, Ruling 19): a 128-wide part plus a narrower tail must give the single
+ * dispatch's bytes, and the new path must run.  Its own x so the tests above keep their random stream. */
+static void test_q4_nax_tile_split_type(arena_t *a, const char *type, uint32_t wtype) {
+    const uint32_t in_dim = 2048, out_dim = 1024, view_rows = 256, SINGLE = DS4_GPU_TEST_NAX_SINGLE_TILE;
+    double *sh;
+    const uint64_t off = wtype == 12u ? arena_q4_K(a, out_dim, in_dim, &sh, 0.05f)
+                                      : arena_q4_0(a, out_dim, in_dim, &sh, 0.05f);
+    const uint32_t max_n = 2048;
+    float *x = rand_vec((uint64_t)max_n * in_dim, 1.0f);
+    float *junk = rand_vec((uint64_t)view_rows * in_dim, 1.0f);
+    float *padded = malloc(((uint64_t)view_rows + max_n) * in_dim * sizeof(float));
+    memcpy(padded, junk, (uint64_t)view_rows * in_dim * sizeof(float));
+    memcpy(padded + (uint64_t)view_rows * in_dim, x, (uint64_t)max_n * in_dim * sizeof(float));
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)max_n * in_dim);
+    ds4_gpu_tensor *gpad = upload(padded, ((uint64_t)view_rows + max_n) * in_dim);
+
+    /* tile_split_exact: every row (and the guard row, inside nax_call) equals the single-dispatch call's */
+    static const uint32_t ns[] = {480, 448, 416, 511, 479, 2016, 2047, 512, 2048};
+    for (uint32_t i = 0; i < sizeof(ns) / sizeof(ns[0]); i++) {
+        const uint32_t n = ns[i];
+        float *split = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, n, 0u, false, 0);
+        float *single = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, n, SINGLE, false, 0);
+        nax_expect_equal("tile_split_exact (split vs single tile)", type, n, split, single, 0, n, out_dim);
+        free(split); free(single);
+    }
+    printf("  %s tile_split_exact n=480,448,416,511,479,2016,2047,512,2048: 128-wide part plus tail == single dispatch, guard row intact\n", type);
+
+    /* tile_split_through_view: the second part's offsets must follow the views */
+    {
+        float *plain = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, 511, 0u, false, 0);
+        float *viewed = nax_call(a, wtype, off, in_dim, out_dim, gpad, view_rows, 511, 0u, false, view_rows);
+        nax_expect_equal("tile_split_through_view", type, 511, plain, viewed, 0, 511, out_dim);
+        free(plain); free(viewed);
+    }
+    printf("  %s tile_split_through_view n=511: 256-row views of x and out give the unviewed bytes\n", type);
+
+    /* tile_split_runs: bytes cannot show the new path, the tensor dispatch count does.  A prefix with a tail
+     * (not a multiple of 128 and at least 128) is two dispatches, one without the tail or under the flag. */
+    static const uint32_t run_ns[] = {480, 448, 416, 511, 2016, 2047, 512, 2048};
+    for (uint32_t i = 0; i < sizeof(run_ns) / sizeof(run_ns[0]); i++) {
+        const uint32_t n = run_ns[i], p = n - n % 32u;
+        const uint32_t want = (p >= 128u && p % 128u != 0u) ? 2u : 1u;
+        uint32_t c0 = ds4_gpu_test_nax_dispatches();
+        float *split = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, n, 0u, false, 0);
+        const uint32_t split_count = ds4_gpu_test_nax_dispatches() - c0;
+        c0 = ds4_gpu_test_nax_dispatches();
+        float *single = nax_call(a, wtype, off, in_dim, out_dim, gx, 0, n, SINGLE, false, 0);
+        const uint32_t single_count = ds4_gpu_test_nax_dispatches() - c0;
+        if (split_count != want || single_count != 1u) {
+            fprintf(stderr, "nax tile split %s tile_split_runs n=%u: %u tensor dispatches without the flag (want %u), "
+                            "%u with it (want 1)\n", type, n, split_count, want, single_count);
+            exit(1);
+        }
+        free(split); free(single);
+    }
+    printf("  %s tile_split_runs n=480,448,416,511,2016,2047: two tensor dispatches, one under the single-tile flag; n=512,2048: one either way\n", type);
+    free(sh);
+    ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gpad);
+    free(x); free(junk); free(padded);
+}
+
 /* out_dim not a multiple of 64 never took the tensor kernel and must not split */
 static void test_q4_nax_split_odd_out(arena_t *a, const char *type, uint32_t wtype) {
     const uint32_t in_dim = 2048, out_dim = 1000, n = 511;
@@ -5337,6 +5398,8 @@ static void test_q4_nax_split(arena_t *a) {
     printf("qwen35 Q4_K/Q4_0 ragged prefill split\n");
     test_q4_nax_split_type(a, "Q4_K", 12u);
     test_q4_nax_split_type(a, "Q4_0", 2u);
+    test_q4_nax_tile_split_type(a, "Q4_K", 12u);
+    test_q4_nax_tile_split_type(a, "Q4_0", 2u);
     test_q4_nax_split_odd_out(a, "Q4_K", 12u);
     test_q4_nax_split_odd_out(a, "Q4_0", 2u);
     a->used = used;
